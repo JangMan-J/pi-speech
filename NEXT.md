@@ -32,8 +32,9 @@ the way.
 
 Hosts: `agent-jail` is the laptop (speakers, PulseAudio, `pacat`/`pw-cat`/`ffplay` installed);
 `decent-spider` is the VPS (no GPU, no sound). Streaming must work in both places (answered 2026-11-12):
-local playback on `agent-jail` first, then through the bridge when Pi runs on `decent-spider`. Still open:
-whether audio (A) or text (B) crosses the bridge; B makes `agent-jail` synthesize as well as play.
+local playback on `agent-jail` first, then through the bridge when Pi runs on `decent-spider`. Audio crosses
+the bridge: `decent-spider` synthesizes and the Rust receiver on `agent-jail` plays a stream. Sending text to
+a headless Pi on `agent-jail` was considered and turned down as less robust than the receiver already built.
 
 ## What is measured (2026-11-12, a 253-character text, about 15 s of audio)
 
