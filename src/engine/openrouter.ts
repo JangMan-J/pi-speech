@@ -3,13 +3,20 @@
  * The API key is sent only to OpenRouter, only in the Authorization header.
  */
 
+import { clipOf, collect, streamFromBody, streamOfClip } from "./audio-stream";
 import { chatSynthesize, chatTranscribe } from "./chat-audio";
 import { type KeyRegistry, resolveApiKey } from "./credentials";
 import { type Env, errorMessage } from "./env";
 import { FEATURES, type ModelKind, modelFeatures, vendorOf } from "./features";
 import { chatPriceTag, type OpenRouterPricing, priceTag } from "./pricing";
-import type { SpeechProvider, SynthesisRequest, SynthesizedAudio, TranscriptionRequest, Via } from "./provider";
-import { wrapPcmAsWav } from "./wav";
+import type {
+  AudioStream,
+  SpeechProvider,
+  SynthesisRequest,
+  SynthesizedAudio,
+  TranscriptionRequest,
+  Via,
+} from "./provider";
 
 export type { SynthesizedAudio } from "./provider";
 export { wrapPcmAsWav } from "./wav";
@@ -138,17 +145,18 @@ export async function fetchSpeechCatalog(signal?: AbortSignal): Promise<SpeechCa
 }
 
 /**
- * Synthesize `text`. PCM is requested (lossless) and wrapped as WAV; models that reject the PCM format
- * by name (e.g. MiniMax) are asked again for MP3. `voice` DEFAULT_VOICE (or empty) omits the voice.
- * Throws a readable error on failure.
+ * Synthesize `text` as a Stream. PCM is requested (lossless); models that reject the PCM format by name
+ * (e.g. MiniMax) are asked again for MP3. Whether the audio arrives over time or in one burst at the end is
+ * up to the model's maker; both come the same way. `voice` DEFAULT_VOICE (or empty) omits the voice.
+ * Throws a readable error when the request fails; a response that breaks off throws while it is read.
  */
-export async function synthesize(
+export async function synthesizeStream(
   apiKey: string,
   text: string,
   model: string,
   voice: string,
   signal?: AbortSignal,
-): Promise<SynthesizedAudio> {
+): Promise<AudioStream> {
   const request = (format: string) =>
     fetch(`${OPENROUTER_API}/audio/speech`, {
       method: "POST",
@@ -169,17 +177,19 @@ export async function synthesize(
     res = await request("mp3");
     if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
   }
+  return streamFromBody(res.body, res.headers.get("content-type") || "audio/mpeg", "OpenRouter");
+}
 
-  const audio = new Uint8Array(await res.arrayBuffer());
-  const type = res.headers.get("content-type") || "audio/mpeg";
-  if (/audio\/pcm/i.test(type)) {
-    const rate = Number(/rate=(\d+)/.exec(type)?.[1] ?? 24000);
-    const channels = Number(/channels=(\d+)/.exec(type)?.[1] ?? 1);
-    return { audio: wrapPcmAsWav(audio, rate, channels), format: "wav" };
-  }
-  if (/wav/i.test(type)) return { audio, format: "wav" };
-  if (/mp3|mpeg/i.test(type)) return { audio, format: "mp3" };
-  throw new Error(`unexpected audio type from OpenRouter: ${type}`);
+/** Synthesize `text` as one clip: PCM wrapped as WAV, or MP3 (see synthesizeStream). Throws a readable error. */
+export async function synthesize(
+  apiKey: string,
+  text: string,
+  model: string,
+  voice: string,
+  signal?: AbortSignal,
+): Promise<SynthesizedAudio> {
+  const stream = await synthesizeStream(apiKey, text, model, voice, signal);
+  return clipOf(stream.format, await collect(stream.chunks), "OpenRouter");
 }
 
 /** Transcribe audio bytes in `format` (wav, mp3, flac, m4a, ogg, webm, aac). Throws on failure. */
@@ -234,13 +244,22 @@ export class OpenRouterProvider implements SpeechProvider {
   }
 
   async synthesize(req: SynthesisRequest): Promise<SynthesizedAudio> {
+    const stream = await this.synthesizeStream(req);
+    return clipOf(stream.format, await collect(stream.chunks), this.name);
+  }
+
+  async synthesizeStream(req: SynthesisRequest): Promise<AudioStream> {
     const key = await this.key();
     if (req.via === "chat") {
       const voice = req.voice && req.voice !== DEFAULT_VOICE ? req.voice : undefined;
-      return chatSynthesize(this.target(key), { text: req.text, model: req.model, voice }, req.signal);
+      // Checked against its transcript as a whole before it plays: one chunk, once the reading is complete.
+      return streamOfClip(
+        await chatSynthesize(this.target(key), { text: req.text, model: req.model, voice }, req.signal),
+        this.name,
+      );
     }
     try {
-      return await synthesize(key, req.text, req.model, req.voice, req.signal);
+      return await synthesizeStream(key, req.text, req.model, req.voice, req.signal);
     } catch (err) {
       const msg = errorMessage(err);
       const hint = /does not exist/.test(msg)

@@ -98,7 +98,8 @@ describe("playback-only speech of a long text", () => {
     expect(r.files.length).toBe(1);
     expect(r.files[0].endsWith(".mp3")).toBe(true);
     expect(readdirSync(join(work, "history"))).toEqual([r.files[0].split("/").at(-1)]);
-    expect(local.plays.map((p) => p.file)).toEqual([r.files[0]]);
+    // The one request plays as a Stream of MP3.
+    expect(local.plays.map((p) => p.stream?.format)).toEqual([{ codec: "mp3" }]);
     // The next long text goes straight to one request.
     inputs.length = 0;
     await engine.speech.say(LONG);

@@ -157,6 +157,27 @@ describe("local playback", () => {
       expect(c.ok && c.args).toEqual(["--playback", "--format=s16le", "--rate=24000", "--channels=1"]);
     });
 
+    it("an MP3 Stream goes to ffplay, mpv or mpg123, reading the file from stdin", () => {
+      exe("pacat");
+      exe("mpg123");
+      const m = chooseStreamPlayer({ PATH: dir }, { codec: "mp3" });
+      expect(m.ok && m.name).toBe("mpg123");
+      expect(m.ok && m.args).toEqual(["-q", "-"]);
+      exe("ffplay");
+      expect((chooseStreamPlayer({ PATH: dir }, { codec: "mp3" }) as { name: string }).name).toBe("ffplay");
+    });
+
+    it("a WAV Stream that is not 16-bit PCM needs ffplay or mpv; mpg123 does not do WAV", () => {
+      exe("mpg123");
+      const c = chooseStreamPlayer({ PATH: dir }, { codec: "wav" });
+      expect(!c.ok && c.reason).toMatch(/ffplay, mpv/);
+    });
+
+    it("PI_SPEECH_STREAM_PLAYER gets the file format of an MP3 Stream as its one argument", () => {
+      const c = chooseStreamPlayer({ PI_SPEECH_STREAM_PLAYER: exe("mystream"), PATH: "" }, { codec: "mp3" });
+      expect(c.ok && c.args).toEqual(["mp3"]);
+    });
+
     it("keeps to PI_SPEECH_PLAYER, which plays files only, and says how to play a Stream", () => {
       exe("pacat");
       const c = chooseStreamPlayer({ PI_SPEECH_PLAYER: exe("myplayer"), PATH: dir }, PCM);

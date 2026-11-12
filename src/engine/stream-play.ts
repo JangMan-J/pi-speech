@@ -39,14 +39,16 @@ export async function streamAndPlay(
   const request = new AbortController();
   let started: PlayStart | undefined;
   let stopped = false;
-  const stop = () => {
+  /** Stop: cancel the request and the playback, unless the playback has ended by itself (`ended`). */
+  const stop = (ended = false) => {
     if (stopped) return;
     stopped = true;
     request.abort();
-    if (started?.ok) void started.stop().catch(() => {});
+    if (started?.ok && !ended) void started.stop().catch(() => {});
   };
-  stale.addEventListener("abort", stop);
-  caller?.addEventListener("abort", stop);
+  const onAbort = () => stop();
+  stale.addEventListener("abort", onAbort);
+  caller?.addEventListener("abort", onAbort);
   const failed = async (reason: string): Promise<never> => {
     if (started?.ok) await started.stop().catch(() => {});
     throw new Error(`Speech synthesis failed: ${reason}`);
@@ -74,7 +76,7 @@ export async function streamAndPlay(
     if (started.ok) {
       if (stopped) void started.stop().catch(() => {});
       void started.done.then((o) => {
-        if (o.state === "cancelled") stop();
+        if (o.state === "cancelled") stop(true);
       });
     } else if (started.reason === REPLACED) stop();
     const failure = await download;
@@ -88,7 +90,7 @@ export async function streamAndPlay(
     }
     return { state: "arrived", audio, started };
   } finally {
-    stale.removeEventListener("abort", stop);
-    caller?.removeEventListener("abort", stop);
+    stale.removeEventListener("abort", onAbort);
+    caller?.removeEventListener("abort", onAbort);
   }
 }

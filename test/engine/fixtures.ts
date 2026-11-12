@@ -72,7 +72,9 @@ export interface FakeStreamPlay {
 }
 
 export interface FakeOutput extends AudioOutput {
-  plays: Array<{ file: string; kind: PlayKind }>;
+  /** Every playback in order: a file (`file`) or a Stream (`stream`); `end(i)` ends the i-th. */
+  plays: Array<{ file?: string; kind: PlayKind; stream?: FakeStreamPlay }>;
+  /** The Streams among `plays`. */
   streams: FakeStreamPlay[];
   /** Playbacks stopped one by one. */
   cancelled: number;
@@ -119,6 +121,8 @@ export function fakeOutput(name: string, opts: { streams?: boolean } = {}): Fake
         play.outcome = o;
       });
       out.streams.push(play);
+      out.plays.push({ kind, stream: play });
+      endings.push(end);
       void (async () => {
         try {
           for await (const c of stream.chunks) {

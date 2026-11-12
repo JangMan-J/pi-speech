@@ -153,7 +153,8 @@ describe("running /speech", () => {
     const n = requests.length;
     await s.run("--replay", ui);
     expect(requests.length).toBe(n);
-    expect(local.plays.map((p) => p.file)).toEqual([local.plays[0].file, local.plays[0].file]);
+    // The message played as a Stream; replay plays its saved file.
+    expect(local.plays.map((p) => p.file)).toEqual([undefined, engine.speech.lastMessage()]);
     expect(notes.map((x) => x.level)).not.toContain("error");
   });
 

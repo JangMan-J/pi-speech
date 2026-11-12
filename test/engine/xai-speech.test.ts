@@ -189,7 +189,7 @@ describe("xai with an xAI login", () => {
     expect(req?.body).toMatchObject({ text: "Hello from xai", voice_id: "leo", language: "auto" });
     expect(req?.auth).toBe(`Bearer ${TOKEN}`);
     expect(local.streams).toHaveLength(1);
-    expect(local.plays).toHaveLength(0);
+    expect(local.plays.filter((p) => p.file)).toHaveLength(0);
     expect(saved(engine.speech.historyDir).filter((f) => f.endsWith(".wav"))).toHaveLength(1);
     expect(svc.openrouter().filter((x) => x.method === "POST")).toHaveLength(0);
   });

@@ -71,7 +71,7 @@ describe("xai played as a Stream", () => {
     x.bodies[0].end();
     expect((await spoken).error).toBeUndefined();
     await until(() => local.streams[0].ended);
-    expect(local.plays).toHaveLength(0);
+    expect(local.plays.filter((p) => p.file)).toHaveLength(0);
     expect(history()).toHaveLength(1);
     const wav = readFileSync(join(engine.speech.historyDir, history()[0]));
     expect(wav.toString("latin1", 0, 4)).toBe("RIFF");
@@ -179,7 +179,6 @@ describe("xai played as a Stream", () => {
     x.bodies[0].end();
     const r = await spoken;
     expect(r.notPlayed).toBe("play was false");
-    expect(local.streams).toHaveLength(0);
     expect(local.plays).toHaveLength(0);
     expect(history()).toHaveLength(1);
   });
@@ -270,5 +269,98 @@ describe("xai played as a Stream", () => {
     await second;
     expect(bridgeOut.plays).toHaveLength(2);
     expect(bridgeOut.cancelled).toBe(1);
+  });
+});
+
+/** OpenRouter's /audio/speech behind a stubbed fetch: each request gets a body the test sends by hand. */
+function fakeOpenRouterSpeech(type = "audio/pcm;rate=24000;channels=1", refusePcm = false) {
+  const bodies: Array<ReturnType<typeof chunkedBody> & { aborted: boolean }> = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string, init: RequestInit = {}) => {
+      if (!url.endsWith("/audio/speech")) return new Response("not found", { status: 404 });
+      if (refusePcm && JSON.parse(String(init.body)).response_format === "pcm") {
+        return new Response('{"error":{"message":"response_format pcm unsupported"}}', { status: 400 });
+      }
+      const b = Object.assign(chunkedBody(), { aborted: false });
+      init.signal?.addEventListener("abort", () => {
+        b.aborted = true;
+        b.fail(new DOMException("This operation was aborted", "AbortError"));
+      });
+      bodies.push(b);
+      return new Response(b.body, { headers: { "content-type": type } });
+    }),
+  );
+  return { bodies };
+}
+
+describe("OpenRouter audio speech played as a Stream", () => {
+  async function orSetup() {
+    const made = makeEngine();
+    const surface = new Surface(made.engine);
+    const run = async (args: string) => {
+      const s = scriptedUi();
+      await surface.run(args, s.ui).catch((err) => s.notes.push({ message: (err as Error).message, level: "error" }));
+      return s.notes.map((n) => n.message).join("\n");
+    };
+    await run("--set tts-model x-ai/grok-voice-tts-1.0");
+    const history = () => {
+      const dir = made.engine.speech.historyDir;
+      return existsSync(dir) ? readdirSync(dir) : [];
+    };
+    return { ...made, run, history };
+  }
+
+  it("a maker that sends audio over time: the first chunk plays before the last has arrived", async () => {
+    const or = fakeOpenRouterSpeech();
+    const { run, local, history } = await orSetup();
+    const spoken = run("Hello from OpenRouter");
+    await until(() => or.bodies.length === 1);
+    or.bodies[0].send(pcmBytes(4800));
+    await until(() => local.streams[0]?.chunks.length === 1);
+    expect(history()).toHaveLength(0);
+    or.bodies[0].send(pcmBytes(4800, 4800));
+    or.bodies[0].end();
+    await spoken;
+    expect(history().filter((f) => f.endsWith(".wav"))).toHaveLength(1);
+  });
+
+  it("a maker that sends one late burst plays through the same path", async () => {
+    const or = fakeOpenRouterSpeech();
+    const { run, local, history } = await orSetup();
+    const spoken = run("Hello from OpenRouter");
+    await until(() => or.bodies.length === 1);
+    or.bodies[0].send(pcmBytes(9600));
+    or.bodies[0].end();
+    await spoken;
+    expect(local.streams).toHaveLength(1);
+    expect(Buffer.concat(local.streams[0].chunks).length).toBe(9600);
+    expect(history().filter((f) => f.endsWith(".wav"))).toHaveLength(1);
+  });
+
+  it("a model that refuses PCM plays its MP3 as a Stream and saves it as MP3", async () => {
+    const or = fakeOpenRouterSpeech("audio/mpeg", true);
+    const { run, local, history } = await orSetup();
+    const spoken = run("Hello in MP3");
+    await until(() => or.bodies.length === 1);
+    or.bodies[0].send(new Uint8Array([0xff, 0xfb, 0x90, 0x00, 1, 2, 3, 4, 5, 6, 7, 8]));
+    await until(() => local.streams[0]?.chunks.length === 1);
+    expect(local.streams[0].format).toEqual({ codec: "mp3" });
+    or.bodies[0].end();
+    await spoken;
+    expect(history().filter((f) => f.endsWith(".mp3"))).toHaveLength(1);
+  });
+
+  it("stop during the download cancels OpenRouter's request and saves nothing", async () => {
+    const or = fakeOpenRouterSpeech();
+    const { run, local, engine, history } = await orSetup();
+    const spoken = run("Hello from OpenRouter");
+    await until(() => or.bodies.length === 1);
+    or.bodies[0].send(pcmBytes(100));
+    await until(() => local.streams[0]?.chunks.length === 1);
+    await engine.player.stop();
+    expect(await spoken).toBe("Stopped.");
+    expect(or.bodies[0].aborted).toBe(true);
+    expect(history()).toHaveLength(0);
   });
 });
