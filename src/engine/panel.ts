@@ -15,9 +15,9 @@ import type { HistoryMessage } from "./history";
 import type { ModelOption, SpeechCatalog } from "./openrouter";
 import { REPLACED } from "./player";
 import { priceValue } from "./pricing";
+import { ReadingFailed, readingFailedMessage } from "./reading";
 import { type BridgeMode, MODEL_SORTS, type ModelSort } from "./settings";
 import { languageLabel, type SampleResult, type SettingName } from "./speech";
-import { ReadingFailed, readingFailedMessage } from "./stream";
 import type { Surface, SurfaceUi } from "./surface";
 import { XAI_MODEL } from "./xai";
 

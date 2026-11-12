@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SpeechCatalog } from "../../src/engine/openrouter";
 import { Panel } from "../../src/engine/panel";
-import { STREAM_MIN_CHARS } from "../../src/engine/pieces";
+import { READING_MIN_CHARS } from "../../src/engine/pieces";
 import { Surface } from "../../src/engine/surface";
 import { CATALOG, makeEngine as makeFixtureEngine, scriptedUi } from "./fixtures";
 
@@ -176,7 +176,7 @@ describe("a chat model as the speech model", () => {
     const { engine } = makeEngine();
     await engine.speech.set("tts-model", "openai/gpt-audio-mini");
     const long = Array.from({ length: 10 }, (_, i) => `This is sentence ${i + 1} of a long spoken reply.`).join(" ");
-    expect(long.length).toBeGreaterThan(STREAM_MIN_CHARS);
+    expect(long.length).toBeGreaterThan(READING_MIN_CHARS);
     const r = await engine.speech.say(long);
     expect(requests.length).toBeGreaterThanOrEqual(2);
     expect(new Set(paths(requests))).toEqual(new Set(["/chat/completions"]));

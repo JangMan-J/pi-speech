@@ -7,7 +7,7 @@ import type { SavedMessage } from "../../src/engine/history";
 import { wrapPcmAsWav } from "../../src/engine/openrouter";
 import { Player } from "../../src/engine/player";
 import type { SynthesizedAudio } from "../../src/engine/provider";
-import { IN_FLIGHT, ReadingFailed, type StreamDeps, speakInPieces } from "../../src/engine/stream";
+import { IN_FLIGHT, type ReadingDeps, ReadingFailed, speakInPieces } from "../../src/engine/reading";
 
 const tick = async (n = 5) => {
   for (let i = 0; i < n; i++) await new Promise((r) => setTimeout(r, 0));
@@ -23,9 +23,9 @@ interface Request {
   reject(e: Error): void;
 }
 
-/** A stream over a fake output and a fake speech service answered by hand. */
+/** A Reading over a fake output and a fake speech service answered by hand. */
 function harness(opts: { convert?: (from: string, to: string) => Promise<boolean>; refuse?: string } = {}) {
-  const dir = mkdtempSync(join(tmpdir(), "pi-speech-stream-"));
+  const dir = mkdtempSync(join(tmpdir(), "pi-speech-reading-"));
   const plays: string[] = [];
   const playedBytes: Buffer[] = [];
   const endings: Array<(o: PlayOutcome) => void> = [];
@@ -58,7 +58,7 @@ function harness(opts: { convert?: (from: string, to: string) => Promise<boolean
   const requests: Request[] = [];
   const saved: Uint8Array[] = [];
   let saving: Promise<void> | undefined;
-  const deps = (pieces: string[]): StreamDeps => ({
+  const deps = (pieces: string[]): ReadingDeps => ({
     pieces,
     player,
     synthesize: (text, signal) =>
@@ -202,7 +202,7 @@ describe("speaking a text in pieces", () => {
     expect(h.tempFiles()).toEqual([]);
   });
 
-  it("cannot stream when the first piece cannot become WAV: nothing plays, nothing is left", async () => {
+  it("cannot be read in pieces when the first piece cannot become WAV: nothing plays, nothing is left", async () => {
     const h = harness({ convert: async () => false });
     const run = speakInPieces(h.deps(PIECES));
     await tick();
@@ -226,7 +226,7 @@ describe("speaking a text in pieces", () => {
     expect(h.saved).toEqual([]);
   });
 
-  it("cannot stream when the first piece cannot become WAV, even after a later piece could not", async () => {
+  it("cannot be read in pieces when the first piece cannot become WAV, even after a later piece could not", async () => {
     const h = harness({ convert: async () => false });
     const run = speakInPieces(h.deps(PIECES));
     await tick();

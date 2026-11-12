@@ -6,8 +6,8 @@
 import { errorMessage } from "./env";
 import { REPLACED } from "./player";
 import { cutForSpeech, finalAssistantText, speakable } from "./readable";
+import { ReadingFailed, readingFailedMessage } from "./reading";
 import type { Speech } from "./speech";
-import { ReadingFailed, readingFailedMessage } from "./stream";
 
 export type Notify = (message: string, level: "info" | "warning" | "error") => void;
 

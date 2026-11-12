@@ -2,7 +2,7 @@ import { readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { STREAM_MIN_CHARS } from "../../src/engine/pieces";
+import { READING_MIN_CHARS } from "../../src/engine/pieces";
 import { Surface } from "../../src/engine/surface";
 import { fakeOpenRouter, makeEngine as makeFixtureEngine, scriptedUi } from "./fixtures";
 
@@ -32,7 +32,7 @@ describe("playback-only speech of a long text", () => {
   it("is spoken in pieces, played in order as one playback, and saved as one message", async () => {
     const requests = fakeOpenRouter();
     const { engine, work, local } = makeEngine();
-    expect(LONG.length).toBeGreaterThan(STREAM_MIN_CHARS);
+    expect(LONG.length).toBeGreaterThan(READING_MIN_CHARS);
     const r = await engine.speech.say(LONG);
     const inputs = requests.filter((q) => q.url.endsWith("/audio/speech")).map((q) => q.body.input);
     expect(inputs.length).toBeGreaterThanOrEqual(2);
@@ -70,7 +70,7 @@ describe("playback-only speech of a long text", () => {
     expect(requests.filter((q) => q.url.endsWith("/audio/speech")).length).toBe(1);
   });
 
-  it("/speech <text> and read-aloud stream a long text", async () => {
+  it("/speech <text> and read-aloud read a long text in pieces", async () => {
     const requests = fakeOpenRouter();
     const { engine } = makeEngine();
     const ui = scriptedUi();

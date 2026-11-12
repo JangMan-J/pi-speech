@@ -1,10 +1,10 @@
 /**
- * Streamed speech: a long text spoken in pieces (see pieces.ts). One request per piece, the first asked
+ * A Reading: a long text spoken in pieces (see pieces.ts). One request per piece, the first asked
  * first and at most IN_FLIGHT at once; each piece plays once it is ready and the one before has finished,
  * all of them as one reading of the player. Once every piece is synthesized their WAV data is joined and
  * saved as one message.
  *
- * Whether the text can be streamed is decided from the first piece alone, before anything plays: when it
+ * Whether the text can be read in pieces is decided from the first piece alone, before anything plays: when it
  * cannot be WAV the reading ends unplayed and the caller speaks the text in one request. From then on any
  * problem (a failed request, a piece that cannot be converted or comes in another format) is a failure:
  * no later piece plays and nothing is saved. A stop or newer audio cancels the rest and saves nothing.
@@ -24,7 +24,7 @@ import { joinWav, wavFormat } from "./wav";
 /** Speech requests in flight at once. */
 export const IN_FLIGHT = 2;
 
-export interface StreamDeps {
+export interface ReadingDeps {
   pieces: readonly string[];
   /** One speech request; throws a readable error (the provider's status or message). */
   synthesize(text: string, signal: AbortSignal): Promise<SynthesizedAudio>;
@@ -39,7 +39,7 @@ export interface StreamDeps {
   signal?: AbortSignal;
 }
 
-export type StreamResult =
+export type ReadingResult =
   /** Every piece was synthesized and the message saved; `player` once the first piece started. */
   | { state: "saved"; saved: SavedMessage; player?: string; notPlayed?: string }
   /** Stopped or replaced before every piece was synthesized: nothing saved. */
@@ -105,7 +105,7 @@ class Run {
   /** Plays the pieces in order; settles when the reading has ended and its last piece stopped playing. */
   readonly playing: Promise<void>;
 
-  constructor(private readonly d: StreamDeps) {
+  constructor(private readonly d: ReadingDeps) {
     this.dir = mkdtempSync(join(d.tmpRoot, `pi-speech-reading-${process.pid}-`));
     this.reading = d.player.read();
     this.halted = new Promise((r) => this.halt.signal.addEventListener("abort", () => r("halted")));
@@ -123,7 +123,7 @@ class Run {
   }
 
   /** Synthesize and play; resolves once every piece is synthesized and saved, or the reading stopped or failed. */
-  async synthesizeAndSave(): Promise<StreamResult> {
+  async synthesizeAndSave(): Promise<ReadingResult> {
     await Promise.all(Array.from({ length: IN_FLIGHT }, () => this.worker()));
     await Promise.all(this.checks);
     const wavs = this.slots.map((s) => s.value);
@@ -192,7 +192,7 @@ class Run {
     return wav ?? null;
   }
 
-  /** The first piece decides whether the text can be streamed at all. */
+  /** The first piece decides whether the text can be read in pieces at all. */
   private acceptFirst(wav: Uint8Array | null): void {
     const format = wav && wavFormat(wav);
     if (!wav || !format) {
@@ -270,7 +270,7 @@ class Run {
  * Speak `d.pieces` as one reading. Resolves once every piece is synthesized and the message saved (the last
  * pieces may still be playing), or once the reading stopped; throws ReadingFailed when it failed.
  */
-export async function speakInPieces(d: StreamDeps): Promise<StreamResult> {
+export async function speakInPieces(d: ReadingDeps): Promise<ReadingResult> {
   if (d.signal?.aborted) return { state: "stopped" };
   const run = new Run(d);
   const onAbort = () => run.stop();

@@ -35,7 +35,7 @@ const SUITES = {
   'bridge-dictation': { receiver: true, steps: [node('bridge-dictation/check.mjs')] },
   'bridge-auto': { receiver: true, steps: [node('bridge-auto/visible.mjs'), node('bridge-auto/heldout.mjs')] },
   redesign: { receiver: true, steps: [node('redesign/visible.mjs'), node('redesign/heldout.mjs')] },
-  stream: { receiver: true, steps: ['stream/visible.mjs', 'stream/heldout.mjs'].filter((f) => fs.existsSync(path.join(HERE, f))).map(node) },
+  reading: { receiver: true, steps: ['reading/visible.mjs', 'reading/heldout.mjs'].filter((f) => fs.existsSync(path.join(HERE, f))).map(node) },
   panel: { receiver: true, steps: ['panel/visible.mjs', 'panel/heldout.mjs'].filter((f) => fs.existsSync(path.join(HERE, f))).map(node) },
   xai: { steps: ['xai/visible.mjs', 'xai/heldout.mjs'].filter((f) => fs.existsSync(path.join(HERE, f))).map(node) },
 };

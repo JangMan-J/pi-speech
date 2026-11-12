@@ -21,11 +21,11 @@ import {
   OpenRouterProvider,
   type SpeechCatalog,
 } from "./openrouter";
-import { STREAM_MIN_CHARS, splitForSpeech } from "./pieces";
+import { READING_MIN_CHARS, splitForSpeech } from "./pieces";
 import type { Player } from "./player";
 import type { SpeechProvider } from "./provider";
+import { speakInPieces } from "./reading";
 import { DEFAULT_SETTINGS, type ModelSort, type Settings, type SettingsFile } from "./settings";
-import { speakInPieces } from "./stream";
 import { XAI_MODEL, XAI_PRICE, XaiProvider } from "./xai";
 
 /** The xAI choice as a model option, offered while Pi holds an xAI login. */
@@ -146,7 +146,7 @@ export class Speech {
   private failedAt = 0;
   private lastSaved?: string[];
   private samples = 0;
-  /** Models whose pieces could not be streamed in this session (e.g. MP3 without a converter). */
+  /** Models whose texts could not be read in pieces in this session (e.g. MP3 without a converter). */
   private readonly unchunkable = new Set<string>();
   private readonly history: History;
   private readonly convert: Converter;
@@ -689,13 +689,13 @@ export class Speech {
   }
 
   /**
-   * Playback-only speech (read-aloud, /speech <text>): a text longer than STREAM_MIN_CHARS is spoken in pieces
+   * Playback-only speech (read-aloud, /speech <text>): a text longer than READING_MIN_CHARS is spoken in pieces
    * that start playing after the first is synthesized, and saved as one message; a shorter one as `speak`.
    * Stopped before every piece was synthesized, it saves nothing and is `stopped`. A failed request throws
    * ReadingFailed with the provider's message.
    */
   async say(text: string, opts: CallOptions = {}): Promise<SpeechResult> {
-    if (text.trim().length <= STREAM_MIN_CHARS) return this.speak(text, opts);
+    if (text.trim().length <= READING_MIN_CHARS) return this.speak(text, opts);
     const { model, voice } = await this.choose();
     if (this.unchunkable.has(model)) return this.speak(text, opts);
     const provider = this.provider(model);

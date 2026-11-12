@@ -10,9 +10,9 @@ import { basename } from "node:path";
 import type { DictationUi } from "./dictation";
 import type { Engine } from "./engine";
 import { REPLACED } from "./player";
+import { ReadingFailed, readingFailedMessage } from "./reading";
 import type { BridgeMode } from "./settings";
 import { languageLabel, type SampleResult, SETTING_NAMES, type SpeechResult } from "./speech";
-import { ReadingFailed, readingFailedMessage } from "./stream";
 
 export interface SurfaceUi extends DictationUi {
   /** Base for a relative audio path passed to --transcribe. */
