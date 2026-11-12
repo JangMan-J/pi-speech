@@ -32,6 +32,9 @@ export function runDictationOutput(command: string, text: string, env: Env, time
       if (code === 0) resolve();
       else reject(new Error(err.trim() || `the command exited with code ${code ?? "unknown"}`));
     });
+    // A command that takes the text as %s or $DICTATION_TEXT may exit without reading its stdin; the write
+    // then fails (EPIPE), which is no failure of the command.
+    child.stdin?.on("error", () => {});
     child.stdin?.end(text);
   });
 }

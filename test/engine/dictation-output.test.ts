@@ -47,6 +47,12 @@ describe("the dictation output command", () => {
     expect(existsSync(marker)).toBe(false); // the injected command never ran
   });
 
+  it("a command that exits without reading its stdin is no failure", async () => {
+    // It took the text as %s or $DICTATION_TEXT. The write to its stdin then fails now and then (EPIPE: about
+    // once in 400 runs on a quiet machine, far more often on a loaded one) and must not surface as an error.
+    for (let i = 0; i < 50; i++) await runDictationOutput("exit 0", "some words", env);
+  });
+
   it("rejects with the command's stderr when it fails", async () => {
     await expect(runDictationOutput("echo boom >&2; exit 3", "x", env)).rejects.toThrow(/boom/);
   });
