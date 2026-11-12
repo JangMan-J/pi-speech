@@ -92,6 +92,13 @@ export class Player {
     return ticket;
   }
 
+  /** Whether the selected output plays a Stream of 16-bit PCM now (the format every streaming provider can give). */
+  canStream(): boolean {
+    const output = this.output();
+    if (!output.playStream) return false;
+    return output.canStream?.({ codec: "pcm", rate: 24000, channels: 1 }).ok ?? true;
+  }
+
   /**
    * Aborted once `ticket` is stale (a newer claim or a stop), so work for it can be cancelled: already
    * aborted when it is stale now.

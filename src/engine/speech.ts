@@ -26,6 +26,7 @@ import { READING_MIN_CHARS, splitForSpeech } from "./pieces";
 import { type Player, REPLACED } from "./player";
 import { type SpeechProvider, type SynthesisRequest, type SynthesizedAudio, streams } from "./provider";
 import { speakInPieces } from "./reading";
+import { streamReading } from "./reading-stream";
 import { DEFAULT_SETTINGS, type ModelSort, type Settings, type SettingsFile } from "./settings";
 import { streamAndPlay } from "./stream-play";
 import { XAI_MODEL, XAI_PRICE, XaiProvider } from "./xai";
@@ -725,17 +726,29 @@ export class Speech {
     if (this.unchunkable.has(model)) return this.speak(text, opts);
     const provider = this.provider(model);
     await provider.ensureCredential();
-    const r = await speakInPieces({
-      pieces: splitForSpeech(text),
-      // Plain speech never names a language, as in `speak`.
-      synthesize: (piece, signal) =>
-        provider.synthesize({ text: piece, model, voice, language: "auto", signal, via: this.via("tts", model) }),
-      player: this.player,
-      convert: this.convert,
-      save: (wav) => this.history.save(text, wav, "wav"),
-      tmpRoot: tmpdir(),
-      signal: opts.signal,
-    });
+    const via = this.via("tts", model);
+    // Plain speech never names a language, as in `speak`.
+    const r =
+      streams(provider) && this.player.canStream()
+        ? await streamReading({
+            pieces: splitForSpeech(text),
+            synthesize: (piece, signal) =>
+              provider.synthesizeStream({ text: piece, model, voice, language: "auto", signal, via }),
+            player: this.player,
+            save: (audio) => this.history.save(text, audio.audio, audio.format),
+            who: provider.name,
+            signal: opts.signal,
+          })
+        : await speakInPieces({
+            pieces: splitForSpeech(text),
+            synthesize: (piece, signal) =>
+              provider.synthesize({ text: piece, model, voice, language: "auto", signal, via }),
+            player: this.player,
+            convert: this.convert,
+            save: (wav) => this.history.save(text, wav, "wav"),
+            tmpRoot: tmpdir(),
+            signal: opts.signal,
+          });
     if (r.state === "unchunkable") {
       this.unchunkable.add(model);
       return this.speak(text, opts);
