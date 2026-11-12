@@ -6,6 +6,7 @@
 import { readFile } from "node:fs/promises";
 import { extname } from "node:path";
 import type { AudioInput, AudioOutput, PlayKind, PlayOutcome, PlayStart, Recording } from "../engine/audio";
+import type { AudioStream, StreamFormat } from "../engine/provider";
 
 export interface BridgeConfig {
   url: string;
@@ -147,9 +148,19 @@ export function createBridgeAudioFrom(getConfig: () => BridgeConfig): BridgeAudi
 
   const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
+  /** Whether the receiver plays a Stream (its health lists `stream`); undefined until asked. */
+  let streamCapable: boolean | undefined;
+  /** Why the receiver cannot play a Stream of a codec, as it said (503), until it is asked again. */
+  const noStreamPlayer = new Map<string, string>();
+  const TOO_OLD =
+    "the playback receiver plays whole files only (update pi-speech-receiver to play speech as it arrives)";
+
   async function health(): Promise<BridgeHealth> {
     try {
-      const h = await json<{ protocol?: number; name?: string; version?: string }>(await call("GET", "/v1/health"));
+      const h = await json<{ protocol?: number; name?: string; version?: string; capabilities?: unknown }>(
+        await call("GET", "/v1/health"),
+      );
+      streamCapable = Array.isArray(h.capabilities) && h.capabilities.includes("stream");
       if (h.name !== "pi-speech-receiver") return { ok: false, reason: "the server there is not a pi-speech-receiver" };
       if (h.protocol !== 1) {
         return { ok: false, reason: `the receiver speaks bridge protocol ${String(h.protocol)}, not 1` };
@@ -187,8 +198,93 @@ export function createBridgeAudioFrom(getConfig: () => BridgeConfig): BridgeAudi
     }
   }
 
+  /** Send the chunks of a Stream as the body of POST /v1/play/<id>/audio, each as it arrives. */
+  async function upload(id: string, chunks: AsyncIterable<Uint8Array>, signal: AbortSignal): Promise<void> {
+    const { base, token } = resolve();
+    const it = chunks[Symbol.asyncIterator]();
+    const body = new ReadableStream<Uint8Array>({
+      async pull(c) {
+        const n = await it.next();
+        if (n.done) c.close();
+        else c.enqueue(n.value);
+      },
+      cancel() {
+        void it.return?.(undefined);
+      },
+    });
+    const res = await fetch(`${base}/v1/play/${encodeURIComponent(id)}/audio`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/octet-stream" },
+      body,
+      duplex: "half",
+      redirect: "error",
+      signal,
+    } as RequestInit & { duplex: "half" });
+    await res.arrayBuffer().catch(() => {});
+  }
+
+  const formatBody = (f: StreamFormat) =>
+    f.codec === "pcm" ? { format: "pcm", rate: f.rate, channels: f.channels } : { format: f.codec };
+
   const output: AudioOutput = {
     name: "bridge",
+
+    canStream(format: StreamFormat) {
+      if (streamCapable === false) return { ok: false as const, reason: TOO_OLD };
+      const reason = noStreamPlayer.get(format.codec);
+      return reason ? { ok: false as const, reason } : { ok: true as const };
+    },
+
+    async playStream(stream: AudioStream, kind: PlayKind): Promise<PlayStart> {
+      try {
+        if (streamCapable === undefined) {
+          const h = await health();
+          if (!h.ok) return { ok: false, reason: h.reason };
+        }
+        if (!streamCapable) return { ok: false, reason: TOO_OLD, cannotStream: true };
+        let reply: Reply;
+        try {
+          reply = await call("POST", "/v1/play/stream", {
+            body: Buffer.from(JSON.stringify(formatBody(stream.format))),
+            contentType: "application/json",
+            headers: { "X-Pi-Speech-Kind": kind },
+          });
+        } catch (err) {
+          if (err instanceof ReceiverError && err.status === 503) {
+            const reason = err.message;
+            noStreamPlayer.set(stream.format.codec, reason);
+            return { ok: false, reason, cannotStream: true };
+          }
+          throw err;
+        }
+        noStreamPlayer.delete(stream.format.codec);
+        const { id } = await json<{ id?: string }>(reply);
+        if (!id) return { ok: false, reason: "the playback receiver did not return a playback id" };
+        active.set(id, kind);
+        const sending = new AbortController();
+        // A body that breaks off ends the playback as failed on the receiver; `done` reports it.
+        void upload(id, stream.chunks, sending.signal).catch(() => {});
+        const done = follow(id);
+        void done.then(() => sending.abort());
+        return {
+          ok: true,
+          player: "pi-speech-receiver",
+          done,
+          async stop() {
+            try {
+              await call("POST", `/v1/play/${encodeURIComponent(id)}/cancel`);
+            } catch {
+              sending.abort();
+              return; // `done` reports a receiver that cannot be reached
+            }
+            sending.abort();
+            await Promise.race([done, new Promise((r) => setTimeout(r, 3000))]);
+          },
+        };
+      } catch (err) {
+        return { ok: false, reason: message(err) };
+      }
+    },
 
     async play(file: string, kind: PlayKind): Promise<PlayStart> {
       try {

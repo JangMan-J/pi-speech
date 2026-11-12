@@ -335,3 +335,166 @@ describe("record", () => {
     );
   });
 });
+
+describe("a Stream", () => {
+  /** A receiver that sees the audio of a Stream as it arrives. */
+  async function streamReceiver(opts: { capabilities?: string[]; streamStatus?: number } = {}) {
+    const got: Buffer[] = [];
+    const asked: Array<{ url: string; body?: string; kind?: string }> = [];
+    let audioEnded = false;
+    let state = "playing";
+    const srv = createServer((req, res) => {
+      const u = req.url ?? "";
+      asked.push({ url: u, kind: req.headers["x-pi-speech-kind"] as string | undefined });
+      if (req.headers.authorization !== `Bearer ${TOKEN}`) return send(res, 401, { error: "unauthorized" });
+      if (u === "/v1/play/s1/audio") {
+        req.on("data", (c: Buffer) => got.push(c));
+        req.on("end", () => {
+          audioEnded = true;
+          send(res, 200, { id: "s1", state });
+        });
+        req.on("error", () => {});
+        return;
+      }
+      const chunks: Buffer[] = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", () => {
+        asked[asked.length - 1].body = Buffer.concat(chunks).toString();
+        if (u === "/v1/health") {
+          return send(res, 200, {
+            protocol: 1,
+            name: "pi-speech-receiver",
+            version: "0.2.0",
+            capabilities: opts.capabilities ?? ["play", "record", "stream"],
+          });
+        }
+        if (u === "/v1/play/stream") {
+          if (opts.streamStatus === 503) return send(res, 503, { error: "no player for a Stream: install pacat" });
+          return send(res, 202, { id: "s1" });
+        }
+        if (u === "/v1/play/s1/cancel") {
+          state = "cancelled";
+          return send(res, 200, { id: "s1", state });
+        }
+        if (u.startsWith("/v1/play/s1")) {
+          const wait = () =>
+            state === "playing" && !audioEnded
+              ? setTimeout(wait, 10)
+              : send(res, 200, { id: "s1", state: state === "playing" ? "completed" : state });
+          return wait();
+        }
+        send(res, 404, { error: "not found" });
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+    const at = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+    return {
+      at,
+      got,
+      asked,
+      bytes: () => Buffer.concat(got).length,
+      ended: () => audioEnded,
+      close: async () => {
+        srv.closeAllConnections();
+        await new Promise((r) => srv.close(r));
+      },
+    };
+  }
+
+  /** A Stream fed by hand. */
+  function hand() {
+    const queue: Uint8Array[] = [];
+    let ended = false;
+    let wake: (() => void) | undefined;
+    const reads = { n: 0 };
+    async function* chunks() {
+      reads.n++;
+      while (true) {
+        if (queue.length) yield queue.shift()!;
+        else if (ended) return;
+        else await new Promise<void>((r) => (wake = r));
+      }
+    }
+    const poke = () => {
+      const w = wake;
+      wake = undefined;
+      w?.();
+    };
+    return {
+      reads,
+      stream: { format: { codec: "pcm" as const, rate: 24000, channels: 1 }, chunks: chunks() },
+      send: (b: Uint8Array) => {
+        queue.push(b);
+        poke();
+      },
+      end: () => {
+        ended = true;
+        poke();
+      },
+    };
+  }
+
+  const until = async (cond: () => boolean) => {
+    const end = Date.now() + 3000;
+    while (!cond()) {
+      if (Date.now() > end) throw new Error("condition not met in time");
+      await new Promise((r) => setTimeout(r, 5));
+    }
+  };
+
+  it("starts the receiver's player with the format, then sends the audio as it arrives", async () => {
+    const rx = await streamReceiver();
+    const out = createBridgeAudio({ url: rx.at, token: TOKEN }).output;
+    const h = hand();
+    const r = await out.playStream!(h.stream, "sample");
+    if (!r.ok) throw new Error(r.reason);
+    expect(r.player).toBe("pi-speech-receiver");
+    const start = rx.asked.find((a) => a.url === "/v1/play/stream");
+    expect(JSON.parse(start?.body ?? "")).toEqual({ format: "pcm", rate: 24000, channels: 1 });
+    expect(start?.kind).toBe("sample");
+    h.send(Buffer.alloc(1000, 1));
+    await until(() => rx.bytes() === 1000);
+    expect(rx.ended()).toBe(false);
+    h.send(Buffer.alloc(500, 2));
+    h.end();
+    expect(await r.done).toEqual({ state: "completed" });
+    expect(rx.bytes()).toBe(1500);
+    await rx.close();
+  });
+
+  it("an older receiver without the stream capability cannot play it; nothing of the Stream is read", async () => {
+    const rx = await streamReceiver({ capabilities: ["play", "record"] });
+    const out = createBridgeAudio({ url: rx.at, token: TOKEN }).output;
+    const h = hand();
+    const r = await out.playStream!(h.stream, "message");
+    expect(r.ok).toBe(false);
+    expect(!r.ok && r.cannotStream).toBe(true);
+    expect(!r.ok && r.reason).toMatch(/update pi-speech-receiver/);
+    expect(h.reads.n).toBe(0);
+    expect(out.canStream!({ codec: "pcm", rate: 24000, channels: 1 }).ok).toBe(false);
+    await rx.close();
+  });
+
+  it("a receiver with no player for a Stream (503) cannot play it, with the receiver's reason", async () => {
+    const rx = await streamReceiver({ streamStatus: 503 });
+    const out = createBridgeAudio({ url: rx.at, token: TOKEN }).output;
+    const r = await out.playStream!(hand().stream, "message");
+    expect(!r.ok && r.cannotStream).toBe(true);
+    expect(!r.ok && r.reason).toMatch(/install pacat/);
+    await rx.close();
+  });
+
+  it("stop() cancels the playback on the receiver and ends the upload", async () => {
+    const rx = await streamReceiver();
+    const out = createBridgeAudio({ url: rx.at, token: TOKEN }).output;
+    const h = hand();
+    const r = await out.playStream!(h.stream, "message");
+    if (!r.ok) throw new Error(r.reason);
+    h.send(Buffer.alloc(100));
+    await until(() => rx.bytes() === 100);
+    await r.stop();
+    expect(await r.done).toEqual({ state: "cancelled" });
+    expect(rx.asked.some((a) => a.url === "/v1/play/s1/cancel")).toBe(true);
+    await rx.close();
+  });
+});
