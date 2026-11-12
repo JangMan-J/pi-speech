@@ -3,7 +3,7 @@ type: glossary
 created: 2026-11-12T13:39:07Z
 created_by: claude-opus-5-5
 created_session: 01a1cfe8-fb2e-76f9-8621-eae06c80679c
-updated: 2026-11-12T15:30:00Z
+updated: 2026-11-12T17:32:09Z
 updated_by: claude-opus-5-5
 updated_session: 01a1cfe8-fb2e-76f9-8621-eae06c80679c
 ---
@@ -20,7 +20,8 @@ Audio that starts playing while the rest of it is still arriving, the way a vide
 before the whole file is downloaded. The player is fed as the provider's response comes in.
 _Example_: xAI sends PCM for a few sentences; the first sound plays at about 0.3 s while the response
 goes on arriving until about 1 s.
-_Not_: a Reading; a download that plays once it is complete.
+_Not_: a Reading (that is how a long text is split; a Reading plays as one Stream where the output can);
+a download that plays once it is complete.
 _Avoid_: streamed speech (for a Reading), progressive playback
 _Confirmed_: 2026-11-12, Jang ("the same way Netflix does").
 
@@ -28,7 +29,7 @@ _Confirmed_: 2026-11-12, Jang ("the same way Netflix does").
 One playback of a long text split into parts that are requested ahead and played one after another, so
 the player counts as playing from the first part to the last.
 _Example_: a 900-character answer read aloud in four parts, two requested at a time.
-_Not_: a Stream (a Reading's parts may each be a Stream).
+_Not_: a Stream (a Reading is about the text; where the output can, the whole Reading plays as one Stream).
 _Avoid_: streamed speech, stream
 _Confirmed_: 2026-11-12, Jang.
 
@@ -40,6 +41,15 @@ _Confirmed_: 2026-11-12, Jang (a Stray stops playback by default).
 
 ## Unresolved
 
-- **piece / part**: the Reading entry says "parts"; the code says "pieces" (`pieces.ts`, `reading.ts`).
-- **reading (lowercase)**: chat-audio code and the Stray entry call a chat model's spoken version "a
-  reading", which can be confused with a Reading.
+- **reading (lowercase)**: chat-audio code (`readingEvents`, `ReadingEvent`), the README and the Stray entry
+  call a chat model's spoken version "a reading", which can be confused with a Reading.
+- **piece / part / chunk**: the Reading entry says "parts" and the code "pieces" (`pieces.ts`, `reading.ts`)
+  for the parts of a Reading's text, but the receiver's `read_pieces` and `protocol/bridge.md` also use
+  "piece" and "part" for a chunk of an HTTP body.
+- **Stream player**: the player that reads a Stream on its input (`PI_SPEECH_STREAM_PLAYER`,
+  `PI_SPEECH_RECEIVER_STREAM_PLAYER`), as opposed to the file player. Capitalised in places, no entry.
+- **Stream for a burst**: a maker that sends all its audio at the end goes through the Stream path but plays
+  only once complete; is that a Stream (the Stream entry's _Not_ says a download that plays once complete is
+  not)?
+- **vouch**: the chat gate's word for words said so far being the start of the text (`whole`, `start`,
+  `stray`).

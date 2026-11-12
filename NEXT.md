@@ -1,121 +1,63 @@
 # NEXT
 
-Written 2026-11-12 at the end of a session on `decent-spider` (Pi over SSH), for whoever picks this up on
-the user's laptop. Live state is in `git log`, `package.json` and the registry; this file holds what those
-do not say.
+Written 2026-11-12 on `agent-jail` (the laptop) at the end of the session that built streaming playback.
+Live state is in `git log`, `package.json` and the registry; this file holds what those do not say. The
+plan and its slices are in `.pad/streaming-playback/` (not committed); the terms are in `GLOSSARY.md`.
 
-## The goal
+## Hosts
 
-**Streaming audio playback.** When pi-speech speaks (read-aloud, `/speech <text>`, `speech_synthesize`),
-sound starts as soon as the provider has produced the first audio and keeps playing while the rest arrives.
-Today nothing plays until a whole clip (or the whole first piece of a long text) has been generated,
-downloaded and handed to a player as a file.
+`agent-jail` is the laptop: speakers, PulseAudio, `pacat`/`pw-cat`/`ffplay`/`mpv`/`mpg123` installed. All
+audio plays there. `decent-spider` is a VPS in a datacenter (no GPU, no sound); Pi there reaches the laptop
+through the playback bridge (`pi-speech-receiver` on the laptop, over an SSH port forward). Audio, not text,
+crosses the bridge; the Rust receiver stays (the user turned down a headless-Pi server as less robust).
 
-The user's words: "what I want, primarily, is streaming audio playback", and "I have an xAI subscription,
-if that'll do it". It was their answer to an offer of realtime dictation, so dictation over a realtime
-protocol is not the goal.
+## The goal, and where it stands
 
-How the user wants it handled:
+**Streaming audio playback** (a Stream, `GLOSSARY.md`): speech starts playing while the rest of it is still
+arriving, from every provider whose audio can arrive in pieces, on the laptop and through the bridge.
 
-- Build the thing asked for. Earlier in the session a request for the unsupported endpoint types was
-  answered with something adjacent (direct vendor endpoints), and they had to ask whether the answer was no.
-- "If you can't do it just say you can't. I'd prefer admission of inability."
-- Say what a live measurement will cost before running it. The session spent about $1.20 of their
-  OpenRouter credit on measurements without asking first.
+Built and committed (`bdb4955`..`5f21dce`), `npm run check` and the receiver's fmt/clippy/test green, and
+`e2e/run all` passes every suite but `panel`, which fails the same 22 checks it failed before this work:
 
-## Why the work moved to the laptop
+1. xAI plays as a Stream on the Pi host. **Confirmed by ear** by the user (start and stop).
+2. OpenRouter `/audio/speech`: every maker the same way (over time or one late burst); MP3 from models that
+   refuse PCM streams through an MP3 player. Checked live on the free `fish-audio/s2.1-pro-free:free`.
+3. OpenAI-compatible endpoints: WAV (sizes left open), raw PCM, MP3. Checked against a local server only.
+4. Chat audio (`openai/gpt-audio*`): audio plays only once the transcript said after it is still the start
+   of the text; a Stray stops playback, saves nothing, no second request.
+5. A Reading (texts over 280 characters) plays as one Stream on one player, pieces requested two at a time.
+   Checked live with xAI through a logging player (22 s of audio over 1 s, one player).
+6. The bridge: protocol capability `stream` (`protocol/bridge.md`, "Playing a Stream"), the client, and
+   receiver 0.2.0. Checked live on the laptop: real receiver, real Pi with `--bridge on`, xAI.
 
-On `decent-spider` audio reaches the user through the playback bridge: the extension uploads a finished
-file to `pi-speech-receiver` on the laptop. Streaming over that path needs a new receiver, which can only
-be installed and heard on the laptop. With Pi on the laptop, playback is local and the bridge is not in
-the way.
+Where a Stream cannot play (no player for it, only `PI_SPEECH_PLAYER` set, a receiver older than 0.2.0),
+the clip plays as a file once it has arrived, with one warning; a long text then plays piece by piece as
+files, and no piece is asked for twice.
 
-Hosts: `agent-jail` is the laptop (speakers, PulseAudio, `pacat`/`pw-cat`/`ffplay` installed);
-`decent-spider` is the VPS (no GPU, no sound). Streaming must work in both places (answered 2026-11-12):
-local playback on `agent-jail` first, then through the bridge when Pi runs on `decent-spider`. Audio crosses
-the bridge: `decent-spider` synthesizes and the Rust receiver on `agent-jail` plays a stream. Sending text to
-a headless Pi on `agent-jail` was considered and turned down as less robust than the receiver already built.
+## Open, for the user
 
-## What is measured (2026-11-12, a 253-character text, about 15 s of audio)
+- **By ear**: a long text (no gap between pieces), and Pi on `decent-spider` through the bridge. The bridge
+  was only run with Pi and the receiver both on the laptop; the SSH forward was not in the path.
+- **Decide**: a message stopped after its audio has fully arrived (about 1 s for xAI, while it plays for
+  ten) is still saved in the history. Kept that way for now, as a Reading already did.
+- **Not measured, costs money**: whether a chat model's transcript leads or lags its audio. The gate is
+  safe either way (a Stray leaks at most about one word; "Sure!" before the text plays nothing), but if the
+  transcript lags, chat audio starts late. One reading with `openai/gpt-audio-mini` costs well under one
+  US cent; ask before running it.
+- `GLOSSARY.md` lists unresolved terms (piece/part/chunk, lowercase reading, Stream player, a burst as a
+  Stream, vouch).
+- The receiver on the laptop must be rebuilt and restarted (0.2.0) for the bridge to stream.
 
-- **xAI direct** (`POST https://api.x.ai/v1/tts`, the user's login in Pi): with `output_format.codec` `pcm`
-  or `mp3` the body arrives progressively, first byte at 0.30 s, all of it at 1.0 s. With `wav`, which
-  `src/engine/xai.ts` asks for (`OUTPUT_FORMAT`), it arrives in one burst at 1.2 s.
-- **OpenRouter `/audio/speech`**: no server-sent events; `stream` and `stream_format` are ignored. The body
-  is raw audio, chunked. Whether it arrives over time depends on the maker (one model each, first byte →
-  last byte):
-  - over time: `x-ai/grok-voice-tts-1.0` 0.4 → 1.4 s, `deepgram/aura-2` 0.4 → 7.1, `fish-audio` 0.5 → 5.6,
-    `mistralai/voxtral-mini-tts` 0.7 → 3.2, `qwen` 1.5 → 3.2, `assemblyai` 0.7 → 2.1, `heygen` 0.4 → 1.3,
-    `minimax` (MP3 only) 0.7 → 1.6
-  - one burst when generation ends: `elevenlabs` 2.6 s, `google/gemini-*-tts` 3.3, `canopylabs/orpheus` 4.9,
-    `bytedance-seed` 19, `hexgrad/kokoro` 0.4, `microsoft/mai-voice-2.1-flash` 1.0 to 1.4, `speechify` 0.4 to 0.9
-- **OpenRouter `/chat/completions`** (`openai/gpt-audio`, `gpt-audio-mini`): real SSE, first audio at 0.57 s.
-  `src/engine/chat-audio.ts` collects the whole reading first, because it checks the model's transcript
-  against the text before anything plays. Streaming there needs that check done on the transcript as a
-  prefix, stopping playback when it strays.
-- The user's saved speech model was `microsoft/mai-voice-2.1` (voice `ko-KR-Haena:MAI-Voice-2.1`); the
-  sampled Flash variant sends one burst. Streaming means selecting `xai`, or an OpenRouter maker from the
-  first list.
-- Long texts already start early: above 280 characters `src/engine/pieces.ts` and `stream.ts` split the text,
-  ask for two pieces at a time, and play each as its own file once it is whole.
-
-## Every streaming source, not only xAI
-
-The user (2026-11-12): xAI is one example; support every source whose audio can arrive in pieces. That is
-all four providers: `xai.ts`, `openrouter.ts` (`/audio/speech`, every maker), `chat-audio.ts` (SSE, with the
-transcript check done on the prefix) and `endpoints.ts` (OpenAI-compatible endpoints). So the streaming
-path is the one path, not an xAI special case:
-
-- A provider hands over audio as an async sequence of chunks plus a format. A maker that sends one burst
-  is the same path with one late chunk; it needs no second code path and no allow-list of makers.
-- Formats: raw PCM where the source offers it; encoded streams (MP3 from `minimax`, any endpoint that
-  cannot send PCM) go to a player or decoder that reads that format on stdin.
-- Test against a fake server that sends chunks with delays, so every provider is checked for first sound
-  before last byte without spending credit.
-
-## What has to change
-
-1. **Synthesis that yields audio as it arrives.** `SpeechProvider.synthesize` returns a finished
-   `{ audio, format }`. xAI needs `codec: "pcm"`; OpenRouter needs the response body read as it comes
-   (`response_format: "pcm"`, 24 kHz mono 16-bit).
-2. **An output that plays a stream.** `AudioOutput.play(file, kind)` in `src/engine/audio.ts` takes a file,
-   and `src/engine/local-output.ts` runs `<player> <file>`, which is also the contract of
-   `PI_SPEECH_PLAYER`. A stream needs a player fed on stdin with raw PCM, for example
-   `pacat --playback --format=s16le --rate=24000 --channels=1`, `pw-cat -p`, or
-   `ffplay -f s16le -ar 24000 -ac 1 -nodisp -autoexit -i -`.
-3. **The player's rules, kept.** One playback at a time, the claim ticket, stop and replace
-   (`src/engine/player.ts`), a failure never falling back to another provider, and the message saved to
-   the history as WAV once the stream has ended.
-4. **The bridge, only if streaming must work with Pi on another host.** `protocol/bridge.md` version 1 has
-   `POST /v1/play` require a `Content-Length` and refuse a chunked body; the receiver stores the file and
-   then starts the player (`play` and `start_playback` in `receiver/src/server.rs`). Streaming needs a new
-   capability in the protocol and the receiver. The user removed `AGENTS.md` and its rule against changing
-   `protocol/bridge.md`; the change is in scope.
-
-Done when: with `xai` selected on `agent-jail` (and each other provider against the fake server), a text of a few sentences starts sounding while its response
-is still arriving, stop works mid-stream, the message is in the history afterwards, `npm run check` passes,
-and the user has confirmed it by ear. Time to first sound can be measured; whether it sounds right cannot.
-
-## State of the repository
-
-- Public at `github.com/JangMan-J/pi-speech`; `@jangmanj/pi-speech@0.1.0` is on npm, published by CI with
-  provenance. A release is `npm version patch && git push --follow-tags`.
-- Nothing for streaming is built.
-- 0.1.0 holds this session's other work: the redesigned `/speech` panel, the dictation output command, chat
-  models on OpenRouter (`src/engine/chat-audio.ts`), and OpenAI-compatible endpoints
-  (`src/engine/endpoints.ts`).
-
-Open items, none of them blocking the goal:
+## Other open items (not blocking)
 
 - Dependabot opened four pull requests; the dev-tools group one fails CI.
-- `e2e/panel/visible.mjs` still asserts the panel layout from before the redesign and fails. `e2e/run core`
-  has not been run since the chat models and endpoints went in.
-- The direct endpoints were only tested against a local server. The Fireworks key in Pi is refused by
-  Fireworks' audio hosts (plain `curl` gets the same 401), so no real vendor has been through them.
+- `e2e/panel/visible.mjs` still asserts the panel layout from before the redesign and fails.
+- The direct endpoints were only tested against a local server; the Fireworks key in Pi is refused by
+  Fireworks' audio hosts.
 
 ## Checks
 
-- `npm run check` (typecheck, lint, 470 tests), `npm run smoke:pack`, and in `receiver/`:
-  `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`. CI runs all of them.
-- `e2e/chat-models/live.test.ts` measures the chat models against live OpenRouter and costs about 15 US
-  cents a run; `e2e/README.md` has the command.
+- `npm run check` (typecheck, lint, tests), `npm run smoke:pack`, and in `receiver/`: `cargo fmt --check`,
+  `cargo clippy --all-targets -- -D warnings`, `cargo test`. CI runs all of them.
+- `e2e/run all` drives a real `pi --mode rpc` against fake servers and the real receiver; no cost.
+- `e2e/chat-models/live.test.ts` costs about 15 US cents a run; `e2e/README.md` has the command.
