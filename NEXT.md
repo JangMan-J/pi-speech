@@ -30,8 +30,10 @@ file to `pi-speech-receiver` on the laptop. Streaming over that path needs a new
 be installed and heard on the laptop. With Pi on the laptop, playback is local and the bridge is not in
 the way.
 
-Open question for the user before designing: is local playback on the laptop enough, or must streaming
-also work when Pi runs on `decent-spider`? The second needs the bridge change below.
+Hosts: `agent-jail` is the laptop (speakers, PulseAudio, `pacat`/`pw-cat`/`ffplay` installed);
+`decent-spider` is the VPS (no GPU, no sound). Streaming must work in both places (answered 2026-11-12):
+local playback on `agent-jail` first, then through the bridge when Pi runs on `decent-spider`. Still open:
+whether audio (A) or text (B) crosses the bridge; B makes `agent-jail` synthesize as well as play.
 
 ## What is measured (2026-11-12, a 253-character text, about 15 s of audio)
 
@@ -72,8 +74,8 @@ also work when Pi runs on `decent-spider`? The second needs the bridge change be
 4. **The bridge, only if streaming must work with Pi on another host.** `protocol/bridge.md` version 1 has
    `POST /v1/play` require a `Content-Length` and refuse a chunked body; the receiver stores the file and
    then starts the player (`play` and `start_playback` in `receiver/src/server.rs`). Streaming needs a new
-   capability in the protocol and the receiver. `AGENTS.md` says not to change `protocol/bridge.md`; the
-   user was asked whether to lift that and chose to move to the laptop instead. Ask again before touching it.
+   capability in the protocol and the receiver. The user removed `AGENTS.md` and its rule against changing
+   `protocol/bridge.md`; the change is in scope.
 
 Done when: with `xai` selected on the laptop, a text of a few sentences starts sounding while its response
 is still arriving, stop works mid-stream, the message is in the history afterwards, `npm run check` passes,
