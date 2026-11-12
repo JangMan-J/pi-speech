@@ -123,10 +123,15 @@ describe("xaiSynthesizeStream", () => {
     expect(err.message).toMatch(/socket hang up/);
   });
 
-  it("an answer that is not PCM is an error before any audio", async () => {
-    stubFetch(() => new Response(new Uint8Array(7), { headers: { "content-type": "audio/mpeg" } }));
+  it("an MP3 answer is taken as MP3; anything that is not audio is an error", async () => {
+    const mp3 = new Uint8Array([0xff, 0xfb, 0x90, 0, 1, 2, 3, 4, 5, 6, 7, 8]);
+    stubFetch(() => new Response(mp3, { headers: { "content-type": "audio/mpeg" } }));
+    expect((await xaiSynthesizeStream(TOKEN, { text: "hi", voice: "eve", language: "auto" })).format).toEqual({
+      codec: "mp3",
+    });
+    stubFetch(() => new Response("<html>gateway</html>", { headers: { "content-type": "text/html" } }));
     const err = await xaiSynthesizeStream(TOKEN, { text: "hi", voice: "eve", language: "auto" }).catch((e) => e);
-    expect(err.message).toMatch(/audio\/mpeg/);
+    expect(err.message).toMatch(/unexpected audio from xAI: text\/html/);
   });
 });
 

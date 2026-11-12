@@ -4,7 +4,7 @@
  * Authorization header, and never appears in an error text.
  */
 
-import { bodyChunks, clipOf, collect } from "./audio-stream";
+import { clipOf, collect, streamFromBody } from "./audio-stream";
 import { type KeyRegistry, resolveXaiToken } from "./credentials";
 import type {
   AudioStream,
@@ -109,13 +109,10 @@ export async function xaiSynthesizeStream(
     signal,
   });
   if (!res.ok) throw await failure(res, token);
+  // PCM as asked for, at the rate asked for unless the type names one; MP3 or WAV are taken as they come.
   const type = res.headers.get("content-type") ?? "";
-  if (type && !/pcm|octet-stream/i.test(type)) {
-    res.body?.cancel().catch(() => {});
-    throw new Error(`unexpected audio type from xAI: ${type}`);
-  }
-  if (!res.body) throw new Error("xAI returned no audio");
-  return { format: PCM, chunks: bodyChunks(res.body, "xAI") };
+  const named = /audio\/pcm/i.test(type) && !/rate=/i.test(type);
+  return streamFromBody(res.body, named ? `audio/pcm;rate=${PCM.rate};channels=${PCM.channels}` : type, "xAI");
 }
 
 /** Synthesize `text` in `voice` as one WAV clip. Throws on failure. */

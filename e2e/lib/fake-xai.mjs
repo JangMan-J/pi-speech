@@ -1,7 +1,7 @@
-// A fake of the xAI speech endpoints, as observed against the real service:
+// A fake of the xAI speech endpoints, as observed against the real service and its documentation:
 //   GET  /v1/tts/voices  -> {voices: [{voice_id, name, language, gender}]}
-//   POST /v1/tts         JSON {text, voice_id, language[, output_format: {codec, sample_rate}]} -> audio/mpeg, or audio/wav
-//                        when output_format.codec is "wav"; `language` is required (422), an unknown voice is 404
+//   POST /v1/tts         JSON {text, voice_id, language[, output_format: {codec, sample_rate}]} -> audio/mpeg, audio/wav
+//                        when output_format.codec is "wav", or raw 16-bit PCM (audio/pcm) when it is "pcm"; `language` is required (422), an unknown voice is 404
 //   POST /v1/stt         multipart `file` -> {text, language, duration, words: []}
 // Every request needs `Authorization: Bearer <key>`; anything else is 401.
 import fs from 'node:fs';
@@ -55,6 +55,7 @@ export async function startFakeXai({ key, voices = VOICES, transcript = 'hello f
       if (typeof body.language !== 'string') return send(422, { 'content-type': 'text/plain' }, 'Failed to deserialize the JSON body into the target type: missing field `language`');
       if (!voices.some((v) => v.voice_id === body.voice_id)) return json(404, { error: `TTS synthesis failed: Voice '${body.voice_id}' not found` });
       if (body.output_format?.codec === 'wav') return send(200, { 'content-type': 'audio/wav' }, wavWrap(pcmTone(0.5, 24000), 24000));
+      if (body.output_format?.codec === 'pcm') return send(200, { 'content-type': 'audio/pcm' }, pcmTone(0.5, 24000));
       return send(200, { 'content-type': 'audio/mpeg' }, mp3);
     }
     if (req.method === 'POST' && u.pathname === '/v1/stt') {

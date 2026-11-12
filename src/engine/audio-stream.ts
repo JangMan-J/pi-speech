@@ -80,10 +80,10 @@ function wavHead(b: Buffer): WavHead {
 }
 
 /**
- * A speech response as a Stream, told by its bytes first and its Content-Type second, since services disagree
- * on the type: a WAV (its header removed when it holds 16-bit PCM), raw PCM (`audio/pcm` or `audio/l16`,
- * rate and channels from the type), or MP3. Resolves once the first audio has arrived; throws when the
- * response holds no audio or audio of another kind.
+ * A speech response as a Stream: raw PCM when its Content-Type says so (`audio/pcm` or `audio/l16`, rate and
+ * channels from the type), at once; otherwise told by its bytes first and its type second, since services
+ * disagree on the type: a WAV (its header removed when it holds 16-bit PCM) or MP3, once enough has arrived to
+ * tell. Throws when the response holds no audio or audio of another kind.
  */
 export async function streamFromBody(
   body: ReadableStream<Uint8Array> | null,
@@ -91,6 +91,11 @@ export async function streamFromBody(
   who: string,
 ): Promise<AudioStream> {
   if (!body) throw new Error(`${who} returned no audio`);
+  if (/audio\/(?:pcm|l16)/i.test(contentType)) {
+    const rate = Number(/rate=(\d+)/i.exec(contentType)?.[1] ?? 24000);
+    const channels = Number(/channels=(\d+)/i.exec(contentType)?.[1] ?? 1);
+    return { format: { codec: "pcm", rate, channels }, chunks: bodyChunks(body, who) };
+  }
   const it = bodyChunks(body, who)[Symbol.asyncIterator]();
   let head = Buffer.alloc(0);
   const more = async () => {
@@ -121,11 +126,6 @@ export async function streamFromBody(
       return { format: { codec: "pcm", rate: w.rate, channels: w.channels }, chunks: rest(w.data) };
     if (w.state === "other") return { format: { codec: "wav" }, chunks: rest(0) };
     return fail(`${who} sent a WAV whose header never ended`);
-  }
-  if (/audio\/(?:pcm|l16)/i.test(contentType)) {
-    const rate = Number(/rate=(\d+)/i.exec(contentType)?.[1] ?? 24000);
-    const channels = Number(/channels=(\d+)/i.exec(contentType)?.[1] ?? 1);
-    return { format: { codec: "pcm", rate, channels }, chunks: rest(0) };
   }
   if (isMp3(head) || /mp3|mpeg/i.test(contentType)) return { format: { codec: "mp3" }, chunks: rest(0) };
   return fail(`unexpected audio from ${who}: ${contentType || "no content type"}`);

@@ -67,7 +67,7 @@ describe("streamFromBody", () => {
   });
 
   it("no audio, or audio of another kind, is an error naming the service", async () => {
-    await expect(streamFromBody(new Response(new Uint8Array(0)).body, "audio/pcm", "S")).rejects.toThrow(
+    await expect(streamFromBody(new Response(new Uint8Array(0)).body, "audio/mpeg", "S")).rejects.toThrow(
       /S returned no audio/,
     );
     await expect(streamFromBody(new Response("<html>hello there</html>").body, "text/html", "S")).rejects.toThrow(
