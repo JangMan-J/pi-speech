@@ -12,6 +12,7 @@
  */
 
 import type { AudioOutput, Playback, PlayKind, PlayStart } from "./audio";
+import type { AudioStream } from "./provider";
 
 export interface PlayerEvents {
   /** The player started or stopped playing. */
@@ -34,8 +35,10 @@ interface InternalPlayOptions extends PlayOptions {
 interface Current {
   playback: Playback;
   kind: PlayKind;
-  file: string;
 }
+
+/** What one play starts on the output: a file (kept for replay when it is a message) or a Stream. */
+type Source = { file: string } | { stream: AudioStream };
 
 /** One playback made of pieces played in order; see `Player.read()`. */
 export interface Reading {
@@ -95,7 +98,7 @@ export class Player {
       get current() {
         return current();
       },
-      play: (file, cleanup) => this.start(file, "message", { ticket: state.ticket, cleanup, reading: state }),
+      play: (file, cleanup) => this.start({ file }, "message", { ticket: state.ticket, cleanup, reading: state }),
       end: () => {
         if (this.reading === state) this.endReading();
       },
@@ -103,7 +106,15 @@ export class Player {
   }
 
   async play(file: string, kind: PlayKind, opts: PlayOptions = {}): Promise<PlayStart> {
-    return this.start(file, kind, opts);
+    return this.start({ file }, kind, opts);
+  }
+
+  /**
+   * Play a Stream as its chunks arrive, under the same rules as a file. `{ ok: false, cannotStream: true }`
+   * when the selected output cannot play a Stream now; nothing of the Stream was read then.
+   */
+  async playStream(stream: AudioStream, kind: PlayKind, opts: PlayOptions = {}): Promise<PlayStart> {
+    return this.start({ stream }, kind, opts);
   }
 
   private stale(opts: InternalPlayOptions): boolean {
@@ -111,16 +122,21 @@ export class Player {
     return opts.ticket !== undefined && opts.ticket !== this.tickets;
   }
 
-  private async start(file: string, kind: PlayKind, opts: InternalPlayOptions): Promise<PlayStart> {
+  private async start(source: Source, kind: PlayKind, opts: InternalPlayOptions): Promise<PlayStart> {
     if (this.stale(opts)) {
       opts.cleanup?.();
       return { ok: false, reason: REPLACED };
+    }
+    const output = this.output();
+    if ("stream" in source && !output.playStream) {
+      opts.cleanup?.();
+      return { ok: false, reason: `${output.name} playback cannot play speech as it arrives`, cannotStream: true };
     }
     if (!opts.reading) this.endReading();
     const replacing = await this.stopCurrent(false);
     let started: PlayStart;
     try {
-      started = await this.output().play(file, kind);
+      started = "file" in source ? await output.play(source.file, kind) : await output.playStream!(source.stream, kind);
     } catch (err) {
       started = { ok: false, reason: err instanceof Error ? err.message : String(err) };
     }
@@ -137,8 +153,8 @@ export class Player {
       return { ok: false, reason: REPLACED };
     }
     if (opts.reading) opts.reading.started = true;
-    else if (kind === "message") this.lastFile = file;
-    const entry: Current = { playback: started, kind, file };
+    else if (kind === "message" && "file" in source) this.lastFile = source.file;
+    const entry: Current = { playback: started, kind };
     // Another play may have started while this one was starting; the newest wins.
     await this.stopCurrent(false);
     this.current = entry;

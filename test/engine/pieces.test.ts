@@ -21,7 +21,7 @@ describe("splitting a long text into pieces", () => {
   it("splits at sentence ends, with a short first piece and whole sentences after it", () => {
     const sentences = Array.from(
       { length: 12 },
-      (_, i) => `Sentence number ${i + 1} says that the streamed reading should begin early and never lose a word.`,
+      (_, i) => `Sentence number ${i + 1} says that the Reading should begin early and never lose a word.`,
     );
     const text = sentences.join(" ");
     const pieces = splitForSpeech(text);

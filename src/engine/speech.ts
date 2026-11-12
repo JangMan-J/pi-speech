@@ -9,6 +9,7 @@ import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { extname, isAbsolute, join, resolve } from "node:path";
 import { type VoiceLanguage, voiceLanguage, voiceSample } from "../voice-language/index";
+import type { PlayStart } from "./audio";
 import type { KeyRegistry } from "./credentials";
 import { buildEndpoints, type Endpoint, endpointNameProblem, PRESETS } from "./endpoints";
 import { type Env, errorMessage } from "./env";
@@ -22,10 +23,11 @@ import {
   type SpeechCatalog,
 } from "./openrouter";
 import { READING_MIN_CHARS, splitForSpeech } from "./pieces";
-import type { Player } from "./player";
-import type { SpeechProvider } from "./provider";
+import { type Player, REPLACED } from "./player";
+import type { SpeechProvider, SynthesisRequest, SynthesizedAudio } from "./provider";
 import { speakInPieces } from "./reading";
 import { DEFAULT_SETTINGS, type ModelSort, type Settings, type SettingsFile } from "./settings";
+import { streamAndPlay, streams } from "./stream-play";
 import { XAI_MODEL, XAI_PRICE, XaiProvider } from "./xai";
 
 /** The xAI choice as a model option, offered while Pi holds an xAI login. */
@@ -146,6 +148,8 @@ export class Speech {
   private failedAt = 0;
   private lastSaved?: string[];
   private samples = 0;
+  /** Reasons a Stream could not play, each told once per session. */
+  private readonly streamWarnings = new Set<string>();
   /** Models whose texts could not be read in pieces in this session (e.g. MP3 without a converter). */
   private readonly unchunkable = new Set<string>();
   private readonly history: History;
@@ -670,8 +674,27 @@ export class Speech {
     if (!text.trim()) throw new Error("Nothing to say: the text is empty");
     const { model, voice } = await this.choose(opts.model, opts.voice);
     const play = opts.play !== false;
-    await this.provider(model).ensureCredential();
+    const provider = this.provider(model);
+    await provider.ensureCredential();
     const ticket = play ? this.player.claim() : undefined;
+    if (play && ticket !== undefined && streams(provider)) {
+      const req = { text, model, voice, language: "auto", signal: opts.signal, via: this.via("tts", model) };
+      const r = await streamAndPlay(provider, req, this.player, "message", ticket);
+      if (r.state === "stopped") return { files: [], model, voice, stopped: true, notPlayed: REPLACED };
+      let started = r.started;
+      const saved = await this.history.save(text, r.wav, "wav", async (file) => {
+        if (!started.ok && started.cannotStream) {
+          this.warnStream(started.reason);
+          started = await this.player.play(file, "message", { ticket });
+        }
+      });
+      this.lastSaved = saved.files;
+      const result: SpeechResult = { files: saved.files, model, voice };
+      if (saved.conversionError) result.conversionError = saved.conversionError;
+      if (started.ok) result.player = started.player;
+      else result.notPlayed = started.reason;
+      return result;
+    }
     // Plain speech never names a language: the text is spoken as written, never translated.
     const audio = await this.synthesize(text, model, voice, "auto", opts.signal);
     let started: Awaited<ReturnType<Player["play"]>> | undefined;
@@ -732,12 +755,17 @@ export class Speech {
     await this.requireVoice(model, v);
     const vl = this.languageOf(model, v);
     const s = voiceSample(vl, v);
-    await this.provider(model).ensureCredential();
+    const provider = this.provider(model);
+    await provider.ensureCredential();
     const ticket = this.player.claim();
-    const audio = await this.synthesize(s.text, model, v, s.language, opts.signal);
-    const file = join(tmpdir(), `pi-speech-sample-${process.pid}-${++this.samples}.${audio.format}`);
-    writeFileSync(file, audio.audio);
-    const started = await this.player.play(file, "sample", { ticket, cleanup: () => rmSync(file, { force: true }) });
+    const started = await this.playSample(provider, ticket, {
+      text: s.text,
+      model,
+      voice: v,
+      language: s.language,
+      signal: opts.signal,
+      via: this.via("tts", model),
+    });
     return {
       model,
       voice: v,
@@ -746,6 +774,30 @@ export class Speech {
       ...(s.notice ? { notice: s.notice } : {}),
       ...(started.ok ? { player: started.player } : { notPlayed: started.reason }),
     };
+  }
+
+  /** Play a sample: as a Stream where the provider and the output can, else as a file once it has arrived. */
+  private async playSample(provider: SpeechProvider, ticket: number, req: SynthesisRequest): Promise<PlayStart> {
+    let audio: SynthesizedAudio;
+    if (streams(provider)) {
+      const r = await streamAndPlay(provider, req, this.player, "sample", ticket);
+      if (r.state === "stopped") return { ok: false, reason: REPLACED };
+      if (r.started.ok || !r.started.cannotStream) return r.started;
+      this.warnStream(r.started.reason);
+      audio = { audio: r.wav, format: "wav" };
+    } else {
+      audio = await this.synthesize(req.text, req.model, req.voice, req.language, req.signal);
+    }
+    const file = join(tmpdir(), `pi-speech-sample-${process.pid}-${++this.samples}.${audio.format}`);
+    writeFileSync(file, audio.audio);
+    return this.player.play(file, "sample", { ticket, cleanup: () => rmSync(file, { force: true }) });
+  }
+
+  /** Tell once per session why speech plays only once it has fully arrived. */
+  private warnStream(reason: string): void {
+    if (this.streamWarnings.has(reason)) return;
+    this.streamWarnings.add(reason);
+    this.onWarning(`Speech plays once it has fully arrived: ${reason}`);
   }
 
   /** The spoken messages of the history, the newest first. */

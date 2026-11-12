@@ -3,7 +3,7 @@ type: glossary
 created: 2026-11-12T13:39:07Z
 created_by: claude-opus-5-5
 created_session: 01a1cfe8-fb2e-76f9-8621-eae06c80679c
-updated: 2026-11-12T13:39:07Z
+updated: 2026-11-12T15:30:00Z
 updated_by: claude-opus-5-5
 updated_session: 01a1cfe8-fb2e-76f9-8621-eae06c80679c
 ---
@@ -37,3 +37,9 @@ A chat model's reading that does not say the text it was given, word for word: i
 or leaves out words. Told by comparing the model's own transcript with the text.
 _Example_: asked to say "Turn left at the bridge", the model says "Sure! Turn left at the bridge."
 _Confirmed_: 2026-11-12, Jang (a Stray stops playback by default).
+
+## Unresolved
+
+- **piece / part**: the Reading entry says "parts"; the code says "pieces" (`pieces.ts`, `reading.ts`).
+- **reading (lowercase)**: chat-audio code and the Stray entry call a chat model's spoken version "a
+  reading", which can be confused with a Reading.

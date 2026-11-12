@@ -8,6 +8,7 @@ import type { BridgeAudio } from "../../src/bridge/index";
 import type { AudioInput, AudioOutput, PlayKind, PlayOutcome, PlayStart } from "../../src/engine/audio";
 import { Engine } from "../../src/engine/engine";
 import type { SpeechCatalog } from "../../src/engine/openrouter";
+import type { AudioStream, StreamFormat } from "../../src/engine/provider";
 import type { SurfaceUi } from "../../src/engine/surface";
 
 export const CATALOG: SpeechCatalog = {
@@ -57,8 +58,22 @@ export const CATALOG: SpeechCatalog = {
   ],
 };
 
+/** A Stream the fake output plays: every chunk it has read, when, and how the playback ended. */
+export interface FakeStreamPlay {
+  kind: PlayKind;
+  format: StreamFormat;
+  chunks: Uint8Array[];
+  /** The Stream ended: every chunk was read. */
+  ended: boolean;
+  /** How the playback ended, once it has. */
+  outcome?: PlayOutcome;
+  /** End the playback, as a player that finished (or failed) would. */
+  finish(o: PlayOutcome): void;
+}
+
 export interface FakeOutput extends AudioOutput {
   plays: Array<{ file: string; kind: PlayKind }>;
+  streams: FakeStreamPlay[];
   /** Playbacks stopped one by one. */
   cancelled: number;
   /** Calls of stop() for the whole output. */
@@ -66,11 +81,13 @@ export interface FakeOutput extends AudioOutput {
   end(i: number, o: PlayOutcome): void;
 }
 
-export function fakeOutput(name: string): FakeOutput {
+/** A fake output; with `streams` it plays a Stream too, reading its chunks as they arrive. */
+export function fakeOutput(name: string, opts: { streams?: boolean } = {}): FakeOutput {
   const endings: Array<(o: PlayOutcome) => void> = [];
   const out: FakeOutput = {
     name,
     plays: [],
+    streams: [],
     cancelled: 0,
     stops: 0,
     end: (i, o) => endings[i](o),
@@ -91,6 +108,36 @@ export function fakeOutput(name: string): FakeOutput {
       out.stops++;
     },
   };
+  if (opts.streams) {
+    out.playStream = async (stream: AudioStream, kind: PlayKind): Promise<PlayStart> => {
+      let end!: (o: PlayOutcome) => void;
+      const done = new Promise<PlayOutcome>((r) => {
+        end = r;
+      });
+      const play: FakeStreamPlay = { kind, format: stream.format, chunks: [], ended: false, finish: (o) => end(o) };
+      void done.then((o) => {
+        play.outcome = o;
+      });
+      out.streams.push(play);
+      void (async () => {
+        try {
+          for await (const c of stream.chunks) {
+            if (play.outcome) return;
+            play.chunks.push(c);
+          }
+          play.ended = true;
+        } catch {
+          /* the owner of the Stream reports it */
+        }
+      })();
+      const stop = async () => {
+        out.cancelled++;
+        end({ state: "cancelled" });
+        await done;
+      };
+      return { ok: true, player: name, done, stop };
+    };
+  }
   return out;
 }
 
@@ -118,7 +165,7 @@ export function makeEngine(
   catalog: SpeechCatalog = CATALOG,
 ) {
   const work = mkdtempSync(join(tmpdir(), "pi-speech-engine-"));
-  const local = fakeOutput("local");
+  const local = fakeOutput("local", { streams: true });
   const bridgeOut = fakeOutput("bridge");
   const noInput: AudioInput = {
     name: "local",
@@ -166,4 +213,44 @@ export function scriptedUi(answers: Array<(title: string, options?: string[]) =>
     input: (title) => next("input", title),
   };
   return { ui, notes, dialogs, pasted };
+}
+
+/**
+ * A response body the test sends by hand, chunk by chunk, as a speech service sends audio while it is still
+ * producing it. `cancelled` turns true when the reader gives up (an aborted request).
+ */
+export function chunkedBody() {
+  let controller!: ReadableStreamDefaultController<Uint8Array>;
+  const state = { cancelled: false, pulls: 0 };
+  const body = new ReadableStream<Uint8Array>({
+    start(c) {
+      controller = c;
+    },
+    cancel() {
+      state.cancelled = true;
+    },
+  });
+  return {
+    body,
+    get cancelled() {
+      return state.cancelled;
+    },
+    send: (bytes: Uint8Array) => controller.enqueue(bytes),
+    end: () => controller.close(),
+    fail: (err: Error) => controller.error(err),
+  };
+}
+
+/** Bytes 0, 1, 2, ... of length `n`, so joined chunks can be compared with what was sent. */
+export function pcmBytes(n: number, start = 0): Uint8Array<ArrayBuffer> {
+  return Uint8Array.from({ length: n }, (_, i) => (start + i) % 256);
+}
+
+/** Resolves once `cond` holds, polling every 5 ms; fails after `ms`. */
+export async function until(cond: () => boolean, ms = 2000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > end) throw new Error("condition not met in time");
+    await new Promise((r) => setTimeout(r, 5));
+  }
 }

@@ -25,7 +25,9 @@ Or load it for one run: `pi -e ./index.ts`. pi-speech registers only the `/speec
 
 You need an OpenRouter API key or an xAI login in Pi (see [Credentials](#credentials)), and for playback on the Pi host one of
 `mpv`, `ffplay`, `paplay`, `pw-play`, `mpg123` (or `PI_SPEECH_PLAYER`). `ffmpeg` adds the second history
-format.
+format. With xai, speech plays as it arrives through one of `pacat`, `pw-cat`, `ffplay`, `mpv`, `aplay` (or
+`PI_SPEECH_STREAM_PLAYER`); without one, or with only `PI_SPEECH_PLAYER` set, it plays once it has fully
+arrived.
 
 ## `/speech`
 
@@ -410,16 +412,17 @@ of any error text. An endpoint you added with no key is sent none.
 
 ## Environment
 
-| Variable                      | Meaning                                                                    |
-| ----------------------------- | -------------------------------------------------------------------------- |
-| `OPENROUTER_API_KEY`          | OpenRouter API key                                                         |
-| `PI_SPEECH_DIR`               | History directory (default `~/Music/pi-speech`)                            |
-| `PI_SPEECH_PLAYER`            | Player on the Pi host, run as `<player> <audio file>`                      |
-| `PI_SPEECH_RECORDER`          | Recorder on the Pi host, run as `<recorder> <output.wav>`, stops on SIGINT |
-| `PI_SPEECH_LOCAL_MIC`         | `1`: the Pi host's microphone is yours, even over SSH                      |
-| `PI_SPEECH_BRIDGE_URL`        | Receiver URL (default `http://127.0.0.1:47613`; loopback only)             |
-| `PI_SPEECH_BRIDGE_TOKEN`      | Bridge token                                                               |
-| `PI_SPEECH_BRIDGE_TOKEN_FILE` | File holding the bridge token (default `~/.config/pi-speech/bridge.token`) |
+| Variable                      | Meaning                                                                                 |
+| ----------------------------- | --------------------------------------------------------------------------------------- |
+| `OPENROUTER_API_KEY`          | OpenRouter API key                                                                      |
+| `PI_SPEECH_DIR`               | History directory (default `~/Music/pi-speech`)                                         |
+| `PI_SPEECH_PLAYER`            | Player on the Pi host, run as `<player> <audio file>`                                   |
+| `PI_SPEECH_STREAM_PLAYER`     | Player of speech as it arrives, run as `<player> s16le <rate> <channels>`, PCM on stdin |
+| `PI_SPEECH_RECORDER`          | Recorder on the Pi host, run as `<recorder> <output.wav>`, stops on SIGINT              |
+| `PI_SPEECH_LOCAL_MIC`         | `1`: the Pi host's microphone is yours, even over SSH                                   |
+| `PI_SPEECH_BRIDGE_URL`        | Receiver URL (default `http://127.0.0.1:47613`; loopback only)                          |
+| `PI_SPEECH_BRIDGE_TOKEN`      | Bridge token                                                                            |
+| `PI_SPEECH_BRIDGE_TOKEN_FILE` | File holding the bridge token (default `~/.config/pi-speech/bridge.token`)              |
 
 ## Development
 

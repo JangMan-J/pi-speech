@@ -26,7 +26,7 @@
  *   recording made three models copy it into the transcript, and none at all lost three more, so there is
  *   one, before it. One model once took five minutes to fail, so a request is given up after three.
  *
- * Streamed speech comes as 16-bit PCM only (OpenAI refuses every other format while streaming), 24 kHz mono.
+ * Audio sent as server-sent events comes as 16-bit PCM only (OpenAI refuses every other format then), 24 kHz mono.
  */
 
 import { bearer, errorText, failure } from "./http";

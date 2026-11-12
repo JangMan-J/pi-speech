@@ -20,7 +20,7 @@ interface Logged {
   form?: FormData;
 }
 
-/** Stub fetch for both services: xAI answers WAV / voices / a transcript; OpenRouter as in fixtures. */
+/** Stub fetch for both services: xAI answers PCM / voices / a transcript; OpenRouter as in fixtures. */
 function fakeServices(opts: { voices?: unknown[]; transcript?: string } = {}) {
   const log: Logged[] = [];
   const failures: Array<{ status: number; body: unknown }> = [];
@@ -45,7 +45,7 @@ function fakeServices(opts: { voices?: unknown[]; transcript?: string } = {}) {
         }
         if (url.endsWith("/v1/tts/voices")) return Response.json({ voices });
         if (url.endsWith("/v1/tts")) {
-          return new Response(new Uint8Array(100), { headers: { "content-type": "audio/wav" } });
+          return new Response(new Uint8Array(100), { headers: { "content-type": "audio/pcm" } });
         }
         if (url.endsWith("/v1/stt")) return Response.json({ text: opts.transcript ?? "hello from xai" });
         return Response.json({ error: "not found" }, { status: 404 });
@@ -175,7 +175,7 @@ describe("xai with an xAI login", () => {
     expect((await run("hello")).error).toMatch(/no voices/i);
   });
 
-  it("speaks: text, voice_id, language auto, WAV and MP3 in the history, played, no OpenRouter", async () => {
+  it("speaks: text, voice_id, language auto, WAV and MP3 in the history, played as a Stream, no OpenRouter", async () => {
     const svc = fakeServices();
     const { run, engine, local } = setup({ env: { OPENROUTER_API_KEY: "" } });
     await run("--set tts-model xai");
@@ -188,7 +188,8 @@ describe("xai with an xAI login", () => {
       .at(-1);
     expect(req?.body).toMatchObject({ text: "Hello from xai", voice_id: "leo", language: "auto" });
     expect(req?.auth).toBe(`Bearer ${TOKEN}`);
-    expect(local.plays).toHaveLength(1);
+    expect(local.streams).toHaveLength(1);
+    expect(local.plays).toHaveLength(0);
     expect(saved(engine.speech.historyDir).filter((f) => f.endsWith(".wav"))).toHaveLength(1);
     expect(svc.openrouter().filter((x) => x.method === "POST")).toHaveLength(0);
   });

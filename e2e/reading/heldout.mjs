@@ -1,4 +1,4 @@
-// Held-out acceptance: streamed reading, edge cases.
+// Held-out acceptance: a Reading (a long text read in pieces), edge cases.
 import fs from 'node:fs';
 import path from 'node:path';
 import { callTool, check, command, errors, finish, notes, setup } from '../lib/lib.mjs';
@@ -21,7 +21,7 @@ const MS = 8;
     for (let i = 0; i < 100 && ctx.playerLog().length < 1; i++) await sleep(100);
     await sleep(MS * text.length * 0.7 + 2000);
     const inputs = ctx.speechRequests().slice(from).map((r) => r.body?.input ?? '');
-    check(inputs.length >= 3 && norm(inputs.join(' ')) === norm(text), '/speech <long text> is streamed too and holds every word', inputs.length);
+    check(inputs.length >= 3 && norm(inputs.join(' ')) === norm(text), '/speech <long text> is read in pieces too and holds every word', inputs.length);
     check(ctx.or.maxInflight() <= 2, 'at most 2 speech requests are in flight at once', ctx.or.maxInflight());
 
     from = ctx.speechRequests().length;
@@ -44,14 +44,14 @@ const MS = 8;
     const s = await ctx.pi();
     await command(s, '/speech --set tts-model hexgrad/kokoro-82m'); await command(s, '/speech --set voice af_heart');
     await command(s, '/speech --read-aloud on');
-    ctx.or.failNext(1, 500, { error: { message: 'injected stream failure', code: 500 } });
+    ctx.or.failNext(1, 500, { error: { message: 'injected reading failure', code: 500 } });
     const from = s.uiRequests.length;
     const reqFrom = ctx.speechRequests().length;
     ctx.llm.script([{ text: make('failing') }]);
     await s.prompt('go', 60000);
     await sleep(MS * 300 + 3000);
     const errs = errors(s.uiRequests.slice(from).filter((u) => u.method === 'notify'));
-    check(errs.length === 1 && /injected stream failure|500/.test(errs[0].message), 'one visible error with the reason', errs.map((e) => e.message));
+    check(errs.length === 1 && /injected reading failure|500/.test(errs[0].message), 'one visible error with the reason', errs.map((e) => e.message));
     check(/not saved|nothing was saved|no audio/i.test(errs[0]?.message ?? ''), 'the error says the reply was not saved', errs[0]?.message);
     check(ctx.speechRequests().length - reqFrom <= 3, 'no further pieces are requested after a failure', ctx.speechRequests().length - reqFrom);
     check(ctx.history().length === 0, 'nothing is saved', ctx.history());
@@ -110,7 +110,7 @@ const rcv = await startReceiver();
   } finally { await ctx.close(); ctx.cleanup(); await rcv.stop(); rcv.cleanup(); }
 }
 
-// 5. xai streams too
+// 5. xai is read in pieces too
 {
   const ctx = await setup({ xai: true });
   try {
@@ -122,7 +122,7 @@ const rcv = await startReceiver();
     await s.prompt('go', 60000);
     await sleep(3000);
     const inputs = ctx.xai.tts().map((r) => r.body?.text ?? '');
-    check(inputs.length >= 3 && norm(inputs.join(' ')) === norm(text), 'a xai reply is streamed in pieces that hold every word', inputs.length);
+    check(inputs.length >= 3 && norm(inputs.join(' ')) === norm(text), 'a xai reply is read in pieces that hold every word', inputs.length);
     check(ctx.speechRequests().length === 0, 'OpenRouter is not used');
     check(ctx.history().filter((f) => f.endsWith('.wav')).length === 1, 'one message in the history');
     await s.close();

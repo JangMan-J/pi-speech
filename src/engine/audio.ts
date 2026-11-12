@@ -3,6 +3,8 @@
  * user's playback machine. Which one is used is decided by the route (see routes.ts), never by fallback.
  */
 
+import type { AudioStream } from "./provider";
+
 export type PlayKind = "message" | "sample";
 
 export type PlayOutcome = { state: "completed" } | { state: "failed"; error: string } | { state: "cancelled" };
@@ -16,12 +18,24 @@ export interface Playback {
   stop(): Promise<void>;
 }
 
-export type PlayStart = ({ ok: true } & Playback) | { ok: false; reason: string };
+export type PlayStart =
+  | ({ ok: true } & Playback)
+  | {
+      ok: false;
+      reason: string;
+      /** The output cannot play a Stream now (no player for a Stream, a route without Streams); nothing of it was read. */
+      cannotStream?: boolean;
+    };
 
 export interface AudioOutput {
   readonly name: string;
   /** Start playing `file` without waiting for it to finish. Never throws: a failure to start is `{ ok: false }`. */
   play(file: string, kind: PlayKind): Promise<PlayStart>;
+  /**
+   * Optional: start playing a Stream as its chunks arrive, without waiting for it to finish. Never throws.
+   * `{ ok: false, cannotStream: true }` when it cannot play a Stream now; the Stream is then left unread.
+   */
+  playStream?(stream: AudioStream, kind: PlayKind): Promise<PlayStart>;
   /** Stop what this output plays: everything, or only one kind. */
   stop(kind?: PlayKind): Promise<void>;
 }

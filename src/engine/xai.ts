@@ -4,8 +4,17 @@
  * Authorization header, and never appears in an error text.
  */
 
+import { bodyChunks, collect } from "./audio-stream";
 import { type KeyRegistry, resolveXaiToken } from "./credentials";
-import type { SpeechProvider, SynthesisRequest, SynthesizedAudio, TranscriptionRequest } from "./provider";
+import type {
+  AudioStream,
+  PcmFormat,
+  SpeechProvider,
+  SynthesisRequest,
+  SynthesizedAudio,
+  TranscriptionRequest,
+} from "./provider";
+import { wrapPcmAsWav } from "./wav";
 
 export const XAI_API = "https://api.x.ai/v1";
 
@@ -25,8 +34,10 @@ export interface XaiVoice {
   gender?: string;
 }
 
-/** Ask for WAV so the history's WAV comes straight from the service. */
-const OUTPUT_FORMAT = { codec: "wav", sample_rate: 24000 };
+/** Raw PCM arrives while it is produced (WAV arrives in one burst at the end); measured 2026-11-12. */
+const OUTPUT_FORMAT = { codec: "pcm", sample_rate: 24000 };
+/** xAI's PCM: signed 16-bit little-endian, mono, at the rate asked for. */
+const PCM: PcmFormat = { codec: "pcm", rate: OUTPUT_FORMAT.sample_rate, channels: 1 };
 
 const MIME: Record<string, string> = {
   wav: "audio/wav",
@@ -83,12 +94,15 @@ export async function listXaiVoices(token: string, signal?: AbortSignal): Promis
   return voices;
 }
 
-/** Synthesize `text` in `voice`; `language` is "auto" or a tag such as "ja". Throws on failure. */
-export async function xaiSynthesize(
+/**
+ * Synthesize `text` in `voice` as a Stream of PCM; `language` is "auto" or a tag such as "ja". Throws on a
+ * failed request; a response that breaks off throws while its chunks are read.
+ */
+export async function xaiSynthesizeStream(
   token: string,
   req: { text: string; voice: string; language: string },
   signal?: AbortSignal,
-): Promise<SynthesizedAudio> {
+): Promise<AudioStream> {
   const res = await fetch(`${XAI_API}/tts`, {
     method: "POST",
     headers: { ...headers(token), "Content-Type": "application/json" },
@@ -96,11 +110,25 @@ export async function xaiSynthesize(
     signal,
   });
   if (!res.ok) throw await failure(res, token);
-  const audio = new Uint8Array(await res.arrayBuffer());
-  const type = res.headers.get("content-type") || "audio/mpeg";
-  if (/wav/i.test(type)) return { audio, format: "wav" };
-  if (/mp3|mpeg/i.test(type)) return { audio, format: "mp3" };
-  throw new Error(`unexpected audio type from xAI: ${type}`);
+  const type = res.headers.get("content-type") ?? "";
+  if (type && !/pcm|octet-stream/i.test(type)) {
+    res.body?.cancel().catch(() => {});
+    throw new Error(`unexpected audio type from xAI: ${type}`);
+  }
+  if (!res.body) throw new Error("xAI returned no audio");
+  return { format: PCM, chunks: bodyChunks(res.body, "xAI") };
+}
+
+/** Synthesize `text` in `voice` as one WAV clip. Throws on failure. */
+export async function xaiSynthesize(
+  token: string,
+  req: { text: string; voice: string; language: string },
+  signal?: AbortSignal,
+): Promise<SynthesizedAudio> {
+  const stream = await xaiSynthesizeStream(token, req, signal);
+  const pcm = await collect(stream.chunks);
+  if (pcm.length < 2) throw new Error("xAI returned no audio");
+  return { audio: wrapPcmAsWav(pcm.subarray(0, pcm.length - (pcm.length % 2)), PCM.rate, PCM.channels), format: "wav" };
 }
 
 /** Transcribe audio bytes in `format`, posted as the multipart field `file`. Throws on failure. */
@@ -169,6 +197,10 @@ export class XaiProvider implements SpeechProvider {
 
   async synthesize(req: SynthesisRequest): Promise<SynthesizedAudio> {
     return xaiSynthesize(await this.requireToken(), req, req.signal);
+  }
+
+  async synthesizeStream(req: SynthesisRequest): Promise<AudioStream> {
+    return xaiSynthesizeStream(await this.requireToken(), req, req.signal);
   }
 
   async transcribe(req: TranscriptionRequest): Promise<string> {

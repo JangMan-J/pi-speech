@@ -12,6 +12,25 @@ export interface SynthesizedAudio {
   format: "wav" | "mp3";
 }
 
+/** Raw signed 16-bit little-endian PCM at `rate` Hz with `channels` interleaved channels. */
+export interface PcmFormat {
+  codec: "pcm";
+  rate: number;
+  channels: number;
+}
+
+/** The audio format of a Stream. */
+export type StreamFormat = PcmFormat;
+
+/**
+ * Audio that arrives while the provider is still producing it (a Stream, see GLOSSARY.md): chunks in order.
+ * Iterating throws a readable error when the response breaks off; the request's signal cancels it.
+ */
+export interface AudioStream {
+  format: StreamFormat;
+  chunks: AsyncIterable<Uint8Array>;
+}
+
 /**
  * The endpoint type a model is reached through when it is not the audio endpoints built for speech and
  * transcription: "chat" is the chat-completions API (src/engine/chat-audio.ts).
@@ -48,6 +67,11 @@ export interface SpeechProvider {
   ensureCredential(): Promise<void>;
   /** Throws a readable error on failure. */
   synthesize(req: SynthesisRequest): Promise<SynthesizedAudio>;
+  /**
+   * Optional: synthesize as a Stream. Resolves once the response has started; a failed request throws a
+   * readable error before any audio, a response that breaks off throws while its chunks are read.
+   */
+  synthesizeStream?(req: SynthesisRequest): Promise<AudioStream>;
   /** Throws a readable error on failure. */
   transcribe(req: TranscriptionRequest): Promise<string>;
 }
