@@ -13,14 +13,14 @@
  * Each key is sent only to its own base URL, in the Authorization header, and never appears in an error.
  */
 
+import { clipOf, collect, streamFromBody, streamOfClip } from "./audio-stream";
 import { chatSynthesize, chatTranscribe } from "./chat-audio";
 import type { KeyRegistry } from "./credentials";
 import type { Env } from "./env";
 import { FEATURES, type ModelKind, modelFeatures } from "./features";
 import { bearer as auth, failure } from "./http";
 import { CHAT_NOTE, DEFAULT_VOICE, type ModelOption, type SpeechCatalog } from "./openrouter";
-import type { SpeechProvider, SynthesisRequest, SynthesizedAudio, TranscriptionRequest } from "./provider";
-import { joinWav, wrapPcmAsWav } from "./wav";
+import type { AudioStream, SpeechProvider, SynthesisRequest, SynthesizedAudio, TranscriptionRequest } from "./provider";
 
 /** A user-defined endpoint, as saved in the settings. */
 export interface EndpointConfig {
@@ -137,19 +137,16 @@ const MIME: Record<string, string> = {
   aac: "audio/aac",
 };
 
-const isMp3 = (b: Uint8Array) =>
-  (b[0] === 0x49 && b[1] === 0x44 && b[2] === 0x33) || (b[0] === 0xff && ((b[1] ?? 0) & 0xe0) === 0xe0);
-
 /**
- * Synthesize through POST /audio/speech. WAV is asked for (every known server has it, Groq nothing else);
- * a server that rejects the format by name is asked again for MP3. The reply is told by its bytes, since
- * servers disagree on the Content-Type.
+ * Synthesize through POST /audio/speech as a Stream. WAV is asked for (every known server has it, Groq nothing
+ * else); a server that rejects the format by name is asked again for MP3. The reply is told by its bytes, since
+ * servers disagree on the Content-Type. Throws a readable error when the request fails.
  */
-export async function endpointSynthesize(
+export async function endpointSynthesizeStream(
   ep: { title: string; baseUrl: string; key?: string },
   req: { text: string; model: string; voice: string },
   signal?: AbortSignal,
-): Promise<SynthesizedAudio> {
+): Promise<AudioStream> {
   const send = (format: string) =>
     fetch(`${ep.baseUrl}/audio/speech`, {
       method: "POST",
@@ -171,18 +168,17 @@ export async function endpointSynthesize(
     res = await send("mp3");
     if (!res.ok) throw failure(ep.title, res.status, await res.text().catch(() => ""), ep.key);
   }
-  const audio = new Uint8Array(await res.arrayBuffer());
-  const type = res.headers.get("content-type") ?? "";
-  // A streamed WAV leaves its sizes open (0xFFFFFFFF); joinWav writes them.
-  const wav = joinWav([audio]);
-  if (wav) return { audio: wav, format: "wav" };
-  if (/audio\/(?:pcm|l16)/i.test(type)) {
-    const rate = Number(/rate=(\d+)/.exec(type)?.[1] ?? 24000);
-    const channels = Number(/channels=(\d+)/.exec(type)?.[1] ?? 1);
-    return { audio: wrapPcmAsWav(audio, rate, channels), format: "wav" };
-  }
-  if (isMp3(audio) || /mp3|mpeg/i.test(type)) return { audio, format: "mp3" };
-  throw new Error(`unexpected audio from ${ep.title}: ${type || "no content type"}`);
+  return streamFromBody(res.body, res.headers.get("content-type") ?? "", ep.title);
+}
+
+/** Synthesize through POST /audio/speech as one clip (see endpointSynthesizeStream). */
+export async function endpointSynthesize(
+  ep: { title: string; baseUrl: string; key?: string },
+  req: { text: string; model: string; voice: string },
+  signal?: AbortSignal,
+): Promise<SynthesizedAudio> {
+  const stream = await endpointSynthesizeStream(ep, req, signal);
+  return clipOf(stream.format, await collect(stream.chunks), ep.title);
 }
 
 /** Transcribe through POST /audio/transcriptions: the audio as the multipart field `file`. */
@@ -365,12 +361,20 @@ export class Endpoint implements SpeechProvider {
   }
 
   async synthesize(req: SynthesisRequest): Promise<SynthesizedAudio> {
+    const stream = await this.synthesizeStream(req);
+    return clipOf(stream.format, await collect(stream.chunks), this.name);
+  }
+
+  async synthesizeStream(req: SynthesisRequest): Promise<AudioStream> {
     await this.ensureCredential();
+    const target = await this.target();
     if (req.via === "chat") {
       const voice = req.voice && req.voice !== DEFAULT_VOICE ? req.voice : undefined;
-      return chatSynthesize(await this.target(), { text: req.text, model: this.bare(req.model), voice }, req.signal);
+      // Checked against its transcript as a whole before it plays: one chunk, once the reading is complete.
+      const clip = await chatSynthesize(target, { text: req.text, model: this.bare(req.model), voice }, req.signal);
+      return streamOfClip(clip, target.title);
     }
-    return endpointSynthesize(await this.target(), { ...req, model: this.bare(req.model) }, req.signal);
+    return endpointSynthesizeStream(target, { ...req, model: this.bare(req.model) }, req.signal);
   }
 
   async transcribe(req: TranscriptionRequest): Promise<string> {
