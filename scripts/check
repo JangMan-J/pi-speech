@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Run each proof check; OPEN is unfinished, FAIL blocks a merge.
+cd "$(dirname "$0")/.." || exit 1
+status=0
+for f in scripts/*; do
+  case "$(basename "$f")" in check|README*) continue ;; esac
+  [ -f "$f" ] || continue
+  if [ ! -x "$f" ]; then echo "FAIL $f (not executable)"; status=1; continue; fi
+  "$f" >/dev/null 2>&1; rc=$?
+  case $rc in
+    0)  echo "PASS $f" ;;
+    78) echo "OPEN $f" ;;
+    *)  echo "FAIL $f (exit $rc)"; status=1 ;;
+  esac
+done
+exit "$status"

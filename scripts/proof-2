@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# proof-2: remote-to-local playback: automated suites, then live playback on the user's machine through the receiver
+# Exit 0 passes, 78 is OPEN (a live requirement is missing; the reason is printed), anything else fails.
+cd "$(dirname "$0")/.." || exit 1
+e2e/run receiver receiver-hardening bridge || { echo "FAIL proof-2: automated suites failed"; exit 1; }
+exec node e2e/live/proof-2.mjs

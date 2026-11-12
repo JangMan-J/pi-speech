@@ -1,0 +1,133 @@
+#!/usr/bin/env node
+// Runs end-to-end suites from the repository root: `e2e/run <suite>...` (or `e2e/run all`).
+// Prints each suite's PASS/FAIL lines and a one-line summary; exits 0 only when every suite passed.
+import { spawn, spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { buildReceiver } from './lib/receiver.mjs';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.dirname(HERE);
+const LIB = path.join(HERE, 'lib');
+const STEP_TIMEOUT_MS = 15 * 60 * 1000;
+
+const node = (file) => ({ kind: 'node', file });
+const python = (file) => ({ kind: 'python', file });
+const vitest = (dir) => ({ kind: 'vitest', dir });
+
+// Each suite lists its steps the way the acceptance `run` scripts ran them.
+const SUITES = {
+  core: { steps: [node('core/visible.mjs'), node('core/heldout.mjs')] },
+  'voice-language': { steps: [vitest('voice-language')] },
+  receiver: { receiver: true, steps: [python('receiver/visible_tests.py'), python('receiver/heldout_tests.py')] },
+  'receiver-hardening': {
+    receiver: true,
+    steps: [
+      python('receiver/visible_tests.py'), python('receiver-hardening/hardening_tests.py'),
+      python('receiver/heldout_tests.py'), python('receiver-hardening/hardening_heldout.py'),
+    ],
+  },
+  samples: { steps: [node('samples/visible.mjs'), node('samples/heldout.mjs')] },
+  'read-aloud': { steps: [node('read-aloud/visible.mjs'), node('read-aloud/heldout.mjs')] },
+  bridge: { receiver: true, steps: [node('bridge/visible.mjs'), node('bridge/heldout.mjs'), vitest('bridge')] },
+  dictation: { steps: [node('dictation/visible.mjs'), node('dictation/heldout.mjs')] },
+  'bridge-dictation': { receiver: true, steps: [node('bridge-dictation/check.mjs')] },
+  'bridge-auto': { receiver: true, steps: [node('bridge-auto/visible.mjs'), node('bridge-auto/heldout.mjs')] },
+  redesign: { receiver: true, steps: [node('redesign/visible.mjs'), node('redesign/heldout.mjs')] },
+  stream: { receiver: true, steps: ['stream/visible.mjs', 'stream/heldout.mjs'].filter((f) => fs.existsSync(path.join(HERE, f))).map(node) },
+  panel: { receiver: true, steps: ['panel/visible.mjs', 'panel/heldout.mjs'].filter((f) => fs.existsSync(path.join(HERE, f))).map(node) },
+  xai: { steps: ['xai/visible.mjs', 'xai/heldout.mjs'].filter((f) => fs.existsSync(path.join(HERE, f))).map(node) },
+};
+
+const names = process.argv.slice(2);
+if (names.length === 0 || names.includes('-h') || names.includes('--help')) {
+  console.log(`usage: e2e/run <suite>... | all\nsuites: ${Object.keys(SUITES).join(', ')}`);
+  process.exit(names.length === 0 ? 2 : 0);
+}
+const wanted = names.includes('all') ? Object.keys(SUITES) : [...new Set(names)];
+const unknown = wanted.filter((n) => !SUITES[n]);
+if (unknown.length) {
+  console.error(`unknown suite: ${unknown.join(', ')} (known: ${Object.keys(SUITES).join(', ')})`);
+  process.exit(2);
+}
+
+process.chdir(ROOT);
+if (!fs.existsSync(path.join(ROOT, 'node_modules'))) {
+  console.log('== installing node modules (npm ci)');
+  const r = spawnSync('npm', ['ci', '--prefer-offline', '--no-audit', '--no-fund', '--loglevel=error'], { stdio: 'inherit' });
+  if (r.status !== 0) { console.error('FAIL npm ci'); process.exit(1); }
+}
+
+// The suites run against a clean environment: no inherited bridge, key, or SSH settings.
+const baseEnv = { ...process.env, PYTHONDONTWRITEBYTECODE: '1', PYTHONPATH: [LIB, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter) };
+for (const k of Object.keys(baseEnv)) if (k.startsWith('PI_SPEECH_') || k === 'SSH_CONNECTION' || k === 'SSH_TTY' || k === 'OPENROUTER_API_KEY') delete baseEnv[k];
+
+let receiverBin;
+function ensureReceiver() {
+  if (receiverBin) return;
+  console.log('== building the receiver');
+  receiverBin = buildReceiver(ROOT);
+}
+
+function command(step) {
+  if (step.kind === 'node') return ['node', [path.join(HERE, step.file)]];
+  if (step.kind === 'python') return ['python3', [path.join(HERE, step.file)]];
+  return ['npx', ['vitest', 'run', '--root', '.', '--config', 'e2e/vitest.config.ts', `e2e/${step.dir}/`]];
+}
+
+function runStep(step, env) {
+  const [cmd, args] = command(step);
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    let out = '';
+    const pipe = (stream, sink) => stream.on('data', (d) => { out += d; sink.write(d); });
+    pipe(child.stdout, process.stdout);
+    pipe(child.stderr, process.stderr);
+    const timer = setTimeout(() => { console.log('FAIL step timed out'); try { process.kill(-child.pid, 'SIGKILL'); } catch {} }, STEP_TIMEOUT_MS);
+    child.on('error', (err) => { clearTimeout(timer); console.log(`FAIL could not run ${cmd}: ${err.message}`); resolve({ code: 127, out }); });
+    child.on('close', (code) => { clearTimeout(timer); resolve({ code: code ?? 1, out }); });
+  });
+}
+
+function tally(step, out) {
+  if (step.kind === 'vitest') {
+    const text = out.replace(/\x1b\[[0-9;]*m/g, '');
+    const m = /Tests\s+(?:(\d+) failed \|\s*)?(?:(\d+) passed)?/.exec(text);
+    return { pass: Number(m?.[2] ?? 0), fail: Number(m?.[1] ?? 0) };
+  }
+  const lines = out.split('\n');
+  return { pass: lines.filter((l) => l.startsWith('PASS ')).length, fail: lines.filter((l) => l.startsWith('FAIL ')).length };
+}
+
+const summary = [];
+try {
+  for (const name of wanted) {
+    const suite = SUITES[name];
+    console.log(`\n=== suite ${name}`);
+    const env = { ...baseEnv };
+    let pass = 0, fail = 0, bad = 0;
+    if (suite.receiver) {
+      try { ensureReceiver(); } catch (err) { console.log(`FAIL building the receiver: ${err.message}`); fail++; bad++; }
+      if (receiverBin) { env.RECEIVER_BIN = receiverBin; env.RECEIVER_FAKES = LIB; }
+    }
+    if (!suite.receiver || receiverBin) {
+      for (const step of suite.steps) {
+        console.log(`--- ${step.file ?? `vitest e2e/${step.dir}/`}`);
+        const { code, out } = await runStep(step, env);
+        const t = tally(step, out);
+        pass += t.pass; fail += t.fail;
+        if (code !== 0) { bad++; if (t.fail === 0) fail++; console.log(`FAIL ${step.file ?? `vitest e2e/${step.dir}/`} exited ${code}`); }
+      }
+    }
+    const ok = bad === 0 && fail === 0;
+    summary.push({ name, ok });
+    console.log(`SUITE ${name}: ${ok ? 'PASS' : 'FAIL'} (${pass} passed, ${fail} failed)`);
+  }
+} finally {
+  if (receiverBin) fs.rmSync(path.dirname(receiverBin), { recursive: true, force: true });
+}
+
+const failed = summary.filter((s) => !s.ok).map((s) => s.name);
+console.log(`\n${failed.length ? `FAILED: ${failed.join(', ')}` : 'all suites passed'} (${summary.length - failed.length}/${summary.length})`);
+process.exit(failed.length ? 1 : 0);

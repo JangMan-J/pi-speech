@@ -1,0 +1,72 @@
+{
+  "name": "@jangmanj/pi-speech",
+  "version": "0.1.0",
+  "description": "Speech for Pi through OpenRouter: synthesis, transcription, Alt+Z dictation, voice-language samples, and remote-to-local playback",
+  "license": "MIT",
+  "author": "JangMan-J",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JangMan-J/pi-speech.git"
+  },
+  "homepage": "https://github.com/JangMan-J/pi-speech#readme",
+  "bugs": {
+    "url": "https://github.com/JangMan-J/pi-speech/issues"
+  },
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "speech",
+    "text-to-speech",
+    "speech-to-text",
+    "dictation",
+    "openrouter"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "files": [
+    "index.ts",
+    "src",
+    "receiver/src",
+    "receiver/Cargo.toml",
+    "receiver/Cargo.lock",
+    "protocol",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "vitest run --passWithNoTests",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "check": "npm run typecheck && npm run lint && npm test",
+    "smoke:pack": "node scripts/smoke-pack.mjs",
+    "init-package": "node scripts/init-package.mjs",
+    "bootstrap:npm": "bash scripts/npm-bootstrap.sh"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": ">=1.4.0",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.16",
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@earendil-works/pi-tui": "1.4.0",
+    "@types/node": "~22.19.0",
+    "typebox": "1.3.27",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.7"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

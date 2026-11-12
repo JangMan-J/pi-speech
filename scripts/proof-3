@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# proof-3: voice-language samples: automated suites, then live samples of two non-English voices transcribed back
+# Exit 0 passes, 78 is OPEN (a live requirement is missing; the reason is printed), anything else fails.
+cd "$(dirname "$0")/.." || exit 1
+e2e/run voice-language samples || { echo "FAIL proof-3: automated suites failed"; exit 1; }
+exec node e2e/live/proof-3.mjs

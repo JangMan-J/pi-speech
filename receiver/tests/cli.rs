@@ -1,0 +1,324 @@
+//! The binary: command line, token file rules, output, and signals.
+
+mod support;
+
+use std::io::{BufRead, BufReader, Read};
+use std::net::SocketAddr;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
+use support::*;
+
+const BIN: &str = env!("CARGO_BIN_EXE_pi-speech-receiver");
+const TOKEN: &str = "cli-token-0123456789abcdef0123456789abcdef";
+
+fn token_file(dir: &Path, mode: u32) -> PathBuf {
+    let p = dir.join("token");
+    std::fs::write(&p, format!("{TOKEN}\n")).unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+    p
+}
+
+fn command(dir: &Path, args: &[&str]) -> Command {
+    let mut c = Command::new(BIN);
+    c.args(args)
+        .env("XDG_CONFIG_HOME", dir.join("xdg"))
+        .env("XDG_RUNTIME_DIR", dir)
+        .env_remove("PI_SPEECH_RECEIVER_PLAYER")
+        .env_remove("PI_SPEECH_RECEIVER_RECORDER")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    c
+}
+
+struct Running {
+    child: Child,
+    addr: SocketAddr,
+    first_line: String,
+}
+
+fn start(mut c: Command) -> Running {
+    let mut child = c.spawn().unwrap();
+    let mut out = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    out.read_line(&mut line).unwrap();
+    let addr = line
+        .trim()
+        .strip_prefix("listening ")
+        .unwrap_or_else(|| panic!("no listening line: {line:?}"))
+        .parse()
+        .unwrap();
+    // Keep the pipe open and drained so the receiver never blocks on it.
+    std::mem::forget(out);
+    Running {
+        child,
+        addr,
+        first_line: line,
+    }
+}
+
+fn signal(child: &Child, sig: i32) {
+    unsafe { libc::kill(child.id() as i32, sig) };
+}
+
+fn exit_code_within(child: &mut Child, secs: u64) -> Option<i32> {
+    let mut code = None;
+    wait_until(Duration::from_secs(secs), || {
+        code = child.try_wait().unwrap().map(|s| s.code().unwrap_or(-1));
+        code.is_some()
+    });
+    code
+}
+
+fn temp_entries(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("pi-speech-receiver-"))
+        .collect()
+}
+
+#[test]
+fn prints_one_listening_line_and_stops_cleanly_on_sigterm_and_sigint() {
+    for sig in [15, 2] {
+        let dir = scratch("cli-sig");
+        let tf = token_file(&dir, 0o600);
+        let mut r = start(command(
+            &dir,
+            &[
+                "--listen",
+                "127.0.0.1:0",
+                "--token-file",
+                tf.to_str().unwrap(),
+            ],
+        ));
+        assert!(r.first_line.starts_with("listening 127.0.0.1:"));
+        assert_ne!(r.addr.port(), 0);
+        let dirs = temp_entries(&dir);
+        assert_eq!(dirs.len(), 1, "private temp directory exists while running");
+        let mode = std::fs::metadata(dir.join(&dirs[0]))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+
+        let rep = request(r.addr, "GET", "/v1/health", Some(TOKEN), &[], &[], None);
+        assert_eq!(rep.status, 200);
+        signal(&r.child, sig);
+        assert_eq!(exit_code_within(&mut r.child, 8), Some(0), "signal {sig}");
+        assert!(temp_entries(&dir).is_empty(), "temp directory removed");
+
+        let mut rest = String::new();
+        r.child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut rest)
+            .unwrap();
+        assert!(!rest.contains(TOKEN), "token never reaches output");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[test]
+fn refuses_non_loopback_listen_addresses() {
+    let dir = scratch("cli-lb");
+    let tf = token_file(&dir, 0o600);
+    for a in [
+        "0.0.0.0:0",
+        "192.168.1.2:0",
+        "[::]:0",
+        "localhost:0",
+        "garbage",
+    ] {
+        let out = command(&dir, &["--listen", a, "--token-file", tf.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{a}");
+        assert!(out.stdout.is_empty(), "{a}: nothing on stdout");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn accepts_ipv6_loopback() {
+    let dir = scratch("cli-v6");
+    let tf = token_file(&dir, 0o600);
+    let mut r = start(command(
+        &dir,
+        &["--listen", "[::1]:0", "--token-file", tf.to_str().unwrap()],
+    ));
+    assert!(r.first_line.starts_with("listening [::1]:"));
+    signal(&r.child, 15);
+    assert_eq!(exit_code_within(&mut r.child, 8), Some(0));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn refuses_a_token_file_readable_by_group_or_others() {
+    let dir = scratch("cli-mode");
+    for mode in [0o640, 0o604, 0o644, 0o660] {
+        let tf = token_file(&dir, mode);
+        let out = command(
+            &dir,
+            &[
+                "--listen",
+                "127.0.0.1:0",
+                "--token-file",
+                tf.to_str().unwrap(),
+            ],
+        )
+        .output()
+        .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{mode:o}");
+        assert!(out.stdout.is_empty());
+        assert!(!String::from_utf8_lossy(&out.stderr).contains(TOKEN));
+    }
+    assert!(temp_entries(&dir).is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn default_token_file_is_created_private_and_works() {
+    let dir = scratch("cli-default");
+    let mut r = start(command(&dir, &["--listen", "127.0.0.1:0"]));
+    let tf = dir.join("xdg/pi-speech/receiver.token");
+    assert_eq!(
+        std::fs::metadata(&tf).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let token = std::fs::read_to_string(&tf).unwrap().trim().to_string();
+    assert!(token.len() >= 32);
+    assert_eq!(
+        request(r.addr, "GET", "/v1/health", Some(&token), &[], &[], None).status,
+        200
+    );
+    assert_eq!(
+        request(r.addr, "GET", "/v1/health", Some(TOKEN), &[], &[], None).status,
+        401
+    );
+    signal(&r.child, 15);
+    assert_eq!(exit_code_within(&mut r.child, 8), Some(0));
+
+    // A second start reuses the same token.
+    let mut r2 = start(command(&dir, &["--listen", "127.0.0.1:0"]));
+    assert_eq!(
+        request(r2.addr, "GET", "/v1/health", Some(&token), &[], &[], None).status,
+        200
+    );
+    signal(&r2.child, 15);
+    assert_eq!(exit_code_within(&mut r2.child, 8), Some(0));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn sigterm_stops_a_running_player_and_removes_its_file() {
+    let dir = scratch("cli-play");
+    let tf = token_file(&dir, 0o600);
+    let log = dir.join("player.log");
+    let player = dir.join("player");
+    script(
+        &player,
+        &format!(
+            "#!/bin/bash\ntrap 'echo INT >> {l}; kill $c; exit 130' INT\necho \"$1\" > {l}.path\nsleep 30 & c=$!; wait $c\n",
+            l = log.display()
+        ),
+    );
+    let mut c = command(
+        &dir,
+        &[
+            "--listen",
+            "127.0.0.1:0",
+            "--token-file",
+            tf.to_str().unwrap(),
+        ],
+    );
+    c.env("PI_SPEECH_RECEIVER_PLAYER", &player);
+    let mut r = start(c);
+    let rep = request(
+        r.addr,
+        "POST",
+        "/v1/play",
+        Some(TOKEN),
+        &[("Content-Type", "audio/wav")],
+        &wav(0.2),
+        None,
+    );
+    assert_eq!(rep.status, 202);
+    let pathfile = dir.join("player.log.path");
+    assert!(wait_until(Duration::from_secs(3), || pathfile.exists()
+        && !std::fs::read_to_string(&pathfile).unwrap().is_empty()));
+    signal(&r.child, 15);
+    assert_eq!(exit_code_within(&mut r.child, 8), Some(0));
+    assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "INT");
+    assert!(temp_entries(&dir).is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+fn cpu_seconds(pid: u32) -> f64 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let f: Vec<&str> = stat
+        .rsplit_once(')')
+        .unwrap()
+        .1
+        .split_whitespace()
+        .collect();
+    let ticks: f64 = f[11].parse::<f64>().unwrap() + f[12].parse::<f64>().unwrap();
+    ticks / unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64
+}
+
+#[test]
+fn out_of_descriptors_the_receiver_backs_off_and_recovers() {
+    use std::os::unix::process::CommandExt;
+    let dir = scratch("fds");
+    let tf = token_file(&dir, 0o600);
+    let mut cmd = command(
+        &dir,
+        &[
+            "--listen",
+            "127.0.0.1:0",
+            "--token-file",
+            tf.to_str().unwrap(),
+        ],
+    );
+    unsafe {
+        cmd.pre_exec(|| {
+            let lim = libc::rlimit {
+                rlim_cur: 40,
+                rlim_max: 40,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut run = start(cmd);
+    // More connections than descriptors: the receiver runs dry.
+    let hold: Vec<_> = (0..80)
+        .filter_map(|_| {
+            std::net::TcpStream::connect_timeout(&run.addr, Duration::from_secs(2)).ok()
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(800));
+    let before = cpu_seconds(run.child.id());
+    std::thread::sleep(Duration::from_secs(3));
+    let spent = cpu_seconds(run.child.id()) - before;
+    assert!(spent < 0.5, "spun for {spent:.2}s of CPU in 3 s");
+    drop(hold);
+    let mut answered = false;
+    wait_until(Duration::from_secs(15), || {
+        let r = std::panic::catch_unwind(|| {
+            request(run.addr, "GET", "/v1/health", Some(TOKEN), &[], &[], None).status
+        });
+        answered = matches!(r, Ok(200));
+        answered
+    });
+    assert!(answered, "no answer after the descriptors were free again");
+    signal(&run.child, libc::SIGTERM);
+    assert_eq!(exit_code_within(&mut run.child, 10), Some(0));
+    std::fs::remove_dir_all(dir).ok();
+}

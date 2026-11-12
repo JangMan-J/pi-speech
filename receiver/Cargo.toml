@@ -1,0 +1,20 @@
+[package]
+name = "pi-speech-receiver"
+version = "0.1.0"
+edition = "2021"
+description = "Playback-machine receiver for the pi-speech playback bridge (play and record)"
+license = "MIT"
+
+[lib]
+name = "pi_speech_receiver"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pi-speech-receiver"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+panic = "unwind"

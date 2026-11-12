@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Fake player for tests: logs its argument, copies the file, then behaves per $FAKE_DIR/player-mode.
+f="$1"
+echo "start $$ $f" >> "$FAKE_DIR/player.log"
+cp "$f" "$FAKE_DIR/last-played" 2>/dev/null
+mode=$(cat "$FAKE_DIR/player-mode" 2>/dev/null || echo ok)
+child=""
+trap 'echo "signal $$ INT" >> "$FAKE_DIR/player.log"; [ -n "$child" ] && kill "$child" 2>/dev/null; exit 130' INT
+trap 'echo "signal $$ TERM" >> "$FAKE_DIR/player.log"; [ -n "$child" ] && kill "$child" 2>/dev/null; exit 143' TERM
+case "$mode" in
+  ok) sleep 0.3 & child=$!; wait "$child"; echo "done $$" >> "$FAKE_DIR/player.log"; exit 0 ;;
+  long) sleep 30 & child=$!; wait "$child"; exit 0 ;;
+  fail) echo "fake player: cannot open audio device" >&2; exit 3 ;;
+esac

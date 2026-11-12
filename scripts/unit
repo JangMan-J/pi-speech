@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Unit tests and type check for the extension; cargo tests for the receiver when it exists.
+cd "$(dirname "$0")/.." || exit 1
+[ -d node_modules ] || npm ci --no-audit --no-fund >/dev/null || exit 1
+npx vitest run --passWithNoTests || exit 1
+if ls index.ts src >/dev/null 2>&1; then npx tsc --noEmit || exit 1; fi
+if [ -f receiver/Cargo.toml ]; then (cd receiver && cargo test --quiet) || exit 1; fi
+exit 0

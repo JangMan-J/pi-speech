@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# proof-4: playback control and history: automated suites only
+# Exit 0 passes, 78 is OPEN (a live requirement is missing; the reason is printed), anything else fails.
+cd "$(dirname "$0")/.." || exit 1
+e2e/run read-aloud core samples || { echo "FAIL proof-4: automated suites failed"; exit 1; }
+echo "PASS proof-4: playback control, history, conversion, player failures, rapid sample replacement"

@@ -1,0 +1,278 @@
+/**
+ * HTTP client for pi-speech-receiver (protocol/bridge.md): the bridge's AudioOutput and AudioInput.
+ * The token is sent only in the Authorization header and is scrubbed from every message produced here.
+ */
+
+import { readFile } from "node:fs/promises";
+import { extname } from "node:path";
+import type { AudioInput, AudioOutput, PlayKind, PlayOutcome, PlayStart, Recording } from "../engine/audio";
+
+export interface BridgeConfig {
+  url: string;
+  token: string;
+}
+
+export type BridgeHealth = { ok: true; version: string } | { ok: false; reason: string };
+
+export interface BridgeAudio {
+  output: AudioOutput;
+  input: AudioInput;
+  health(): Promise<BridgeHealth>;
+}
+
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "[::1]", "localhost"]);
+const CONTROL_TIMEOUT_MS = 10_000;
+const UPLOAD_TIMEOUT_MS = 60_000;
+const DOWNLOAD_TIMEOUT_MS = 60_000;
+const POLL_WAIT_SECONDS = 30;
+const MIN_POLL_MS = 100;
+const MIN_TOKEN_LENGTH = 32;
+
+/** The base URL of a loopback http receiver; throws a readable Error for anything else. */
+export function loopbackBase(url: string): string {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    throw new Error("the bridge URL is not a valid URL; use http://127.0.0.1:<port>");
+  }
+  if (u.protocol !== "http:") {
+    throw new Error(`the bridge URL must be plain http on a loopback address, not ${u.protocol}//`);
+  }
+  if (!LOOPBACK_HOSTS.has(u.hostname)) {
+    throw new Error(
+      `the bridge URL must use a loopback address (127.0.0.1, ::1 or localhost), not ${u.hostname}: the token travels in plain HTTP`,
+    );
+  }
+  if (u.username || u.password) throw new Error("the bridge URL must not contain a user name or password");
+  return u.origin;
+}
+
+/** The URL for display: no credentials, whatever else it is. */
+export function displayUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    u.username = "";
+    u.password = "";
+    return u.origin === "null" ? u.href : u.origin;
+  } catch {
+    return "(invalid URL)";
+  }
+}
+
+class ReceiverError extends Error {
+  constructor(
+    message: string,
+    readonly status?: number,
+  ) {
+    super(message);
+  }
+}
+
+interface Reply {
+  status: number;
+  type: string;
+  body: Buffer;
+}
+
+function describeError(err: unknown): string {
+  if (err instanceof Error) {
+    const cause = (err as { cause?: unknown }).cause;
+    const detail = cause instanceof Error ? cause.message : "";
+    if (err.name === "TimeoutError" || err.name === "AbortError") return "the request timed out";
+    return detail ? `${err.message} (${detail})` : err.message;
+  }
+  return String(err);
+}
+
+export function createBridgeAudioFrom(getConfig: () => BridgeConfig): BridgeAudio {
+  /** Resolve the configuration once per operation: base URL, token, and a scrubber for messages. */
+  function resolve() {
+    const { url, token } = getConfig();
+    const base = loopbackBase(url);
+    if (!/^[\x21-\x7e]+$/.test(token)) throw new Error("the bridge token is empty or contains invalid characters");
+    if (token.length < MIN_TOKEN_LENGTH) {
+      throw new Error(`the bridge token is too short: it must be at least ${MIN_TOKEN_LENGTH} characters`);
+    }
+    const scrub = (text: string) => text.split(token).join("***");
+    return { base, token, scrub };
+  }
+
+  async function call(
+    method: "GET" | "POST",
+    path: string,
+    opts: { body?: Buffer; contentType?: string; headers?: Record<string, string>; timeoutMs?: number } = {},
+  ): Promise<Reply> {
+    const { base, token, scrub } = resolve();
+    const headers: Record<string, string> = { Authorization: `Bearer ${token}`, ...opts.headers };
+    if (opts.contentType) headers["Content-Type"] = opts.contentType;
+    let res: Response;
+    let body: Buffer;
+    try {
+      res = await fetch(base + path, {
+        method,
+        headers,
+        body: opts.body ? new Uint8Array(opts.body) : undefined,
+        redirect: "error",
+        signal: AbortSignal.timeout(opts.timeoutMs ?? CONTROL_TIMEOUT_MS),
+      });
+      body = Buffer.from(await res.arrayBuffer());
+    } catch (err) {
+      throw new ReceiverError(
+        scrub(`the playback receiver is not reachable at ${displayUrl(base)}: ${describeError(err)}`),
+      );
+    }
+    const type = res.headers.get("content-type") ?? "";
+    if (res.status >= 400) {
+      let message = res.statusText || "request failed";
+      try {
+        const parsed = JSON.parse(body.toString("utf8")) as { error?: unknown };
+        if (typeof parsed.error === "string" && parsed.error) message = parsed.error;
+      } catch {
+        /* not JSON: keep the status text */
+      }
+      const hint = res.status === 401 ? " (check the bridge token)" : "";
+      throw new ReceiverError(scrub(`the playback receiver answered ${res.status}: ${message}${hint}`), res.status);
+    }
+    return { status: res.status, type, body };
+  }
+
+  async function json<T>(reply: Reply): Promise<T> {
+    try {
+      return JSON.parse(reply.body.toString("utf8")) as T;
+    } catch {
+      throw new ReceiverError("the playback receiver sent an unreadable answer");
+    }
+  }
+
+  const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
+
+  async function health(): Promise<BridgeHealth> {
+    try {
+      const h = await json<{ protocol?: number; name?: string; version?: string }>(await call("GET", "/v1/health"));
+      if (h.name !== "pi-speech-receiver") return { ok: false, reason: "the server there is not a pi-speech-receiver" };
+      if (h.protocol !== 1) {
+        return { ok: false, reason: `the receiver speaks bridge protocol ${String(h.protocol)}, not 1` };
+      }
+      return { ok: true, version: String(h.version ?? "unknown") };
+    } catch (err) {
+      return { ok: false, reason: message(err) };
+    }
+  }
+
+  // ── Playback ────────────────────────────────────────────────────────────
+
+  /** Ids of playbacks started here and not yet ended, with their kinds. */
+  const active = new Map<string, PlayKind>();
+
+  async function follow(id: string): Promise<PlayOutcome> {
+    try {
+      for (;;) {
+        const started = Date.now();
+        const reply = await call("GET", `/v1/play/${encodeURIComponent(id)}?wait=${POLL_WAIT_SECONDS}`, {
+          timeoutMs: (POLL_WAIT_SECONDS + 10) * 1000,
+        });
+        const s = await json<{ state?: string; error?: string }>(reply);
+        if (s.state === "completed") return { state: "completed" };
+        if (s.state === "cancelled") return { state: "cancelled" };
+        if (s.state === "failed") return { state: "failed", error: s.error || "the receiver's player failed" };
+        if (s.state !== "playing") return { state: "failed", error: `unknown playback state ${String(s.state)}` };
+        const spent = Date.now() - started;
+        if (spent < MIN_POLL_MS) await new Promise((r) => setTimeout(r, MIN_POLL_MS - spent));
+      }
+    } catch (err) {
+      return { state: "failed", error: message(err) };
+    } finally {
+      active.delete(id);
+    }
+  }
+
+  const output: AudioOutput = {
+    name: "bridge",
+
+    async play(file: string, kind: PlayKind): Promise<PlayStart> {
+      try {
+        const ext = extname(file).toLowerCase();
+        const contentType = ext === ".wav" ? "audio/wav" : ext === ".mp3" ? "audio/mpeg" : undefined;
+        if (!contentType) return { ok: false, reason: `the bridge plays .wav and .mp3 files, not ${ext || file}` };
+        resolve(); // refuse a bad URL or token before reading anything
+        const bytes = await readFile(file).catch((err: NodeJS.ErrnoException) => {
+          throw new Error(`cannot read ${file}: ${err.code ?? err.message}`);
+        });
+        const reply = await call("POST", "/v1/play", {
+          body: bytes,
+          contentType,
+          headers: { "X-Pi-Speech-Kind": kind },
+          timeoutMs: UPLOAD_TIMEOUT_MS,
+        });
+        const { id } = await json<{ id?: string }>(reply);
+        if (!id) return { ok: false, reason: "the playback receiver did not return a playback id" };
+        active.set(id, kind);
+        const done = follow(id);
+        return {
+          ok: true,
+          player: "pi-speech-receiver",
+          done,
+          async stop() {
+            try {
+              await call("POST", `/v1/play/${encodeURIComponent(id)}/cancel`);
+            } catch {
+              return; // `done` reports a receiver that cannot be reached
+            }
+            await Promise.race([done, new Promise((r) => setTimeout(r, 3000))]);
+          },
+        };
+      } catch (err) {
+        return { ok: false, reason: message(err) };
+      }
+    },
+
+    async stop(kind?: PlayKind): Promise<void> {
+      if (!kind) {
+        await call("POST", "/v1/stop");
+        return;
+      }
+      // The receiver cannot stop one kind; cancel the playbacks of that kind started here.
+      // One failed cancel (a restarted receiver lost the id) must not keep the others playing.
+      for (const [id, k] of [...active]) {
+        if (k !== kind) continue;
+        try {
+          await call("POST", `/v1/play/${encodeURIComponent(id)}/cancel`);
+        } catch {
+          active.delete(id);
+        }
+      }
+    },
+  };
+
+  // ── Recording ───────────────────────────────────────────────────────────
+
+  const input: AudioInput = {
+    name: "bridge",
+
+    async start(): Promise<Recording> {
+      const reply = await call("POST", "/v1/record/start");
+      const { id } = await json<{ id?: string }>(reply);
+      if (!id) throw new Error("the playback receiver did not return a recording id");
+      const path = `/v1/record/${encodeURIComponent(id)}`;
+      return {
+        async stop() {
+          const r = await call("POST", `${path}/stop`, { timeoutMs: DOWNLOAD_TIMEOUT_MS });
+          if (!/audio\/(x-)?wav/i.test(r.type) || r.body.subarray(0, 4).toString("latin1") !== "RIFF") {
+            throw new Error("the playback receiver did not return a WAV recording");
+          }
+          return { audio: r.body, format: "wav" as const };
+        },
+        async cancel() {
+          await call("POST", `${path}/cancel`);
+        },
+      };
+    },
+  };
+
+  return { output, input, health };
+}
+
+export function createBridgeAudio(config: BridgeConfig): BridgeAudio {
+  return createBridgeAudioFrom(() => config);
+}

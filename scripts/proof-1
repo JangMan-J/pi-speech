@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# proof-1: standalone speech: automated suites, then live OpenRouter through the extension
+# Exit 0 passes, 78 is OPEN (a live requirement is missing; the reason is printed), anything else fails.
+cd "$(dirname "$0")/.." || exit 1
+e2e/run core voice-language || { echo "FAIL proof-1: automated suites failed"; exit 1; }
+node e2e/live/proof-1.mjs; rc=$?
+if [ "$rc" -ne 0 ]; then exit "$rc"; fi
+exec node e2e/live/proof-1-xai.mjs

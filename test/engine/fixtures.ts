@@ -1,0 +1,169 @@
+/** Test fixtures: an engine with a fixed catalog, a recording fake output, and a fake OpenRouter fetch. */
+
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { vi } from "vitest";
+import type { BridgeAudio } from "../../src/bridge/index";
+import type { AudioInput, AudioOutput, PlayKind, PlayOutcome, PlayStart } from "../../src/engine/audio";
+import { Engine } from "../../src/engine/engine";
+import type { SpeechCatalog } from "../../src/engine/openrouter";
+import type { SurfaceUi } from "../../src/engine/surface";
+
+export const CATALOG: SpeechCatalog = {
+  tts: [
+    {
+      id: "google/gemini-3.8-flash-tts",
+      label: "Gemini",
+      voices: ["Kore", "Puck"],
+      price: "~$0.03/min",
+      vendor: "Google",
+      features: ["tags", "fast"],
+      created: 300,
+      description: "Gemini 3.8 Flash TTS is a text-to-speech model from Google.",
+    },
+    {
+      id: "hexgrad/kokoro-82m",
+      label: "Kokoro",
+      voices: ["af_heart", "jf_alpha"],
+      price: "~$0.001/min",
+      vendor: "hexgrad",
+      features: ["multilingual"],
+      languages: "8 langs",
+      created: 100,
+      description: "Kokoro 82M is a lightweight text-to-speech model across 8 languages.",
+    },
+    {
+      id: "x-ai/grok-voice-tts-1.0",
+      label: "Grok",
+      voices: ["eve", "ara"],
+      price: "~$0.01/min",
+      vendor: "SpaceXAI",
+      features: ["multilingual"],
+      languages: "20+ langs",
+      created: 200,
+    },
+  ],
+  stt: [
+    {
+      id: "openai/whisper-large-v3-turbo",
+      label: "Whisper turbo",
+      price: "$0.0007/min",
+      vendor: "OpenAI",
+      features: ["multilingual", "fast"],
+      languages: "99+ langs",
+    },
+    { id: "openai/whisper-1", label: "Whisper", price: "$0.006/min", vendor: "OpenAI", features: ["translate"] },
+  ],
+};
+
+export interface FakeOutput extends AudioOutput {
+  plays: Array<{ file: string; kind: PlayKind }>;
+  /** Playbacks stopped one by one. */
+  cancelled: number;
+  /** Calls of stop() for the whole output. */
+  stops: number;
+  end(i: number, o: PlayOutcome): void;
+}
+
+export function fakeOutput(name: string): FakeOutput {
+  const endings: Array<(o: PlayOutcome) => void> = [];
+  const out: FakeOutput = {
+    name,
+    plays: [],
+    cancelled: 0,
+    stops: 0,
+    end: (i, o) => endings[i](o),
+    async play(file, kind): Promise<PlayStart> {
+      out.plays.push({ file, kind });
+      let end!: (o: PlayOutcome) => void;
+      const done = new Promise<PlayOutcome>((r) => {
+        end = r;
+      });
+      endings.push(end);
+      const stop = async () => {
+        out.cancelled++;
+        end({ state: "cancelled" });
+      };
+      return { ok: true, player: name, done, stop };
+    },
+    async stop() {
+      out.stops++;
+    },
+  };
+  return out;
+}
+
+/** Stub fetch: speech requests answer WAV-wrapped PCM, transcriptions a fixed text; returns the request log. */
+export function fakeOpenRouter(transcript = "hello world") {
+  const requests: Array<{ url: string; body: any; auth?: string }> = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string, init: RequestInit) => {
+      const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      requests.push({ url, body, auth: (init?.headers as Record<string, string>)?.Authorization });
+      if (url.endsWith("/audio/speech")) {
+        return new Response(new Uint8Array(4800), { headers: { "content-type": "audio/pcm;rate=24000;channels=1" } });
+      }
+      if (url.endsWith("/audio/transcriptions")) return Response.json({ text: transcript });
+      return new Response("not found", { status: 404 });
+    }),
+  );
+  return requests;
+}
+
+export function makeEngine(
+  env: Record<string, string> = {},
+  localInput?: AudioInput,
+  catalog: SpeechCatalog = CATALOG,
+) {
+  const work = mkdtempSync(join(tmpdir(), "pi-speech-engine-"));
+  const local = fakeOutput("local");
+  const bridgeOut = fakeOutput("bridge");
+  const noInput: AudioInput = {
+    name: "local",
+    start: async () => {
+      throw new Error("no microphone here");
+    },
+  };
+  const bridge: BridgeAudio = {
+    output: bridgeOut,
+    input: { ...noInput, name: "bridge" },
+    health: async () => ({ ok: true, version: "0.1.0" }),
+  };
+  const engine = new Engine({
+    agentDir: join(work, "agent"),
+    env: { OPENROUTER_API_KEY: "sk-test", PI_SPEECH_DIR: join(work, "history"), ...env },
+    home: join(work, "home"),
+    convert: async () => false,
+    fetchCatalog: async () => catalog,
+    bridge,
+    localOutput: local,
+    localInput: localInput ?? noInput,
+  });
+  const notes: Array<{ message: string; level: string }> = [];
+  engine.notify = (message, level) => notes.push({ message, level });
+  engine.start();
+  return { engine, work, local, bridgeOut, notes };
+}
+
+/** A UI that answers dialogs from a script and records what it was shown. */
+export function scriptedUi(answers: Array<(title: string, options?: string[]) => string | undefined> = []) {
+  const notes: Array<{ message: string; level: string }> = [];
+  const dialogs: Array<{ kind: string; title: string; options?: string[] }> = [];
+  const pasted: string[] = [];
+  const next = (kind: string, title: string, options?: string[]) => {
+    dialogs.push({ kind, title, options });
+    const answer = answers.shift();
+    return Promise.resolve(answer ? answer(title, options) : undefined);
+  };
+  const ui: SurfaceUi = {
+    cwd: "/",
+    notify: (message, level) => notes.push({ message, level }),
+    paste: (t) => pasted.push(t),
+    select: (title, options) => next("select", title, options),
+    pick: (title, options) => next("pick", title, options),
+    input: (title) => next("input", title),
+  };
+  return { ui, notes, dialogs, pasted };
+}

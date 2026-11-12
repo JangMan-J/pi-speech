@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# proof-5: Alt+Z dictation: automated suites, then a live recording through the receiver and the user's confirmation
+# Exit 0 passes, 78 is OPEN (a live requirement is missing; the reason is printed), anything else fails.
+cd "$(dirname "$0")/.." || exit 1
+e2e/run dictation bridge-dictation || { echo "FAIL proof-5: automated suites failed"; exit 1; }
+exec node e2e/live/proof-5.mjs
