@@ -112,7 +112,7 @@ export async function xaiSynthesizeStream(
   // PCM as asked for, at the rate asked for unless the type names one; MP3 or WAV are taken as they come.
   const type = res.headers.get("content-type") ?? "";
   const named = /audio\/pcm/i.test(type) && !/rate=/i.test(type);
-  return streamFromBody(res.body, named ? `audio/pcm;rate=${PCM.rate};channels=${PCM.channels}` : type, "xAI");
+  return streamFromBody(res.body, named ? `audio/pcm;rate=${PCM.rate};channels=${PCM.channels}` : type, "xAI", PCM);
 }
 
 /** Synthesize `text` in `voice` as one WAV clip. Throws on failure. */

@@ -729,9 +729,12 @@ export class Speech {
     const via = this.via("tts", model);
     const pieces = splitForSpeech(text);
     // Plain speech never names a language, as in `speak`.
-    let r: ReadingResult | undefined;
-    if (streams(provider) && this.player.canStream()) {
-      r = await streamReading({
+    const one = (piece: string, signal: AbortSignal) =>
+      provider.synthesize({ text: piece, model, voice, language: "auto", signal, via });
+    let asFiles: (piece: string, signal: AbortSignal, i: number) => Promise<SynthesizedAudio> = one;
+    const can = this.player.canStream();
+    if (streams(provider) && can.ok) {
+      const s = await streamReading({
         pieces,
         synthesize: (piece, signal) =>
           provider.synthesizeStream({ text: piece, model, voice, language: "auto", signal, via }),
@@ -740,18 +743,33 @@ export class Speech {
         who: provider.name,
         signal: opts.signal,
       });
-      // Where it cannot play as a Stream after all (an older receiver), it is read in pieces as files.
-      if (r.state === "unchunkable") r = undefined;
+      if (s.state !== "files") return this.readingResult(s, text, model, voice, opts);
+      // It cannot play as a Stream after all: read in pieces as files, taking the pieces already asked for.
+      this.warnStream(s.reason);
+      asFiles = (piece, signal, i) => s.requested(i, signal) ?? one(piece, signal);
+    } else if (streams(provider) && !can.ok) {
+      this.warnStream(can.reason);
     }
-    r ??= await speakInPieces({
+    const r = await speakInPieces({
       pieces,
-      synthesize: (piece, signal) => provider.synthesize({ text: piece, model, voice, language: "auto", signal, via }),
+      synthesize: asFiles,
       player: this.player,
       convert: this.convert,
       save: (wav) => this.history.save(text, wav, "wav"),
       tmpRoot: tmpdir(),
       signal: opts.signal,
     });
+    return this.readingResult(r, text, model, voice, opts);
+  }
+
+  /** The result of a Reading; one whose pieces cannot be WAV is spoken in one request instead. */
+  private async readingResult(
+    r: ReadingResult,
+    text: string,
+    model: string,
+    voice: string,
+    opts: CallOptions,
+  ): Promise<SpeechResult> {
     if (r.state === "unchunkable") {
       this.unchunkable.add(model);
       return this.speak(text, opts);

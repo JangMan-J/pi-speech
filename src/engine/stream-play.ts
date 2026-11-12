@@ -50,6 +50,7 @@ export async function streamAndPlay(
   stale.addEventListener("abort", onAbort);
   caller?.addEventListener("abort", onAbort);
   const failed = async (reason: string): Promise<never> => {
+    request.abort(); // a response still coming (after a Stray) is not wanted
     if (started?.ok) await started.stop().catch(() => {});
     throw new Error(`Speech synthesis failed: ${reason}`);
   };

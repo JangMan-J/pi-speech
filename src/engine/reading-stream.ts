@@ -5,8 +5,11 @@
  *
  * A stop, a newer playback, or the caller's signal cancels every request and saves nothing. A piece that fails
  * (its request, its response breaking off, a Stray, another audio format) stops playback, plays nothing after
- * it, and throws ReadingFailed. Once every piece has fully arrived they are saved as one message. Where the
- * first piece cannot play as a Stream, nothing plays and the result is `unchunkable`.
+ * it, and throws ReadingFailed. Once every piece has fully arrived they are saved as one message.
+ *
+ * Where the first piece turns out not to play as a Stream (the output cannot, or it is a WAV file), nothing
+ * plays here and the result is `files`: the pieces already asked for go on arriving and are handed to the
+ * caller, so none is asked for twice.
  */
 
 import type { PlayStart } from "./audio";
@@ -33,6 +36,18 @@ export interface StreamReadingDeps {
   signal?: AbortSignal;
 }
 
+export type StreamReadingResult =
+  | ReadingResult
+  /**
+   * The Reading cannot play as a Stream (`reason`); nothing played. `requested(i, signal)` is piece `i` as one
+   * clip when it was already asked for (aborting `signal` cancels it), else undefined: ask for it then.
+   */
+  | {
+      state: "files";
+      reason: string;
+      requested(i: number, signal: AbortSignal): Promise<SynthesizedAudio> | undefined;
+    };
+
 const sameFormat = (a: StreamFormat, b: StreamFormat) =>
   a.codec === b.codec && (a.codec !== "pcm" || (b.codec === "pcm" && a.rate === b.rate && a.channels === b.channels));
 
@@ -48,26 +63,48 @@ interface Piece {
   format: Promise<StreamFormat | undefined>;
   resolve(format: StreamFormat | undefined): void;
   audio: ChunkBuffer;
+  /** Cancels this piece's request. */
+  request: AbortController;
+  /** Settles once the piece has fully arrived, or failed (`error`). */
+  arrived: Promise<void>;
+  arrive(): void;
+  error?: string;
 }
 
 /** Speak `d.pieces` as one Reading played as a Stream; see the module comment. */
-export async function streamReading(d: StreamReadingDeps): Promise<ReadingResult> {
+export async function streamReading(d: StreamReadingDeps): Promise<StreamReadingResult> {
   const ticket = d.player.claim();
   const stale = d.player.signalFor(ticket);
   if (stale.aborted || d.signal?.aborted) return { state: "stopped" };
   const halt = new AbortController();
   const halted = new Promise<"halted">((r) => halt.signal.addEventListener("abort", () => r("halted")));
   let stopped = false;
+  /** The pieces go to the caller as files: no new piece is asked for here. */
+  let handedOff = false;
   let failure: string | undefined;
   let started: PlayStart | undefined;
+
+  const pieces: Piece[] = d.pieces.map(() => {
+    let resolve!: (f: StreamFormat | undefined) => void;
+    const format = new Promise<StreamFormat | undefined>((r) => {
+      resolve = r;
+    });
+    let arrive!: () => void;
+    const arrived = new Promise<void>((r) => {
+      arrive = r;
+    });
+    return { format, resolve, audio: new ChunkBuffer(), request: new AbortController(), arrived, arrive };
+  });
+
   const stop = (ended = false) => {
     if (stopped) return;
     stopped = true;
     halt.abort();
+    for (const p of pieces) p.request.abort();
     if (started?.ok && !ended) void started.stop().catch(() => {});
   };
   const fail = (reason: string) => {
-    if (stopped) return;
+    if (stopped || handedOff) return;
     failure = reason;
     stop();
   };
@@ -75,36 +112,57 @@ export async function streamReading(d: StreamReadingDeps): Promise<ReadingResult
   stale.addEventListener("abort", onAbort);
   d.signal?.addEventListener("abort", onAbort);
 
-  const pieces: Piece[] = d.pieces.map(() => {
-    let resolve!: (f: StreamFormat | undefined) => void;
-    const format = new Promise<StreamFormat | undefined>((r) => {
-      resolve = r;
-    });
-    return { format, resolve, audio: new ChunkBuffer() };
-  });
   let next = 0;
   const worker = async () => {
-    while (next < pieces.length && !stopped) {
+    while (next < pieces.length && !stopped && !handedOff) {
       const piece = pieces[next];
       const text = d.pieces[next++];
       try {
-        const stream = await d.synthesize(text, halt.signal);
+        const stream = await d.synthesize(text, piece.request.signal);
         piece.resolve(stream.format);
         for await (const chunk of stream.chunks) piece.audio.push(chunk);
       } catch (err) {
+        piece.error = errorMessage(err);
         piece.resolve(undefined);
-        fail(errorMessage(err));
+        fail(piece.error);
         return;
       } finally {
         piece.audio.end();
+        piece.arrive();
       }
     }
   };
   const workers = Promise.all(Array.from({ length: IN_FLIGHT }, worker));
-  // A piece never asked for (the Reading stopped first) has no format.
+  // A piece never asked for (the Reading stopped or was handed off first) has no format.
   void workers.then(() => {
-    for (const p of pieces) p.resolve(undefined);
+    for (const p of pieces.slice(next)) p.resolve(undefined);
   });
+
+  /** Hand the pieces asked for so far to the caller, to play as files. */
+  const handOff = (reason: string): StreamReadingResult => {
+    handedOff = true;
+    const asked = next;
+    return {
+      state: "files",
+      reason,
+      requested(i, signal) {
+        if (i >= asked) return undefined;
+        const p = pieces[i];
+        const cancel = () => p.request.abort();
+        signal.addEventListener("abort", cancel);
+        return (async () => {
+          try {
+            const format = await p.format;
+            await p.arrived;
+            if (p.error !== undefined || !format) throw new Error(p.error ?? "the piece was cancelled");
+            return clipOf(format, p.audio.bytes(), d.who);
+          } finally {
+            signal.removeEventListener("abort", cancel);
+          }
+        })();
+      },
+    };
+  };
 
   /** The format of piece `i`, checked against the first piece's; undefined when the Reading is over. */
   const formatOf = async (i: number, first: StreamFormat): Promise<StreamFormat | undefined> => {
@@ -126,7 +184,7 @@ export async function streamReading(d: StreamReadingDeps): Promise<ReadingResult
         length += chunk.byteLength;
         yield chunk;
       }
-      if (stopped) return;
+      if (stopped || pieces[i].error !== undefined) return;
       const pad = padding(first, length);
       if (pad && i < pieces.length - 1) yield new Uint8Array(pad);
     }
@@ -139,11 +197,7 @@ export async function streamReading(d: StreamReadingDeps): Promise<ReadingResult
       if (failure !== undefined) throw new ReadingFailed(failure);
       return { state: "stopped" };
     }
-    if (first.codec === "wav") {
-      halt.abort();
-      await workers;
-      return { state: "unchunkable", reason: "the pieces come as WAV files that cannot be joined as they play" };
-    }
+    if (first.codec === "wav") return handOff("the pieces come as WAV files that cannot be joined as they play");
     started = await d.player.playStream({ format: first, chunks: feed(first) }, "message", { ticket });
     if (started.ok) {
       if (stopped) void started.stop().catch(() => {});
@@ -151,9 +205,7 @@ export async function streamReading(d: StreamReadingDeps): Promise<ReadingResult
         if (o.state === "cancelled") stop(true);
       });
     } else if (started.cannotStream) {
-      halt.abort();
-      await workers;
-      return { state: "unchunkable", reason: started.reason };
+      return handOff(started.reason);
     } else if (started.reason === REPLACED) stop();
     await workers;
     for (let i = 1; i < pieces.length && !stopped; i++) await formatOf(i, first);

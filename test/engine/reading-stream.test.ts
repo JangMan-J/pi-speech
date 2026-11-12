@@ -205,13 +205,30 @@ describe("a Reading played as one Stream", () => {
     expect(err.reason).toMatch(/different audio format/);
   });
 
-  it("where the first piece cannot play as a Stream, nothing plays and the text is left to be spoken another way", async () => {
-    const h = harness(["one.", "two."]);
+  it("where the first piece cannot play as a Stream, nothing plays and the pieces asked for are handed over", async () => {
+    const h = harness(["one.", "two.", "three."]);
     h.out.canStream = () => ({ ok: false, reason: "no player" });
     await until(() => h.asked.length === 2);
     h.asked[0].start();
-    expect(await h.result).toEqual({ state: "unchunkable", reason: "no player" });
-    expect(h.asked.every((p) => p.aborted)).toBe(true);
+    h.asked[0].send(pcmBytes(4));
+    const r = await h.result;
+    if (r.state !== "files") throw new Error(`expected files, got ${r.state}`);
+    expect(r.reason).toBe("no player");
     expect(h.out.plays).toHaveLength(0);
+    // No new piece is asked for, and the ones in flight are not cancelled.
+    await settle();
+    expect(h.asked).toHaveLength(2);
+    expect(h.asked.some((p) => p.aborted)).toBe(false);
+    const signal = new AbortController().signal;
+    expect(r.requested(2, signal)).toBeUndefined();
+    const first = r.requested(0, signal)!;
+    h.asked[0].end();
+    expect(Array.from(Buffer.from((await first).audio).subarray(44))).toEqual(Array.from(pcmBytes(4)));
+    // A piece handed over is cancelled with the signal it is asked for with.
+    const stopper = new AbortController();
+    const second = r.requested(1, stopper.signal)!;
+    stopper.abort();
+    await expect(second).rejects.toThrow();
+    expect(h.asked[1].aborted).toBe(true);
   });
 });

@@ -28,6 +28,8 @@ const DOWNLOAD_TIMEOUT_MS = 60_000;
 const POLL_WAIT_SECONDS = 30;
 const MIN_POLL_MS = 100;
 const MIN_TOKEN_LENGTH = 32;
+/** How long a receiver's "no player for a Stream" is believed before it is asked again. */
+const NO_STREAM_PLAYER_MS = 60_000;
 
 /** The base URL of a loopback http receiver; throws a readable Error for anything else. */
 export function loopbackBase(url: string): string {
@@ -148,10 +150,11 @@ export function createBridgeAudioFrom(getConfig: () => BridgeConfig): BridgeAudi
 
   const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
-  /** Whether the receiver plays a Stream (its health lists `stream`); undefined until asked. */
-  let streamCapable: boolean | undefined;
-  /** Why the receiver cannot play a Stream of a codec, as it said (503), until it is asked again. */
-  const noStreamPlayer = new Map<string, string>();
+  /** Whether the receiver at a base URL plays a Stream (its health lists `stream`); unknown until asked. */
+  const streamCapable = new Map<string, boolean>();
+  /** Why the receiver at a base URL cannot play a Stream of a codec, as it said, and until when that is believed. */
+  const noStreamPlayer = new Map<string, { reason: string; until: number }>();
+  const base = () => resolve().base;
   const TOO_OLD =
     "the playback receiver plays whole files only (update pi-speech-receiver to play speech as it arrives)";
 
@@ -160,7 +163,7 @@ export function createBridgeAudioFrom(getConfig: () => BridgeConfig): BridgeAudi
       const h = await json<{ protocol?: number; name?: string; version?: string; capabilities?: unknown }>(
         await call("GET", "/v1/health"),
       );
-      streamCapable = Array.isArray(h.capabilities) && h.capabilities.includes("stream");
+      streamCapable.set(base(), Array.isArray(h.capabilities) && h.capabilities.includes("stream"));
       if (h.name !== "pi-speech-receiver") return { ok: false, reason: "the server there is not a pi-speech-receiver" };
       if (h.protocol !== 1) {
         return { ok: false, reason: `the receiver speaks bridge protocol ${String(h.protocol)}, not 1` };
@@ -230,18 +233,26 @@ export function createBridgeAudioFrom(getConfig: () => BridgeConfig): BridgeAudi
     name: "bridge",
 
     canStream(format: StreamFormat) {
-      if (streamCapable === false) return { ok: false as const, reason: TOO_OLD };
-      const reason = noStreamPlayer.get(format.codec);
-      return reason ? { ok: false as const, reason } : { ok: true as const };
+      let at: string;
+      try {
+        at = base();
+      } catch (err) {
+        return { ok: false as const, reason: message(err) };
+      }
+      if (streamCapable.get(at) === false) return { ok: false as const, reason: TOO_OLD };
+      const no = noStreamPlayer.get(`${at} ${format.codec}`);
+      return no && no.until > Date.now() ? { ok: false as const, reason: no.reason } : { ok: true as const };
     },
 
     async playStream(stream: AudioStream, kind: PlayKind): Promise<PlayStart> {
       try {
-        if (streamCapable === undefined) {
+        const at = base();
+        if (!streamCapable.has(at)) {
           const h = await health();
           if (!h.ok) return { ok: false, reason: h.reason };
         }
-        if (!streamCapable) return { ok: false, reason: TOO_OLD, cannotStream: true };
+        if (!streamCapable.get(at)) return { ok: false, reason: TOO_OLD, cannotStream: true };
+        const key = `${at} ${stream.format.codec}`;
         let reply: Reply;
         try {
           reply = await call("POST", "/v1/play/stream", {
@@ -250,14 +261,14 @@ export function createBridgeAudioFrom(getConfig: () => BridgeConfig): BridgeAudi
             headers: { "X-Pi-Speech-Kind": kind },
           });
         } catch (err) {
-          if (err instanceof ReceiverError && err.status === 503) {
-            const reason = err.message;
-            noStreamPlayer.set(stream.format.codec, reason);
-            return { ok: false, reason, cannotStream: true };
+          // No player for this format (503), or a format it does not take (400): the clip goes as a file.
+          if (err instanceof ReceiverError && (err.status === 503 || err.status === 400)) {
+            noStreamPlayer.set(key, { reason: err.message, until: Date.now() + NO_STREAM_PLAYER_MS });
+            return { ok: false, reason: err.message, cannotStream: true };
           }
           throw err;
         }
-        noStreamPlayer.delete(stream.format.codec);
+        noStreamPlayer.delete(key);
         const { id } = await json<{ id?: string }>(reply);
         if (!id) return { ok: false, reason: "the playback receiver did not return a playback id" };
         active.set(id, kind);
@@ -265,7 +276,10 @@ export function createBridgeAudioFrom(getConfig: () => BridgeConfig): BridgeAudi
         // A body that breaks off ends the playback as failed on the receiver; `done` reports it.
         void upload(id, stream.chunks, sending.signal).catch(() => {});
         const done = follow(id);
-        void done.then(() => sending.abort());
+        // Cancelled on the receiver: nothing more to send. A failed status check is not a reason to stop sending.
+        void done.then((o) => {
+          if (o.state === "cancelled") sending.abort();
+        });
         return {
           ok: true,
           player: "pi-speech-receiver",

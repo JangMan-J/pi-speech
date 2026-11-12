@@ -96,7 +96,7 @@ Starts a player that reads a Stream from its input, without any audio yet.
 - Response: `202 {"id": "<playback id>"}` once the player has started, in state
   `playing`. If no player for that format can start, `503`; the client then sends the
   audio as one file with `POST /v1/play` once it has all of it.
-- A playback whose audio does not begin to arrive within 30 s of this answer is stopped
+- A playback whose audio does not begin to arrive within 120 s of this answer is stopped
   and becomes `failed`.
 
 #### `POST /v1/play/<id>/audio`
@@ -111,7 +111,7 @@ Carries the audio of a Stream started with `POST /v1/play/stream`.
 - The total is bounded by the receiver's body limit (`413` after it, and the playback
   becomes `failed`).
 - When the body breaks off before its end (the connection closes, a malformed chunk,
-  more than 30 s without any byte), the receiver stops the player and the playback
+  more than 120 s without any byte), the receiver stops the player and the playback
   becomes `failed`.
 - Response, once the body has ended: `200` with the playback's state as in
   `GET /v1/play/<id>`. The player may still be playing what it was given; the state

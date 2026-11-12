@@ -92,11 +92,11 @@ export class Player {
     return ticket;
   }
 
-  /** Whether the selected output plays a Stream of 16-bit PCM now (the format every streaming provider can give). */
-  canStream(): boolean {
+  /** Whether the selected output plays a Stream of 16-bit PCM now (the format every streaming provider can give), or why not. */
+  canStream(): { ok: true } | { ok: false; reason: string } {
     const output = this.output();
-    if (!output.playStream) return false;
-    return output.canStream?.({ codec: "pcm", rate: 24000, channels: 1 }).ok ?? true;
+    if (!output.playStream) return { ok: false, reason: `${output.name} playback cannot play speech as it arrives` };
+    return output.canStream?.({ codec: "pcm", rate: 24000, channels: 1 }) ?? { ok: true };
   }
 
   /**

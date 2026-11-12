@@ -82,13 +82,18 @@ async function* sseData(res: Response): AsyncGenerator<string> {
   if (!reader) return;
   const decoder = new TextDecoder();
   let pending = "";
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (value) pending += decoder.decode(value, { stream: true });
-    const lines = pending.split("\n");
-    pending = done ? "" : (lines.pop() ?? "");
-    for (const line of lines) if (line.startsWith("data:")) yield line.slice(5).trim();
-    if (done) return;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (value) pending += decoder.decode(value, { stream: true });
+      const lines = pending.split("\n");
+      pending = done ? "" : (lines.pop() ?? "");
+      for (const line of lines) if (line.startsWith("data:")) yield line.slice(5).trim();
+      if (done) return;
+    }
+  } finally {
+    // Read no further when the reader stops early (a Stray): the response is closed, not left generating.
+    reader.cancel().catch(() => {});
   }
 }
 

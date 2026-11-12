@@ -32,9 +32,9 @@ const MAX_CONNECTIONS: usize = 512;
 pub const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 const KEPT_PLAYBACKS: usize = 64;
 /// How long a Stream waits for its audio request to begin.
-pub const STREAM_START: Duration = Duration::from_secs(30);
+pub const STREAM_START: Duration = Duration::from_secs(120);
 /// The longest a Stream's audio may go without any byte before it counts as broken off.
-pub const STREAM_IDLE: Duration = Duration::from_secs(30);
+pub const STREAM_IDLE: Duration = Duration::from_secs(120);
 /// The largest body of `POST /v1/play/stream`; a valid one is far smaller.
 const MAX_STREAM_REQUEST: u64 = 4096;
 

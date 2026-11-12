@@ -123,6 +123,15 @@ describe("xaiSynthesizeStream", () => {
     expect(err.message).toMatch(/socket hang up/);
   });
 
+  it("an answer of no clear type is the PCM asked for, even when its first sample looks like an MP3 frame", async () => {
+    const pcm = new Uint8Array([0xff, 0xff, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0]); // first sample -1
+    for (const type of ["application/octet-stream", ""]) {
+      stubFetch(() => new Response(pcm, type ? { headers: { "content-type": type } } : {}));
+      const s = await xaiSynthesizeStream(TOKEN, { text: "hi", voice: "eve", language: "auto" });
+      expect(s.format).toEqual({ codec: "pcm", rate: 24000, channels: 1 });
+    }
+  });
+
   it("an MP3 answer is taken as MP3; anything that is not audio is an error", async () => {
     const mp3 = new Uint8Array([0xff, 0xfb, 0x90, 0, 1, 2, 3, 4, 5, 6, 7, 8]);
     stubFetch(() => new Response(mp3, { headers: { "content-type": "audio/mpeg" } }));

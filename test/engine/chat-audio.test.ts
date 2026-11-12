@@ -258,6 +258,20 @@ describe("speech through a chat model as a Stream", () => {
     expect(d.bytes()).toBe(0);
   });
 
+  it("a Stray closes the response: nothing more of it is read", async () => {
+    const b = chunkedBody();
+    const enc = new TextEncoder();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(b.body, { headers: { "content-type": "text/event-stream" } })),
+    );
+    const s = await chatSynthesizeStream(TARGET, { text: TEXT, model: "m" });
+    const d = drain(s.chunks);
+    b.send(enc.encode(`data: ${JSON.stringify(delta({ transcript: "Sure! " }))}\n\n`));
+    await d.ended;
+    expect(b.cancelled).toBe(true);
+  });
+
   it("a Stray midway ends the Stream; audio after it never plays", async () => {
     const sse = handSse();
     const s = await chatSynthesizeStream(TARGET, { text: TEXT, model: "m" });

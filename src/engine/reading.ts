@@ -27,7 +27,7 @@ export const IN_FLIGHT = 2;
 export interface ReadingDeps {
   pieces: readonly string[];
   /** One speech request; throws a readable error (the provider's status or message). */
-  synthesize(text: string, signal: AbortSignal): Promise<SynthesizedAudio>;
+  synthesize(text: string, signal: AbortSignal, index: number): Promise<SynthesizedAudio>;
   player: Player;
   /** Converts an MP3 piece to WAV (format from the file extension); false when it cannot. */
   convert: Converter;
@@ -182,7 +182,7 @@ class Run {
   private async synthesizePiece(i: number): Promise<Uint8Array | null | undefined> {
     let audio: SynthesizedAudio;
     try {
-      audio = await this.d.synthesize(this.d.pieces[i], this.halt.signal);
+      audio = await this.d.synthesize(this.d.pieces[i], this.halt.signal, i);
     } catch (err) {
       return this.fail({ reason: errorMessage(err) });
     }

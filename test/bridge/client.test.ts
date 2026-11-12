@@ -370,6 +370,7 @@ describe("a Stream", () => {
         }
         if (u === "/v1/play/stream") {
           if (opts.streamStatus === 503) return send(res, 503, { error: "no player for a Stream: install pacat" });
+          if (opts.streamStatus === 400) return send(res, 400, { error: "rate must be 8000..=192000" });
           return send(res, 202, { id: "s1" });
         }
         if (u === "/v1/play/s1/cancel") {
@@ -481,6 +482,16 @@ describe("a Stream", () => {
     const r = await out.playStream!(hand().stream, "message");
     expect(!r.ok && r.cannotStream).toBe(true);
     expect(!r.ok && r.reason).toMatch(/install pacat/);
+    await rx.close();
+  });
+
+  it("a format the receiver refuses (400) cannot play as a Stream; it is not asked again for a while", async () => {
+    const rx = await streamReceiver({ streamStatus: 400 });
+    const out = createBridgeAudio({ url: rx.at, token: TOKEN }).output;
+    const r = await out.playStream!(hand().stream, "message");
+    expect(!r.ok && r.cannotStream).toBe(true);
+    expect(out.canStream!({ codec: "pcm", rate: 24000, channels: 1 }).ok).toBe(false);
+    expect(out.canStream!({ codec: "mp3" }).ok).toBe(true);
     await rx.close();
   });
 

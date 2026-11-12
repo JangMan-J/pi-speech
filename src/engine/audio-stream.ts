@@ -8,7 +8,7 @@
  */
 
 import { errorMessage } from "./env";
-import type { AudioStream, StreamFormat, SynthesizedAudio } from "./provider";
+import type { AudioStream, PcmFormat, StreamFormat, SynthesizedAudio } from "./provider";
 import { joinWav, wrapPcmAsWav } from "./wav";
 
 /** The chunks of a response body as they arrive. A body that breaks off throws "`who` stopped sending audio: …". */
@@ -83,12 +83,15 @@ function wavHead(b: Buffer): WavHead {
  * A speech response as a Stream: raw PCM when its Content-Type says so (`audio/pcm` or `audio/l16`, rate and
  * channels from the type), at once; otherwise told by its bytes first and its type second, since services
  * disagree on the type: a WAV (its header removed when it holds 16-bit PCM) or MP3, once enough has arrived to
- * tell. Throws when the response holds no audio or audio of another kind.
+ * tell. Throws when the response holds no audio or audio of another kind. With `expect` (the PCM that was
+ * asked for), a response of no clear type that is not a WAV or a tagged MP3 is taken as that PCM: raw samples
+ * can start like an MP3 frame, so the frame start alone is not trusted then.
  */
 export async function streamFromBody(
   body: ReadableStream<Uint8Array> | null,
   contentType: string,
   who: string,
+  expect?: PcmFormat,
 ): Promise<AudioStream> {
   if (!body) throw new Error(`${who} returned no audio`);
   if (/audio\/(?:pcm|l16)/i.test(contentType)) {
@@ -127,7 +130,10 @@ export async function streamFromBody(
     if (w.state === "other") return { format: { codec: "wav" }, chunks: rest(0) };
     return fail(`${who} sent a WAV whose header never ended`);
   }
-  if (isMp3(head) || /mp3|mpeg/i.test(contentType)) return { format: { codec: "mp3" }, chunks: rest(0) };
+  const id3 = head.toString("latin1", 0, 3) === "ID3";
+  if (/mp3|mpeg/i.test(contentType) || id3) return { format: { codec: "mp3" }, chunks: rest(0) };
+  if (expect && (!contentType || /octet-stream/i.test(contentType))) return { format: expect, chunks: rest(0) };
+  if (isMp3(head)) return { format: { codec: "mp3" }, chunks: rest(0) };
   return fail(`unexpected audio from ${who}: ${contentType || "no content type"}`);
 }
 

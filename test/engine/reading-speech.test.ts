@@ -121,9 +121,9 @@ describe("playback-only speech of a long text", () => {
     expect(inputs).toEqual([LONG]);
   });
 
-  it("an output that turns out not to play a Stream (an older receiver) reads in pieces as files, every time", async () => {
+  it("an output that turns out not to play a Stream (an older receiver) reads in pieces as files, asking for each piece once", async () => {
     const requests = fakeOpenRouter();
-    const { engine, bridgeOut } = makeEngine();
+    const { engine, bridgeOut, notes } = makeEngine();
     await engine.setBridge("on");
     bridgeOut.playStream = async () => ({ ok: false, reason: "plays whole files only", cannotStream: true });
     for (let round = 0; round < 2; round++) {
@@ -131,13 +131,17 @@ describe("playback-only speech of a long text", () => {
       const played = bridgeOut.plays.length;
       const r = await engine.speech.say(LONG);
       expect(r.files).toHaveLength(1);
-      // At least two requests for the pieces, and the first piece plays as a file.
-      expect(requests.length - before).toBeGreaterThanOrEqual(2);
+      // One request per piece, the first piece playing as a file.
+      const inputs = requests.slice(before).map((q) => q.body.input);
+      expect(norm(inputs.join(" "))).toBe(norm(LONG));
       expect(bridgeOut.plays.length).toBeGreaterThan(played);
       expect(bridgeOut.plays.at(-1)?.file).toBeDefined();
       for (let i = played; i < bridgeOut.plays.length; i++) bridgeOut.end(i, { state: "completed" });
       await tick();
     }
+    expect(notes.filter((n) => /plays once it has fully arrived: plays whole files only/.test(n.message))).toHaveLength(
+      1,
+    );
   });
 
   it("a failed request is one error that says what failed and that nothing was saved", async () => {
