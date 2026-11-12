@@ -59,6 +59,20 @@ a headless Pi on `agent-jail` was considered and turned down as less robust than
 - Long texts already start early: above 280 characters `src/engine/pieces.ts` and `stream.ts` split the text,
   ask for two pieces at a time, and play each as its own file once it is whole.
 
+## Every streaming source, not only xAI
+
+The user (2026-11-12): xAI is one example; support every source whose audio can arrive in pieces. That is
+all four providers: `xai.ts`, `openrouter.ts` (`/audio/speech`, every maker), `chat-audio.ts` (SSE, with the
+transcript check done on the prefix) and `endpoints.ts` (OpenAI-compatible endpoints). So the streaming
+path is the one path, not an xAI special case:
+
+- A provider hands over audio as an async sequence of chunks plus a format. A maker that sends one burst
+  is the same path with one late chunk; it needs no second code path and no allow-list of makers.
+- Formats: raw PCM where the source offers it; encoded streams (MP3 from `minimax`, any endpoint that
+  cannot send PCM) go to a player or decoder that reads that format on stdin.
+- Test against a fake server that sends chunks with delays, so every provider is checked for first sound
+  before last byte without spending credit.
+
 ## What has to change
 
 1. **Synthesis that yields audio as it arrives.** `SpeechProvider.synthesize` returns a finished
@@ -78,7 +92,7 @@ a headless Pi on `agent-jail` was considered and turned down as less robust than
    capability in the protocol and the receiver. The user removed `AGENTS.md` and its rule against changing
    `protocol/bridge.md`; the change is in scope.
 
-Done when: with `xai` selected on the laptop, a text of a few sentences starts sounding while its response
+Done when: with `xai` selected on `agent-jail` (and each other provider against the fake server), a text of a few sentences starts sounding while its response
 is still arriving, stop works mid-stream, the message is in the history afterwards, `npm run check` passes,
 and the user has confirmed it by ear. Time to first sound can be measured; whether it sounds right cannot.
 
