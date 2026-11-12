@@ -43,7 +43,7 @@ Every non-2xx response has the body `{"error": "<readable message>"}`.
 | 401    | Missing or wrong token.                                                                |
 | 408    | The request head did not arrive within 10 s.                                           |
 | 404    | Unknown endpoint, or unknown playback or recording id.                                 |
-| 409    | A recording is already active.                                                         |
+| 409    | A recording is already active, or a Stream's playback cannot take audio (see below).   |
 | 413    | Body larger than the receiver's limit (default 64 MiB).                                |
 | 415    | The body is not WAV or MP3.                                                            |
 | 422    | The recording holds less than 0.1 s of audio.                                          |
@@ -53,7 +53,10 @@ Every non-2xx response has the body `{"error": "<readable message>"}`.
 
 ### `GET /v1/health`
 
-`200 {"protocol": 1, "name": "pi-speech-receiver", "version": "<semver>", "capabilities": ["play", "record"]}`
+`200 {"protocol": 1, "name": "pi-speech-receiver", "version": "<semver>", "capabilities": ["play", "record", "stream"]}`
+
+A receiver that lists `stream` has the two endpoints under "Playing a Stream". A client
+checks for it before using them; an older receiver without it gets whole files only.
 
 ### `POST /v1/play`
 
@@ -71,6 +74,53 @@ Plays one audio file on the playback machine.
   `cancelled`.
 - Response: `202 {"id": "<playback id>"}` once the player has started. If no player can
   start, `503`.
+
+### Playing a Stream
+
+A Stream is audio that plays while the rest of it is still arriving (speech the Pi host
+receives from a provider in pieces). It takes two requests, because a client cannot read
+a response before it has sent its whole request body: one starts the player and returns
+its id, the other carries the audio.
+
+#### `POST /v1/play/stream`
+
+Starts a player that reads a Stream from its input, without any audio yet.
+
+- Body: JSON `{"format": "pcm", "rate": <Hz>, "channels": 1 | 2}` for raw signed 16-bit
+  little-endian PCM, or `{"format": "mp3"}` or `{"format": "wav"}` for a file of that
+  format sent as it is produced. A rate outside 8000..=192000 or another format gets
+  `400`.
+- Optional header `X-Pi-Speech-Kind: message | sample` (default `message`).
+- A new play request (of either kind) stops the playback in progress; that playback
+  becomes `cancelled`.
+- Response: `202 {"id": "<playback id>"}` once the player has started, in state
+  `playing`. If no player for that format can start, `503`; the client then sends the
+  audio as one file with `POST /v1/play` once it has all of it.
+- A playback whose audio does not begin to arrive within 30 s of this answer is stopped
+  and becomes `failed`.
+
+#### `POST /v1/play/<id>/audio`
+
+Carries the audio of a Stream started with `POST /v1/play/stream`.
+
+- Body: the audio, sent as it arrives, with `Transfer-Encoding: chunked` (or with a
+  `Content-Length` when the client has it all). The receiver writes each part to the
+  player's input as it arrives and closes the input after the last.
+- At most one audio request per playback; a second, or one for a playback that is no
+  longer `playing`, gets `409`. Unknown ids get `404`.
+- The total is bounded by the receiver's body limit (`413` after it, and the playback
+  becomes `failed`).
+- When the body breaks off before its end (the connection closes, a malformed chunk,
+  more than 30 s without any byte), the receiver stops the player and the playback
+  becomes `failed`.
+- Response, once the body has ended: `200` with the playback's state as in
+  `GET /v1/play/<id>`. The player may still be playing what it was given; the state
+  turns `completed` when it exits with status 0.
+- A stop or cancel during the upload stops the player at once; the receiver reads and
+  drops the rest of the body and answers with state `cancelled`.
+
+The playback is then like any other: `GET /v1/play/<id>`, `POST /v1/play/<id>/cancel`
+and `POST /v1/stop` apply to it.
 
 ### `GET /v1/play/<id>`
 
@@ -136,6 +186,13 @@ The receiver runs local programs it finds itself. Requests never choose them.
   that play once without a window and exit), unless the environment variable
   `PI_SPEECH_RECEIVER_PLAYER` names an executable. That executable is run as
   `<player> <audio-file>` and plays the file once.
+- Stream player, which reads a Stream from its standard input and exits once the input
+  has ended and played: for PCM the first available of `pacat`, `pw-cat`, `ffplay`,
+  `mpv`, `aplay`; for MP3 of `ffplay`, `mpv`, `mpg123`; for WAV of `ffplay`, `mpv`;
+  unless `PI_SPEECH_RECEIVER_STREAM_PLAYER` names an executable. That executable is run
+  as `<player> s16le <rate> <channels>` for PCM and `<player> mp3` or `<player> wav`
+  for the others. When `PI_SPEECH_RECEIVER_PLAYER` is set and
+  `PI_SPEECH_RECEIVER_STREAM_PLAYER` is not, no Stream player is used (`503`).
 - Recorder: the first available of `pw-record`, `parecord`, `arecord`, recording mono
   16-bit PCM WAV, unless `PI_SPEECH_RECEIVER_RECORDER` names an executable. That
   executable is run as `<recorder> <output.wav>`, writes a WAV file to that path, and
