@@ -3,8 +3,8 @@
  * The API key is sent only to OpenRouter, only in the Authorization header.
  */
 
-import { clipOf, collect, streamFromBody, streamOfClip } from "./audio-stream";
-import { chatSynthesize, chatTranscribe } from "./chat-audio";
+import { clipOf, collect, streamFromBody } from "./audio-stream";
+import { chatSynthesize, chatSynthesizeStream, chatTranscribe } from "./chat-audio";
 import { type KeyRegistry, resolveApiKey } from "./credentials";
 import { type Env, errorMessage } from "./env";
 import { FEATURES, type ModelKind, modelFeatures, vendorOf } from "./features";
@@ -244,6 +244,10 @@ export class OpenRouterProvider implements SpeechProvider {
   }
 
   async synthesize(req: SynthesisRequest): Promise<SynthesizedAudio> {
+    if (req.via === "chat") {
+      const voice = req.voice && req.voice !== DEFAULT_VOICE ? req.voice : undefined;
+      return chatSynthesize(this.target(await this.key()), { text: req.text, model: req.model, voice }, req.signal);
+    }
     const stream = await this.synthesizeStream(req);
     return clipOf(stream.format, await collect(stream.chunks), this.name);
   }
@@ -252,11 +256,7 @@ export class OpenRouterProvider implements SpeechProvider {
     const key = await this.key();
     if (req.via === "chat") {
       const voice = req.voice && req.voice !== DEFAULT_VOICE ? req.voice : undefined;
-      // Checked against its transcript as a whole before it plays: one chunk, once the reading is complete.
-      return streamOfClip(
-        await chatSynthesize(this.target(key), { text: req.text, model: req.model, voice }, req.signal),
-        this.name,
-      );
+      return chatSynthesizeStream(this.target(key), { text: req.text, model: req.model, voice }, req.signal);
     }
     try {
       return await synthesizeStream(key, req.text, req.model, req.voice, req.signal);

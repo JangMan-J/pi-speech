@@ -13,8 +13,8 @@
  * Each key is sent only to its own base URL, in the Authorization header, and never appears in an error.
  */
 
-import { clipOf, collect, streamFromBody, streamOfClip } from "./audio-stream";
-import { chatSynthesize, chatTranscribe } from "./chat-audio";
+import { clipOf, collect, streamFromBody } from "./audio-stream";
+import { chatSynthesize, chatSynthesizeStream, chatTranscribe } from "./chat-audio";
 import type { KeyRegistry } from "./credentials";
 import type { Env } from "./env";
 import { FEATURES, type ModelKind, modelFeatures } from "./features";
@@ -361,6 +361,11 @@ export class Endpoint implements SpeechProvider {
   }
 
   async synthesize(req: SynthesisRequest): Promise<SynthesizedAudio> {
+    if (req.via === "chat") {
+      await this.ensureCredential();
+      const voice = req.voice && req.voice !== DEFAULT_VOICE ? req.voice : undefined;
+      return chatSynthesize(await this.target(), { text: req.text, model: this.bare(req.model), voice }, req.signal);
+    }
     const stream = await this.synthesizeStream(req);
     return clipOf(stream.format, await collect(stream.chunks), this.name);
   }
@@ -370,9 +375,7 @@ export class Endpoint implements SpeechProvider {
     const target = await this.target();
     if (req.via === "chat") {
       const voice = req.voice && req.voice !== DEFAULT_VOICE ? req.voice : undefined;
-      // Checked against its transcript as a whole before it plays: one chunk, once the reading is complete.
-      const clip = await chatSynthesize(target, { text: req.text, model: this.bare(req.model), voice }, req.signal);
-      return streamOfClip(clip, target.title);
+      return chatSynthesizeStream(target, { text: req.text, model: this.bare(req.model), voice }, req.signal);
     }
     return endpointSynthesizeStream(target, { ...req, model: this.bare(req.model) }, req.signal);
   }
