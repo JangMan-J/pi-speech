@@ -1,16 +1,18 @@
 /**
  * Playback on the Pi host. Files: `PI_SPEECH_PLAYER`, when set, names an executable run as
  * `<player> <audio file>`; otherwise the first available of mpv, ffplay, paplay, pw-play, mpg123.
- * A Stream: `PI_SPEECH_STREAM_PLAYER`, when set, names an executable run as `<player> s16le <rate> <channels>`
- * that plays raw PCM from stdin; otherwise the first available of pacat, pw-cat, ffplay, mpv, aplay. A
- * `PI_SPEECH_PLAYER` without `PI_SPEECH_STREAM_PLAYER` is kept to: a Stream then cannot play here.
+ * A Stream, fed on stdin as it arrives: `PI_SPEECH_STREAM_PLAYER`, when set, names an executable run as
+ * `<player> s16le <rate> <channels>` for raw PCM and `<player> mp3` or `<player> wav` for those files;
+ * otherwise for PCM the first available of pacat, pw-cat, ffplay, mpv, aplay, and for MP3 or WAV of ffplay,
+ * mpv, mpg123 (MP3 only). A `PI_SPEECH_PLAYER` without `PI_SPEECH_STREAM_PLAYER` is kept to: a Stream then
+ * cannot play here.
  * Playback never blocks. Derived from pi-openrouter-multimodal (MIT).
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
 import type { AudioOutput, PlayKind, PlayOutcome, PlayStart } from "./audio";
 import { childEnv, type Env, errorMessage, findExecutable } from "./env";
-import type { AudioStream, PcmFormat } from "./provider";
+import type { AudioStream, PcmFormat, StreamFormat } from "./provider";
 
 const PLAYERS: ReadonlyArray<readonly [string, (file: string) => string[]]> = [
   ["mpv", (f) => ["--no-video", "--really-quiet", f]],
@@ -44,6 +46,13 @@ const STREAM_PLAYERS: ReadonlyArray<readonly [string, (f: PcmFormat) => string[]
   ["aplay", (f) => ["-q", "-t", "raw", "-f", "S16_LE", "-r", `${f.rate}`, "-c", `${f.channels}`]],
 ];
 
+/** Players of an MP3 or WAV file on stdin; `formats` are the ones each decodes. */
+const FILE_STREAM_PLAYERS: ReadonlyArray<readonly [string, ReadonlyArray<string>, string[]]> = [
+  ["ffplay", ["mp3", "wav"], ["-nodisp", "-autoexit", "-loglevel", "quiet", "-i", "-"]],
+  ["mpv", ["mp3", "wav"], ["--no-video", "--really-quiet", "-"]],
+  ["mpg123", ["mp3"], ["-q", "-"]],
+];
+
 export type PlayerChoice =
   | { ok: true; name: string; bin: string; args: (file: string) => string[] }
   | { ok: false; reason: string };
@@ -68,12 +77,13 @@ export function choosePlayer(env: Env): PlayerChoice {
 }
 
 /** The player of a Stream in `format`, or why there is none. */
-export function chooseStreamPlayer(env: Env, format: PcmFormat): StreamPlayerChoice {
+export function chooseStreamPlayer(env: Env, format: StreamFormat): StreamPlayerChoice {
   const custom = env.PI_SPEECH_STREAM_PLAYER;
   if (custom) {
     const bin = findExecutable(custom, env);
     if (!bin) return { ok: false, reason: `PI_SPEECH_STREAM_PLAYER (${custom}) is not an executable` };
-    return { ok: true, name: custom, bin, args: ["s16le", `${format.rate}`, `${format.channels}`] };
+    const args = format.codec === "pcm" ? ["s16le", `${format.rate}`, `${format.channels}`] : [format.codec];
+    return { ok: true, name: custom, bin, args };
   }
   if (env.PI_SPEECH_PLAYER) {
     return {
@@ -81,12 +91,24 @@ export function chooseStreamPlayer(env: Env, format: PcmFormat): StreamPlayerCho
       reason: "PI_SPEECH_PLAYER plays files only; set PI_SPEECH_STREAM_PLAYER to play speech as it arrives",
     };
   }
-  for (const [name, args] of STREAM_PLAYERS) {
-    const bin = findExecutable(name, env);
-    if (bin) return { ok: true, name, bin, args: args(format) };
+  if (format.codec === "pcm") {
+    for (const [name, args] of STREAM_PLAYERS) {
+      const bin = findExecutable(name, env);
+      if (bin) return { ok: true, name, bin, args: args(format) };
+    }
+    const names = STREAM_PLAYERS.map(([n]) => n).join(", ");
+    return { ok: false, reason: `no player for speech as it arrives (install one of ${names})` };
   }
-  const names = STREAM_PLAYERS.map(([n]) => n).join(", ");
-  return { ok: false, reason: `no player for speech as it arrives (install one of ${names})` };
+  const players = FILE_STREAM_PLAYERS.filter(([, formats]) => formats.includes(format.codec));
+  for (const [name, , args] of players) {
+    const bin = findExecutable(name, env);
+    if (bin) return { ok: true, name, bin, args };
+  }
+  const names = players.map(([n]) => n).join(", ");
+  return {
+    ok: false,
+    reason: `no player for ${format.codec.toUpperCase()} speech as it arrives (install one of ${names})`,
+  };
 }
 
 function kill(c: ChildProcess): void {
@@ -114,6 +136,11 @@ export class LocalOutput implements AudioOutput {
     const choice = choosePlayer(this.env);
     if (!choice.ok) return choice;
     return this.launch(choice.name, choice.bin, choice.args(file), kind);
+  }
+
+  canStream(format: StreamFormat): { ok: true } | { ok: false; reason: string } {
+    const choice = chooseStreamPlayer(this.env, format);
+    return choice.ok ? { ok: true } : choice;
   }
 
   async playStream(stream: AudioStream, kind: PlayKind): Promise<PlayStart> {

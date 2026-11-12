@@ -64,6 +64,8 @@ export const REPLACED = "a newer playback or a stop replaced it";
 export class Player {
   private current?: Current;
   private tickets = 0;
+  /** Aborted when the newest ticket goes stale: a newer claim or a stop. */
+  private claimed = new AbortController();
   private lastFile?: string;
   private reading?: ReadingState;
 
@@ -84,8 +86,18 @@ export class Player {
   /** Reserve the next playback; plays with older tickets are skipped. */
   claim(): number {
     const ticket = ++this.tickets;
+    this.claimed.abort();
+    this.claimed = new AbortController();
     this.endReading();
     return ticket;
+  }
+
+  /**
+   * Aborted once `ticket` is stale (a newer claim or a stop), so work for it can be cancelled: already
+   * aborted when it is stale now.
+   */
+  signalFor(ticket: number): AbortSignal {
+    return ticket === this.tickets ? this.claimed.signal : AbortSignal.abort();
   }
 
   /** Start a reading: one playback of pieces played in order. It replaces a reading in progress. */
@@ -128,9 +140,15 @@ export class Player {
       return { ok: false, reason: REPLACED };
     }
     const output = this.output();
-    if ("stream" in source && !output.playStream) {
-      opts.cleanup?.();
-      return { ok: false, reason: `${output.name} playback cannot play speech as it arrives`, cannotStream: true };
+    if ("stream" in source) {
+      // Decided before anything stops: where a Stream cannot play, what plays now goes on until the clip is ready.
+      const can = output.playStream
+        ? (output.canStream?.(source.stream.format) ?? { ok: true as const })
+        : { ok: false as const, reason: `${output.name} playback cannot play speech as it arrives` };
+      if (!can.ok) {
+        opts.cleanup?.();
+        return { ok: false, reason: can.reason, cannotStream: true };
+      }
     }
     if (!opts.reading) this.endReading();
     const replacing = await this.stopCurrent(false);

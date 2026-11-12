@@ -19,8 +19,11 @@ export interface PcmFormat {
   channels: number;
 }
 
-/** The audio format of a Stream. */
-export type StreamFormat = PcmFormat;
+/**
+ * The audio format of a Stream: raw PCM, or a file format the player decodes (MP3; a WAV that is not 16-bit
+ * PCM).
+ */
+export type StreamFormat = PcmFormat | { codec: "mp3" } | { codec: "wav" };
 
 /**
  * Audio that arrives while the provider is still producing it (a Stream, see GLOSSARY.md): chunks in order.
@@ -74,4 +77,12 @@ export interface SpeechProvider {
   synthesizeStream?(req: SynthesisRequest): Promise<AudioStream>;
   /** Throws a readable error on failure. */
   transcribe(req: TranscriptionRequest): Promise<string>;
+}
+
+/** A speech provider that can synthesize as a Stream. */
+export type StreamingProvider = SpeechProvider & Required<Pick<SpeechProvider, "synthesizeStream">>;
+
+/** Whether `provider` can synthesize as a Stream. */
+export function streams(provider: SpeechProvider): provider is StreamingProvider {
+  return typeof provider.synthesizeStream === "function";
 }

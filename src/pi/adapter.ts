@@ -45,6 +45,7 @@ const ACTION_VALUES: Record<string, string[]> = {
 
 /** The tool result for a synthesis: files, model and voice, and whether it plays. Never contains the key. */
 export function describeForTool(r: SpeechResult): string {
+  if (r.stopped) return "Stopped before the speech had fully arrived; nothing was saved.";
   return [
     `Saved: ${r.files.join(", ")}`,
     `Model: ${r.model}, voice: ${r.voice}`,

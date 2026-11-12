@@ -3,7 +3,7 @@
  * user's playback machine. Which one is used is decided by the route (see routes.ts), never by fallback.
  */
 
-import type { AudioStream } from "./provider";
+import type { AudioStream, StreamFormat } from "./provider";
 
 export type PlayKind = "message" | "sample";
 
@@ -36,6 +36,8 @@ export interface AudioOutput {
    * `{ ok: false, cannotStream: true }` when it cannot play a Stream now; the Stream is then left unread.
    */
   playStream?(stream: AudioStream, kind: PlayKind): Promise<PlayStart>;
+  /** Optional, with `playStream`: whether a Stream in `format` can play now, or why not. Starts nothing. */
+  canStream?(format: StreamFormat): { ok: true } | { ok: false; reason: string };
   /** Stop what this output plays: everything, or only one kind. */
   stop(kind?: PlayKind): Promise<void>;
 }

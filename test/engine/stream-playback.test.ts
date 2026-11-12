@@ -196,4 +196,79 @@ describe("xai played as a Stream", () => {
     expect((await sampled).error).toBeUndefined();
     expect(history()).toHaveLength(0);
   });
+
+  it("the caller's signal during the download stops it: the request is cancelled, nothing is saved", async () => {
+    const x = fakeXai();
+    const { engine, local, history } = await setup();
+    const caller = new AbortController();
+    const spoken = engine.speech.speak("Hello from xai", { signal: caller.signal });
+    await until(() => x.bodies.length === 1);
+    x.bodies[0].send(pcmBytes(100));
+    await until(() => local.streams[0]?.chunks.length === 1);
+    caller.abort();
+    const r = await spoken;
+    expect(r.stopped).toBe(true);
+    expect(x.bodies[0].aborted).toBe(true);
+    expect(local.streams[0].outcome).toEqual({ state: "cancelled" });
+    expect(history()).toHaveLength(0);
+  });
+
+  it("the caller's signal aborted after the speech was saved does not stop its playback", async () => {
+    const x = fakeXai();
+    const { engine, local } = await setup();
+    const caller = new AbortController();
+    const spoken = engine.speech.speak("Hello from xai", { signal: caller.signal });
+    await until(() => x.bodies.length === 1);
+    x.bodies[0].send(pcmBytes(100));
+    x.bodies[0].end();
+    expect((await spoken).player).toBe("local");
+    caller.abort();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(local.streams[0].outcome).toBeUndefined();
+    expect(engine.player.playing).toBe(true);
+  });
+
+  it("a caller's signal already aborted sends no request", async () => {
+    const x = fakeXai();
+    const { engine, history } = await setup();
+    const r = await engine.speech.speak("Hello from xai", { signal: AbortSignal.abort() });
+    expect(r.stopped).toBe(true);
+    expect(x.bodies).toHaveLength(0);
+    expect(history()).toHaveLength(0);
+  });
+
+  it("where a Stream cannot play, stop during the download cancels the request and saves nothing", async () => {
+    const x = fakeXai();
+    const { run, engine, bridgeOut, history } = await setup();
+    expect((await run("--bridge on")).error).toBeUndefined();
+    const spoken = run("Hello from xai");
+    await until(() => x.bodies.length === 1);
+    x.bodies[0].send(pcmBytes(100));
+    await engine.player.stop();
+    expect((await spoken).text).toBe("Stopped.");
+    expect(x.bodies[0].aborted).toBe(true);
+    expect(bridgeOut.plays).toHaveLength(0);
+    expect(history()).toHaveLength(0);
+  });
+
+  it("where a Stream cannot play, what plays goes on until the next clip has arrived", async () => {
+    const x = fakeXai();
+    const { run, bridgeOut } = await setup();
+    expect((await run("--bridge on")).error).toBeUndefined();
+    const first = run("First");
+    await until(() => x.bodies.length === 1);
+    x.bodies[0].send(pcmBytes(100));
+    x.bodies[0].end();
+    await first;
+    expect(bridgeOut.plays).toHaveLength(1);
+    const second = run("Second");
+    await until(() => x.bodies.length === 2);
+    x.bodies[1].send(pcmBytes(100));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(bridgeOut.cancelled).toBe(0);
+    x.bodies[1].end();
+    await second;
+    expect(bridgeOut.plays).toHaveLength(2);
+    expect(bridgeOut.cancelled).toBe(1);
+  });
 });

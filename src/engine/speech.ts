@@ -14,7 +14,7 @@ import type { KeyRegistry } from "./credentials";
 import { buildEndpoints, type Endpoint, endpointNameProblem, PRESETS } from "./endpoints";
 import { type Env, errorMessage } from "./env";
 import { featureLine } from "./features";
-import { type Converter, ffmpegConvert, History, type HistoryMessage, historyDir } from "./history";
+import { type Converter, ffmpegConvert, History, type HistoryMessage, historyDir, type SavedMessage } from "./history";
 import {
   DEFAULT_VOICE,
   fetchSpeechCatalog,
@@ -24,10 +24,10 @@ import {
 } from "./openrouter";
 import { READING_MIN_CHARS, splitForSpeech } from "./pieces";
 import { type Player, REPLACED } from "./player";
-import type { SpeechProvider, SynthesisRequest, SynthesizedAudio } from "./provider";
+import { type SpeechProvider, type SynthesisRequest, type SynthesizedAudio, streams } from "./provider";
 import { speakInPieces } from "./reading";
 import { DEFAULT_SETTINGS, type ModelSort, type Settings, type SettingsFile } from "./settings";
-import { streamAndPlay, streams } from "./stream-play";
+import { streamAndPlay } from "./stream-play";
 import { XAI_MODEL, XAI_PRICE, XaiProvider } from "./xai";
 
 /** The xAI choice as a model option, offered while Pi holds an xAI login. */
@@ -676,38 +676,40 @@ export class Speech {
     const play = opts.play !== false;
     const provider = this.provider(model);
     await provider.ensureCredential();
-    const ticket = play ? this.player.claim() : undefined;
-    if (play && ticket !== undefined && streams(provider)) {
-      const req = { text, model, voice, language: "auto", signal: opts.signal, via: this.via("tts", model) };
+    // Plain speech never names a language: the text is spoken as written, never translated.
+    const req = { text, model, voice, language: "auto", signal: opts.signal, via: this.via("tts", model) };
+    if (!play) {
+      const audio = await this.synthesize(text, model, voice, "auto", opts.signal);
+      const saved = await this.history.save(text, audio.audio, audio.format);
+      return this.spoken(saved, model, voice, { ok: false, reason: "play was false" });
+    }
+    const ticket = this.player.claim();
+    let audio: SynthesizedAudio;
+    let started: PlayStart | undefined;
+    if (streams(provider)) {
       const r = await streamAndPlay(provider, req, this.player, "message", ticket);
       if (r.state === "stopped") return { files: [], model, voice, stopped: true, notPlayed: REPLACED };
-      let started = r.started;
-      const saved = await this.history.save(text, r.wav, "wav", async (file) => {
-        if (!started.ok && started.cannotStream) {
-          this.warnStream(started.reason);
-          started = await this.player.play(file, "message", { ticket });
-        }
-      });
-      this.lastSaved = saved.files;
-      const result: SpeechResult = { files: saved.files, model, voice };
-      if (saved.conversionError) result.conversionError = saved.conversionError;
-      if (started.ok) result.player = started.player;
-      else result.notPlayed = started.reason;
-      return result;
+      audio = r.audio;
+      // Where a Stream cannot play, the clip plays as a file once saved.
+      if (r.started.ok || !r.started.cannotStream) started = r.started;
+      else this.warnStream(r.started.reason);
+    } else {
+      audio = await this.synthesize(text, model, voice, "auto", opts.signal);
     }
-    // Plain speech never names a language: the text is spoken as written, never translated.
-    const audio = await this.synthesize(text, model, voice, "auto", opts.signal);
-    let started: Awaited<ReturnType<Player["play"]>> | undefined;
     const saved = await this.history.save(text, audio.audio, audio.format, async (file) => {
       // Playback starts before the conversion to the other format.
-      if (play) started = await this.player.play(file, "message", { ticket });
+      started ??= await this.player.play(file, "message", { ticket });
     });
+    return this.spoken(saved, model, voice, started ?? { ok: false, reason: "playback did not start" });
+  }
+
+  /** The result of a message saved in the history, played by `started` or not. */
+  private spoken(saved: SavedMessage, model: string, voice: string, started: PlayStart): SpeechResult {
     this.lastSaved = saved.files;
     const result: SpeechResult = { files: saved.files, model, voice };
     if (saved.conversionError) result.conversionError = saved.conversionError;
-    if (!play) result.notPlayed = "play was false";
-    else if (started?.ok) result.player = started.player;
-    else result.notPlayed = started?.reason ?? "playback did not start";
+    if (started.ok) result.player = started.player;
+    else result.notPlayed = started.reason;
     return result;
   }
 
@@ -784,7 +786,7 @@ export class Speech {
       if (r.state === "stopped") return { ok: false, reason: REPLACED };
       if (r.started.ok || !r.started.cannotStream) return r.started;
       this.warnStream(r.started.reason);
-      audio = { audio: r.wav, format: "wav" };
+      audio = r.audio;
     } else {
       audio = await this.synthesize(req.text, req.model, req.voice, req.language, req.signal);
     }

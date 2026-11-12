@@ -4,7 +4,7 @@
  * Authorization header, and never appears in an error text.
  */
 
-import { bodyChunks, collect } from "./audio-stream";
+import { bodyChunks, clipOf, collect } from "./audio-stream";
 import { type KeyRegistry, resolveXaiToken } from "./credentials";
 import type {
   AudioStream,
@@ -14,7 +14,6 @@ import type {
   SynthesizedAudio,
   TranscriptionRequest,
 } from "./provider";
-import { wrapPcmAsWav } from "./wav";
 
 export const XAI_API = "https://api.x.ai/v1";
 
@@ -126,9 +125,7 @@ export async function xaiSynthesize(
   signal?: AbortSignal,
 ): Promise<SynthesizedAudio> {
   const stream = await xaiSynthesizeStream(token, req, signal);
-  const pcm = await collect(stream.chunks);
-  if (pcm.length < 2) throw new Error("xAI returned no audio");
-  return { audio: wrapPcmAsWav(pcm.subarray(0, pcm.length - (pcm.length % 2)), PCM.rate, PCM.channels), format: "wav" };
+  return clipOf(stream.format, await collect(stream.chunks), "xAI");
 }
 
 /** Transcribe audio bytes in `format`, posted as the multipart field `file`. Throws on failure. */
