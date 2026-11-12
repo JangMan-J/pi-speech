@@ -5,5 +5,6 @@ pub mod front;
 pub mod http;
 pub mod proc;
 pub mod server;
+pub mod stream;
 pub mod token;
 pub mod wav;

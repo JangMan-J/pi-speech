@@ -26,6 +26,7 @@ fn command(dir: &Path, args: &[&str]) -> Command {
         .env("XDG_CONFIG_HOME", dir.join("xdg"))
         .env("XDG_RUNTIME_DIR", dir)
         .env_remove("PI_SPEECH_RECEIVER_PLAYER")
+        .env_remove("PI_SPEECH_RECEIVER_STREAM_PLAYER")
         .env_remove("PI_SPEECH_RECEIVER_RECORDER")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -255,6 +256,96 @@ fn sigterm_stops_a_running_player_and_removes_its_file() {
     assert_eq!(exit_code_within(&mut r.child, 8), Some(0));
     assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "INT");
     assert!(temp_entries(&dir).is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+fn listening(dir: &Path, env: &[(&str, &Path)]) -> Running {
+    let tf = token_file(dir, 0o600);
+    let mut c = command(
+        dir,
+        &[
+            "--listen",
+            "127.0.0.1:0",
+            "--token-file",
+            tf.to_str().unwrap(),
+        ],
+    );
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    start(c)
+}
+
+const PCM: &[u8] = br#"{"format": "pcm", "rate": 24000, "channels": 1}"#;
+
+#[test]
+fn with_only_the_file_player_set_there_is_no_stream_player() {
+    let dir = scratch("cli-nostream");
+    let player = dir.join("player");
+    script(&player, "#!/bin/sh\nexit 0\n");
+    let mut r = listening(&dir, &[("PI_SPEECH_RECEIVER_PLAYER", &player)]);
+    let rep = request(
+        r.addr,
+        "POST",
+        "/v1/play/stream",
+        Some(TOKEN),
+        &[],
+        PCM,
+        None,
+    );
+    assert_eq!(rep.status, 503, "{}", rep.text());
+    assert!(rep.text().contains("PI_SPEECH_RECEIVER_STREAM_PLAYER"));
+    signal(&r.child, 15);
+    assert_eq!(exit_code_within(&mut r.child, 8), Some(0));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn sigterm_stops_a_stream_player_during_its_upload() {
+    let dir = scratch("cli-stream");
+    let log = dir.join("streamer.log");
+    let out = dir.join("streamed");
+    let streamer = dir.join("streamer");
+    script(
+        &streamer,
+        &format!(
+            "#!/bin/bash\ntrap 'echo INT >> {l}; kill $c; exit 130' INT\necho \"$*\" > {l}.args\ncat <&0 > {o} & c=$!; wait $c\n",
+            l = log.display(),
+            o = out.display()
+        ),
+    );
+    let player = dir.join("player");
+    script(&player, "#!/bin/sh\nexit 0\n");
+    let mut r = listening(
+        &dir,
+        &[
+            ("PI_SPEECH_RECEIVER_STREAM_PLAYER", &streamer),
+            ("PI_SPEECH_RECEIVER_PLAYER", &player),
+        ],
+    );
+    let rep = request(
+        r.addr,
+        "POST",
+        "/v1/play/stream",
+        Some(TOKEN),
+        &[],
+        PCM,
+        None,
+    );
+    assert_eq!(rep.status, 202, "{}", rep.text());
+    let id = json_field(&rep.text(), "id").unwrap();
+    let mut up = Upload::chunked(r.addr, &id, TOKEN);
+    up.chunk(b"spoken words");
+    assert!(wait_until(Duration::from_secs(5), || {
+        std::fs::read(&out).unwrap_or_default() == b"spoken words"
+    }));
+    let args = std::fs::read_to_string(dir.join("streamer.log.args")).unwrap();
+    assert_eq!(args.trim(), "s16le 24000 1");
+    signal(&r.child, 15);
+    assert_eq!(exit_code_within(&mut r.child, 8), Some(0));
+    assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "INT");
+    assert!(temp_entries(&dir).is_empty());
+    drop(up);
     std::fs::remove_dir_all(&dir).ok();
 }
 

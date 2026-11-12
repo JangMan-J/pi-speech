@@ -62,8 +62,31 @@ while :; do sleep 0.05 & wait $!; done
             ),
         );
         fs::write(dir.join("empty.wav"), wav(0.0)).unwrap();
+        // Plays a Stream: appends its input to `streamed` as it arrives.
+        script(
+            &dir.join("streamer"),
+            &format!(
+                r#"#!/bin/bash
+echo "start $*" >> {d}/streamer.log
+echo $$ >> {d}/streamer.pids
+trap 'echo "signal INT" >> {d}/streamer.log; kill $c 2>/dev/null; exit 130' INT
+mode=$(cat {d}/streamer-mode 2>/dev/null || echo ok)
+case "$mode" in
+  ok) cat <&0 >> {d}/streamed & c=$!;;
+  early) head -c 4 <&0 >> {d}/streamed & c=$!;;
+  fail) cat <&0 > /dev/null & c=$!;;
+  deaf) sleep 30 & c=$!;;
+esac
+echo $c >> {d}/streamer.pids
+wait $c
+[ "$mode" = fail ] && {{ echo "no audio device here" >&2; exit 3; }}
+exit 0
+"#
+            ),
+        );
         let mut cfg = Config::new("127.0.0.1:0".parse().unwrap(), TOKEN.into(), tmp.clone());
         cfg.player = Some(dir.join("player"));
+        cfg.stream_player = Some(dir.join("streamer"));
         cfg.recorder = Some(dir.join("recorder"));
         tweak(&mut cfg);
         let srv = Server::start(cfg).unwrap();
@@ -130,7 +153,59 @@ while :; do sleep 0.05 & wait $!; done
     fn files_in_tmp(&self) -> usize {
         fs::read_dir(&self.tmp).map(|d| d.count()).unwrap_or(0)
     }
+
+    fn stream_with(&self, body: &str) -> Reply {
+        request(
+            self.addr,
+            "POST",
+            "/v1/play/stream",
+            Some(TOKEN),
+            &[("Content-Type", "application/json")],
+            body.as_bytes(),
+            None,
+        )
+    }
+
+    /// Start a 24 kHz mono PCM Stream; its id.
+    fn stream(&self) -> String {
+        let r = self.stream_with(PCM);
+        assert_eq!(r.status, 202, "{}", r.text());
+        json_field(&r.text(), "id").unwrap()
+    }
+
+    /// What the Stream players have received so far.
+    fn streamed(&self) -> Vec<u8> {
+        fs::read(self.dir.join("streamed")).unwrap_or_default()
+    }
+
+    /// Processes of the Stream players started so far (the script and its child).
+    fn stream_pids(&self) -> Vec<u32> {
+        fs::read_to_string(self.dir.join("streamer.pids"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect()
+    }
+
+    fn no_stream_player_left(&self) -> bool {
+        wait_until(Duration::from_secs(5), || {
+            self.stream_pids().into_iter().all(gone)
+        })
+    }
+
+    fn upload(&self, id: &str) -> Upload {
+        Upload::chunked(self.addr, id, TOKEN)
+    }
+
+    fn state_and_error(&self, id: &str, wait: u32) -> (String, String) {
+        let t = self
+            .call("GET", &format!("/v1/play/{id}?wait={wait}"))
+            .text();
+        (json_field(&t, "state").unwrap(), t)
+    }
 }
+
+const PCM: &str = r#"{"format": "pcm", "rate": 24000, "channels": 1}"#;
 
 impl Drop for Rig {
     fn drop(&mut self) {
@@ -170,7 +245,7 @@ fn health_reports_protocol_and_capabilities() {
     let t = rep.text();
     assert!(t.contains("\"protocol\": 1"));
     assert!(t.contains("\"name\": \"pi-speech-receiver\""));
-    assert!(t.contains("\"capabilities\": [\"play\", \"record\"]"));
+    assert!(t.contains("\"capabilities\": [\"play\", \"record\", \"stream\"]"));
 }
 
 #[test]
@@ -720,4 +795,425 @@ fn a_recorder_that_finishes_just_inside_the_grace_period_is_a_clean_stop() {
     let rep = r.call("POST", &format!("/v1/record/{id}/stop"));
     assert_eq!(rep.status, 200, "{}", rep.text());
     assert!(wav_len(&rep.body) > 0);
+}
+
+// ---- Streams ----
+
+#[test]
+fn a_stream_player_gets_each_piece_before_the_client_has_sent_the_rest() {
+    let r = Rig::new();
+    let id = r.stream();
+    assert_eq!(r.state(&id, 0), "playing");
+    let mut up = r.upload(&id);
+    up.chunk(b"first piece|");
+    // The key check: the first piece is played while the request is still open.
+    assert!(
+        wait_until(Duration::from_secs(5), || r.streamed() == b"first piece|"),
+        "the player did not get the first piece before the rest was sent"
+    );
+    up.chunk(b"second|");
+    up.chunk(&[7u8; 100_000]);
+    let rep = up.end();
+    assert_eq!(rep.status, 200, "{}", rep.text());
+    assert_eq!(json_field(&rep.text(), "id").unwrap(), id);
+    assert!(["playing", "completed"].contains(&json_field(&rep.text(), "state").unwrap().as_str()));
+    assert_eq!(r.state(&id, 10), "completed");
+    let want = [b"first piece|second|".to_vec(), vec![7u8; 100_000]].concat();
+    assert_eq!(r.streamed(), want);
+    assert!(r.no_stream_player_left());
+    assert_eq!(r.files_in_tmp(), 0);
+}
+
+#[test]
+fn a_stream_player_gets_the_format_as_its_arguments() {
+    let r = Rig::new();
+    for (body, args) in [
+        (PCM, "s16le 24000 1"),
+        (
+            r#"{"format": "pcm", "rate": 48000, "channels": 2}"#,
+            "s16le 48000 2",
+        ),
+        (r#"{"format": "mp3"}"#, "mp3"),
+        (r#"{"format": "wav"}"#, "wav"),
+    ] {
+        let rep = request(
+            r.addr,
+            "POST",
+            "/v1/play/stream",
+            Some(TOKEN),
+            &[("X-Pi-Speech-Kind", "sample")],
+            body.as_bytes(),
+            None,
+        );
+        assert_eq!(rep.status, 202, "{body}: {}", rep.text());
+        let id = json_field(&rep.text(), "id").unwrap();
+        assert_eq!(r.upload(&id).end().status, 200);
+        assert_eq!(r.state(&id, 10), "completed");
+        assert_eq!(r.log("streamer").last().unwrap(), &format!("start {args}"));
+    }
+    assert!(
+        r.log("player").is_empty(),
+        "the file player is never used for a Stream"
+    );
+}
+
+#[test]
+fn a_content_length_audio_body_also_plays_as_it_arrives() {
+    let r = Rig::new();
+    let id = r.stream();
+    let audio = b"0123456789abcdefghij";
+    let mut up = Upload::open_with(
+        r.addr,
+        &id,
+        Some(TOKEN),
+        &format!("Content-Length: {}\r\n", audio.len()),
+    );
+    up.0.write_all(&audio[..8]).unwrap();
+    assert!(wait_until(Duration::from_secs(5), || r.streamed() == audio[..8]));
+    up.0.write_all(&audio[8..]).unwrap();
+    let rep = up.reply();
+    assert_eq!(rep.status, 200, "{}", rep.text());
+    assert_eq!(r.state(&id, 10), "completed");
+    assert_eq!(r.streamed(), audio);
+}
+
+#[test]
+fn a_stop_cancel_or_newer_play_during_the_upload_ends_the_stream_cancelled() {
+    for how in ["stop", "cancel", "file play", "stream"] {
+        let r = Rig::new();
+        let id = r.stream();
+        let mut up = r.upload(&id);
+        up.chunk(b"piece one");
+        assert!(wait_until(Duration::from_secs(5), || r.streamed() == b"piece one"));
+        let pids = r.stream_pids();
+        match how {
+            "stop" => {
+                let rep = r.call("POST", "/v1/stop");
+                assert!(rep.text().contains("\"stopped\": 1"), "{}", rep.text());
+            }
+            "cancel" => {
+                let rep = r.call("POST", &format!("/v1/play/{id}/cancel"));
+                assert_eq!(json_field(&rep.text(), "state").unwrap(), "cancelled");
+            }
+            "file play" => {
+                r.play();
+            }
+            _ => {
+                r.stream();
+            }
+        }
+        assert_eq!(r.state(&id, 0), "cancelled", "{how}");
+        assert!(r.log("streamer").iter().any(|l| l == "signal INT"), "{how}");
+        assert!(
+            wait_until(Duration::from_secs(5), || pids.iter().all(|&p| gone(p))),
+            "{how}: the player is still running"
+        );
+        // The rest of the body is read and dropped; the answer is the cancelled state.
+        up.chunk(b"piece two");
+        up.chunk(&[0u8; 300_000]);
+        let rep = up.end();
+        assert_eq!(rep.status, 200, "{how}: {}", rep.text());
+        assert_eq!(
+            json_field(&rep.text(), "state").unwrap(),
+            "cancelled",
+            "{how}"
+        );
+        assert_eq!(r.streamed(), b"piece one", "{how}");
+    }
+}
+
+#[test]
+fn a_stop_frees_an_upload_held_up_by_a_player_that_does_not_read() {
+    let r = Rig::new();
+    r.mode("streamer", "deaf");
+    let id = r.stream();
+    let addr = r.addr;
+    let sender = std::thread::spawn(move || {
+        let mut up = Upload::chunked(addr, &id, TOKEN);
+        // Far more than a pipe holds: the receiver is soon stuck writing to the player.
+        up.chunk(&vec![1u8; 4 << 20]);
+        (id, up.end())
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let t0 = Instant::now();
+    assert!(r.call("POST", "/v1/stop").text().contains("\"stopped\": 1"));
+    let (id, rep) = sender.join().unwrap();
+    assert_eq!(rep.status, 200, "{}", rep.text());
+    assert_eq!(json_field(&rep.text(), "state").unwrap(), "cancelled");
+    assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
+    assert_eq!(r.state(&id, 0), "cancelled");
+    assert!(r.no_stream_player_left());
+}
+
+#[test]
+fn an_upload_that_breaks_off_fails_the_stream_and_leaves_no_player() {
+    for how in ["closed mid-chunk", "malformed chunk", "no byte in time"] {
+        let r = Rig::with(|c| c.stream_idle = Duration::from_millis(700));
+        let id = r.stream();
+        let mut up = r.upload(&id);
+        up.0.write_all(b"20\r\nonly part of it").unwrap();
+        assert!(wait_until(Duration::from_secs(5), || r.streamed()
+            == b"only part of it"));
+        match how {
+            "closed mid-chunk" => drop(up),
+            "malformed chunk" => {
+                up.0.write_all(b" and the rest!!\r\nzz\r\n").unwrap();
+                let rep = up.reply();
+                assert_eq!(rep.status, 400, "{}", rep.text());
+            }
+            _ => {
+                let t0 = Instant::now();
+                let rep = up.reply();
+                assert_eq!(rep.status, 400, "{}", rep.text());
+                assert!(
+                    t0.elapsed() >= Duration::from_millis(600),
+                    "{:?}",
+                    t0.elapsed()
+                );
+            }
+        }
+        let (state, text) = r.state_and_error(&id, 10);
+        assert_eq!(state, "failed", "{how}: {text}");
+        assert!(text.contains("\"error\""), "{how}: {text}");
+        assert!(r.no_stream_player_left(), "{how}");
+        assert_eq!(r.files_in_tmp(), 0);
+    }
+}
+
+#[test]
+fn audio_past_the_body_limit_is_413_and_fails_the_stream() {
+    let r = Rig::with(|c| c.max_body = 1000);
+    let id = r.stream();
+    let mut up = r.upload(&id);
+    up.chunk(&[1u8; 600]);
+    up.chunk(&[2u8; 600]);
+    let rep = up.reply();
+    assert_eq!(rep.status, 413, "{}", rep.text());
+    assert_eq!(r.state(&id, 10), "failed");
+    assert!(r.streamed().len() <= 600);
+
+    let id = r.stream();
+    let rep = Upload::open_with(r.addr, &id, Some(TOKEN), "Content-Length: 1001\r\n").reply();
+    assert_eq!(rep.status, 413, "{}", rep.text());
+    assert_eq!(r.state(&id, 10), "failed");
+    assert!(r.no_stream_player_left());
+}
+
+#[test]
+fn a_stream_whose_audio_never_begins_fails() {
+    let r = Rig::with(|c| c.stream_start = Duration::from_millis(600));
+    let id = r.stream();
+    let (state, text) = r.state_and_error(&id, 10);
+    assert_eq!(state, "failed", "{text}");
+    assert!(text.contains("no audio"), "{text}");
+    assert!(r.no_stream_player_left());
+    assert_eq!(r.upload(&id).reply().status, 409);
+
+    // Audio that begins in time may take longer than that in all.
+    let id = r.stream();
+    let mut up = r.upload(&id);
+    for _ in 0..5 {
+        up.chunk(b"x");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert_eq!(up.end().status, 200);
+    assert_eq!(r.state(&id, 10), "completed");
+}
+
+#[test]
+fn a_player_that_ends_early_does_not_upset_the_upload() {
+    let r = Rig::new();
+    r.mode("streamer", "early");
+    let id = r.stream();
+    let mut up = r.upload(&id);
+    up.chunk(b"abcdefgh");
+    // The player takes 4 bytes and exits; writing the rest meets a closed pipe.
+    up.chunk(&[0u8; 1 << 20]);
+    up.chunk(b"more");
+    let rep = up.end();
+    assert_eq!(rep.status, 200, "{}", rep.text());
+    assert_eq!(json_field(&rep.text(), "state").unwrap(), "completed");
+    assert_eq!(r.streamed(), b"abcd");
+    assert_eq!(r.call("GET", "/v1/health").status, 200);
+}
+
+#[test]
+fn a_stream_player_failure_is_failed_with_its_error_text() {
+    let r = Rig::new();
+    r.mode("streamer", "fail");
+    let id = r.stream();
+    let mut up = r.upload(&id);
+    up.chunk(b"audio");
+    assert_eq!(up.end().status, 200);
+    let (state, text) = r.state_and_error(&id, 10);
+    assert_eq!(state, "failed");
+    assert!(
+        text.contains("status 3") && text.contains("no audio device here"),
+        "{text}"
+    );
+}
+
+#[test]
+fn stream_requests_are_checked() {
+    let r = Rig::new();
+    // Without the right token: 401 and no effect.
+    for tok in [None, Some("wrong")] {
+        let rep = request(
+            r.addr,
+            "POST",
+            "/v1/play/stream",
+            tok,
+            &[],
+            PCM.as_bytes(),
+            None,
+        );
+        assert_eq!(rep.status, 401);
+    }
+    assert!(r.log("streamer").is_empty());
+    let id = r.stream();
+    for tok in [None, Some("wrong")] {
+        let up = Upload::open_with(r.addr, &id, tok, "Transfer-Encoding: chunked\r\n");
+        assert_eq!(up.reply().status, 401);
+    }
+    // Unknown ids, a body without framing, and a coding other than chunked.
+    assert_eq!(r.upload("deadbeefdeadbeef").reply().status, 404);
+    assert_eq!(
+        Upload::open_with(r.addr, &id, Some(TOKEN), "")
+            .reply()
+            .status,
+        400
+    );
+    let gz = Upload::open_with(r.addr, &id, Some(TOKEN), "Transfer-Encoding: gzip\r\n");
+    assert_eq!(gz.reply().status, 400);
+    // None of that used up the Stream: its audio request works, and only once.
+    let mut first = r.upload(&id);
+    first.chunk(b"abc");
+    assert!(wait_until(Duration::from_secs(5), || r.streamed() == b"abc"));
+    let second = r.upload(&id).reply();
+    assert_eq!(second.status, 409, "{}", second.text());
+    assert!(second.text().contains("\"error\""));
+    assert_eq!(first.end().status, 200);
+    assert_eq!(r.state(&id, 10), "completed");
+    assert_eq!(r.upload(&id).reply().status, 409, "no longer playing");
+    // A file playback takes no audio request.
+    r.mode("player", "long");
+    let file = r.play();
+    assert_eq!(r.upload(&file).reply().status, 409);
+
+    for body in [
+        "",
+        "{}",
+        r#"{"format": "ogg"}"#,
+        r#"{"format": "pcm", "rate": 7999, "channels": 1}"#,
+        r#"{"format": "pcm", "rate": 192001, "channels": 1}"#,
+        r#"{"format": "pcm", "rate": 24000, "channels": 3}"#,
+        r#"{"format": "pcm", "rate": 24000}"#,
+        r#"{"format": "mp3", "command": "rm"}"#,
+        "not json",
+    ] {
+        let rep = r.stream_with(body);
+        assert_eq!(rep.status, 400, "{body:?}: {}", rep.text());
+        assert!(rep.text().contains("\"error\""));
+    }
+    let kind = request(
+        r.addr,
+        "POST",
+        "/v1/play/stream",
+        Some(TOKEN),
+        &[("X-Pi-Speech-Kind", "shell")],
+        PCM.as_bytes(),
+        None,
+    );
+    assert_eq!(kind.status, 400);
+    assert_eq!(
+        r.log("streamer")
+            .iter()
+            .filter(|l| l.starts_with("start"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        r.state(&file, 0),
+        "playing",
+        "refused requests stop nothing"
+    );
+}
+
+#[test]
+fn a_chunked_stream_request_body_is_accepted() {
+    let r = Rig::new();
+    let mut s = TcpStream::connect(r.addr).unwrap();
+    let mut req = format!(
+        "POST /v1/play/stream HTTP/1.1\r\nAuthorization: Bearer {TOKEN}\r\nTransfer-Encoding: chunked\r\n\r\n"
+    )
+    .into_bytes();
+    req.extend(chunk_frame(&PCM.as_bytes()[..10]));
+    req.extend(chunk_frame(&PCM.as_bytes()[10..]));
+    req.extend(b"0\r\n\r\n");
+    s.write_all(&req).unwrap();
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).unwrap();
+    assert_eq!(parse_reply(raw).status, 202);
+}
+
+#[test]
+fn no_stream_player_when_only_the_file_player_is_configured() {
+    let r = Rig::with(|c| c.stream_player = None);
+    let rep = r.stream_with(PCM);
+    assert_eq!(rep.status, 503, "{}", rep.text());
+    assert!(
+        rep.text().contains("PI_SPEECH_RECEIVER_STREAM_PLAYER"),
+        "{}",
+        rep.text()
+    );
+    // The file player still works, and the 503 stopped nothing.
+    r.mode("player", "long");
+    let id = r.play();
+    assert_eq!(r.stream_with(r#"{"format": "mp3"}"#).status, 503);
+    assert_eq!(r.state(&id, 0), "playing");
+
+    let r = Rig::with(|c| c.stream_player = Some("/nonexistent/streamer".into()));
+    let rep = r.stream_with(PCM);
+    assert_eq!(rep.status, 503);
+    assert!(rep.text().contains("\"error\""));
+}
+
+#[test]
+fn a_stream_stops_the_file_playback_in_progress() {
+    let r = Rig::new();
+    r.mode("player", "long");
+    let file = r.play();
+    assert!(wait_until(Duration::from_secs(3), || r
+        .started("player")
+        .len()
+        == 1));
+    let id = r.stream();
+    assert_eq!(r.state(&file, 0), "cancelled");
+    assert!(r.log("player").iter().any(|l| l == "signal INT"));
+    assert_eq!(r.state(&id, 0), "playing");
+}
+
+#[test]
+fn shutdown_stops_stream_players_and_leaves_no_files() {
+    for uploading in [false, true] {
+        let r = Rig::new();
+        let id = r.stream();
+        // The script and its child are listed once its INT trap is set.
+        assert!(wait_until(Duration::from_secs(5), || r.stream_pids().len() == 2));
+        let mut up = r.upload(&id);
+        if uploading {
+            up.chunk(b"something");
+            assert!(wait_until(Duration::from_secs(5), || r.streamed() == b"something"));
+        }
+        r.srv.shutdown();
+        let ints = r
+            .log("streamer")
+            .iter()
+            .filter(|l| *l == "signal INT")
+            .count();
+        assert_eq!(ints, 1, "uploading: {uploading}");
+        assert!(r.no_stream_player_left(), "uploading: {uploading}");
+        assert!(!r.tmp.exists());
+        drop(up);
+    }
 }

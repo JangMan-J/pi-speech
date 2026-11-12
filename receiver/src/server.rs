@@ -1,8 +1,11 @@
 //! The playback bridge: endpoints, playback and recording state.
 
 use crate::front::{self, Ready};
-use crate::http::{answer_nonblocking, json_str, BodyError, Conn, Request, Response};
+use crate::http::{
+    answer_nonblocking, json_str, BodyError, BodyFault, Conn, Framing, Request, Response,
+};
 use crate::proc::{self, lock, start_thread, Exit, ProcCtl};
+use crate::stream::{self, Format};
 use crate::token::{ct_eq, random_hex};
 use crate::wav::{self, Kind};
 use std::fs::{self, DirBuilder, OpenOptions};
@@ -10,7 +13,7 @@ use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{ChildStdin, Command};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -28,8 +31,15 @@ const SETTLE: Duration = Duration::from_secs(6);
 const MAX_CONNECTIONS: usize = 512;
 pub const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 const KEPT_PLAYBACKS: usize = 64;
+/// How long a Stream waits for its audio request to begin.
+pub const STREAM_START: Duration = Duration::from_secs(30);
+/// The longest a Stream's audio may go without any byte before it counts as broken off.
+pub const STREAM_IDLE: Duration = Duration::from_secs(30);
+/// The largest body of `POST /v1/play/stream`; a valid one is far smaller.
+const MAX_STREAM_REQUEST: u64 = 4096;
 
 pub const PLAYER_ENV: &str = "PI_SPEECH_RECEIVER_PLAYER";
+pub const STREAM_PLAYER_ENV: &str = "PI_SPEECH_RECEIVER_STREAM_PLAYER";
 pub const RECORDER_ENV: &str = "PI_SPEECH_RECEIVER_RECORDER";
 
 const PLAYERS: [(&str, &[&str]); 4] = [
@@ -65,6 +75,9 @@ pub struct Config {
     pub tmp_dir: PathBuf,
     /// Player executable from the environment; `None` means search for a known player.
     pub player: Option<PathBuf>,
+    /// Stream player executable from the environment; `None` means search for a known
+    /// one, unless `player` is set: then there is no Stream player.
+    pub stream_player: Option<PathBuf>,
     /// Recorder executable from the environment; `None` means search for a known recorder.
     pub recorder: Option<PathBuf>,
     pub max_body: u64,
@@ -73,6 +86,10 @@ pub struct Config {
     pub pickup: Duration,
     /// How long a client has to send its whole request head.
     pub head_timeout: Duration,
+    /// How long a Stream waits for its audio request to begin.
+    pub stream_start: Duration,
+    /// How long a Stream's audio may go without any byte.
+    pub stream_idle: Duration,
 }
 
 impl Config {
@@ -87,11 +104,14 @@ impl Config {
             token,
             tmp_dir,
             player: from_env(PLAYER_ENV),
+            stream_player: from_env(STREAM_PLAYER_ENV),
             recorder: from_env(RECORDER_ENV),
             max_body: MAX_BODY,
             max_record_seconds: MAX_RECORD_SECONDS,
             pickup: Duration::from_secs(PICKUP_SECONDS),
             head_timeout: HEAD_TIMEOUT,
+            stream_start: STREAM_START,
+            stream_idle: STREAM_IDLE,
         }
     }
 }
@@ -141,11 +161,22 @@ impl PlayState {
     }
 }
 
+/// Where a playback's audio comes from.
+enum Feed {
+    /// A file, stored before the player started.
+    File,
+    /// A Stream whose audio request has not begun: the player's input, kept open.
+    Waiting(ChildStdin),
+    /// A Stream whose input was taken: by its audio request, or closed when it ended.
+    Taken,
+}
+
 struct Play {
     id: String,
     state: PlayState,
     error: Option<String>,
     ctl: Arc<ProcCtl>,
+    feed: Feed,
 }
 
 impl Play {
@@ -317,6 +348,29 @@ fn not_found() -> Response {
     Response::error(404, "not found")
 }
 
+/// The optional `X-Pi-Speech-Kind` header must be `message` or `sample`.
+fn check_kind(req: &Request) -> Result<(), Response> {
+    match req.header("x-pi-speech-kind").unwrap_or("message") {
+        "message" | "sample" => Ok(()),
+        _ => Err(Response::error(
+            400,
+            "X-Pi-Speech-Kind must be message or sample",
+        )),
+    }
+}
+
+/// Forget the oldest ended playbacks beyond the ones kept.
+fn prune(g: &mut Inner) {
+    while g.plays.len() > KEPT_PLAYBACKS {
+        match g.plays.iter().position(|p| p.state != PlayState::Playing) {
+            Some(i) => {
+                g.plays.remove(i);
+            }
+            None => break,
+        }
+    }
+}
+
 /// Text for a failure message: the program's own words when it said any.
 fn with_note(what: &str, note: &str) -> String {
     if note.is_empty() {
@@ -336,6 +390,15 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
         })
 }
 
+/// A configured program: a bare name is looked up on PATH.
+fn configured_program(p: &Path) -> PathBuf {
+    if p.components().count() == 1 {
+        find_in_path(&p.to_string_lossy()).unwrap_or_else(|| p.to_path_buf())
+    } else {
+        p.to_path_buf()
+    }
+}
+
 /// The configured program, or the first known one found on PATH.
 fn resolve(
     configured: &Option<PathBuf>,
@@ -343,12 +406,7 @@ fn resolve(
     what: &str,
 ) -> Result<(PathBuf, Vec<String>), String> {
     if let Some(p) = configured {
-        let p = if p.components().count() == 1 {
-            find_in_path(&p.to_string_lossy()).unwrap_or_else(|| p.clone())
-        } else {
-            p.clone()
-        };
-        return Ok((p, Vec::new()));
+        return Ok((configured_program(p), Vec::new()));
     }
     known
         .iter()
@@ -396,11 +454,13 @@ impl Shared {
             ("GET", ["v1", "health"]) => Response::json(
                 200,
                 format!(
-                    "{{\"protocol\": 1, \"name\": \"pi-speech-receiver\", \"version\": {}, \"capabilities\": [\"play\", \"record\"]}}",
+                    "{{\"protocol\": 1, \"name\": \"pi-speech-receiver\", \"version\": {}, \"capabilities\": [\"play\", \"record\", \"stream\"]}}",
                     json_str(env!("CARGO_PKG_VERSION"))
                 ),
             ),
             ("POST", ["v1", "play"]) => self.play(conn, req),
+            ("POST", ["v1", "play", "stream"]) => self.play_stream(conn, req),
+            ("POST", ["v1", "play", id, "audio"]) => self.stream_audio(conn, req, id),
             ("GET", ["v1", "play", id]) => match query_wait(req.query.as_deref()) {
                 Ok(w) => self.get_play(id, w),
                 Err(()) => Response::error(400, "wait must be a number of seconds"),
@@ -421,9 +481,8 @@ impl Shared {
     // ---- playback ----
 
     fn play(self: &Arc<Self>, conn: &mut Conn, req: &Request) -> Response {
-        match req.header("x-pi-speech-kind").unwrap_or("message") {
-            "message" | "sample" => {}
-            _ => return Response::error(400, "X-Pi-Speech-Kind must be message or sample"),
+        if let Err(resp) = check_kind(req) {
+            return resp;
         }
         if req.header("transfer-encoding").is_some() {
             return Response::error(400, "send the audio with Content-Length, not chunked");
@@ -520,25 +579,7 @@ impl Shared {
         let mut g = lock(&self.inner);
         let spawned = proc::spawn(cmd, move |exit| {
             let _ = fs::remove_file(&done_path);
-            let (state, error) = if exit.stop_requested {
-                (PlayState::Cancelled, None)
-            } else if exit.success() {
-                (PlayState::Completed, None)
-            } else {
-                (
-                    PlayState::Failed,
-                    Some(with_note(
-                        &format!("player {}", exit.describe()),
-                        &exit.stderr_tail,
-                    )),
-                )
-            };
-            let mut g = lock(&sh.inner);
-            if let Some(p) = g.plays.iter_mut().find(|p| p.id == done_id) {
-                p.state = state;
-                p.error = error;
-            }
-            sh.cv.notify_all();
+            sh.player_ended(&done_id, &exit);
         });
         let ctl = match spawned {
             Ok(c) => c,
@@ -558,16 +599,271 @@ impl Shared {
             state: PlayState::Playing,
             error: None,
             ctl,
+            feed: Feed::File,
         });
-        while g.plays.len() > KEPT_PLAYBACKS {
-            match g.plays.iter().position(|p| p.state != PlayState::Playing) {
-                Some(i) => {
-                    g.plays.remove(i);
-                }
-                None => break,
+        prune(&mut g);
+        Response::json(202, format!("{{\"id\": {}}}", json_str(&id)))
+    }
+
+    /// Mark playback `id` by how its player ended.
+    fn player_ended(&self, id: &str, exit: &Exit) {
+        let (state, error) = if let Some(why) = &exit.failure {
+            (PlayState::Failed, Some(why.clone()))
+        } else if exit.stop_requested {
+            (PlayState::Cancelled, None)
+        } else if exit.success() {
+            (PlayState::Completed, None)
+        } else {
+            (
+                PlayState::Failed,
+                Some(with_note(
+                    &format!("player {}", exit.describe()),
+                    &exit.stderr_tail,
+                )),
+            )
+        };
+        let mut g = lock(&self.inner);
+        if let Some(p) = g.plays.iter_mut().find(|p| p.id == id) {
+            p.state = state;
+            p.error = error;
+            if let Feed::Waiting(_) = p.feed {
+                p.feed = Feed::Taken; // closes the input nobody will write to now
             }
         }
+        self.cv.notify_all();
+    }
+
+    // ---- Streams ----
+
+    /// `POST /v1/play/stream`: start a player that reads a Stream from its input.
+    fn play_stream(self: &Arc<Self>, conn: &mut Conn, req: &Request) -> Response {
+        if let Err(resp) = check_kind(req) {
+            return resp;
+        }
+        let framing = match Framing::of(req) {
+            Ok(f) => f,
+            Err(e) => return Response::error(400, e),
+        };
+        conn.send_continue(req);
+        let mut body = Vec::new();
+        let read = conn.read_pieces(framing, MAX_STREAM_REQUEST, self.cfg.stream_idle, |p| {
+            body.extend_from_slice(p)
+        });
+        if let Err(e) = read {
+            return Response::error(400, &format!("unusable Stream request: {}", e.describe()));
+        }
+        match Format::parse(&body) {
+            Ok(format) => self.start_stream(format),
+            Err(e) => Response::error(400, &e),
+        }
+    }
+
+    /// The Stream player for `format`: the configured one, or the first known one found.
+    fn stream_player(&self, format: Format) -> Result<(PathBuf, Vec<String>), String> {
+        if let Some(p) = &self.cfg.stream_player {
+            return Ok((configured_program(p), stream::configured_args(format)));
+        }
+        if self.cfg.player.is_some() {
+            return Err(format!(
+                "no Stream player: {PLAYER_ENV} is set and {STREAM_PLAYER_ENV} is not"
+            ));
+        }
+        let known = stream::players(format);
+        known
+            .iter()
+            .find_map(|name| find_in_path(name).map(|p| (p, stream::player_args(name, format))))
+            .ok_or_else(|| {
+                format!(
+                    "no Stream player for {} found (tried {})",
+                    format.name(),
+                    known.join(", ")
+                )
+            })
+    }
+
+    fn start_stream(self: &Arc<Self>, format: Format) -> Response {
+        let _p = lock(&self.play_lock);
+        if self.down.load(Ordering::SeqCst) {
+            return Response::error(503, "the receiver is shutting down");
+        }
+        // Without a Stream player the client sends the audio as a file later; until
+        // then, what plays now keeps playing.
+        let (program, args) = match self.stream_player(format) {
+            Ok(x) => x,
+            Err(e) => return Response::error(503, &e),
+        };
+        let id = match random_hex(8) {
+            Ok(id) => id,
+            Err(e) => return Response::error(503, &format!("no random source: {e}")),
+        };
+        self.stop_playing();
+        let mut cmd = Command::new(&program);
+        cmd.args(&args);
+        let sh = Arc::clone(self);
+        let done_id = id.clone();
+        // Hold the lock across spawn so the exit callback cannot run before the entry exists.
+        let mut g = lock(&self.inner);
+        let spawned = proc::spawn_with_input(cmd, move |exit| sh.player_ended(&done_id, &exit));
+        let (ctl, input) = match spawned {
+            Ok(x) => x,
+            Err(e) => {
+                drop(g);
+                let name = program
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned());
+                return Response::error(
+                    503,
+                    &format!(
+                        "cannot start the Stream player {}: {e}",
+                        name.unwrap_or_default()
+                    ),
+                );
+            }
+        };
+        let (sh, wait_id, wait_ctl) = (Arc::clone(self), id.clone(), Arc::clone(&ctl));
+        if let Err(e) = start_thread("stream-start", move || sh.await_audio(&wait_id, &wait_ctl)) {
+            // Not yet listed, so the exit callback has nothing to update; the lock must be
+            // released first because that callback takes it.
+            drop(g);
+            ctl.stop();
+            drop(input);
+            return Response::error(503, &format!("cannot start the Stream timer: {e}"));
+        }
+        g.plays.push(Play {
+            id: id.clone(),
+            state: PlayState::Playing,
+            error: None,
+            ctl,
+            feed: Feed::Waiting(input),
+        });
+        prune(&mut g);
         Response::json(202, format!("{{\"id\": {}}}", json_str(&id)))
+    }
+
+    /// Fail Stream `id` when its audio request has not begun in time.
+    fn await_audio(&self, id: &str, ctl: &ProcCtl) {
+        let waiting = |g: &Inner| {
+            !self.down.load(Ordering::SeqCst)
+                && g.plays.iter().any(|p| {
+                    p.id == id
+                        && p.state == PlayState::Playing
+                        && matches!(p.feed, Feed::Waiting(_))
+                })
+        };
+        let g = lock(&self.inner);
+        let (mut g, _) = self
+            .cv
+            .wait_timeout_while(g, self.cfg.stream_start, |g| waiting(g))
+            .unwrap_or_else(|e| e.into_inner());
+        if !waiting(&g) {
+            return;
+        }
+        // Taken out under the lock, so no audio request can have it any more.
+        let input = g
+            .plays
+            .iter_mut()
+            .find(|p| p.id == id)
+            .map(|p| std::mem::replace(&mut p.feed, Feed::Taken));
+        drop(g);
+        // Stopped before its input closes, so the player cannot end as `completed`.
+        ctl.fail(&format!(
+            "no audio arrived within {} s",
+            self.cfg.stream_start.as_secs_f64()
+        ));
+        drop(input);
+    }
+
+    /// `POST /v1/play/<id>/audio`: write the body to Stream `id`'s player as it arrives.
+    fn stream_audio(&self, conn: &mut Conn, req: &Request, id: &str) -> Response {
+        let framing = match Framing::of(req) {
+            Ok(f) => f,
+            Err(e) => return Response::error(400, e),
+        };
+        let (ctl, input) = {
+            let mut g = lock(&self.inner);
+            let Some(p) = g.plays.iter_mut().find(|p| p.id == id) else {
+                return Response::error(404, "unknown playback id");
+            };
+            let playing = p.state == PlayState::Playing && !p.ctl.stopping();
+            let input = match std::mem::replace(&mut p.feed, Feed::Taken) {
+                Feed::Waiting(input) if playing => input,
+                other => {
+                    let msg = match other {
+                        _ if !playing => "the playback is no longer playing",
+                        Feed::File => "the playback is not a Stream",
+                        _ => "the Stream already has its audio request",
+                    };
+                    p.feed = other;
+                    return Response::error(409, msg);
+                }
+            };
+            let ctl = Arc::clone(&p.ctl);
+            self.cv.notify_all(); // the start timer stops waiting
+            (ctl, input)
+        };
+        let limit = self.cfg.max_body;
+        let too_large = format!("the audio is larger than the limit of {limit} bytes");
+        if matches!(framing, Framing::Length(n) if n > limit) {
+            self.fail_stream(id, &ctl, Some(input), &too_large);
+            return Response::error(413, &too_large);
+        }
+        conn.send_continue(req);
+        // `None` once the player takes no more: a stop was asked for, or it closed its
+        // input (`lost`). The rest of the body is then read and dropped.
+        let mut input = Some(input);
+        let mut lost = false;
+        let read = conn.read_pieces(framing, limit, self.cfg.stream_idle, |piece| {
+            if let Some(w) = input.as_mut() {
+                if ctl.stopping() {
+                    input = None;
+                } else if w.write_all(piece).is_err() {
+                    // EPIPE from a player that has gone (SIGPIPE is ignored).
+                    input = None;
+                    lost = true;
+                }
+            }
+        });
+        match read {
+            Ok(_) => {
+                // Closing the input lets the player play the rest and exit.
+                drop(input);
+            }
+            Err(BodyFault::TooLarge) => {
+                self.fail_stream(id, &ctl, input, &too_large);
+                return Response::error(413, &too_large);
+            }
+            Err(fault) => {
+                let why = format!("the audio broke off: {}", fault.describe());
+                self.fail_stream(id, &ctl, input, &why);
+                return Response::error(400, &why);
+            }
+        }
+        if lost || ctl.stopping() {
+            // Ending or being stopped: answer with the state that results.
+            self.settle_play(id);
+        }
+        match lock(&self.inner).plays.iter().find(|p| p.id == id) {
+            Some(p) => p.json(),
+            None => Response::error(404, "unknown playback id"),
+        }
+    }
+
+    /// Stop Stream `id` as failed, unless it was already stopped or ended, then close its
+    /// input and wait until it is marked.
+    fn fail_stream(&self, id: &str, ctl: &ProcCtl, input: Option<ChildStdin>, why: &str) {
+        // Stopped before its input closes, so the player cannot end as `completed`.
+        ctl.fail(why);
+        drop(input);
+        self.settle_play(id);
+    }
+
+    /// Wait (bounded) until playback `id` is no longer playing.
+    fn settle_play(&self, id: &str) {
+        self.settle(|g| {
+            g.plays
+                .iter()
+                .all(|p| p.id != id || p.state != PlayState::Playing)
+        });
     }
 
     /// Stop every playback in progress and wait until they are marked. The caller holds
@@ -615,11 +911,7 @@ impl Shared {
             None => return Response::error(404, "unknown playback id"),
         };
         ctl.stop();
-        self.settle(|g| {
-            g.plays
-                .iter()
-                .all(|p| p.id != id || p.state != PlayState::Playing)
-        });
+        self.settle_play(id);
         match lock(&self.inner).plays.iter().find(|p| p.id == id) {
             Some(p) => p.json(),
             None => Response::error(404, "unknown playback id"),

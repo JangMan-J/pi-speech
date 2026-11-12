@@ -124,3 +124,63 @@ pub fn json_field(body: &str, key: &str) -> Option<String> {
     let rest = &body[i..];
     Some(rest[..rest.find('"')?].to_string())
 }
+
+/// One chunk of a chunked body.
+pub fn chunk_frame(data: &[u8]) -> Vec<u8> {
+    [
+        format!("{:x}\r\n", data.len()).into_bytes(),
+        data.to_vec(),
+        b"\r\n".to_vec(),
+    ]
+    .concat()
+}
+
+/// Whether process `pid` is gone (no such process, or only a zombie left).
+pub fn gone(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true,
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+    }
+}
+
+/// The audio request of a Stream, sent piece by piece as a client would.
+pub struct Upload(pub TcpStream);
+
+impl Upload {
+    /// Open `POST /v1/play/<id>/audio` with `framing` as its body header line(s).
+    pub fn open_with(addr: SocketAddr, id: &str, token: Option<&str>, framing: &str) -> Upload {
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_nodelay(true).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        let mut head = format!("POST /v1/play/{id}/audio HTTP/1.1\r\nHost: {addr}\r\n");
+        if let Some(t) = token {
+            head.push_str(&format!("Authorization: Bearer {t}\r\n"));
+        }
+        head.push_str(framing);
+        head.push_str("\r\n");
+        s.write_all(head.as_bytes()).unwrap();
+        Upload(s)
+    }
+
+    pub fn chunked(addr: SocketAddr, id: &str, token: &str) -> Upload {
+        Upload::open_with(addr, id, Some(token), "Transfer-Encoding: chunked\r\n")
+    }
+
+    pub fn chunk(&mut self, data: &[u8]) {
+        self.0.write_all(&chunk_frame(data)).unwrap();
+    }
+
+    /// The terminating chunk, then the answer.
+    pub fn end(mut self) -> Reply {
+        self.0.write_all(b"0\r\n\r\n").unwrap();
+        self.reply()
+    }
+
+    pub fn reply(mut self) -> Reply {
+        let mut raw = Vec::new();
+        let _ = self.0.read_to_end(&mut raw);
+        parse_reply(raw)
+    }
+}

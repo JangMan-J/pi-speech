@@ -5,7 +5,7 @@
 
 use std::io::{self, Read};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
@@ -36,6 +36,8 @@ struct St {
     exited: bool,
     stop_requested: bool,
     killed: bool,
+    /// Why the receiver stopped the child, when that stop was a failure, not a cancel.
+    failure: Option<String>,
 }
 
 /// Handle on a running child.
@@ -52,6 +54,8 @@ pub struct Exit {
     pub stop_requested: bool,
     /// The child ignored SIGINT and was killed.
     pub killed: bool,
+    /// Set when the stop was the receiver's own failure (see [`ProcCtl::fail`]).
+    pub failure: Option<String>,
     /// The end of the child's standard error, readable text.
     pub stderr_tail: String,
 }
@@ -99,12 +103,24 @@ impl ProcCtl {
         r == 0 && unsafe { info.si_pid() } == self.pid
     }
 
-    /// Stop the child and wait for it to be gone. True when it was still running.
-    pub fn stop(&self) -> bool {
-        self.stop_within(STOP_GRACE)
+    /// Whether a stop was asked for or the child has ended.
+    pub fn stopping(&self) -> bool {
+        let s = lock(&self.st);
+        s.stop_requested || s.exited
     }
 
-    fn stop_within(&self, grace: Duration) -> bool {
+    /// Stop the child and wait for it to be gone. True when it was still running.
+    pub fn stop(&self) -> bool {
+        self.stop_within(STOP_GRACE, None)
+    }
+
+    /// Stop the child as a failure, `reason`, unless a stop was already asked for (that
+    /// earlier stop then decides). True when it was still running.
+    pub fn fail(&self, reason: &str) -> bool {
+        self.stop_within(STOP_GRACE, Some(reason))
+    }
+
+    fn stop_within(&self, grace: Duration, failure: Option<&str>) -> bool {
         {
             let mut s = lock(&self.st);
             if s.exited {
@@ -112,6 +128,7 @@ impl ProcCtl {
             }
             if !s.stop_requested {
                 s.stop_requested = true;
+                s.failure = failure.map(String::from);
                 unsafe { libc::kill(self.pid, libc::SIGINT) };
             }
         }
@@ -148,15 +165,48 @@ fn tail_text(raw: &[u8]) -> String {
 
 /// Start `cmd` (stdin and stdout closed, stderr captured, own process group).
 /// `on_exit` runs on a helper thread once the child has ended and been reaped.
-pub fn spawn<F>(mut cmd: Command, on_exit: F) -> io::Result<Arc<ProcCtl>>
+pub fn spawn<F>(cmd: Command, on_exit: F) -> io::Result<Arc<ProcCtl>>
 where
     F: FnOnce(Exit) + Send + 'static,
 {
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .process_group(0);
+    start(cmd, false, on_exit).map(|(ctl, _)| ctl)
+}
+
+/// As [`spawn`], but the child's standard input is a pipe; its writing end is returned.
+/// Dropping it closes the child's input.
+pub fn spawn_with_input<F>(cmd: Command, on_exit: F) -> io::Result<(Arc<ProcCtl>, ChildStdin)>
+where
+    F: FnOnce(Exit) + Send + 'static,
+{
+    match start(cmd, true, on_exit)? {
+        (ctl, Some(input)) => Ok((ctl, input)),
+        // Not reachable with a piped stdin; never leave the child behind regardless.
+        (ctl, None) => {
+            ctl.stop();
+            Err(io::Error::other("the child has no input pipe"))
+        }
+    }
+}
+
+fn start<F>(
+    mut cmd: Command,
+    with_input: bool,
+    on_exit: F,
+) -> io::Result<(Arc<ProcCtl>, Option<ChildStdin>)>
+where
+    F: FnOnce(Exit) + Send + 'static,
+{
+    // Rust creates its pipes close-on-exec, so no later child inherits this input.
+    cmd.stdin(if with_input {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .process_group(0);
     let mut child = cmd.spawn()?;
+    let input = child.stdin.take();
     let pid = child.id() as libc::pid_t;
     let ctl = Arc::new(ProcCtl {
         pid,
@@ -221,11 +271,11 @@ where
         }
         // Remove anything the child left running in its group.
         unsafe { libc::kill(-pid, libc::SIGKILL) };
-        let (stop_requested, killed) = {
+        let (stop_requested, killed, failure) = {
             let mut s = lock(&c.st);
             s.exited = true;
             c.cv.notify_all();
-            (s.stop_requested, s.killed)
+            (s.stop_requested, s.killed, s.failure.take())
         };
         let status = lock(&theirs).take().and_then(|mut ch| ch.wait().ok());
         let _ = done_rx.recv_timeout(Duration::from_millis(300));
@@ -234,6 +284,7 @@ where
             status,
             stop_requested,
             killed,
+            failure,
             stderr_tail,
         });
     });
@@ -243,7 +294,7 @@ where
         }
         return Err(e);
     }
-    Ok(ctl)
+    Ok((ctl, input))
 }
 
 #[cfg(test)]
@@ -357,7 +408,7 @@ pub(crate) mod tests {
             st: Mutex::new(St::default()),
             cv: Condvar::new(),
         };
-        assert!(ctl.stop_within(Duration::from_millis(100)));
+        assert!(ctl.stop_within(Duration::from_millis(100), None));
         assert!(!lock(&ctl.st).killed, "the child had ended on its own");
         child.wait().unwrap();
     }
@@ -370,9 +421,47 @@ pub(crate) mod tests {
         })
         .unwrap();
         std::thread::sleep(Duration::from_millis(300)); // let the trap be set
-        assert!(ctl.stop_within(Duration::from_millis(300)));
+        assert!(ctl.stop_within(Duration::from_millis(300), None));
         let exit = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(exit.killed && exit.stop_requested);
+    }
+
+    #[test]
+    fn input_reaches_the_child_and_closing_it_ends_the_child() {
+        use std::io::Write;
+        let dir = scratch();
+        let out = dir.join("out");
+        let (tx, rx) = channel();
+        let (ctl, mut input) =
+            spawn_with_input(sh(&format!("cat > '{}'", out.display())), move |e| {
+                tx.send(e).unwrap()
+            })
+            .unwrap();
+        input.write_all(b"first").unwrap();
+        drop(input);
+        let exit = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(exit.success() && !exit.stop_requested && exit.failure.is_none());
+        assert!(!ctl.stop(), "already ended");
+        assert_eq!(std::fs::read(&out).unwrap(), b"first");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_failure_is_reported_unless_a_stop_came_first() {
+        for stop_first in [false, true] {
+            let (tx, rx) = channel();
+            let (ctl, _input) =
+                spawn_with_input(sh("cat > /dev/null"), move |e| tx.send(e).unwrap()).unwrap();
+            if stop_first {
+                assert!(ctl.stop());
+            }
+            assert_eq!(ctl.fail("the audio broke off"), !stop_first);
+            assert!(ctl.stopping());
+            let exit = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(exit.stop_requested);
+            let want = (!stop_first).then(|| "the audio broke off".to_string());
+            assert_eq!(exit.failure, want, "stop first: {stop_first}");
+        }
     }
 
     #[test]
@@ -384,7 +473,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         std::thread::sleep(Duration::from_millis(300));
-        assert!(ctl.stop_within(Duration::from_secs(3)));
+        assert!(ctl.stop_within(Duration::from_secs(3), None));
         let exit = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(!exit.killed && exit.stop_requested && exit.success());
     }
