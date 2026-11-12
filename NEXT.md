@@ -90,9 +90,6 @@ and the user has confirmed it by ear. Time to first sound can be measured; wheth
 
 Open items, none of them blocking the goal:
 
-- The placeholders `0.0.0-stage` and `0.0.0-bootstrap` are still on npm. Only the user can remove them
-  (npm login with 2FA): `npm unpublish @jangmanj/pi-speech@0.0.0-bootstrap` and
-  `npm unpublish @jangmanj/pi-speech@0.0.0-stage`, each with its `@version`.
 - Dependabot opened four pull requests; the dev-tools group one fails CI.
 - `e2e/panel/visible.mjs` still asserts the panel layout from before the redesign and fails. `e2e/run core`
   has not been run since the chat models and endpoints went in.
