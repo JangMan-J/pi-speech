@@ -5,7 +5,7 @@
     "clientKind": "git",
     "useIgnoreFile": true
   },
-  "files": { "includes": ["**", "!e2e", "!scripts/init-package.mjs", "!scripts/smoke-pack.mjs"] },
+  "files": { "includes": ["**", "!e2e", "!scripts/init-package.mjs", "!scripts/smoke-pack.mjs", "!GLOSSARY.md"] },
   "assist": { "actions": { "source": { "organizeImports": "on" } } },
   "linter": {
     "enabled": true,
