@@ -121,6 +121,25 @@ describe("playback-only speech of a long text", () => {
     expect(inputs).toEqual([LONG]);
   });
 
+  it("an output that turns out not to play a Stream (an older receiver) reads in pieces as files, every time", async () => {
+    const requests = fakeOpenRouter();
+    const { engine, bridgeOut } = makeEngine();
+    await engine.setBridge("on");
+    bridgeOut.playStream = async () => ({ ok: false, reason: "plays whole files only", cannotStream: true });
+    for (let round = 0; round < 2; round++) {
+      const before = requests.length;
+      const played = bridgeOut.plays.length;
+      const r = await engine.speech.say(LONG);
+      expect(r.files).toHaveLength(1);
+      // At least two requests for the pieces, and the first piece plays as a file.
+      expect(requests.length - before).toBeGreaterThanOrEqual(2);
+      expect(bridgeOut.plays.length).toBeGreaterThan(played);
+      expect(bridgeOut.plays.at(-1)?.file).toBeDefined();
+      for (let i = played; i < bridgeOut.plays.length; i++) bridgeOut.end(i, { state: "completed" });
+      await tick();
+    }
+  });
+
   it("a failed request is one error that says what failed and that nothing was saved", async () => {
     let n = 0;
     vi.stubGlobal(
