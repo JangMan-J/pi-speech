@@ -1,6 +1,6 @@
 // Visible acceptance: the /speech panel, redesign 01 layout. The main view holds only settings, under
 // SPEAK (Alt+S), LISTEN (Alt+Z) and SETTINGS; models and voices show only their names (details in the pickers);
-// Hotkeys runs every action and changes the keys of Speak and Dictate (bound when Pi loads the extension again).
+// Hotkeys runs every action and changes the keys of Speak and Dictate (leaving Hotkeys reloads Pi to bind them).
 import path from 'node:path';
 import { check, finish, ROOT, setup } from '../lib/lib.mjs';
 import { openPanelPi, readSettings, sleep } from '../lib/panel.mjs';
@@ -198,7 +198,7 @@ try {
   check(!lines.some((l) => /Speech › Hotkeys/.test(l)) && lines.some((l) => /REC|microphone|record|Dictation/i.test(l)), 'Dictate closes the panel and starts dictation', lines.slice(-8));
   t.close();
 
-  // 9. k changes the key of Speak: saved at once, bound from the next /reload
+  // 9. k changes the key of Speak: saved at once; leaving Hotkeys reloads Pi silently and binds it
   t = await openPanelPi(ctx, { cols: 100, rows: 40 });
   await t.open();
   await goTo(t, 'Hotkeys');
@@ -208,12 +208,13 @@ try {
   await t.key('alt+d'); await sleep(400);
   d = dock(t.lines());
   check(readSettings(ctx).hotkeys?.speak === 'alt+d', 'the new key is saved in the settings file', readSettings(ctx).hotkeys);
-  check(/Speak…\s+Alt\+S · → Alt\+D after \/reload$/.test(d[1] ?? ''), 'the row keeps the bound key and shows the new one waiting for /reload', d[1]);
-  check(d.some((l) => /Speak is Alt\+D from the next \/reload or start of Pi/.test(l)), 'the status line says when it takes effect', d.slice(-5));
-  await t.key('Escape'); await t.key('Escape'); await sleep(300);
-  t.type('/reload'); await sleep(300); await t.key('Enter'); await sleep(3000);
+  check(/Speak…\s+Alt\+D$/.test(d[1] ?? ''), 'the row shows the new key, with nothing waiting beside it', d[1]);
+  check(d.some((l) => /✓ Speak is Alt\+D$/.test(l)) && !d.some((l) => /reload/.test(l)), 'the status line confirms the key and mentions no /reload', d.slice(-5));
+  await t.key('Escape'); await sleep(3000);
+  lines = t.lines();
+  check(dock(lines).length === 0 && !lines.some((l) => /\/reload|[Rr]eloaded/.test(l)), 'leaving Hotkeys closes the dock and reloads silently, without /reload typed', lines.slice(-8));
   await t.key('alt+d'); await sleep(600);
-  check(/^Speak ─/.test(dock(t.lines())[0] ?? ''), 'after /reload, Alt+D opens the speak composer', t.lines().slice(-8));
+  check(/^Speak ─/.test(dock(t.lines())[0] ?? ''), 'Alt+D opens the speak composer at once', t.lines().slice(-8));
   await t.key('Escape'); await sleep(300);
   await t.key('alt+s'); await sleep(600);
   check(!/^Speak ─/.test(dock(t.lines())[0] ?? ''), 'and Alt+S no longer does', t.lines().slice(-8));

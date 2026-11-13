@@ -218,7 +218,7 @@ describe("drawing the main view", () => {
         view({ status: { tone: "error", text: `✗ ${"very long reason ".repeat(10)}` } }),
         hotkeys(),
         hotkeys({
-          rows: hotkeyRows.map((r) => (r.id === "speak" ? { ...r, note: "→ Ctrl+Alt+Shift+D after /reload" } : r)),
+          rows: hotkeyRows.map((r) => (r.id === "speak" ? { ...r, value: "Ctrl+Alt+Shift+D" } : r)),
         }),
         bridge("on over SSH · plays on the Remote machine · ✗ receiver unreachable", true),
       ]) {
@@ -276,11 +276,9 @@ describe("drawing a submenu", () => {
     }
   });
 
-  it("a changed key waits beside the bound one", () => {
-    const changed = hotkeyRows.map((r) => (r.id === "speak" ? { ...r, note: "→ Alt+D after /reload" } : r));
-    expect(row(renderPanel(hotkeys({ rows: changed }), 80), "Speak…")).toBe(
-      "  ▸ Speak…             Alt+S · → Alt+D after /reload",
-    );
+  it("a changed key shows as the row's value, with nothing beside it", () => {
+    const changed = hotkeyRows.map((r) => (r.id === "speak" ? { ...r, value: "Alt+D" } : r));
+    expect(row(renderPanel(hotkeys({ rows: changed }), 80), "Speak…")).toBe("  ▸ Speak…             Alt+D");
   });
 
   it("the input of Transcribe file… is drawn under its row", () => {

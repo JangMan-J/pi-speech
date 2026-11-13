@@ -28,18 +28,22 @@ function tuiPi() {
     on: (e: string, fn: any) => handlers.set(e, [...(handlers.get(e) ?? []), fn]),
     getActiveTools: () => [],
     setActiveTools: () => {},
+    sendUserMessage: vi.fn(async () => {}),
   };
   const notes: Array<{ message: string; type?: string }> = [];
   const overlay: {
     component?: any;
     options?: any;
-    closed?: Promise<void>;
+    closed?: Promise<unknown>;
     renders: number;
     rows?: number;
   } = { renders: 0 };
   const ctx: any = {
     mode: "tui",
     hasUI: true,
+    idle: true,
+    isIdle: () => ctx.idle,
+    reload: vi.fn(async () => {}),
     cwd: "/",
     modelRegistry: { getApiKeyForProvider: async () => undefined },
     ui: {
@@ -50,9 +54,9 @@ function tuiPi() {
       pasteToEditor: vi.fn(),
       custom: vi.fn((factory: any, options: any) => {
         overlay.options = options;
-        overlay.closed = new Promise<void>((resolve) => {
+        overlay.closed = new Promise<unknown>((resolve) => {
           const tui = { requestRender: () => overlay.renders++, terminal: { rows: overlay.rows } };
-          overlay.component = factory(tui, theme, {}, () => resolve());
+          overlay.component = factory(tui, theme, {}, (result: unknown) => resolve(result));
         });
         return overlay.closed;
       }),
@@ -142,7 +146,7 @@ describe("the panel in Pi's terminal UI", () => {
     await done;
   });
 
-  it("Hotkeys at 80, 100 and 160 columns as agreed; k sets a key that is saved and bound when Pi loads again", async () => {
+  it("Hotkeys at 80, 100 and 160 columns as agreed; k sets a key, and leaving Hotkeys reloads Pi to bind it", async () => {
     fakeOpenRouter();
     const f = tuiPi();
     const { engine, work } = makeEngine();
@@ -179,16 +183,17 @@ describe("the panel in Pi's terminal UI", () => {
       speak: "alt+d",
       dictate: "alt+z",
     });
-    expect(screen(100)[1]).toBe("   ▸ Speak…             Alt+S · → Alt+D after /reload");
-    expect(screen(100).join("\n")).toContain("✓ Speak is Alt+D from the next /reload or start of Pi");
-    // Pi bound the keys when it loaded the extension: until then Alt+S still opens the composer
-    c.handleInput("\x1bs");
-    expect(screen(100)[0]).toMatch(/^ Speak ─/);
-    c.handleInput("\x1b");
-    c.handleInput("\x1b");
+    expect(screen(100)[1]).toBe("   ▸ Speak…             Alt+D");
+    expect(screen(100).join("\n")).toContain("✓ Speak is Alt+D");
+    expect(screen(100).join("\n")).not.toMatch(/reload/);
+    expect(f.ctx.reload).not.toHaveBeenCalled();
+    // leaving Hotkeys closes the panel and reloads Pi silently: no message
     c.handleInput("\x1b");
     await done;
-    // the next load (a /reload or a new start) binds Alt+D, and the panel takes it as the Speak key
+    expect(f.ctx.reload).toHaveBeenCalledTimes(1);
+    expect(f.notes).toEqual([]);
+    expect(f.pi.sendUserMessage).not.toHaveBeenCalled();
+    // the reload loads the extension again: it binds Alt+D, and the panel takes it as the Speak key
     const g = tuiPi();
     const again = new Engine({ agentDir: join(work, "agent"), env: {}, home: join(work, "home") });
     registerPi(g.pi, again, { NO_COLOR: "1" });
@@ -200,6 +205,53 @@ describe("the panel in Pi's terminal UI", () => {
     g.overlay.component.handleInput("\x1b");
     g.overlay.component.handleInput("\x1b");
     await reopened;
+  });
+
+  it("leaving Hotkeys without a change reloads nothing", async () => {
+    fakeOpenRouter();
+    const f = tuiPi();
+    registerPi(f.pi, makeEngine().engine, { NO_COLOR: "1" });
+    await f.emit("session_start");
+    const done = f.commands.get("speech").handler("", f.ctx);
+    const c = f.overlay.component;
+    for (let i = 0; i < 8; i++) c.handleInput("\x1b[B");
+    c.handleInput("\r");
+    c.handleInput("k");
+    c.handleInput("\x1b");
+    c.handleInput("\x1b");
+    expect(stripVTControlCharacters(f.screen())).toContain("SPEAK (Alt+S)");
+    c.handleInput("\x1b");
+    await done;
+    await f.emit("agent_settled");
+    expect(f.ctx.reload).not.toHaveBeenCalled();
+    expect(f.pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("while the agent runs, the reload for a changed key waits until the agent has settled", async () => {
+    fakeOpenRouter();
+    const f = tuiPi();
+    registerPi(f.pi, makeEngine().engine, { NO_COLOR: "1" });
+    await f.emit("session_start");
+    f.ctx.idle = false;
+    const done = f.commands.get("speech").handler("", f.ctx);
+    const c = f.overlay.component;
+    for (let i = 0; i < 8; i++) c.handleInput("\x1b[B");
+    c.handleInput("\r");
+    c.handleInput("k");
+    c.handleInput("\x1bd");
+    c.handleInput("\x1b");
+    await done;
+    expect(f.ctx.reload).not.toHaveBeenCalled();
+    f.ctx.idle = true;
+    await f.emit("agent_settled");
+    // the request goes once, as the hidden /speech argument, which reloads from a command context
+    expect(f.pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(f.pi.sendUserMessage).toHaveBeenCalledWith("/speech --reload-hotkeys", { expandPromptTemplates: true });
+    await f.emit("agent_settled");
+    expect(f.pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    await f.commands.get("speech").handler("--reload-hotkeys", f.ctx);
+    expect(f.ctx.reload).toHaveBeenCalledTimes(1);
+    expect(f.notes).toEqual([]);
   });
 
   it("draws a compact dock: one column of margin, the header as the top rule, three sections, no box", async () => {

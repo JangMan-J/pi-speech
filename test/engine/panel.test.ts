@@ -654,7 +654,7 @@ describe("the panel view model: Hotkeys", () => {
     expect(p.panel.view().menu).toBe("hotkeys");
   });
 
-  it("k changes the key of Speak: saved in the settings at once, bound from the next /reload", async () => {
+  it("k changes the key of Speak: saved in the settings at once; leaving Hotkeys closes the panel to rebind it", async () => {
     const p = open();
     await p.goTo("Speak…");
     await p.type("k");
@@ -665,21 +665,38 @@ describe("the panel view model: Hotkeys", () => {
     expect(p.engine.speech.settings.hotkeys.speak).toBe("alt+d");
     expect(p.panel.view().status).toMatchObject({
       tone: "success",
-      text: "✓ Speak is Alt+D from the next /reload or start of Pi",
+      text: "✓ Speak is Alt+D",
     });
-    // until Pi loads the extension again, the bound key works and shows; the new one waits beside it
-    expect(p.row("Speak…")).toMatchObject({ value: "Alt+S", note: "→ Alt+D after /reload" });
+    // the row shows the new key, with nothing waiting beside it
+    expect(p.row("Speak…")).toEqual(expect.objectContaining({ value: "Alt+D" }));
+    expect(p.row("Speak…")?.note).toBeUndefined();
+    expect(p.panel.rebind).toBe(false);
+    expect(p.close).not.toHaveBeenCalled();
+    // leaving Hotkeys closes the panel and asks the host to reload Pi, which binds the new key
     await p.press("escape");
-    expect(p.panel.view().headings?.speak).toBe("SPEAK (Alt+S)");
+    expect(p.close).toHaveBeenCalledTimes(1);
+    expect(p.panel.rebind).toBe(true);
   });
 
-  it("k on Dictate takes a key with Ctrl and Shift too; setting it back to the bound key clears the note", async () => {
+  it("leaving Hotkeys without a change goes back to the main view and asks for no reload", async () => {
+    const p = open();
+    await p.goTo("Speak…");
+    await p.type("k");
+    await p.press("escape");
+    await p.press("escape");
+    expect(p.close).not.toHaveBeenCalled();
+    expect(p.panel.rebind).toBe(false);
+    expect(p.panel.view().menu).toBe("main");
+  });
+
+  it("k on Dictate takes a key with Ctrl and Shift too; setting it back to the bound key needs no reload", async () => {
     const p = open();
     await p.goTo("Dictate");
     await p.type("k");
     await p.press({ combo: "ctrl+alt+shift+x" });
     expect(settingsOf(p.work).hotkeys).toEqual({ speak: "alt+s", dictate: "ctrl+alt+shift+x" });
-    expect(p.row("Dictate")?.note).toBe("→ Ctrl+Alt+Shift+X after /reload");
+    expect(p.row("Dictate")).toMatchObject({ value: "Ctrl+Alt+Shift+X" });
+    expect(p.row("Dictate")?.note).toBeUndefined();
     await p.type("k");
     await p.press({ key: "dictate", id: "alt+z" });
     expect(p.close).not.toHaveBeenCalled();
@@ -687,6 +704,9 @@ describe("the panel view model: Hotkeys", () => {
     expect(p.row("Dictate")).toMatchObject({ value: "Alt+Z" });
     expect(p.row("Dictate")?.note).toBeUndefined();
     expect(settingsOf(p.work).hotkeys).toBeUndefined();
+    await p.press("escape");
+    expect(p.close).not.toHaveBeenCalled();
+    expect(p.panel.rebind).toBe(false);
   });
 
   it("refuses a key without Alt, and the key of the other action; Esc cancels", async () => {

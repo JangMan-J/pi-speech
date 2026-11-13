@@ -78,10 +78,11 @@ Speech › Hotkeys ────────────────────�
 ```
 
 `k` on Speak… or Dictate waits for a new key: Alt with a letter or a digit (Ctrl and Shift may be added, as
-in Ctrl+Alt+D). The key is saved in the settings file at once, but Pi binds an extension's keys when it loads
-the extension, so the new key works after `/reload` or the next start of Pi; until then the old key keeps
-working, and the row shows the new one waiting (`Alt+S · → Alt+D after /reload`). `r`, `h`, `s` and `t`
-also work in the main view (except on a model or voice row, where typing searches).
+in Ctrl+Alt+D). The key is saved in the settings file at once and the status line confirms it
+(`✓ Speak is Alt+D`). Pi binds an extension's keys when it loads the extension, so leaving Hotkeys with Esc
+after a change closes the dock and reloads Pi silently: the new key works at once. If the agent is running,
+the reload waits until it has finished. `r`, `h`, `s` and `t` also work in the main view (except on a
+model or voice row, where typing searches).
 
 **Bridge connection ›** holds the bridge mode, `auto` (the bridge when Pi runs over SSH), `on` or `off`,
 changed with ←→ or Enter, and says where audio plays: on This machine, or on the Remote machine with the
@@ -92,7 +93,7 @@ receiver's state (`✓ 127.0.0.1:47613`, `✗ receiver unreachable`).
 | `↑` `↓`         | Move row by row (they wrap)                                                                                     |
 | `←` `→`         | Change the value in place (Read aloud options, the bridge mode); saved at once                                  |
 | `Enter`         | Change the value in place; open the picker, field or submenu of a row ending in `›`; in Hotkeys, run the action |
-| `k`             | In Hotkeys, on Speak… or Dictate: set a new key (works after `/reload`)                                         |
+| `k`             | In Hotkeys, on Speak… or Dictate: set a new key (bound when you leave Hotkeys, which reloads Pi)                |
 | `r` `h` `s` `t` | Replay last, History…, Stop, Transcribe file…: in Hotkeys, and on the main view's other rows                    |
 | Speak key       | The speak composer (Alt+S unless changed), also from outside the dock                                           |
 | Dictate key     | Dictate (Alt+Z unless changed): closes the dock and starts (or stops) dictation                                 |
