@@ -1,6 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolveXaiToken } from "../../src/engine/credentials";
-import { listXaiVoices, XAI_MODEL, XAI_PRICE, XaiProvider, xaiSynthesize, xaiTranscribe } from "../../src/engine/xai";
+import {
+  listXaiVoices,
+  XAI_MODEL,
+  XAI_PRICE,
+  XaiProvider,
+  xaiSynthesize,
+  xaiSynthesizeStream,
+  xaiTranscribe,
+} from "../../src/engine/xai";
+import { chunkedBody, pcmBytes } from "./fixtures";
 
 const BASE = "https://api.x.ai/v1";
 const TOKEN = "xai-token-123456";
@@ -71,10 +80,10 @@ describe("listXaiVoices", () => {
   });
 });
 
-describe("xaiSynthesize", () => {
-  it("posts text, voice_id, language and asks for WAV", async () => {
-    const fn = stubFetch(() => new Response(new Uint8Array(50), { headers: { "content-type": "audio/wav" } }));
-    const r = await xaiSynthesize(TOKEN, { text: "hello", voice: "leo", language: "auto" });
+describe("xaiSynthesizeStream", () => {
+  it("posts text, voice_id, language and asks for 24 kHz PCM", async () => {
+    const fn = stubFetch(() => new Response(new Uint8Array(4), { headers: { "content-type": "audio/pcm" } }));
+    const s = await xaiSynthesizeStream(TOKEN, { text: "hello", voice: "leo", language: "auto" });
     const [url, init] = fn.mock.calls[0];
     expect(url).toBe(`${BASE}/tts`);
     expect(init?.method).toBe("POST");
@@ -83,15 +92,76 @@ describe("xaiSynthesize", () => {
       text: "hello",
       voice_id: "leo",
       language: "auto",
-      output_format: { codec: "wav", sample_rate: 24000 },
+      output_format: { codec: "pcm", sample_rate: 24000 },
     });
-    expect(r.format).toBe("wav");
-    expect(r.audio.byteLength).toBe(50);
+    expect(s.format).toEqual({ codec: "pcm", rate: 24000, channels: 1 });
   });
 
-  it("keeps MP3 when the service answers audio/mpeg", async () => {
-    stubFetch(() => new Response(new Uint8Array(7), { headers: { "content-type": "audio/mpeg" } }));
-    expect((await xaiSynthesize(TOKEN, { text: "hi", voice: "eve", language: "ja" })).format).toBe("mp3");
+  it("hands over each chunk as it arrives, before the response has ended", async () => {
+    const b = chunkedBody();
+    stubFetch(() => new Response(b.body, { headers: { "content-type": "audio/pcm" } }));
+    const s = await xaiSynthesizeStream(TOKEN, { text: "hello", voice: "eve", language: "auto" });
+    const it = s.chunks[Symbol.asyncIterator]();
+    b.send(pcmBytes(10));
+    expect(Array.from((await it.next()).value as Uint8Array)).toEqual(Array.from(pcmBytes(10)));
+    b.send(pcmBytes(6, 10));
+    expect(Array.from((await it.next()).value as Uint8Array)).toEqual(Array.from(pcmBytes(6, 10)));
+    b.end();
+    expect((await it.next()).done).toBe(true);
+  });
+
+  it("a response that breaks off midway is an error while reading, naming xAI", async () => {
+    const b = chunkedBody();
+    stubFetch(() => new Response(b.body, { headers: { "content-type": "audio/pcm" } }));
+    const s = await xaiSynthesizeStream(TOKEN, { text: "hello", voice: "eve", language: "auto" });
+    const it = s.chunks[Symbol.asyncIterator]();
+    b.send(pcmBytes(4));
+    await it.next();
+    b.fail(new Error("socket hang up"));
+    const err = await it.next().catch((e) => e);
+    expect(err.message).toMatch(/xAI/);
+    expect(err.message).toMatch(/socket hang up/);
+  });
+
+  it("an answer of no clear type is the PCM asked for, even when its first sample looks like an MP3 frame", async () => {
+    const pcm = new Uint8Array([0xff, 0xff, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0]); // first sample -1
+    for (const type of ["application/octet-stream", ""]) {
+      stubFetch(() => new Response(pcm, type ? { headers: { "content-type": type } } : {}));
+      const s = await xaiSynthesizeStream(TOKEN, { text: "hi", voice: "eve", language: "auto" });
+      expect(s.format).toEqual({ codec: "pcm", rate: 24000, channels: 1 });
+    }
+  });
+
+  it("an MP3 answer is taken as MP3; anything that is not audio is an error", async () => {
+    const mp3 = new Uint8Array([0xff, 0xfb, 0x90, 0, 1, 2, 3, 4, 5, 6, 7, 8]);
+    stubFetch(() => new Response(mp3, { headers: { "content-type": "audio/mpeg" } }));
+    expect((await xaiSynthesizeStream(TOKEN, { text: "hi", voice: "eve", language: "auto" })).format).toEqual({
+      codec: "mp3",
+    });
+    stubFetch(() => new Response("<html>gateway</html>", { headers: { "content-type": "text/html" } }));
+    const err = await xaiSynthesizeStream(TOKEN, { text: "hi", voice: "eve", language: "auto" }).catch((e) => e);
+    expect(err.message).toMatch(/unexpected audio from xAI: text\/html/);
+  });
+});
+
+describe("xaiSynthesize", () => {
+  it("collects the PCM into one 24 kHz mono WAV", async () => {
+    stubFetch(() => new Response(pcmBytes(50), { headers: { "content-type": "audio/pcm" } }));
+    const r = await xaiSynthesize(TOKEN, { text: "hello", voice: "leo", language: "auto" });
+    expect(r.format).toBe("wav");
+    const wav = Buffer.from(r.audio);
+    expect(wav.toString("latin1", 0, 4)).toBe("RIFF");
+    expect(wav.toString("latin1", 8, 12)).toBe("WAVE");
+    expect(wav.readUInt16LE(22)).toBe(1);
+    expect(wav.readUInt32LE(24)).toBe(24000);
+    expect(wav.readUInt16LE(34)).toBe(16);
+    expect(Array.from(wav.subarray(44))).toEqual(Array.from(pcmBytes(50)));
+  });
+
+  it("no audio at all is an error", async () => {
+    stubFetch(() => new Response(new Uint8Array(0), { headers: { "content-type": "audio/pcm" } }));
+    const err = await xaiSynthesize(TOKEN, { text: "hi", voice: "eve", language: "auto" }).catch((e) => e);
+    expect(err.message).toMatch(/no audio/);
   });
 
   it.each([401, 403])("a %i says the xAI login was rejected and to log in again, without the token", async (status) => {

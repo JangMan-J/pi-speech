@@ -1,9 +1,24 @@
 import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { type BinaryChoice, findBinary } from "../../src/engine/binary";
 import { chooseRecorder, LocalInput } from "../../src/engine/local-input";
 import { wavSeconds } from "../../src/engine/wav";
+
+// A private temporary directory for this file: LocalInput puts its recordings in os.tmpdir(), and the
+// leftover counts below must not see the recordings of other test runs on the same machine.
+const savedTmp = process.env.TMPDIR;
+let privateTmp: string;
+beforeAll(() => {
+  privateTmp = mkdtempSync(join(tmpdir(), "pi-speech-local-input-"));
+  process.env.TMPDIR = privateTmp;
+});
+afterAll(() => {
+  if (savedTmp === undefined) delete process.env.TMPDIR;
+  else process.env.TMPDIR = savedTmp;
+  rmSync(privateTmp, { recursive: true, force: true });
+});
 
 let dir: string;
 beforeEach(() => {
@@ -32,7 +47,7 @@ function wav(seconds: number, rate = 16000): Buffer {
 /** A node recorder: `<script> out.wav`; `body` runs in place of the recording. */
 function recorder(name: string, body: string): string {
   const p = join(dir, name);
-  writeFileSync(p, `#!/usr/bin/env node\nconst fs = require("node:fs");\nconst out = process.argv[2];\n${body}\n`);
+  writeFileSync(p, `#!${process.execPath}\nconst fs = require("node:fs");\nconst out = process.argv[2];\n${body}\n`);
   chmodSync(p, 0o755);
   return p;
 }
@@ -43,6 +58,8 @@ h.writeUInt16LE(1,22); h.writeUInt32LE(16000,24); h.writeUInt32LE(32000,28); h.w
 h.write("data",36); h.writeUInt32LE(d.length,40); return Buffer.concat([h,d]); };`;
 
 const base = { PATH: process.env.PATH };
+/** No bundled binary installed. */
+const NONE = (): BinaryChoice => ({ ok: false, reason: "the bundled pi-speech-receiver is not installed" });
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const leftovers = () => readdirSync(tmpdir()).filter((f) => f.startsWith("pi-speech-rec-"));
 
@@ -60,33 +77,53 @@ describe("wavSeconds", () => {
   });
 });
 
-describe("chooseRecorder", () => {
+// The fakes here are shell scripts, which Windows cannot run. Windows coverage of playback and recording
+// comes with the bundled binary (portable-package slice 4), run on the null audio device.
+const onWindows = process.platform === "win32";
+
+describe.skipIf(onWindows)("chooseRecorder", () => {
   it("prefers PI_SPEECH_RECORDER and reports one that is not executable", () => {
     const r = recorder("mine", "");
     expect(chooseRecorder({ ...base, PI_SPEECH_RECORDER: r })).toMatchObject({ ok: true, name: r });
     expect(chooseRecorder({ ...base, PI_SPEECH_RECORDER: join(dir, "missing") })).toMatchObject({ ok: false });
   });
 
-  it("falls back to the first available of pw-record, parecord, arecord, in that order", () => {
+  it("takes the bundled binary, run as `pi-speech-receiver record <out.wav>` and stopped by its stdin too", () => {
+    writeFileSync(join(dir, "pw-record"), "");
+    chmodSync(join(dir, "pw-record"), 0o755);
+    const bin = join(dir, "pi-speech-receiver");
+    const c = chooseRecorder({ PATH: dir }, () => ({ ok: true, path: bin, from: "package" }));
+    expect(c).toMatchObject({ ok: true, name: "pi-speech-receiver", bin, stdinStops: true });
+    expect(c.ok && c.args("/o.wav")).toEqual(["record", "/o.wav"]);
+    const r = recorder("myrec", "");
+    const custom = chooseRecorder({ PATH: dir, PI_SPEECH_RECORDER: r }, () => ({
+      ok: true,
+      path: bin,
+      from: "package",
+    }));
+    expect(custom).toMatchObject({ ok: true, name: r });
+  });
+
+  it("without the bundled binary, falls back to the first available of pw-record, parecord, arecord, in that order", () => {
     for (const n of ["arecord", "parecord"]) {
       const p = join(dir, n);
       writeFileSync(p, "#!/bin/sh\n");
       chmodSync(p, 0o755);
     }
-    expect(chooseRecorder({ PATH: dir })).toMatchObject({ ok: true, name: "parecord" });
-    expect(chooseRecorder({ PATH: join(dir, "nowhere") })).toMatchObject({ ok: false });
+    expect(chooseRecorder({ PATH: dir }, NONE)).toMatchObject({ ok: true, name: "parecord" });
+    expect(chooseRecorder({ PATH: join(dir, "nowhere") }, NONE)).toMatchObject({ ok: false });
   });
 
   it("records mono 16 kHz 16-bit WAV", () => {
     const p = join(dir, "arecord");
     writeFileSync(p, "#!/bin/sh\n");
     chmodSync(p, 0o755);
-    const c = chooseRecorder({ PATH: dir });
+    const c = chooseRecorder({ PATH: dir }, NONE);
     expect(c.ok && c.args("/x.wav").join(" ")).toBe("-q -t wav -f S16_LE -r 16000 -c 1 /x.wav");
   });
 });
 
-describe("LocalInput", () => {
+describe.skipIf(onWindows)("LocalInput", () => {
   const good = () =>
     recorder(
       "good",
@@ -118,7 +155,11 @@ describe("LocalInput", () => {
 
   it("a recorder that exits within the start window fails with the end of its error output", async () => {
     const before = leftovers().length;
-    const r = recorder("dead", `console.error("no such audio device"); process.exit(1);`);
+    // A shell stand-in, not node: it must exit well inside the 500 ms start window even on a
+    // cold machine, where launching node alone can take longer than that.
+    const r = join(dir, "dead");
+    writeFileSync(r, '#!/bin/sh\necho "opening the default input" >&2\necho "no such audio device" >&2\nexit 1\n');
+    chmodSync(r, 0o755);
     await expect(new LocalInput({ ...base, PI_SPEECH_RECORDER: r }).start()).rejects.toThrow(/no such audio device/);
     expect(leftovers().length).toBe(before);
   });
@@ -230,5 +271,27 @@ describe("LocalInput", () => {
       const rec = await input.start();
       await rec.cancel();
     });
+  });
+});
+
+// The bundled binary on the null audio device: PATH holds no audio program. Built by cargo build in receiver/.
+const built = findBinary({});
+describe.skipIf(!built.ok || onWindows)("dictation through the bundled binary (null audio device)", () => {
+  it("records until stopped and returns a WAV of the null device's silence", async () => {
+    const before = leftovers();
+    const input = new LocalInput({ PATH: "", PI_SPEECH_AUDIO_NULL: "1" });
+    const rec = await input.start();
+    await sleep(400);
+    const { audio, format } = await rec.stop();
+    expect(format).toBe("wav");
+    expect(wavSeconds(audio)).toBeGreaterThan(0.3);
+    expect(leftovers().filter((d) => !before.includes(d))).toEqual([]);
+  });
+
+  it("cancel stops it and leaves nothing behind", async () => {
+    const before = leftovers();
+    const rec = await new LocalInput({ PATH: "", PI_SPEECH_AUDIO_NULL: "1" }).start();
+    await rec.cancel();
+    expect(leftovers().filter((d) => !before.includes(d))).toEqual([]);
   });
 });

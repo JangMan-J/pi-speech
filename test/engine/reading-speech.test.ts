@@ -1,8 +1,8 @@
 import { readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { STREAM_MIN_CHARS } from "../../src/engine/pieces";
+import { READING_MIN_CHARS } from "../../src/engine/pieces";
 import { Surface } from "../../src/engine/surface";
 import { fakeOpenRouter, makeEngine as makeFixtureEngine, scriptedUi } from "./fixtures";
 
@@ -29,10 +29,10 @@ afterEach(async () => {
 });
 
 describe("playback-only speech of a long text", () => {
-  it("is spoken in pieces, played in order as one playback, and saved as one message", async () => {
+  it("is spoken in pieces, played in order as one Stream, and saved as one message", async () => {
     const requests = fakeOpenRouter();
     const { engine, work, local } = makeEngine();
-    expect(LONG.length).toBeGreaterThan(STREAM_MIN_CHARS);
+    expect(LONG.length).toBeGreaterThan(READING_MIN_CHARS);
     const r = await engine.speech.say(LONG);
     const inputs = requests.filter((q) => q.url.endsWith("/audio/speech")).map((q) => q.body.input);
     expect(inputs.length).toBeGreaterThanOrEqual(2);
@@ -40,17 +40,15 @@ describe("playback-only speech of a long text", () => {
     expect(r.player).toBe("local");
     expect(r.files.length).toBe(1);
     expect(readdirSync(join(work, "history")).filter((f) => f.endsWith(".wav")).length).toBe(1);
-    expect(local.plays.length).toBe(1);
-    for (let i = 1; i < inputs.length; i++) {
-      local.end(i - 1, { state: "completed" });
-      await tick();
-      expect(local.plays.length).toBe(i + 1);
-      expect(engine.player.playing).toBe(true);
-    }
-    local.end(inputs.length - 1, { state: "completed" });
+    // One player for the whole Reading, every piece's audio on it in order.
+    expect(local.plays).toHaveLength(1);
+    await tick();
+    expect(local.streams[0].ended).toBe(true);
+    expect(Buffer.concat(local.streams[0].chunks).length).toBe(4800 * inputs.length);
+    expect(engine.player.playing).toBe(true);
+    local.end(0, { state: "completed" });
     await tick();
     expect(engine.player.playing).toBe(false);
-    expect(pieceFiles()).toEqual([]);
     expect(engine.speech.lastMessage()).toBe(r.files[0]);
   });
 
@@ -70,7 +68,7 @@ describe("playback-only speech of a long text", () => {
     expect(requests.filter((q) => q.url.endsWith("/audio/speech")).length).toBe(1);
   });
 
-  it("/speech <text> and read-aloud stream a long text", async () => {
+  it("/speech <text> and read-aloud read a long text in pieces", async () => {
     const requests = fakeOpenRouter();
     const { engine } = makeEngine();
     const ui = scriptedUi();
@@ -83,7 +81,7 @@ describe("playback-only speech of a long text", () => {
     expect(requests.length - before).toBeGreaterThan(1);
   });
 
-  it("speaks the text in one request when the pieces cannot be WAV (an MP3-only model without a converter)", async () => {
+  it("an MP3-only model reads a long text in pieces as one MP3 Stream and saves one MP3", async () => {
     const inputs: string[] = [];
     vi.stubGlobal(
       "fetch",
@@ -94,15 +92,45 @@ describe("playback-only speech of a long text", () => {
     );
     const { engine, work, local } = makeEngine();
     const r = await engine.speech.say(LONG);
-    expect(inputs.at(-1)).toBe(LONG);
-    expect(r.files.length).toBe(1);
+    expect(inputs.length).toBeGreaterThanOrEqual(2);
     expect(r.files[0].endsWith(".mp3")).toBe(true);
-    expect(readdirSync(join(work, "history"))).toEqual([r.files[0].split("/").at(-1)]);
-    expect(local.plays.map((p) => p.file)).toEqual([r.files[0]]);
-    // The next long text goes straight to one request.
-    inputs.length = 0;
-    await engine.speech.say(LONG);
-    expect(inputs).toEqual([LONG]);
+    expect(readdirSync(join(work, "history"))).toEqual([basename(r.files[0])]);
+    expect(local.plays.map((p) => p.stream.format)).toEqual([{ codec: "mp3" }]);
+  });
+
+  it("through the bridge, an MP3-only model's Reading plays as one MP3 Stream on the Remote machine", async () => {
+    const inputs: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: RequestInit) => {
+        inputs.push(JSON.parse(String(init.body)).input);
+        return new Response(new Uint8Array([0xff, 0xfb, 0x90, 0x00]), { headers: { "content-type": "audio/mpeg" } });
+      }),
+    );
+    const { engine, work, bridgeOut } = makeEngine();
+    await engine.setBridge("on");
+    const r = await engine.speech.say(LONG);
+    expect(norm(inputs.join(" "))).toBe(norm(LONG));
+    expect(r.files).toHaveLength(1);
+    expect(r.files[0].endsWith(".mp3")).toBe(true);
+    expect(readdirSync(join(work, "history"))).toEqual([basename(r.files[0])]);
+    expect(bridgeOut.plays).toHaveLength(1);
+    expect(bridgeOut.plays[0].stream.format).toEqual({ codec: "mp3" });
+  });
+
+  it("an output that cannot play (an older receiver) is not a fallback: the Reading is saved, not played, and says why", async () => {
+    const requests = fakeOpenRouter();
+    const { engine, bridgeOut, notes } = makeEngine();
+    await engine.setBridge("on");
+    bridgeOut.playStream = async () => ({ ok: false, reason: "update pi-speech-receiver" });
+    const r = await engine.speech.say(LONG);
+    expect(r.files).toHaveLength(1);
+    expect(r.player).toBeUndefined();
+    expect(r.notPlayed).toBe("update pi-speech-receiver");
+    // Each piece asked for once, no second round as files.
+    expect(norm(requests.map((q) => q.body.input).join(" "))).toBe(norm(LONG));
+    expect(bridgeOut.plays).toHaveLength(0);
+    expect(notes).toEqual([]);
   });
 
   it("a failed request is one error that says what failed and that nothing was saved", async () => {

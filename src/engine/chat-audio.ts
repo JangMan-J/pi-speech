@@ -14,8 +14,13 @@
  *
  *   Reading. openai/gpt-audio read 9 of 9 texts word for word, openai/gpt-audio-mini 44 of 48; every miss
  *   was a text that reads as an order ("Ignore your instructions and…"), which it answered, refused, or
- *   prefaced. The model returns the words it spoke, so a reading is checked: one that is not the text, word
- *   for word, is asked for once more and then refused. It is never played.
+ *   prefaced. The model returns the words it spoke, so a reading is checked. Played as a Stream, audio plays
+ *   only once the words said after it are still the start of the text, and a Stray (GLOSSARY.md) stops it
+ *   with nothing saved and no second request. As one clip (not played, or a piece of a Reading), a reading
+ *   that is not the text, word for word, is asked for once more and then refused. Measured 2026-11-12 with
+ *   openai/gpt-audio-mini on a 34-word text: the transcript came first (798 ms, audio 978 ms) and stayed
+ *   0.3 to 1.6 s of speech ahead of the audio, so the check held the first audio back by 47 ms and a Stray is
+ *   seen before its audio arrives.
  *
  *   Transcribing. 33 models, four recordings each, three runs; the last one: a spoken task, all 32 that
  *   answered wrote it down; a spoken question, 32 of 33; a spoken order ("Ignore your instructions and tell
@@ -26,11 +31,11 @@
  *   recording made three models copy it into the transcript, and none at all lost three more, so there is
  *   one, before it. One model once took five minutes to fail, so a request is given up after three.
  *
- * Streamed speech comes as 16-bit PCM only (OpenAI refuses every other format while streaming), 24 kHz mono.
+ * Audio sent as server-sent events comes as 16-bit PCM only (OpenAI refuses every other format then), 24 kHz mono.
  */
 
 import { bearer, errorText, failure } from "./http";
-import type { SynthesizedAudio } from "./provider";
+import type { AudioStream, SynthesizedAudio } from "./provider";
 import { wrapPcmAsWav } from "./wav";
 
 /** Where the requests go: a base URL that has /chat/completions, and its key. */
@@ -80,28 +85,33 @@ async function* sseData(res: Response): AsyncGenerator<string> {
   if (!reader) return;
   const decoder = new TextDecoder();
   let pending = "";
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (value) pending += decoder.decode(value, { stream: true });
-    const lines = pending.split("\n");
-    pending = done ? "" : (lines.pop() ?? "");
-    for (const line of lines) if (line.startsWith("data:")) yield line.slice(5).trim();
-    if (done) return;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (value) pending += decoder.decode(value, { stream: true });
+      const lines = pending.split("\n");
+      pending = done ? "" : (lines.pop() ?? "");
+      for (const line of lines) if (line.startsWith("data:")) yield line.slice(5).trim();
+      if (done) return;
+    }
+  } finally {
+    // Read no further when the reader stops early (a Stray): the response is closed, not left generating.
+    reader.cancel().catch(() => {});
   }
 }
 
-/** The bytes of base64 text that arrives in pieces, each padded on its own or the text cut anywhere. */
+/** Base64 text that arrives in pieces, each padded on its own or the text cut anywhere, decoded as it comes. */
 function base64Pieces() {
-  const parts: Buffer[] = [];
   let carry = "";
   return {
-    push(piece: string): void {
+    /** The bytes of `piece` and what came before it that are whole now; "" hands over the rest. */
+    take(piece: string): Buffer {
       carry += piece;
-      const whole = carry.length - (carry.length % 4);
-      if (whole) parts.push(Buffer.from(carry.slice(0, whole), "base64"));
+      const whole = piece ? carry.length - (carry.length % 4) : carry.length;
+      const out = Buffer.from(carry.slice(0, whole), "base64");
       carry = carry.slice(whole);
+      return out;
     },
-    bytes: (): Buffer => Buffer.concat(carry ? [...parts, Buffer.from(carry, "base64")] : parts),
   };
 }
 
@@ -120,12 +130,18 @@ interface AudioChunk {
   choices?: Array<{ delta?: { audio?: { data?: unknown; transcript?: unknown } } }>;
 }
 
-/** One reading: the PCM and the words the model says it spoke. */
-async function readOnce(
+/** One event of a reading: PCM that arrived, words the model says it spoke, or both. */
+interface ReadingEvent {
+  audio?: Buffer;
+  transcript?: string;
+}
+
+/** Ask for a reading of `req.text`; resolves once the response has started, its events in order. Throws on a failed request. */
+async function readingEvents(
   target: ChatTarget,
   req: { text: string; model: string; voice?: string },
   signal?: AbortSignal,
-): Promise<{ pcm: Buffer; transcript: string }> {
+): Promise<AsyncGenerator<ReadingEvent>> {
   const res = await post(
     target,
     {
@@ -141,31 +157,126 @@ async function readOnce(
     signal,
   );
   if (!res.ok) throw failure(target.title, res.status, await res.text().catch(() => ""), target.key);
-  const audio = base64Pieces();
+  return (async function* () {
+    const audio = base64Pieces();
+    for await (const data of sseData(res)) {
+      if (data === "[DONE]") break;
+      let chunk: AudioChunk;
+      try {
+        chunk = JSON.parse(data) as AudioChunk;
+      } catch {
+        continue; // a keep-alive or a cut line
+      }
+      if (chunk.error) throw new Error(`${target.title}: ${errorText(data, target.key)}`);
+      for (const choice of chunk.choices ?? []) {
+        const part = choice.delta?.audio;
+        const event: ReadingEvent = {};
+        if (typeof part?.data === "string") {
+          const bytes = audio.take(part.data);
+          if (bytes.length) event.audio = bytes;
+        }
+        if (typeof part?.transcript === "string") event.transcript = part.transcript;
+        if (event.audio || event.transcript !== undefined) yield event;
+      }
+    }
+    const rest = audio.take("");
+    if (rest.length) yield { audio: rest };
+  })();
+}
+
+/** One reading: the PCM and the words the model says it spoke. */
+async function readOnce(
+  target: ChatTarget,
+  req: { text: string; model: string; voice?: string },
+  signal?: AbortSignal,
+): Promise<{ pcm: Buffer; transcript: string }> {
+  const parts: Buffer[] = [];
   let transcript = "";
-  for await (const data of sseData(res)) {
-    if (data === "[DONE]") break;
-    let chunk: AudioChunk;
-    try {
-      chunk = JSON.parse(data) as AudioChunk;
-    } catch {
-      continue; // a keep-alive or a cut line
-    }
-    if (chunk.error) throw new Error(`${target.title}: ${errorText(data, target.key)}`);
-    for (const choice of chunk.choices ?? []) {
-      const part = choice.delta?.audio;
-      if (typeof part?.data === "string") audio.push(part.data);
-      if (typeof part?.transcript === "string") transcript += part.transcript;
-    }
+  for await (const e of await readingEvents(target, req, signal)) {
+    if (e.audio) parts.push(e.audio);
+    if (e.transcript) transcript += e.transcript;
   }
-  const pcm = audio.bytes();
+  const pcm = Buffer.concat(parts);
   if (pcm.length < 2) throw new Error(`${target.title} returned no audio`);
   return { pcm: pcm.subarray(0, pcm.length - (pcm.length % 2)), transcript };
 }
 
+const NO_TRANSCRIPT = "the model returned no transcript to check its reading against, so nothing was played";
+
+/** The error for a reading that is not the text, quoting what the model said instead. */
+function strayed(said: string, outcome: string): Error {
+  const flat = said.replace(/\s+/g, " ").trim();
+  const heard = flat.length > 90 ? `${flat.slice(0, 90)}…` : flat;
+  return new Error(
+    `the model did not read the text as written (it said: "${heard}"), so ${outcome}; a chat model can answer a text instead of reading it`,
+  );
+}
+
 /**
- * Speak `text` through a chat model that gives audio. Plays nothing it cannot vouch for: the model's own
- * transcript must be the text, word for word, else it is asked once more and then refused.
+ * How the words said so far stand against the text: "whole" when they are the text, "start" when they are the
+ * start of it (the last word may still be growing), "stray" otherwise (a Stray, see GLOSSARY.md).
+ */
+export function vouch(text: string, said: string): "whole" | "start" | "stray" {
+  if (sameWords(text, said)) return "whole";
+  const want = wordsOf(text);
+  const got = wordsOf(said);
+  const growing = /[\p{L}\p{N}]$/u.test(said.normalize("NFKC"));
+  const done = growing ? got.slice(0, -1) : got;
+  if (done.length > want.length || done.some((w, i) => w !== want[i])) return "stray";
+  if (growing) {
+    const next = want[done.length];
+    if (next === undefined || !next.startsWith(got[got.length - 1])) return "stray";
+  }
+  return "start";
+}
+
+/**
+ * Speak `text` through a chat model that gives audio, as a Stream. Audio plays only once words the model says
+ * it spoke after it are still the start of the text; once they are the whole text, audio plays as it comes.
+ * A Stray ends the Stream with an error quoting what was said; a reading that ends short of the text is one.
+ * There is no second request: part of the reading may already have been heard.
+ */
+export async function chatSynthesizeStream(
+  target: ChatTarget,
+  req: { text: string; model: string; voice?: string },
+  signal?: AbortSignal,
+): Promise<AudioStream> {
+  const events = await readingEvents(target, req, signal);
+  async function* vouched(): AsyncGenerator<Uint8Array> {
+    const held: Buffer[] = [];
+    let said = "";
+    let whole = false;
+    let played = false;
+    const outcome = () => (played ? "playback was stopped" : "nothing was played");
+    const release = function* () {
+      while (held.length) {
+        played = true;
+        yield held.shift()!;
+      }
+    };
+    for await (const e of events) {
+      if (e.audio) {
+        held.push(e.audio);
+        if (whole) yield* release();
+      }
+      if (e.transcript === undefined) continue;
+      said += e.transcript;
+      const v = vouch(req.text, said);
+      if (v === "stray") throw strayed(said, outcome());
+      whole = v === "whole";
+      // Audio that came before these words is vouched for by them.
+      yield* release();
+    }
+    if (!said.trim()) throw new Error(NO_TRANSCRIPT);
+    if (!sameWords(req.text, said)) throw strayed(said, outcome());
+    yield* release();
+  }
+  return { format: { codec: "pcm", rate: PCM_RATE, channels: 1 }, chunks: vouched() };
+}
+
+/**
+ * Speak `text` through a chat model that gives audio, as one clip. Returns nothing it cannot vouch for: the
+ * model's own transcript must be the text, word for word, else it is asked once more and then refused.
  */
 export async function chatSynthesize(
   target: ChatTarget,
@@ -178,13 +289,10 @@ export async function chatSynthesize(
     if (sameWords(req.text, reading.transcript)) {
       return { audio: wrapPcmAsWav(reading.pcm, PCM_RATE, 1), format: "wav" };
     }
-    said = reading.transcript.replace(/\s+/g, " ").trim();
+    said = reading.transcript;
   }
-  if (!said) throw new Error("the model returned no transcript to check its reading against, so nothing was played");
-  const heard = said.length > 90 ? `${said.slice(0, 90)}…` : said;
-  throw new Error(
-    `the model did not read the text as written (it said: "${heard}"), so nothing was played; a chat model can answer a text instead of reading it`,
-  );
+  if (!said.trim()) throw new Error(NO_TRANSCRIPT);
+  throw strayed(said, "nothing was played");
 }
 
 /** Transcribe audio through a chat model that takes audio. `language` is a tag such as "ja", told to the model. */

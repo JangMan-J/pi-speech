@@ -4,8 +4,10 @@
 use pi_speech_receiver::token::random_hex;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 pub fn scratch(name: &str) -> PathBuf {
@@ -112,9 +114,31 @@ pub fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
     }
 }
 
+/// An executable script. (On Windows only the file: these scripts are for Unix shells.)
+///
+/// On Unix the file is written by `cp`, never opened for writing by this process: a test on
+/// another thread that forks while this process holds the file open would keep a writer on
+/// it until its exec, and running the script meanwhile fails with "Text file busy".
 pub fn script(path: &Path, text: &str) {
+    #[cfg(unix)]
+    {
+        let mut draft = path.as_os_str().to_owned();
+        draft.push(".draft");
+        let draft = std::path::PathBuf::from(draft);
+        std::fs::write(&draft, text).unwrap();
+        std::fs::set_permissions(&draft, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_file(path);
+        let ok = std::process::Command::new("cp")
+            .arg(&draft)
+            .arg(path)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "cp {} failed", path.display());
+        let _ = std::fs::remove_file(&draft);
+    }
+    #[cfg(not(unix))]
     std::fs::write(path, text).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 /// Extract `"key": "value"` from a flat JSON object.
@@ -123,4 +147,124 @@ pub fn json_field(body: &str, key: &str) -> Option<String> {
     let i = body.find(&pat)? + pat.len();
     let rest = &body[i..];
     Some(rest[..rest.find('"')?].to_string())
+}
+
+/// One chunk of a chunked body.
+pub fn chunk_frame(data: &[u8]) -> Vec<u8> {
+    [
+        format!("{:x}\r\n", data.len()).into_bytes(),
+        data.to_vec(),
+        b"\r\n".to_vec(),
+    ]
+    .concat()
+}
+
+/// Whether process `pid` is gone (no such process, or only a zombie left).
+#[cfg(target_os = "linux")]
+pub fn gone(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true,
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+    }
+}
+
+/// Whether process `pid` is gone. Without /proc a zombie still counts as running, but
+/// the receiver reaps its children at once, and orphans are reaped by the system.
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn gone(pid: u32) -> bool {
+    let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    r != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// SIGINT; on Windows, which has none, Ctrl+Break, which the receiver takes for it.
+pub const SIGINT: i32 = 2;
+/// SIGTERM (Unix only).
+pub const SIGTERM: i32 = 15;
+
+/// The signals the receiver and the engine stop on, the first the one a user or the system
+/// would send; on Windows, Ctrl+Break.
+#[cfg(unix)]
+pub const STOP_SIGNALS: [i32; 2] = [SIGTERM, SIGINT];
+#[cfg(windows)]
+pub const STOP_SIGNALS: [i32; 1] = [SIGINT];
+
+/// Prepare `c` so that [`signal`] can reach the process: on Windows, a console process
+/// group of its own, on a console this test process shares. Nothing to do on Unix.
+pub fn signalable(c: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Console::AllocConsole;
+        use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+        static CONSOLE: std::sync::Once = std::sync::Once::new();
+        // Control events only reach processes on the sender's console. This fails,
+        // harmlessly, when the test process already has one.
+        CONSOLE.call_once(|| unsafe {
+            AllocConsole();
+        });
+        c.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+    c
+}
+
+/// Send `sig` to `child`. On Windows every signal is Ctrl+Break (the child must have
+/// been started [`signalable`]), which the receiver takes for SIGINT.
+pub fn signal(child: &Child, sig: i32) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(child.id() as i32, sig)
+    };
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
+        let _ = sig;
+        let ok = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, child.id()) };
+        assert!(
+            ok != 0,
+            "cannot send Ctrl+Break: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// The audio request of a Stream, sent piece by piece as a client would.
+pub struct Upload(pub TcpStream);
+
+impl Upload {
+    /// Open `POST /v1/play/<id>/audio` with `framing` as its body header line(s).
+    pub fn open_with(addr: SocketAddr, id: &str, token: Option<&str>, framing: &str) -> Upload {
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_nodelay(true).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        let mut head = format!("POST /v1/play/{id}/audio HTTP/1.1\r\nHost: {addr}\r\n");
+        if let Some(t) = token {
+            head.push_str(&format!("Authorization: Bearer {t}\r\n"));
+        }
+        head.push_str(framing);
+        head.push_str("\r\n");
+        s.write_all(head.as_bytes()).unwrap();
+        Upload(s)
+    }
+
+    pub fn chunked(addr: SocketAddr, id: &str, token: &str) -> Upload {
+        Upload::open_with(addr, id, Some(token), "Transfer-Encoding: chunked\r\n")
+    }
+
+    pub fn chunk(&mut self, data: &[u8]) {
+        self.0.write_all(&chunk_frame(data)).unwrap();
+    }
+
+    /// The terminating chunk, then the answer.
+    pub fn end(mut self) -> Reply {
+        self.0.write_all(b"0\r\n\r\n").unwrap();
+        self.reply()
+    }
+
+    pub fn reply(mut self) -> Reply {
+        let mut raw = Vec::new();
+        let _ = self.0.read_to_end(&mut raw);
+        parse_reply(raw)
+    }
 }

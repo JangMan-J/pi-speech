@@ -5,15 +5,18 @@
  * Derived in part from pi-openrouter-multimodal (MIT).
  */
 
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { extname, isAbsolute, join, resolve } from "node:path";
 import { type VoiceLanguage, voiceLanguage, voiceSample } from "../voice-language/index";
+import type { PlayStart } from "./audio";
 import type { KeyRegistry } from "./credentials";
 import { buildEndpoints, type Endpoint, endpointNameProblem, PRESETS } from "./endpoints";
-import { type Env, errorMessage } from "./env";
+import { childEnv, type Env, errorMessage } from "./env";
 import { featureLine } from "./features";
-import { type Converter, ffmpegConvert, History, type HistoryMessage, historyDir } from "./history";
+import { History, type HistoryMessage, historyDir, type SavedMessage } from "./history";
+import { LocalModels } from "./local-models";
+import { LocalSpeechProvider } from "./local-speech";
 import {
   DEFAULT_VOICE,
   fetchSpeechCatalog,
@@ -21,11 +24,13 @@ import {
   OpenRouterProvider,
   type SpeechCatalog,
 } from "./openrouter";
-import { STREAM_MIN_CHARS, splitForSpeech } from "./pieces";
-import type { Player } from "./player";
-import type { SpeechProvider } from "./provider";
-import { DEFAULT_SETTINGS, type ModelSort, type Settings, type SettingsFile } from "./settings";
-import { speakInPieces } from "./stream";
+import { READING_MIN_CHARS, splitForSpeech } from "./pieces";
+import { type Player, REPLACED } from "./player";
+import type { SpeechProvider, SynthesisRequest } from "./provider";
+import type { ReadingResult } from "./reading";
+import { streamReading } from "./reading-stream";
+import { DEFAULT_SETTINGS, type ModelSort, type Settings, type SettingsFile, SOURCES, type Source } from "./settings";
+import { streamAndPlay } from "./stream-play";
 import { XAI_MODEL, XAI_PRICE, XaiProvider } from "./xai";
 
 /** The xAI choice as a model option, offered while Pi holds an xAI login. */
@@ -62,7 +67,15 @@ const AUDIO_FORMATS: Record<string, string> = {
   aac: "aac",
 };
 
-export type SettingName = "tts-model" | "voice" | "stt-model" | "stt-language" | "tools" | "dictation-output";
+export type SettingName =
+  | "tts-model"
+  | "voice"
+  | "stt-model"
+  | "stt-language"
+  | "tools"
+  | "dictation-output"
+  | "tts-source"
+  | "stt-source";
 export const SETTING_NAMES: SettingName[] = [
   "tts-model",
   "voice",
@@ -70,7 +83,15 @@ export const SETTING_NAMES: SettingName[] = [
   "stt-language",
   "tools",
   "dictation-output",
+  "tts-source",
+  "stt-source",
 ];
+
+/** What speaking says while the Speech source is Local and no local speech model is chosen. */
+export const LOCAL_SPEECH_UNAVAILABLE = "Choose a local speech model first: /speech, Speech model";
+
+/** The direction of a source: speech (text to speech) or transcription. */
+export type Direction = "speech" | "transcription";
 
 /** A language tag as transcription services take it: `ja`, `pt-BR`. */
 const LANGUAGE_TAG = /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/;
@@ -84,7 +105,6 @@ export interface SpeechResult {
   player?: string;
   /** Why the message was not played. */
   notPlayed?: string;
-  conversionError?: string;
   /** A reading stopped or replaced before every piece was synthesized: nothing was saved (`files` is empty). */
   stopped?: boolean;
 }
@@ -109,8 +129,14 @@ export interface SpeechOptions {
   player: Player;
   env: Env;
   home?: string;
-  convert?: Converter;
   fetchCatalog?: () => Promise<SpeechCatalog>;
+  /** The on-device models (default: through the bundled binary). */
+  local?: LocalModels;
+}
+
+/** A local voice for display: its name or number, or "default" for the model's first voice. */
+function voiceName(voice: string): string {
+  return voice || "default";
 }
 
 /** The voice that stays when it is offered, else the preferred one when offered, else the first. */
@@ -138,6 +164,8 @@ export class Speech {
   settings: Settings;
   /** Pi's credential store; set by the adapter. */
   registry?: KeyRegistry;
+  /** The on-device models: This machine's, or the Remote machine's while Run models on says so. */
+  readonly local: LocalModels;
   /** Hears warnings found while loading, such as a replaced model. */
   onWarning: (message: string) => void = () => {};
   private catalog: SpeechCatalog = FALLBACK_CATALOG;
@@ -145,16 +173,14 @@ export class Speech {
   private loading: Promise<void> = Promise.resolve();
   private failedAt = 0;
   private lastSaved?: string[];
-  private samples = 0;
-  /** Models whose pieces could not be streamed in this session (e.g. MP3 without a converter). */
-  private readonly unchunkable = new Set<string>();
   private readonly history: History;
-  private readonly convert: Converter;
   private readonly player: Player;
   private readonly store: SettingsFile;
   private readonly fetchCatalog: () => Promise<SpeechCatalog>;
   private readonly openrouter: OpenRouterProvider;
   private readonly xai: XaiProvider;
+  /** Speech by the on-device voice models, through the bundled binary's `speak`. */
+  private readonly localSpeech: LocalSpeechProvider;
   private readonly env: Env;
   /** The OpenAI-compatible endpoints: the built-in ones and the user's. */
   private endpoints: Endpoint[] = [];
@@ -171,9 +197,14 @@ export class Speech {
     this.xai = new XaiProvider(() => this.registry);
     this.store = opts.settingsFile;
     this.player = opts.player;
-    this.convert = opts.convert ?? ffmpegConvert;
-    this.history = new History(historyDir(opts.env, opts.home ?? homedir()), this.convert);
+    this.history = new History(historyDir(opts.env, opts.home ?? homedir()));
     this.fetchCatalog = opts.fetchCatalog ?? (() => fetchSpeechCatalog());
+    this.local = opts.local ?? new LocalModels(opts.env);
+    this.localSpeech = new LocalSpeechProvider(
+      () => this.local.binary(),
+      () => childEnv(opts.env),
+      () => this.local.remote(),
+    );
     this.settings = this.store.load();
   }
 
@@ -457,6 +488,13 @@ export class Speech {
   }
 
   async voicesReport(): Promise<string> {
+    const target = this.localTarget();
+    if (target) {
+      const voices = await this.localVoices(target.model);
+      return [`Voices of ${target.model} (local):`, ...(voices.length ? voices : ["(the model lists no voices)"])].join(
+        "\n",
+      );
+    }
     const model = this.settings.speechModel;
     const voices = await this.voicesFor(model);
     return [`Voices of ${model}:`, ...(voices.length ? voices : ["(xAI lists no voices)"])].join("\n");
@@ -466,10 +504,15 @@ export class Speech {
   async statusLines(): Promise<string[]> {
     await this.ready();
     const s = this.settings;
+    const local = (id?: string) => `${id ?? "none chosen"} (local)`;
     return [
-      `Speech model: ${s.speechModel}`,
-      `Voice: ${s.voice}`,
-      `Transcription model: ${s.transcriptionModel}`,
+      ...(s.speechSource === "local"
+        ? [
+            `Speech model: ${local(s.localSpeechModel)}`,
+            ...(s.localSpeechModel ? [`Voice: ${voiceName(s.localSpeechVoice ?? "")}`] : []),
+          ]
+        : [`Speech model: ${s.speechModel}`, `Voice: ${s.voice}`]),
+      `Transcription model: ${s.transcriptionSource === "local" ? local(s.localTranscriptionModel) : s.transcriptionModel}`,
       `Tools: ${s.tools ? "on" : "off"}`,
       `History: ${this.history.dir}`,
       ...(this.live ? [] : ["(OpenRouter model catalog not loaded; showing built-in lists)"]),
@@ -507,6 +550,7 @@ export class Speech {
         return `Speech model: ${s.speechModel}, voice: ${s.voice}`;
       }
       case "voice": {
+        if (s.speechSource === "local") return this.setLocalVoice(value);
         const voices = await this.voicesFor(s.speechModel);
         if (!voices.includes(value) && !(value && this.anyVoice(s.speechModel))) {
           throw new Error(`${value || "(empty)"} is not a voice of ${s.speechModel}; choose one of: ${list(voices)}`);
@@ -538,6 +582,12 @@ export class Speech {
         this.save();
         return `Tools: ${value}`;
       }
+      case "tts-source":
+      case "stt-source": {
+        if (!SOURCES.includes(value as Source))
+          throw new Error(`${name} must be provider or local, not ${value || "empty"}`);
+        return this.setSource(name === "tts-source" ? "speech" : "transcription", value as Source);
+      }
       case "dictation-output": {
         const cmd = value.trim();
         if (cmd) s.dictationOutput = cmd;
@@ -548,6 +598,70 @@ export class Speech {
       default:
         throw new Error(`unknown setting ${name || "(none)"}; choose one of: ${list(SETTING_NAMES)}`);
     }
+  }
+
+  // ── Sources ─────────────────────────────────────────────────────────────
+
+  /** Change and save where speech or transcription comes from; each direction on its own. */
+  setSource(direction: Direction, source: Source): string {
+    if (direction === "speech") this.settings.speechSource = source;
+    else this.settings.transcriptionSource = source;
+    this.save();
+    const name = direction === "speech" ? "Speech source" : "Transcription source";
+    const word = source === "local" ? "Local" : "Provider";
+    return `${name}: ${word}`;
+  }
+
+  /** Choose and save the on-device model of a direction (an id of the local catalogue). */
+  setLocalModel(direction: Direction, id: string): string {
+    if (direction === "speech") {
+      // A voice belongs to its model.
+      if (id !== this.settings.localSpeechModel) delete this.settings.localSpeechVoice;
+      this.settings.localSpeechModel = id;
+    } else this.settings.localTranscriptionModel = id;
+    this.save();
+    return `${direction === "speech" ? "Speech" : "Transcription"} model: ${id} (local)`;
+  }
+
+  /** The voice names of a downloaded local speech model, the default (voice 0) first. */
+  async localVoices(model: string, signal?: AbortSignal): Promise<string[]> {
+    return (await this.localSpeech.voices(model, signal)).map((v) => v.name);
+  }
+
+  /** Choose and save the voice of the local speech model (`default` or empty: its first voice). */
+  async setLocalVoice(value: string): Promise<string> {
+    const model = this.settings.localSpeechModel;
+    if (!model) throw new Error(LOCAL_SPEECH_UNAVAILABLE);
+    if (!value || value === "default") {
+      delete this.settings.localSpeechVoice;
+    } else {
+      const voices = await this.localVoices(model);
+      if (!voices.includes(value)) {
+        throw new Error(`${value} is not a voice of ${model}; choose one of: ${voices.join(", ")}`);
+      }
+      this.settings.localSpeechVoice = value;
+    }
+    this.save();
+    return `Voice: ${voiceName(this.settings.localSpeechVoice ?? "")} (local)`;
+  }
+
+  /**
+   * With Speech source Local, the chosen local speech model and the voice: the one given, else the chosen local
+   * voice (a name or number of the model; empty is its first voice); throws when no model is chosen. Undefined
+   * with Speech source Provider.
+   */
+  private localTarget(voice?: string): { model: string; voice: string } | undefined {
+    if (this.settings.speechSource !== "local") return undefined;
+    const model = this.settings.localSpeechModel;
+    if (!model) throw new Error(LOCAL_SPEECH_UNAVAILABLE);
+    return { model, voice: voice || this.settings.localSpeechVoice || "" };
+  }
+
+  /** The local transcription model to use; throws when none is chosen. */
+  private localTranscription(model?: string): string {
+    const id = model || this.settings.localTranscriptionModel;
+    if (!id) throw new Error("Choose a local transcription model first: /speech, Transcription model");
+    return id;
   }
 
   // ── Voice languages ─────────────────────────────────────────────────────
@@ -653,10 +767,9 @@ export class Speech {
   }
 
   /** `language` is the language of the text: a tag, or "auto" to leave it to the service. */
-  private async synthesize(text: string, model: string, voice: string, language: string, signal?: AbortSignal) {
+  private async synthesize(provider: SpeechProvider, req: SynthesisRequest) {
     try {
-      const via = this.via("tts", model);
-      return await this.provider(model).synthesize({ text, model, voice, language, signal, via });
+      return await provider.synthesize(req);
     } catch (err) {
       throw new Error(`Speech synthesis failed: ${errorMessage(err)}`);
     }
@@ -668,57 +781,84 @@ export class Speech {
     opts: CallOptions & { model?: string; voice?: string; play?: boolean } = {},
   ): Promise<SpeechResult> {
     if (!text.trim()) throw new Error("Nothing to say: the text is empty");
-    const { model, voice } = await this.choose(opts.model, opts.voice);
+    // Local: the chosen on-device model (a provider model the caller names does not apply).
+    const target = this.localTarget(opts.voice);
+    const { model, voice } = target ?? (await this.choose(opts.model, opts.voice));
     const play = opts.play !== false;
-    await this.provider(model).ensureCredential();
-    const ticket = play ? this.player.claim() : undefined;
+    const provider = target ? this.localSpeech : this.provider(model);
+    await provider.ensureCredential();
     // Plain speech never names a language: the text is spoken as written, never translated.
-    const audio = await this.synthesize(text, model, voice, "auto", opts.signal);
-    let started: Awaited<ReturnType<Player["play"]>> | undefined;
-    const saved = await this.history.save(text, audio.audio, audio.format, async (file) => {
-      // Playback starts before the conversion to the other format.
-      if (play) started = await this.player.play(file, "message", { ticket });
-    });
-    this.lastSaved = saved.files;
-    const result: SpeechResult = { files: saved.files, model, voice };
-    if (saved.conversionError) result.conversionError = saved.conversionError;
-    if (!play) result.notPlayed = "play was false";
-    else if (started?.ok) result.player = started.player;
-    else result.notPlayed = started?.reason ?? "playback did not start";
+    const via = target ? undefined : this.via("tts", model);
+    const req = { text, model, voice, language: "auto", signal: opts.signal, via };
+    if (!play) {
+      const audio = await this.synthesize(provider, req);
+      const saved = await this.history.save(text, audio.audio, audio.format);
+      return this.spoken(saved, model, voiceName(voice), { ok: false, reason: "play was false" });
+    }
+    const ticket = this.player.claim();
+    const r = await streamAndPlay(provider, req, this.player, "message", ticket);
+    const shown = voiceName(voice);
+    if (r.state === "stopped") return { files: [], model, voice: shown, stopped: true, notPlayed: REPLACED };
+    const saved = await this.history.save(text, r.audio.audio, r.audio.format);
+    return this.spoken(saved, model, shown, r.started);
+  }
+
+  /** The result of a message saved in the history, played by `started` or not. */
+  private spoken(saved: SavedMessage, model: string, voice: string, started: PlayStart): SpeechResult {
+    this.lastSaved = [saved.file];
+    const result: SpeechResult = { files: [saved.file], model, voice };
+    if (started.ok) result.player = started.player;
+    else result.notPlayed = started.reason;
     return result;
   }
 
   /**
-   * Playback-only speech (read-aloud, /speech <text>): a text longer than STREAM_MIN_CHARS is spoken in pieces
-   * that start playing after the first is synthesized, and saved as one message; a shorter one as `speak`.
+   * Playback-only speech (read-aloud, /speech <text>): a text longer than READING_MIN_CHARS is a Reading, spoken
+   * in pieces played as one Stream, and saved as one message; a shorter one as `speak`.
    * Stopped before every piece was synthesized, it saves nothing and is `stopped`. A failed request throws
    * ReadingFailed with the provider's message.
    */
   async say(text: string, opts: CallOptions = {}): Promise<SpeechResult> {
-    if (text.trim().length <= STREAM_MIN_CHARS) return this.speak(text, opts);
+    const target = this.localTarget();
+    if (text.trim().length <= READING_MIN_CHARS) return this.speak(text, opts);
+    if (target) {
+      // One `speak` for the whole text: the model loads once and generates it sentence by sentence, so the
+      // Reading is one piece that streams from its first sentence.
+      const r = await streamReading({
+        pieces: [text],
+        synthesize: (piece, signal) =>
+          this.localSpeech.synthesizeStream({ text: piece, ...target, language: "auto", signal }),
+        player: this.player,
+        save: (audio) => this.history.save(text, audio.audio, audio.format),
+        who: this.localSpeech.name,
+        signal: opts.signal,
+        text,
+      });
+      return this.readingResult(r, target.model, voiceName(target.voice));
+    }
     const { model, voice } = await this.choose();
-    if (this.unchunkable.has(model)) return this.speak(text, opts);
     const provider = this.provider(model);
     await provider.ensureCredential();
-    const r = await speakInPieces({
+    const via = this.via("tts", model);
+    const r = await streamReading({
       pieces: splitForSpeech(text),
       // Plain speech never names a language, as in `speak`.
       synthesize: (piece, signal) =>
-        provider.synthesize({ text: piece, model, voice, language: "auto", signal, via: this.via("tts", model) }),
+        provider.synthesizeStream({ text: piece, model, voice, language: "auto", signal, via }),
       player: this.player,
-      convert: this.convert,
-      save: (wav) => this.history.save(text, wav, "wav"),
-      tmpRoot: tmpdir(),
+      save: (audio) => this.history.save(text, audio.audio, audio.format),
+      who: provider.name,
       signal: opts.signal,
+      text,
     });
-    if (r.state === "unchunkable") {
-      this.unchunkable.add(model);
-      return this.speak(text, opts);
-    }
+    return this.readingResult(r, model, voice);
+  }
+
+  /** The result of a Reading. */
+  private readingResult(r: ReadingResult, model: string, voice: string): SpeechResult {
     if (r.state === "stopped") return { files: [], model, voice, stopped: true };
-    this.lastSaved = r.saved.files;
-    const result: SpeechResult = { files: r.saved.files, model, voice };
-    if (r.saved.conversionError) result.conversionError = r.saved.conversionError;
+    this.lastSaved = [r.saved.file];
+    const result: SpeechResult = { files: [r.saved.file], model, voice };
     if (r.player) result.player = r.player;
     else result.notPlayed = r.notPlayed;
     return result;
@@ -726,18 +866,25 @@ export class Speech {
 
   /** A short sample of a voice of the current model in its voice language; never saved in the history. */
   async sample(voice?: string, opts: CallOptions = {}): Promise<SampleResult> {
+    const target = this.localTarget(voice);
+    if (target) return this.localSample(target, opts);
     await this.ready();
     const model = this.settings.speechModel;
     const v = voice || this.settings.voice;
     await this.requireVoice(model, v);
     const vl = this.languageOf(model, v);
     const s = voiceSample(vl, v);
-    await this.provider(model).ensureCredential();
+    const provider = this.provider(model);
+    await provider.ensureCredential();
     const ticket = this.player.claim();
-    const audio = await this.synthesize(s.text, model, v, s.language, opts.signal);
-    const file = join(tmpdir(), `pi-speech-sample-${process.pid}-${++this.samples}.${audio.format}`);
-    writeFileSync(file, audio.audio);
-    const started = await this.player.play(file, "sample", { ticket, cleanup: () => rmSync(file, { force: true }) });
+    const started = await this.playSample(provider, ticket, {
+      text: s.text,
+      model,
+      voice: v,
+      language: s.language,
+      signal: opts.signal,
+      via: this.via("tts", model),
+    });
     return {
       model,
       voice: v,
@@ -746,6 +893,45 @@ export class Speech {
       ...(s.notice ? { notice: s.notice } : {}),
       ...(started.ok ? { player: started.player } : { notPlayed: started.reason }),
     };
+  }
+
+  /** A sample of a local voice, in the model's language when it has one, else in English. */
+  private async localSample(target: { model: string; voice: string }, opts: CallOptions): Promise<SampleResult> {
+    const { model, voice } = target;
+    let languages: string[] = [];
+    try {
+      languages = (await this.local.list("speech")).find((m) => m.id === model)?.languages ?? [];
+    } catch {
+      /* the sample is then in English; speaking says what is wrong */
+    }
+    const vl =
+      languages.length === 1
+        ? voiceLanguage({ model, voice, override: languages[0] })
+        : voiceLanguage({ model, voice: voice || "default" });
+    const shown = voiceName(voice);
+    const s = voiceSample(vl, shown);
+    const ticket = this.player.claim();
+    const started = await this.playSample(this.localSpeech, ticket, {
+      text: s.text,
+      model,
+      voice,
+      language: s.language,
+      signal: opts.signal,
+    });
+    return {
+      model,
+      voice: shown,
+      language: s.language,
+      voiceLanguage: vl,
+      ...(s.notice ? { notice: s.notice } : {}),
+      ...(started.ok ? { player: started.player } : { notPlayed: started.reason }),
+    };
+  }
+
+  /** Play a sample as a Stream; nothing of it is kept. */
+  private async playSample(provider: SpeechProvider, ticket: number, req: SynthesisRequest): Promise<PlayStart> {
+    const r = await streamAndPlay(provider, req, this.player, "sample", ticket);
+    return r.state === "stopped" ? { ok: false, reason: REPLACED } : r.started;
   }
 
   /** The spoken messages of the history, the newest first. */
@@ -777,6 +963,15 @@ export class Speech {
     const format = AUDIO_FORMATS[extname(full).slice(1).toLowerCase()];
     if (!format)
       throw new Error(`Unsupported audio file ${path}; use one of: ${Object.keys(AUDIO_FORMATS).join(", ")}`);
+    if (this.settings.transcriptionSource === "local") {
+      // On This machine: the binary reads the file; nothing goes over the network.
+      const id = this.localTranscription(opts.model);
+      try {
+        return await this.local.transcribeFile(id, full, opts.signal);
+      } catch (err) {
+        throw new Error(`Transcription failed: ${errorMessage(err)}`);
+      }
+    }
     await this.provider(opts.model || this.settings.transcriptionModel).ensureCredential();
     let audio: Buffer;
     try {
@@ -793,6 +988,14 @@ export class Speech {
     format: string,
     opts: CallOptions & { model?: string; language?: string } = {},
   ): Promise<string> {
+    if (this.settings.transcriptionSource === "local") {
+      const id = this.localTranscription(opts.model);
+      try {
+        return await this.local.transcribe(id, audio, format, opts.signal);
+      } catch (err) {
+        throw new Error(`Transcription failed: ${errorMessage(err)}`);
+      }
+    }
     const model = opts.model || this.settings.transcriptionModel;
     const provider = this.provider(model);
     await provider.ensureCredential();

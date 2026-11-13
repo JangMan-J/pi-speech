@@ -91,8 +91,7 @@ change to those files it exits 78 asking you to run the proof in a terminal. A r
 The receiver runs on your Linux computer (with the speakers and microphone), and Pi runs on `decent-spider`.
 
 1. Build it: `cargo build --release` in `receiver/` (binary `receiver/target/release/pi-speech-receiver`), or copy
-   that binary from another machine. It plays through the first available of `pw-play`, `paplay`, `mpv`, `ffplay`
-   and records with `pw-record`, `parecord`, or `arecord`.
+   that binary from another machine. It plays and records with its own audio engine (no other audio program).
 2. Start it: `pi-speech-receiver` (listens on `127.0.0.1:47613`). With no `--token-file` it creates
    `~/.config/pi-speech/receiver.token` (mode 0600) on first start. Use `--token-file PATH` for another file.
 3. Forward its port to the Pi host from your machine:

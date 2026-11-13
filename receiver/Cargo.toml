@@ -1,8 +1,8 @@
 [package]
 name = "pi-speech-receiver"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
-description = "Playback-machine receiver for the pi-speech playback bridge (play and record)"
+description = "Receiver for the pi-speech playback bridge: play, record, and transcribe with local speech models"
 license = "MIT"
 
 [lib]
@@ -14,7 +14,38 @@ name = "pi-speech-receiver"
 path = "src/main.rs"
 
 [dependencies]
+# The built-in audio engine: devices (PulseAudio when it runs, else ALSA on Linux; CoreAudio
+# on macOS; WASAPI on Windows) and decoding.
+cpal = { version = "0.18.2", features = ["pulseaudio"] }
+symphonia = { version = "0.6.1", default-features = false, features = ["pcm", "wav", "mp3", "id3v1", "id3v2"] }
+# Local speech models run in-process: sherpa-onnx with ONNX Runtime linked statically from the
+# project's prebuilt archives (fetched by sherpa-onnx-sys's build script; on Windows the static-MT
+# archive, which matches this crate's +crt-static build).
+sherpa-onnx = { version = "2.0.1", default-features = false, features = ["static"] }
+# Random bytes (tokens, ids, file names) from the operating system, on every system.
+getrandom = "0.3"
+# Model downloads (`models`): HTTPS with rustls and bundled roots (no system TLS library),
+# pure-Rust bzip2 and tar, and SHA-256 checks. The catalogue and the output are JSON.
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+bzip2 = "0.6"
+tar = { version = "0.4", default-features = false }
+sha2 = "0.11"
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+# Signals, process groups, poll.
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Console control handlers, process control (job objects), and WSAPoll.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
 
 [profile.release]
 panic = "unwind"

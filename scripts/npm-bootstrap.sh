@@ -3,8 +3,16 @@
 # release comes from CI through trusted publishing (OIDC) with provenance, and every later
 # release is a tag push with no human step.
 #
-#   npm run bootstrap:npm              # steps 1-3; one 2FA approval
-#   npm run bootstrap:npm -- --cleanup # later, any time: steps 4-5; two 2FA approvals
+# A release publishes the main package and a platform package per target
+# (`node npm/platforms.mjs targets`, named <main>-<os>-<cpu>). Steps 1, 2, 4 and 5 run for each
+# of them that needs it: a package already on npm skips step 1, so adding the platform packages
+# to an existing main package creates and links only those (step 2 still links every package;
+# limit it with --only). Every npm package needs its own trusted publisher.
+#
+#   npm run bootstrap:npm -- --only <npm-name>   # one package only (repeatable)
+#
+#   npm run bootstrap:npm              # steps 1-3; one 2FA approval per package
+#   npm run bootstrap:npm -- --cleanup # later, any time: steps 4-5; two 2FA approvals per package
 #   npm run bootstrap:npm -- --dry-run # check everything and print the plan; changes nothing
 #   npm run bootstrap:npm -- --from 3  # resume at a step after an interruption
 #
@@ -34,6 +42,7 @@
 set -euo pipefail
 
 DRY_RUN=0
+ONLY=()
 FROM=1
 CLEANUP=0
 while [ $# -gt 0 ]; do
@@ -41,7 +50,8 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY_RUN=1 ;;
     --from) FROM=${2:-}; shift ;;
     --cleanup) CLEANUP=1; FROM=4 ;;
-    *) printf 'usage: %s [--dry-run] [--cleanup] [--from <1-5>]\n' "$0" >&2; exit 2 ;;
+    --only) ONLY+=("${2:-}"); shift ;;
+    *) printf 'usage: %s [--dry-run] [--cleanup] [--from <1-5>] [--only <npm-name>]...\n' "$0" >&2; exit 2 ;;
   esac
   shift
 done
@@ -123,64 +133,88 @@ git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null 2>&1 &&
 ci=$(gh run list --workflow ci.yml --branch "$branch" --commit "$(git rev-parse HEAD)" --limit 1 --json status,conclusion -q '.[0] | "\(.status) \(.conclusion)"' 2>/dev/null || true)
 [ "$ci" = "completed success" ] || die "CI on $branch at HEAD is not green (${ci:-no run found}); fix it before the first release"
 
-package_exists=0
-published "$name" && package_exists=1
+# The main package and its platform packages, or the --only ones.
+packages=("$name")
+while read -r target; do packages+=("$name-$target"); done < <(node npm/platforms.mjs targets)
+if [ ${#ONLY[@]} -gt 0 ]; then
+  for only in "${ONLY[@]}"; do
+    [[ " ${packages[*]} " == *" $only "* ]] || die "--only $only is not one of: ${packages[*]}"
+  done
+  packages=("${ONLY[@]}")
+fi
+# Names already on npm, space-separated (no associative arrays: macOS ships bash 3.2).
+existing=" "
+for pkg in "${packages[@]}"; do
+  published "$pkg" && existing+="$pkg "
+done
+exists() { [[ "$existing" == *" $1 "* ]]; }
 if [ "$FROM" -le 3 ] && published "$name@$version"; then
   die "$name@$version is already on npm: this script is for a package's first release (resume later steps with --from 4)"
 fi
 
 note "npm user:     $npm_user"
 note "package:      $name@$version"
+note "packages:     ${packages[*]}"
 note "repository:   $repo ($branch)"
 note "workflow:     .github/workflows/$WORKFLOW${environment:+ (environment: $environment)}"
-note "package on npm already: $([ $package_exists = 1 ] && echo yes || echo no)"
+for pkg in "${packages[@]}"; do
+  note "on npm already: $pkg: $(exists "$pkg" && echo yes || echo no)"
+done
 [ "$headless" = 1 ] && note "no display: open each npm authentication URL on another device, then wait here"
-stage_id_file="$(git rev-parse --git-dir)/npm-bootstrap-stage-id"
+# Kept per package for step 4, so a resumed run still knows what to reject.
+stage_id_file() { printf '%s/npm-bootstrap-stage-id-%s' "$(git rev-parse --git-dir)" "$(tr '@/' '__' <<<"$1")"; }
 
 # ------------------------------------------------- 1. create the package (staged)
 stage_log=$(mktemp)
 scratch=$(mktemp -d)
-if ! step 1 "Create the package on npm with a staged, throwaway $BOOT_VERSION"; then
+if ! step 1 "Create each package on npm with a staged, throwaway $BOOT_VERSION"; then
   :
-elif [ "$package_exists" = 1 ]; then
-  note "already exists; skipping"
 else
-  NAME="$name" VERSION="$BOOT_VERSION" REPO_URL="$repo_url" node -e '
-    const fs = require("fs");
-    fs.writeFileSync(process.argv[1] + "/package.json", JSON.stringify({
-      name: process.env.NAME, version: process.env.VERSION,
-      description: "Bootstrap placeholder for trusted publishing. Never approved; not a release.",
-      license: "MIT", repository: { type: "git", url: process.env.REPO_URL },
-    }, null, 2));
-    fs.writeFileSync(process.argv[1] + "/README.md", "Bootstrap placeholder for trusted publishing. Not a release.\n");
-  ' "$scratch"
-  if [ "$DRY_RUN" = 1 ]; then
-    if (cd "$scratch" && npm stage publish --tag bootstrap --access public --dry-run >/dev/null 2>&1); then
-      note "npm stage publish --dry-run: ok"
-    else
-      die "npm stage publish --dry-run failed"
-    fi
+for pkg in "${packages[@]}"; do
+if exists "$pkg"; then
+  note "$pkg already exists; skipping"
+  continue
+fi
+pkg_dir="$scratch/$(tr '@/' '__' <<<"$pkg")"
+mkdir -p "$pkg_dir"
+NAME="$pkg" VERSION="$BOOT_VERSION" REPO_URL="$repo_url" node -e '
+  const fs = require("fs");
+  fs.writeFileSync(process.argv[1] + "/package.json", JSON.stringify({
+    name: process.env.NAME, version: process.env.VERSION,
+    description: "Bootstrap placeholder for trusted publishing. Never approved; not a release.",
+    license: "MIT", repository: { type: "git", url: process.env.REPO_URL },
+  }, null, 2));
+  fs.writeFileSync(process.argv[1] + "/README.md", "Bootstrap placeholder for trusted publishing. Not a release.\n");
+' "$pkg_dir"
+if [ "$DRY_RUN" = 1 ]; then
+  if (cd "$pkg_dir" && npm stage publish --tag bootstrap --access public --dry-run >/dev/null 2>&1); then
+    note "$pkg: npm stage publish --dry-run: ok"
   else
-    (cd "$scratch" && npm stage publish --tag bootstrap --access public 2>&1) | tee "$stage_log"
-    # Kept for step 3, so a resumed run still knows what to reject.
-    grep -oE 'staged with id [0-9a-f-]+' "$stage_log" | awk '{print $4}' | head -1 > "$stage_id_file" || true
-    note "waiting for $name to appear on the registry"
-    wait_for "$name" 30 || die "$name did not appear on the registry; check npm stage list $name"
+    die "$pkg: npm stage publish --dry-run failed"
   fi
+else
+  (cd "$pkg_dir" && npm stage publish --tag bootstrap --access public 2>&1) | tee "$stage_log"
+  grep -oE 'staged with id [0-9a-f-]+' "$stage_log" | awk '{print $4}' | head -1 > "$(stage_id_file "$pkg")" || true
+  note "waiting for $pkg to appear on the registry"
+  wait_for "$pkg" 30 || die "$pkg did not appear on the registry; check npm stage list $pkg"
+fi
+done
 fi
 
 # --------------------------------------------------------- 2. trusted publisher
-trust_args=(github "$name" --file "$WORKFLOW" --repo "$repo" --allow-publish --yes)
-[ -n "$environment" ] && trust_args+=(--env "$environment")
-if ! step 2 "Link the trusted publisher (npm asks for 2FA)"; then
+if ! step 2 "Link the trusted publisher of each package (npm asks for 2FA each time)"; then
   :
-elif [ "$DRY_RUN" = 1 ]; then
-  note "[dry-run] npm trust ${trust_args[*]}"
 else
+for pkg in "${packages[@]}"; do
+  trust_args=(github "$pkg" --file "$WORKFLOW" --repo "$repo" --allow-publish --yes)
+  [ -n "$environment" ] && trust_args+=(--env "$environment")
+  if [ "$DRY_RUN" = 1 ]; then
+    note "[dry-run] npm trust ${trust_args[*]}"
   # Listing links needs 2FA too, so try to create it and let a rerun confirm an existing link.
-  if ! npm trust "${trust_args[@]}"; then
-    die "npm trust failed. If the link was in fact created, resume with --from 3 to avoid a duplicate"
+  elif ! npm trust "${trust_args[@]}"; then
+    die "npm trust failed for $pkg. If its link was in fact created, rerun step 2 with --only for the packages after it, then --from 3"
   fi
+done
 fi
 
 # ---------------------------------------------------- 3. first release from CI
@@ -213,12 +247,14 @@ fi
 # whole package and its trust link, and npm then blocks the name for 24 hours.
 if [ "$CLEANUP" = 0 ]; then
   say "4-5/5 Cleanup skipped; run npm run bootstrap:npm -- --cleanup any time (two 2FA approvals)"
-elif step 4 "Reject the staged $BOOT_VERSION (npm asks for 2FA)"; then
-if [ "$DRY_RUN" = 0 ] && ! published "$name@$version"; then
-  die "$name@$version is not on npm yet; rejecting the throwaway now would delete the package"
+elif step 4 "Reject each staged $BOOT_VERSION (npm asks for 2FA)"; then
+for pkg in "${packages[@]}"; do
+if [ "$DRY_RUN" = 0 ] && ! published "$pkg@$version"; then
+  die "$pkg@$version is not on npm yet; rejecting the throwaway now would delete the package"
 fi
-stage_id=$(cat "$stage_id_file" 2>/dev/null || true)
-[ -n "$stage_id" ] || stage_id=$(NAME="$name" BOOT="$BOOT_VERSION" node -e '
+id_file=$(stage_id_file "$pkg")
+stage_id=$(cat "$id_file" 2>/dev/null || true)
+[ -n "$stage_id" ] || stage_id=$(NAME="$pkg" BOOT="$BOOT_VERSION" node -e '
   let input = ""; process.stdin.on("data", d => input += d).on("end", () => {
     try {
       const list = JSON.parse(input);
@@ -226,16 +262,16 @@ stage_id=$(cat "$stage_id_file" 2>/dev/null || true)
       const hit = items.find(item => item && item.version === process.env.BOOT);
       if (hit) console.log(hit.id ?? hit.stage_id ?? hit.stageId ?? "");
     } catch {}
-  });' < <(timeout 60 npm stage list "$name" --json </dev/null 2>/dev/null || echo '[]'))
-[ -n "$stage_id" ] || stage_id=$(grep -oE 'staged with id [0-9a-f-]+' "$stage_log" | awk '{print $4}' | head -1 || true)
+  });' < <(timeout 60 npm stage list "$pkg" --json </dev/null 2>/dev/null || echo '[]'))
 if [ -n "$stage_id" ]; then
   act npm stage reject "$stage_id"
-  [ "$DRY_RUN" = 1 ] || rm -f "$stage_id_file"
-elif [ "$DRY_RUN" = 1 ] && [ "$package_exists" = 0 ]; then
-  note "[dry-run] npm stage reject <id of the $BOOT_VERSION staged in step 1>"
+  [ "$DRY_RUN" = 1 ] || rm -f "$id_file"
+elif [ "$DRY_RUN" = 1 ] && ! exists "$pkg"; then
+  note "[dry-run] npm stage reject <id of $pkg's $BOOT_VERSION staged in step 1>"
 else
-  note "no staged $BOOT_VERSION found; skipping"
+  note "$pkg: no staged $BOOT_VERSION found; skipping"
 fi
+done
 fi
 
 # ------------------------------------------------------- 5. remove the placeholder
@@ -243,10 +279,14 @@ if [ "$CLEANUP" = 0 ]; then
   :
 elif ! step 5 "Remove the $PLACEHOLDER placeholder (npm asks for 2FA)"; then
   :
-elif [ "$DRY_RUN" = 1 ] || published "$name@$PLACEHOLDER"; then
-  act npm unpublish "$name@$PLACEHOLDER"
 else
-  note "no placeholder; skipping"
+  for pkg in "${packages[@]}"; do
+    if [ "$DRY_RUN" = 1 ] || published "$pkg@$PLACEHOLDER"; then
+      act npm unpublish "$pkg@$PLACEHOLDER"
+    else
+      note "$pkg: no placeholder; skipping"
+    fi
+  done
 fi
 
 # ------------------------------------------------------------------ result
@@ -257,8 +297,9 @@ if [ "$DRY_RUN" = 1 ]; then
 fi
 say "Done"
 # `npm view --json` omits the publisher and attestations, so read the registry document itself.
+for pkg in "${packages[@]}"; do
 # shellcheck disable=SC2016 # ${...} below is a JavaScript template literal
-curl -fsS "https://registry.npmjs.org/${name/\//%2F}" | VERSION="$version" node -e '
+curl -fsS "https://registry.npmjs.org/${pkg/\//%2F}" | VERSION="$version" node -e '
   let s = ""; process.stdin.on("data", d => s += d).on("end", () => {
     const pkg = JSON.parse(s), v = pkg.versions?.[process.env.VERSION] ?? {};
     const trusted = v._npmUser?.trustedPublisher;
@@ -266,4 +307,5 @@ curl -fsS "https://registry.npmjs.org/${name/\//%2F}" | VERSION="$version" node 
     console.log(`    publisher:  ${trusted ? `trusted publisher (${trusted.id})` : `NOT a trusted publisher: ${JSON.stringify(v._npmUser)}`}`);
     console.log(`    provenance: ${v.dist?.attestations?.provenance?.predicateType ?? "missing"}`);
   });'
+done
 note "From now on a release is: npm version patch && git push --follow-tags"

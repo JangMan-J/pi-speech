@@ -6,7 +6,7 @@ import type { BridgeMode } from "../../src/engine/settings";
 
 const output = (name: string): AudioOutput => ({
   name,
-  play: async () => ({ ok: false, reason: "unused" }),
+  playStream: async () => ({ ok: false, reason: "unused" }),
   stop: async () => {},
 });
 const input = (name: string): AudioInput => ({

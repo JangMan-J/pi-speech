@@ -1,8 +1,11 @@
 /**
- * The "local" microphone: records this machine's microphone with a command-line recorder.
- * `PI_SPEECH_RECORDER`, when set, names an executable run as `<recorder> <output.wav>` that writes a WAV
- * and finishes it on SIGINT; otherwise the first available of pw-record, parecord, arecord, recording
- * mono 16 kHz 16-bit WAV. The recording lives in a private temporary directory that is removed as soon
+ * The "local" microphone: records this machine's microphone. The recorder is, in order:
+ *   1. `PI_SPEECH_RECORDER`, when set: an executable run as `<recorder> <output.wav>` that writes a WAV and
+ *      finishes it on SIGINT.
+ *   2. The bundled binary (binary.ts), run as `pi-speech-receiver record <output.wav>`: it finishes the file on
+ *      SIGINT or when its stdin ends, which is kept open while it records.
+ *   3. Without the bundled binary: the first available of pw-record, parecord, arecord, recording mono 16 kHz
+ *      16-bit WAV. The recording lives in a private temporary directory that is removed as soon
  * as the audio is read or discarded.
  */
 
@@ -11,6 +14,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AudioInput, Recording } from "./audio";
+import { type BinaryChoice, findBinary } from "./binary";
 import { childEnv, type Env, findExecutable, overSsh } from "./env";
 import { wavSeconds } from "./wav";
 
@@ -28,22 +32,37 @@ const RECORDERS: ReadonlyArray<readonly [string, (file: string) => string[]]> = 
 ];
 
 type RecorderChoice =
-  | { ok: true; name: string; bin: string; args: (file: string) => string[] }
+  | {
+      ok: true;
+      name: string;
+      bin: string;
+      args: (file: string) => string[];
+      /** The recorder also stops when its stdin ends: keep a pipe open while it records. */
+      stdinStops?: boolean;
+    }
   | { ok: false; reason: string };
 
-export function chooseRecorder(env: Env): RecorderChoice {
+export function chooseRecorder(env: Env, binary: () => BinaryChoice = () => findBinary(env)): RecorderChoice {
   const custom = env.PI_SPEECH_RECORDER;
   if (custom) {
     const bin = findExecutable(custom, env);
     if (!bin) return { ok: false, reason: `PI_SPEECH_RECORDER (${custom}) is not an executable` };
     return { ok: true, name: custom, bin, args: (f) => [f] };
   }
+  const bundled = binary();
+  if (bundled.ok) {
+    return { ok: true, name: "pi-speech-receiver", bin: bundled.path, args: (f) => ["record", f], stdinStops: true };
+  }
+  if (bundled.chosen) return { ok: false, reason: bundled.reason };
   for (const [name, args] of RECORDERS) {
     const bin = findExecutable(name, env);
     if (bin) return { ok: true, name, bin, args };
   }
   const names = RECORDERS.map(([n]) => n).join(", ");
-  return { ok: false, reason: `no audio recorder found (set PI_SPEECH_RECORDER or install one of ${names})` };
+  return {
+    ok: false,
+    reason: `no audio recorder found: ${bundled.reason} (or set PI_SPEECH_RECORDER, or install one of ${names})`,
+  };
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -101,6 +120,7 @@ class LocalRecording implements Recording {
 
   private async halt(): Promise<void> {
     if (this.running) {
+      this.child.stdin?.end();
       this.child.kill("SIGINT");
       await Promise.race([this.closed, sleep(STOP_GRACE_MS)]);
       if (this.running) {
@@ -150,10 +170,18 @@ class LocalRecording implements Recording {
   }
 }
 
+export interface LocalInputOptions {
+  /** Where the bundled binary is; replaceable for tests. */
+  binary?: () => BinaryChoice;
+}
+
 export class LocalInput implements AudioInput {
   readonly name = "local";
 
-  constructor(private readonly env: Env) {}
+  constructor(
+    private readonly env: Env,
+    private readonly opts: LocalInputOptions = {},
+  ) {}
 
   async start(): Promise<Recording> {
     if (overSsh(this.env) && this.env.PI_SPEECH_LOCAL_MIC !== "1") {
@@ -163,7 +191,7 @@ export class LocalInput implements AudioInput {
           "or set PI_SPEECH_LOCAL_MIC=1 if this host's microphone is yours.",
       );
     }
-    const choice = chooseRecorder(this.env);
+    const choice = chooseRecorder(this.env, this.opts.binary);
     if (!choice.ok) throw new Error(choice.reason);
     const dir = mkdtempSync(join(tmpdir(), "pi-speech-rec-"));
     const file = join(dir, "dictation.wav");
@@ -174,11 +202,15 @@ export class LocalInput implements AudioInput {
 
     let child: ChildProcess;
     try {
-      child = spawn(choice.bin, choice.args(file), { stdio: ["ignore", "ignore", "pipe"], env: childEnv(this.env) });
+      child = spawn(choice.bin, choice.args(file), {
+        stdio: [choice.stdinStops ? "pipe" : "ignore", "ignore", "pipe"],
+        env: childEnv(this.env),
+      });
     } catch (err) {
       return fail(`cannot start ${choice.name}: ${err instanceof Error ? err.message : String(err)}`);
     }
     track(child, dir);
+    child.stdin?.on("error", () => {}); // a recorder that exits closes the pipe: its exit reports the outcome
     let stderr = "";
     child.stderr?.on("data", (d: Buffer) => {
       stderr = (stderr + d.toString("utf8")).slice(-2000);

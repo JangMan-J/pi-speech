@@ -1,0 +1,1028 @@
+//! Downloading a model into the cache: resumable, checked, and unpacked atomically.
+//!
+//! 1. The archive is fetched into `<dir>.part`; when the file is already partly there, the
+//!    request asks for the rest (HTTP `Range`) and appends to it. A server that answers with the
+//!    whole file instead restarts it.
+//! 2. Its SHA-256 (computed as it arrives, over any earlier part as well) must be the
+//!    catalogue's; else the part is deleted.
+//! 3. It is unpacked into `.unpack-<dir>-<random>` and the model directory is renamed into
+//!    place, so a model directory in the cache is always complete. The part is deleted last.
+//!
+//! A stop (the `stop` flag) leaves the `.part` as it is, to be resumed by the next download.
+//!
+//! Two downloads of the same model may run at once (in other processes: two Pi sessions sharing
+//! one receiver), so from before step 1 until the model is in place or the download ends, a
+//! download holds `<dir>.lock` locked (the system's file lock, released when the process ends
+//! however it ends); another waits for it, then finds the model in place or resumes the part
+//! the first one left. A download removes the lock file as it ends (see [`Lock`]), so that it
+//! stays in the cache only after a hard kill, until the next download of the model.
+//!
+//! A shared lexicon (see [`lexicon`]) is fetched the same way into `<name>.part` in the cache
+//! root, checked, and renamed to `<name>`. Downloads of different voices may need the same
+//! lexicon at the same time, so a fetch holds `<name>.lock` locked in the same way.
+
+use super::cache;
+use super::catalog::{Entry, Lexicon};
+use sha2::{Digest, Sha256};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+/// What a download reports as it goes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// `done` of `total` archive bytes are in the cache.
+    Progress {
+        done: u64,
+        total: u64,
+    },
+    /// `done` of `total` bytes of the lexicon `name` are in the cache.
+    LexiconProgress {
+        name: String,
+        done: u64,
+        total: u64,
+    },
+    Verifying,
+    Unpacking,
+    /// The model is at `path`.
+    Done {
+        path: PathBuf,
+    },
+}
+
+/// Why a download ended without the model.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Failure {
+    /// Stopped on request; `.part` keeps `done` bytes for the next download.
+    Stopped {
+        done: u64,
+    },
+    Failed(String),
+}
+
+impl From<String> for Failure {
+    fn from(s: String) -> Self {
+        Failure::Failed(s)
+    }
+}
+
+/// How often progress is reported, at most (the last byte is always reported).
+const PROGRESS_EVERY: Duration = Duration::from_millis(200);
+const CHUNK: usize = 64 * 1024;
+
+/// Download `entry` into the cache at `root`. Plain `http://` only when `allow_http`.
+pub fn download(
+    entry: &Entry,
+    root: &Path,
+    allow_http: bool,
+    stop: &AtomicBool,
+    emit: &mut dyn FnMut(Event),
+) -> Result<PathBuf, Failure> {
+    let target = cache::model_path(root, entry);
+    if target.is_dir() {
+        emit(Event::Progress {
+            done: entry.size,
+            total: entry.size,
+        });
+        emit(Event::Done {
+            path: target.clone(),
+        });
+        return Ok(target);
+    }
+    if !allow_http && !entry.url.starts_with("https://") {
+        return Err(Failure::Failed(format!(
+            "refusing to download {} over plain HTTP: {}",
+            entry.id, entry.url
+        )));
+    }
+    fs::create_dir_all(root)
+        .map_err(|e| format!("cannot create the model cache {}: {e}", root.display()))?;
+    let part = cache::part_path(root, entry);
+    // Held until the model is in place, or the download has ended and left its part.
+    let (_lock, _) = lock(
+        &cache::model_lock_path(root, entry),
+        &part,
+        entry.size,
+        stop,
+        &mut |done| {
+            emit(Event::Progress {
+                done,
+                total: entry.size,
+            })
+        },
+    )?;
+    if target.is_dir() {
+        // Another download put it in place while this one waited.
+        emit(Event::Progress {
+            done: entry.size,
+            total: entry.size,
+        });
+        emit(Event::Done {
+            path: target.clone(),
+        });
+        return Ok(target);
+    }
+    // No other download is unpacking: these are a hard kill's.
+    for leftover in cache::unpack_leftovers(root, entry) {
+        let _ = cache::remove(&leftover);
+    }
+    let source = Source::archive(entry);
+    fetch(&source, &part, allow_http, stop, &mut |done, total| {
+        emit(Event::Progress { done, total })
+    })?;
+
+    emit(Event::Verifying);
+    // `fetch` checked the size and the checksum as the bytes arrived.
+
+    emit(Event::Unpacking);
+    let path = match unpack(entry, root, &part, stop) {
+        Ok(p) => p,
+        Err(Failure::Failed(e)) => {
+            // A checked archive that does not unpack would fail the same way again.
+            let _ = fs::remove_file(&part);
+            return Err(Failure::Failed(format!("{e}; the download was deleted")));
+        }
+        Err(stopped) => return Err(stopped),
+    };
+    let _ = fs::remove_file(&part);
+    emit(Event::Done { path: path.clone() });
+    Ok(path)
+}
+
+/// Download the shared `lexicon` into the cache at `root` unless it is there; returns its path.
+/// Reports `Event::LexiconProgress` only while it fetches, or waits for another download's fetch
+/// of it (see [`lock`]). Plain `http://` only when `allow_http`.
+pub fn lexicon(
+    lexicon: &Lexicon,
+    root: &Path,
+    allow_http: bool,
+    stop: &AtomicBool,
+    emit: &mut dyn FnMut(Event),
+) -> Result<PathBuf, Failure> {
+    let target = cache::lexicon_path(root, lexicon);
+    if target.is_file() {
+        return Ok(target);
+    }
+    if !allow_http && !lexicon.url.starts_with("https://") {
+        return Err(Failure::Failed(format!(
+            "refusing to download the lexicon {} over plain HTTP: {}",
+            lexicon.name, lexicon.url
+        )));
+    }
+    fs::create_dir_all(root)
+        .map_err(|e| format!("cannot create the model cache {}: {e}", root.display()))?;
+    let part = cache::lexicon_part_path(root, lexicon);
+    let name = lexicon.name.clone();
+    let total = lexicon.size;
+    let mut progress = |done: u64| {
+        emit(Event::LexiconProgress {
+            name: name.clone(),
+            done,
+            total,
+        })
+    };
+    // Held until the lexicon is in place, or the fetch has ended and left its part.
+    let (_lock, waited) = lock(
+        &cache::lexicon_lock_path(root, lexicon),
+        &part,
+        total,
+        stop,
+        &mut progress,
+    )?;
+    if target.is_file() {
+        // Another download fetched it while this one waited.
+        if waited {
+            progress(total);
+        }
+        return Ok(target);
+    }
+    let source = Source {
+        what: format!("the lexicon {}", lexicon.name),
+        file: format!("the lexicon {}", lexicon.name),
+        url: &lexicon.url,
+        size: lexicon.size,
+        sha256: &lexicon.sha256,
+    };
+    fetch(&source, &part, allow_http, stop, &mut |done, _| {
+        progress(done)
+    })?;
+    match fs::rename(&part, &target) {
+        Ok(()) => Ok(target),
+        // Another download got there first.
+        Err(_) if target.is_file() => Ok(target),
+        Err(e) => Err(Failure::Failed(format!(
+            "cannot move the lexicon {} into place at {}: {e}",
+            lexicon.name,
+            target.display()
+        ))),
+    }
+}
+
+/// How often a download waiting for another's fetch of the same file looks again.
+const LOCK_POLL: Duration = Duration::from_millis(50);
+
+/// A lock file locked by this download. Dropping it removes the file while it is still locked
+/// (so that the cache holds no lock file once no download runs), then unlocks it.
+struct Lock {
+    file: Option<File>,
+    path: PathBuf,
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        // A waiter that then gets the lock on the removed file sees that the path no longer
+        // names it (`names`), and opens the path again.
+        #[cfg(unix)]
+        let _ = fs::remove_file(&self.path);
+        drop(self.file.take());
+        // Nobody can remove a file someone has open here (see `open_lock`), so it is removed
+        // once closed, and only if no other download has it open, waiting for it.
+        #[cfg(not(unix))]
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Open (creating) the lock file at `path`. On Windows, others may not delete it while it is
+/// open.
+fn open_lock(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+        const FILE_SHARE_WRITE: u32 = 2;
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    }
+    options.open(path)
+}
+
+/// Whether `path` still names `file` (it was not removed, nor replaced by a new file).
+fn names(path: &Path, file: &File) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (fs::metadata(path), file.metadata()) {
+            (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // It cannot be removed while open (see `open_lock`).
+        let _ = (path, file);
+        true
+    }
+}
+
+/// Lock the lock file at `path` (a model's or a lexicon's), waiting while another download holds
+/// it. While it waits it reports the other's progress: the bytes in `part`, of `total`. A stop
+/// while waiting leaves everything as it is. Returns the lock, and whether it waited.
+fn lock(
+    path: &Path,
+    part: &Path,
+    total: u64,
+    stop: &AtomicBool,
+    progress: &mut dyn FnMut(u64),
+) -> Result<(Lock, bool), Failure> {
+    let mut waited = false;
+    let mut last: Option<Instant> = None;
+    let mut file: Option<File> = None;
+    loop {
+        if file.is_none() {
+            match open_lock(path) {
+                Ok(f) => file = Some(f),
+                // Being removed by the download that held it (Windows): open it again.
+                Err(e) if cfg!(windows) && e.kind() == io::ErrorKind::PermissionDenied => {}
+                Err(e) => {
+                    return Err(Failure::Failed(format!(
+                        "cannot open {}: {e}",
+                        path.display()
+                    )))
+                }
+            }
+        }
+        if let Some(f) = &file {
+            match f.try_lock() {
+                Ok(()) if names(path, f) => {
+                    let lock = Lock {
+                        file,
+                        path: path.to_path_buf(),
+                    };
+                    return Ok((lock, waited));
+                }
+                // The download that held it removed it: lock the path's file instead.
+                Ok(()) => {
+                    file = None;
+                    continue;
+                }
+                Err(fs::TryLockError::WouldBlock) => {}
+                Err(fs::TryLockError::Error(e)) => {
+                    return Err(Failure::Failed(format!(
+                        "cannot lock {}: {e}",
+                        path.display()
+                    )))
+                }
+            }
+        }
+        let done = fs::metadata(part).map_or(0, |m| m.len().min(total));
+        if stop.load(Ordering::SeqCst) {
+            return Err(Failure::Stopped { done });
+        }
+        if last.is_none_or(|t| t.elapsed() >= PROGRESS_EVERY) {
+            progress(done);
+            last = Some(Instant::now());
+        }
+        waited = true;
+        std::thread::sleep(LOCK_POLL);
+    }
+}
+
+/// A file to fetch: an archive or a lexicon.
+struct Source<'a> {
+    /// How messages name what is downloaded: a model's id, or `the lexicon <name>`.
+    what: String,
+    /// How messages name the file: `the archive of <id>`, or `the lexicon <name>`.
+    file: String,
+    url: &'a str,
+    size: u64,
+    sha256: &'a str,
+}
+
+impl<'a> Source<'a> {
+    fn archive(entry: &'a Entry) -> Source<'a> {
+        Source {
+            what: entry.id.clone(),
+            file: format!("the archive of {}", entry.id),
+            url: &entry.url,
+            size: entry.size,
+            sha256: &entry.sha256,
+        }
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The part file, opened for appending, with the hash of what it already holds.
+fn open_part(part: &Path, size: u64, stop: &AtomicBool) -> Result<(File, u64, Sha256), Failure> {
+    let shown = part.display();
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(part)
+        .map_err(|e| format!("cannot open {shown}: {e}"))?;
+    let mut len = file
+        .metadata()
+        .map_err(|e| format!("cannot read {shown}: {e}"))?
+        .len();
+    let mut hasher = Sha256::new();
+    if len > size {
+        file.set_len(0)
+            .map_err(|e| format!("cannot truncate {shown}: {e}"))?;
+        len = 0;
+    }
+    if len > 0 {
+        let mut buf = vec![0u8; CHUNK];
+        let mut read = 0;
+        while read < len {
+            if stop.load(Ordering::SeqCst) {
+                return Err(Failure::Stopped { done: len });
+            }
+            let n = file
+                .read(&mut buf)
+                .map_err(|e| format!("cannot read {shown}: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            read += n as u64;
+        }
+        len = read;
+    }
+    file.seek(SeekFrom::Start(len))
+        .map_err(|e| format!("cannot read {shown}: {e}"))?;
+    Ok((file, len, hasher))
+}
+
+/// The response to a request for the archive from byte `from`: its body, and the byte it
+/// starts at (`from`, or 0 when the server sends the whole file).
+fn request(
+    entry: &Source,
+    from: u64,
+    allow_http: bool,
+) -> Result<(Box<dyn Read + Send>, u64), Failure> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(30))
+        .timeout_read(Duration::from_secs(60))
+        .https_only(!allow_http)
+        .user_agent(concat!("pi-speech-receiver/", env!("CARGO_PKG_VERSION")))
+        .build();
+    let mut req = agent.get(entry.url);
+    if from > 0 {
+        req = req.set("Range", &format!("bytes={from}-"));
+    }
+    let resp = match req.call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, _)) => {
+            return Err(Failure::Failed(format!(
+                "cannot download {}: the server answered {code} for {}",
+                entry.what, entry.url
+            )))
+        }
+        Err(e) => {
+            return Err(Failure::Failed(format!(
+                "cannot download {}: {e}",
+                entry.what
+            )))
+        }
+    };
+    let start = match resp.status() {
+        206 => content_range_start(resp.header("Content-Range")).ok_or_else(|| {
+            format!(
+                "cannot download {}: the server sent part of the file without saying which",
+                entry.what
+            )
+        })?,
+        _ => 0,
+    };
+    Ok((Box::new(resp.into_reader()), start))
+}
+
+/// The first byte of a `Content-Range: bytes <first>-<last>/<total>` header.
+fn content_range_start(header: Option<&str>) -> Option<u64> {
+    let range = header?.trim().strip_prefix("bytes ")?;
+    range.split('-').next()?.trim().parse().ok()
+}
+
+fn fetch(
+    entry: &Source,
+    part: &Path,
+    allow_http: bool,
+    stop: &AtomicBool,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<(), Failure> {
+    let total = entry.size;
+    let shown = part.display();
+    let (mut file, mut done, mut hasher) = open_part(part, total, stop)?;
+    progress(done, total);
+    if done < total {
+        let (mut body, start) = request(entry, done, allow_http)?;
+        if start != done {
+            // The server sent the file from its start (or from elsewhere): begin again.
+            if start != 0 {
+                return Err(Failure::Failed(format!(
+                    "cannot download {}: the server sent bytes from {start}, not {done}",
+                    entry.what
+                )));
+            }
+            file.set_len(0)
+                .and_then(|()| file.seek(SeekFrom::Start(0)).map(drop))
+                .map_err(|e| format!("cannot truncate {shown}: {e}"))?;
+            done = 0;
+            hasher = Sha256::new();
+            progress(done, total);
+        }
+        let mut buf = vec![0u8; CHUNK];
+        let mut last = Instant::now();
+        loop {
+            if stop.load(Ordering::SeqCst) {
+                let _ = file.flush();
+                return Err(Failure::Stopped { done });
+            }
+            let n = match body.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    let _ = file.flush();
+                    return Err(Failure::Failed(format!(
+                        "the download of {} broke off at {done} of {total} bytes ({e}); \
+                         run it again to resume",
+                        entry.what
+                    )));
+                }
+            };
+            if done + n as u64 > total {
+                drop(file);
+                let _ = fs::remove_file(part);
+                return Err(Failure::Failed(format!(
+                    "{} is larger than the catalogue's {total} bytes; the download was deleted",
+                    entry.file
+                )));
+            }
+            file.write_all(&buf[..n])
+                .map_err(|e| format!("cannot write {shown}: {e}"))?;
+            hasher.update(&buf[..n]);
+            done += n as u64;
+            if done == total || last.elapsed() >= PROGRESS_EVERY {
+                progress(done, total);
+                last = Instant::now();
+            }
+        }
+        file.flush()
+            .map_err(|e| format!("cannot write {shown}: {e}"))?;
+        if done < total {
+            return Err(Failure::Failed(format!(
+                "the download of {} broke off at {done} of {total} bytes; run it again to resume",
+                entry.what
+            )));
+        }
+    }
+    drop(file);
+    let got = hex(&hasher.finalize());
+    if got != entry.sha256 {
+        let _ = fs::remove_file(part);
+        return Err(Failure::Failed(format!(
+            "{} does not match the catalogue's checksum (SHA-256 {got}, expected {}); \
+             the download was deleted",
+            entry.file, entry.sha256
+        )));
+    }
+    Ok(())
+}
+
+/// Unpack the checked archive at `part` and rename the model into place.
+fn unpack(entry: &Entry, root: &Path, part: &Path, stop: &AtomicBool) -> Result<PathBuf, Failure> {
+    let suffix = crate::token::random_hex(6)
+        .map_err(|e| format!("cannot name a temporary directory: {e}"))?;
+    let tmp = root.join(format!("{}{suffix}", cache::unpack_prefix(entry)));
+    let result = unpack_into(entry, part, &tmp, stop).and_then(|()| {
+        let target = cache::model_path(root, entry);
+        let from = model_root(&tmp, &entry.dir);
+        match fs::rename(&from, &target) {
+            Ok(()) => Ok(target),
+            // Another download got there first.
+            Err(_) if target.is_dir() => Ok(target),
+            Err(e) => Err(Failure::Failed(format!(
+                "cannot move {} into place at {}: {e}",
+                entry.id,
+                target.display()
+            ))),
+        }
+    });
+    let _ = cache::remove(&tmp);
+    result
+}
+
+fn unpack_into(entry: &Entry, part: &Path, tmp: &Path, stop: &AtomicBool) -> Result<(), Failure> {
+    let failed = |e: io::Error| {
+        Failure::Failed(format!(
+            "cannot unpack {} into {}: {e}",
+            entry.id,
+            tmp.display()
+        ))
+    };
+    fs::create_dir(tmp).map_err(failed)?;
+    let file = File::open(part).map_err(failed)?;
+    let bz = bzip2::read::MultiBzDecoder::new(BufReader::new(file));
+    let mut archive = tar::Archive::new(bz);
+    for item in archive.entries().map_err(failed)? {
+        if stop.load(Ordering::SeqCst) {
+            return Err(Failure::Stopped { done: entry.size });
+        }
+        let mut item = item.map_err(failed)?;
+        item.unpack_in(tmp).map_err(failed)?;
+    }
+    Ok(())
+}
+
+/// The model's directory in an unpacked archive: the directory named as in the catalogue,
+/// else its only top-level directory, else the whole of it.
+fn model_root(tmp: &Path, dir: &str) -> PathBuf {
+    let named = tmp.join(dir);
+    if named.is_dir() {
+        return named;
+    }
+    let tops: Vec<_> = fs::read_dir(tmp)
+        .map(|r| r.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    match tops.as_slice() {
+        [only] if only.is_dir() => only.clone(),
+        _ => tmp.to_path_buf(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_range_gives_the_first_byte() {
+        assert_eq!(content_range_start(Some("bytes 100-199/200")), Some(100));
+        assert_eq!(content_range_start(Some("bytes 0-0/1")), Some(0));
+        assert_eq!(content_range_start(Some("bytes */200")), None);
+        assert_eq!(content_range_start(None), None);
+    }
+
+    /// Serve `body` over HTTP on 127.0.0.1 to each of `requests` requests (the whole of it,
+    /// whatever the range asked).
+    fn serve(body: &'static [u8], requests: usize) -> String {
+        use std::io::{BufRead, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(requests) {
+                let mut stream = stream.unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+                    line.clear();
+                }
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+        format!("http://{addr}/lexicon-xx.txt")
+    }
+
+    /// Serve `body` over HTTP on 127.0.0.1 to one request for each of `pauses` (the whole of it,
+    /// whatever the range asked), slowly: 16 KiB at a time, that request's pause apart.
+    fn serve_slowly(body: Vec<u8>, pauses: &[Duration]) -> String {
+        use std::io::{BufRead, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let pauses = pauses.to_vec();
+        std::thread::spawn(move || {
+            for (stream, pause) in listener.incoming().zip(pauses) {
+                let mut stream = stream.unwrap();
+                let body = body.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+                        line.clear();
+                    }
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    for piece in body.chunks(16 * 1024) {
+                        if stream.write_all(piece).is_err() {
+                            return;
+                        }
+                        std::thread::sleep(pause);
+                    }
+                });
+            }
+        });
+        format!("http://{addr}/lexicon-xx.txt")
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "pisr-{name}-{}",
+            crate::token::random_hex(6).unwrap()
+        ))
+    }
+
+    #[test]
+    fn a_lexicon_is_fetched_checked_and_put_in_the_cache_root() {
+        const BODY: &[u8] = b"hello HH AH0 L OW1\n";
+        let root = scratch("lexicon");
+        let lexicon = Lexicon {
+            name: "lexicon-xx.txt".into(),
+            url: serve(BODY, 1),
+            size: BODY.len() as u64,
+            sha256: hex(&Sha256::digest(BODY)),
+        };
+        let stop = AtomicBool::new(false);
+        let mut events = Vec::new();
+        let path = super::lexicon(&lexicon, &root, true, &stop, &mut |e| events.push(e)).unwrap();
+        assert_eq!(path, root.join("lexicon-xx.txt"));
+        assert_eq!(fs::read(&path).unwrap(), BODY);
+        assert!(!cache::lexicon_part_path(&root, &lexicon).exists());
+        let total = BODY.len() as u64;
+        assert_eq!(
+            events.first(),
+            Some(&Event::LexiconProgress {
+                name: "lexicon-xx.txt".into(),
+                done: 0,
+                total
+            })
+        );
+        assert_eq!(
+            events.last(),
+            Some(&Event::LexiconProgress {
+                name: "lexicon-xx.txt".into(),
+                done: total,
+                total
+            })
+        );
+        // There already: nothing is fetched (the server is gone) and nothing reported.
+        events.clear();
+        let again = super::lexicon(&lexicon, &root, true, &stop, &mut |e| events.push(e));
+        assert_eq!(again, Ok(path));
+        assert!(events.is_empty());
+        // Plain HTTP only from a test catalogue.
+        let other = Lexicon {
+            name: "lexicon-yy.txt".into(),
+            ..lexicon.clone()
+        };
+        match super::lexicon(&other, &root, false, &stop, &mut |_| {}) {
+            Err(Failure::Failed(e)) => assert!(e.contains("plain HTTP"), "{e}"),
+            r => panic!("{r:?}"),
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn two_downloads_of_the_same_lexicon_at_once_both_get_the_whole_checked_file() {
+        let body: Vec<u8> = (0..256 * 1024u32).map(|i| (i * 31 % 251) as u8).collect();
+        let total = body.len() as u64;
+        let root = scratch("lexicon-twice");
+        let lexicon = Lexicon {
+            name: "lexicon-xx.txt".into(),
+            // A second request (there is none with the lock) would be the slower.
+            url: serve_slowly(
+                body.clone(),
+                &[Duration::from_millis(10), Duration::from_millis(100)],
+            ),
+            size: total,
+            sha256: hex(&Sha256::digest(&body)),
+        };
+        // Each returns what was at the path the moment it got it.
+        let run = || {
+            let (lexicon, root) = (lexicon.clone(), root.clone());
+            std::thread::spawn(move || {
+                let stop = AtomicBool::new(false);
+                let mut events = Vec::new();
+                let r = super::lexicon(&lexicon, &root, true, &stop, &mut |e| events.push(e));
+                let got = r.as_ref().ok().map(|p| fs::read(p).unwrap());
+                (r, got, events)
+            })
+        };
+        let first = run();
+        // The second starts while the first is midway. Without the lock it would begin the
+        // shared part again (the server sends the whole file whatever the range asked), and
+        // the first would put it in place before the second had rewritten its start.
+        let part = cache::lexicon_part_path(&root, &lexicon);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while fs::metadata(&part).map_or(0, |m| m.len()) < 128 * 1024 {
+            assert!(Instant::now() < deadline, "the first fetch did not start");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let second = run();
+        for run in [first, second] {
+            let (r, got, events) = run.join().unwrap();
+            assert_eq!(r, Ok(root.join("lexicon-xx.txt")));
+            assert!(got.as_deref() == Some(&body[..]), "not the whole lexicon");
+            assert_eq!(
+                events.last(),
+                Some(&Event::LexiconProgress {
+                    name: "lexicon-xx.txt".into(),
+                    done: total,
+                    total
+                })
+            );
+        }
+        assert!(!part.exists());
+        assert!(!cache::lexicon_lock_path(&root, &lexicon).exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_download_waiting_for_another_fetch_of_its_lexicon_can_be_stopped() {
+        let root = scratch("lexicon-wait");
+        let lexicon = Lexicon {
+            name: "lexicon-xx.txt".into(),
+            url: "http://127.0.0.1:1/lexicon-xx.txt".into(),
+            size: 10,
+            sha256: "00".repeat(32),
+        };
+        fs::create_dir_all(&root).unwrap();
+        // Another download is fetching it: it holds the lock and has 4 bytes in the part.
+        let held = File::create(cache::lexicon_lock_path(&root, &lexicon)).unwrap();
+        held.lock().unwrap();
+        fs::write(cache::lexicon_part_path(&root, &lexicon), b"abcd").unwrap();
+        let stop = AtomicBool::new(false);
+        let mut events = Vec::new();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(150));
+                stop.store(true, Ordering::SeqCst);
+            });
+            let r = super::lexicon(&lexicon, &root, true, &stop, &mut |e| events.push(e));
+            assert_eq!(r, Err(Failure::Stopped { done: 4 }));
+        });
+        assert_eq!(
+            events.first(),
+            Some(&Event::LexiconProgress {
+                name: "lexicon-xx.txt".into(),
+                done: 4,
+                total: 10
+            })
+        );
+        // The other's part is left as it was.
+        assert_eq!(
+            fs::read(cache::lexicon_part_path(&root, &lexicon)).unwrap(),
+            b"abcd"
+        );
+        drop(held);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A `.tar.bz2` archive of the directory `dir` holding `data.bin` = `data`.
+    fn archive(dir: &str, data: &[u8]) -> Vec<u8> {
+        let bz = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
+        let mut tar = tar::Builder::new(bz);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, format!("{dir}/data.bin"), data)
+            .unwrap();
+        tar.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn model(url: String, size: u64, sha256: String) -> Entry {
+        Entry {
+            id: "m".into(),
+            kind: super::super::catalog::Kind::Speech,
+            name: "M".into(),
+            languages: vec!["en".into()],
+            size,
+            url,
+            sha256,
+            dir: "m-dir".into(),
+        }
+    }
+
+    #[test]
+    fn two_downloads_of_the_same_model_at_once_both_get_the_whole_checked_model() {
+        // Bytes that do not compress, so that the archive is about as large.
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let data: Vec<u8> = (0..320 * 1024)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        let body = archive("m-dir", &data);
+        let total = body.len() as u64;
+        assert!(total > 256 * 1024);
+        let root = scratch("model-twice");
+        let entry = model(
+            // A second request (there is none with the lock) would be the slower.
+            serve_slowly(
+                body.clone(),
+                &[Duration::from_millis(10), Duration::from_millis(100)],
+            ),
+            total,
+            hex(&Sha256::digest(&body)),
+        );
+        // Each returns what was in the model the moment it got it.
+        let run = || {
+            let (entry, root) = (entry.clone(), root.clone());
+            std::thread::spawn(move || {
+                let stop = AtomicBool::new(false);
+                let mut events = Vec::new();
+                let r = super::download(&entry, &root, true, &stop, &mut |e| events.push(e));
+                let got = r.as_ref().ok().map(|p| fs::read(p.join("data.bin")).ok());
+                (r, got, events)
+            })
+        };
+        let first = run();
+        // The second starts while the first is midway. Without the lock it would begin the
+        // shared part again (the server sends the whole file whatever the range asked) while
+        // the first goes on writing it and then unpacks it.
+        let part = cache::part_path(&root, &entry);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while fs::metadata(&part).map_or(0, |m| m.len()) < total / 2 {
+            assert!(Instant::now() < deadline, "the first fetch did not start");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let second = run();
+        let target = root.join("m-dir");
+        for run in [first, second] {
+            let (r, got, events) = run.join().unwrap();
+            assert_eq!(r, Ok(target.clone()));
+            assert!(got == Some(Some(data.clone())), "not the whole model");
+            assert!(
+                events.contains(&Event::Progress { done: total, total }),
+                "{events:?}"
+            );
+            assert_eq!(
+                events.last(),
+                Some(&Event::Done {
+                    path: target.clone()
+                })
+            );
+        }
+        assert!(!part.exists());
+        assert!(cache::unpack_leftovers(&root, &entry).is_empty());
+        assert!(!cache::model_lock_path(&root, &entry).exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_download_waiting_for_another_download_of_its_model_can_be_stopped() {
+        let root = scratch("model-wait");
+        let entry = model("http://127.0.0.1:1/m.tar.bz2".into(), 10, "00".repeat(32));
+        fs::create_dir_all(&root).unwrap();
+        // Another download is fetching it: it holds the lock and has 4 bytes in the part.
+        let held = File::create(cache::model_lock_path(&root, &entry)).unwrap();
+        held.lock().unwrap();
+        fs::write(cache::part_path(&root, &entry), b"abcd").unwrap();
+        let stop = AtomicBool::new(false);
+        let mut events = Vec::new();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(150));
+                stop.store(true, Ordering::SeqCst);
+            });
+            let r = super::download(&entry, &root, true, &stop, &mut |e| events.push(e));
+            assert_eq!(r, Err(Failure::Stopped { done: 4 }));
+        });
+        assert_eq!(
+            events.first(),
+            Some(&Event::Progress { done: 4, total: 10 })
+        );
+        // The other's part is left as it was.
+        assert_eq!(fs::read(cache::part_path(&root, &entry)).unwrap(), b"abcd");
+        drop(held);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_file_is_removed_when_unlocked_and_a_waiter_on_it_locks_the_new_one() {
+        let root = scratch("lock");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("m.lock");
+        let part = root.join("m.part");
+        let stop = AtomicBool::new(false);
+        let (held, waited) = lock(&path, &part, 1, &stop, &mut |_| {}).unwrap();
+        assert!(!waited);
+        // A waiter opened it before it was removed.
+        let old = open_lock(&path).unwrap();
+        drop(held);
+        assert!(!path.exists());
+        old.try_lock().unwrap();
+        assert!(!names(&path, &old));
+        // Another download locks the path's new file.
+        let (again, _) = lock(&path, &part, 1, &stop, &mut |_| {}).unwrap();
+        assert!(names(&path, again.file.as_ref().unwrap()));
+        drop(again);
+        drop(old);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_lexicon_that_does_not_match_its_checksum_is_deleted() {
+        const BODY: &[u8] = b"not the lexicon\n";
+        let root = scratch("lexicon-bad");
+        let lexicon = Lexicon {
+            name: "lexicon-xx.txt".into(),
+            url: serve(BODY, 1),
+            size: BODY.len() as u64,
+            sha256: "00".repeat(32),
+        };
+        let stop = AtomicBool::new(false);
+        match super::lexicon(&lexicon, &root, true, &stop, &mut |_| {}) {
+            Err(Failure::Failed(e)) => {
+                assert!(
+                    e.contains("the lexicon lexicon-xx.txt does not match"),
+                    "{e}"
+                )
+            }
+            r => panic!("{r:?}"),
+        }
+        assert!(!cache::lexicon_path(&root, &lexicon).exists());
+        assert!(!cache::lexicon_part_path(&root, &lexicon).exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn hex_is_lowercase_and_padded() {
+        assert_eq!(hex(&[0, 15, 255]), "000fff");
+    }
+
+    #[test]
+    fn the_model_root_is_the_named_or_only_directory() {
+        let tmp = std::env::temp_dir().join(format!(
+            "pisr-root-{}",
+            crate::token::random_hex(6).unwrap()
+        ));
+        fs::create_dir_all(tmp.join("other")).unwrap();
+        assert_eq!(model_root(&tmp, "m"), tmp.join("other"));
+        fs::create_dir_all(tmp.join("m")).unwrap();
+        assert_eq!(model_root(&tmp, "m"), tmp.join("m"));
+        fs::remove_dir_all(tmp.join("m")).unwrap();
+        fs::write(tmp.join("loose.txt"), "x").unwrap();
+        assert_eq!(model_root(&tmp, "m"), tmp);
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+}

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SpeechCatalog } from "../../src/engine/openrouter";
 import { Panel } from "../../src/engine/panel";
-import { STREAM_MIN_CHARS } from "../../src/engine/pieces";
+import { READING_MIN_CHARS } from "../../src/engine/pieces";
 import { Surface } from "../../src/engine/surface";
 import { CATALOG, makeEngine as makeFixtureEngine, scriptedUi } from "./fixtures";
 
@@ -129,7 +129,7 @@ describe("a chat model as the transcription model", () => {
     const panel = new Panel(engine, new Surface(engine), { ui: ui.ui, close: vi.fn(), changed: vi.fn() });
     panel.open();
     await panel.idle();
-    while (panel.view().rows[panel.view().selected].label !== "Transcription") panel.handle({ key: "down" });
+    while (panel.view().rows[panel.view().selected].label !== "Transcription model") panel.handle({ key: "down" });
     panel.handle({ key: "enter" });
     await panel.idle();
     const row = () => panel.view().picker?.items.find((i) => i.id === "google/gemini-3.8-flash");
@@ -157,16 +157,36 @@ describe("a chat model as the speech model", () => {
     expect(local.plays).toHaveLength(1);
   });
 
-  it("plays and saves nothing when the model answers the text instead of reading it", async () => {
+  it("plays and saves nothing when the model answers the text instead of reading it, and asks only once", async () => {
     const requests = fakeOpenRouter(() => "The capital of France is Paris.");
     const { engine, local, work } = makeEngine();
     await engine.speech.set("tts-model", "openai/gpt-audio-mini");
     await expect(engine.speech.speak("What is the capital of France?")).rejects.toThrow(
       /^Speech synthesis failed: the model did not read the text as written \(it said: "The capital of France is Paris\."\), so nothing was played/,
     );
-    expect(paths(requests)).toEqual(["/chat/completions", "/chat/completions"]);
-    expect(local.plays).toEqual([]);
+    // Played as a Stream, a reading is not asked for again: part of it may have been heard.
+    expect(paths(requests)).toEqual(["/chat/completions"]);
+    expect(local.streams.flatMap((s) => s.chunks)).toEqual([]);
     expect(engine.speech.messages()).toEqual([]);
+    const history = join(work, "history");
+    expect(existsSync(history) ? readdirSync(history).filter((f) => /\.(wav|mp3)$/.test(f)) : []).toEqual([]);
+  });
+
+  it("plays as a Stream while the words match, and a Stray midway stops it and saves nothing", async () => {
+    const pcm = Buffer.alloc(4800, 3).toString("base64");
+    const said = (transcript: string) => ({ choices: [{ delta: { audio: { transcript } } }] });
+    const audio = { choices: [{ delta: { audio: { data: pcm } } }] };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => sse([said("The build"), audio, said(" passed."), audio, said(" Anything else?"), audio])),
+    );
+    const { engine, local, work } = makeEngine();
+    await engine.speech.set("tts-model", "openai/gpt-audio-mini");
+    await expect(engine.speech.speak("The build passed.")).rejects.toThrow(
+      /it said: "The build passed\. Anything else\?"\), so playback was stopped/,
+    );
+    expect(local.streams[0].outcome).toEqual({ state: "cancelled" });
+    expect(engine.player.playing).toBe(false);
     const history = join(work, "history");
     expect(existsSync(history) ? readdirSync(history).filter((f) => /\.(wav|mp3)$/.test(f)) : []).toEqual([]);
   });
@@ -176,7 +196,7 @@ describe("a chat model as the speech model", () => {
     const { engine } = makeEngine();
     await engine.speech.set("tts-model", "openai/gpt-audio-mini");
     const long = Array.from({ length: 10 }, (_, i) => `This is sentence ${i + 1} of a long spoken reply.`).join(" ");
-    expect(long.length).toBeGreaterThan(STREAM_MIN_CHARS);
+    expect(long.length).toBeGreaterThan(READING_MIN_CHARS);
     const r = await engine.speech.say(long);
     expect(requests.length).toBeGreaterThanOrEqual(2);
     expect(new Set(paths(requests))).toEqual(new Set(["/chat/completions"]));

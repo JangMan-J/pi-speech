@@ -1,4 +1,4 @@
-// Build and run pi-speech-receiver for acceptance checks, with fake player and recorder programs.
+// Build and run pi-speech-receiver for acceptance checks, with fake Stream player and recorder programs.
 import { execFileSync, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -8,14 +8,17 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
-/** Build receiver/ of the tree in `root` (shared, locked cargo target dir); returns the binary path. */
+/**
+ * Build receiver/ of the tree in `root` (locked cargo target dir, one per tree: a target dir shared by trees can
+ * hand one tree another's binary when its sources are older); returns the binary path.
+ */
 export function buildReceiver(root = process.cwd()) {
   const cache = path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'speech-refactor');
   fs.mkdirSync(cache, { recursive: true });
   const out = fs.mkdtempSync(path.join(os.tmpdir(), 'recv-bin-'));
   execFileSync('flock', [path.join(cache, 'receiver-build.lock'), 'bash', '-c',
-    'export CARGO_TARGET_DIR="$1/receiver-target"; cd "$2/receiver" && cargo build --release --locked --quiet && cp "$CARGO_TARGET_DIR/release/pi-speech-receiver" "$3/"',
-    '_', cache, root, out], { stdio: ['ignore', 2, 2] });
+    'export CARGO_TARGET_DIR="$1/receiver-target-$4"; cd "$2/receiver" && cargo build --release --locked --quiet && cp "$CARGO_TARGET_DIR/release/pi-speech-receiver" "$3/"',
+    '_', cache, root, out, crypto.createHash('sha256').update(fs.realpathSync(root)).digest('hex').slice(0, 12)], { stdio: ['ignore', 2, 2] });
   return path.join(out, 'pi-speech-receiver');
 }
 
@@ -28,7 +31,7 @@ export async function startReceiver({ bin = process.env.RECEIVER_BIN, fakes = pr
   const tokenFile = path.join(dir, 'token');
   fs.writeFileSync(tokenFile, token + '\n', { mode: 0o600 });
   const child = spawn(bin, ['--listen', '127.0.0.1:0', '--token-file', tokenFile], {
-    env: { ...process.env, PI_SPEECH_RECEIVER_PLAYER: path.join(fakes, 'fake-player'),
+    env: { ...process.env, PI_SPEECH_RECEIVER_STREAM_PLAYER: path.join(fakes, 'fake-player'), PI_SPEECH_AUDIO_NULL: '1',
       PI_SPEECH_RECEIVER_RECORDER: path.join(fakes, 'fake-recorder'), FAKE_DIR: fake, XDG_CONFIG_HOME: path.join(dir, 'xdg') },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -52,6 +55,8 @@ export async function startReceiver({ bin = process.env.RECEIVER_BIN, fakes = pr
     log: read,
     starts(who) { return read(who).filter((l) => l.startsWith('start ')); },
     lastPlayed() { const p = path.join(fake, 'last-played'); return fs.existsSync(p) ? fs.readFileSync(p) : undefined; },
+    /** The arguments of the last Stream played: `s16le <rate> <channels>`, `mp3` or `wav`. */
+    lastArgs() { const p = path.join(fake, 'last-args'); return fs.existsSync(p) ? fs.readFileSync(p, 'utf8').trim() : undefined; },
     output: () => output,
     async stop() { if (child.exitCode === null) { child.kill('SIGTERM'); await exited; } },
     cleanup() { fs.rmSync(dir, { recursive: true, force: true }); },

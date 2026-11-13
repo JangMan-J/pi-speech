@@ -1,63 +1,109 @@
 /**
- * The /speech settings panel, Pi-free: a plain view model of the panel (rows, values, notes, live state,
- * the key hints for the current focus) built from engine state, and what each key does. Every change goes
- * through the same engine operations as the `/speech --` actions. The Pi adapter draws the view model and
- * feeds the keys; nothing here knows about terminals.
+ * The /speech settings panel, Pi-free: a plain view model of the panel (rows, values, live state, the key
+ * hints for the current focus) built from engine state, and what each key does. Every change goes through the
+ * same engine operations as the `/speech --` actions. The Pi adapter draws the view model and feeds the keys;
+ * nothing here knows about terminals.
+ *
+ * The main view holds only settings, under SPEAK (with the Speak key), LISTEN (with the Dictate key) and
+ * SETTINGS; a model or a voice shows only its name there (prices, features and languages are in the pickers).
+ * Values cycle in place; rows that list things open a picker; Hotkeys and Bridge connection are submenus.
+ * Hotkeys holds every action, runnable, and changes the keys of Speak and Dictate.
  */
 
 import { basename } from "node:path";
-import type { BridgeHealth } from "../bridge/index";
+import { type BridgeHealth, type BridgeProbe, bridgeTarget, displayUrl, PairingError } from "../bridge/index";
 import type { VoiceLanguage } from "../voice-language/index";
 import type { Engine } from "./engine";
 import { errorMessage } from "./env";
 import { FEATURES, featureLine, type ModelKind, modelColumns, vendorOf } from "./features";
 import type { HistoryMessage } from "./history";
+import { type DownloadProgress, formatSize, type LocalModel } from "./local-models";
 import type { ModelOption, SpeechCatalog } from "./openrouter";
 import { REPLACED } from "./player";
 import { priceValue } from "./pricing";
-import { type BridgeMode, MODEL_SORTS, type ModelSort } from "./settings";
-import { languageLabel, type SampleResult, type SettingName } from "./speech";
-import { ReadingFailed, readingFailedMessage } from "./stream";
+import {
+  LENGTH_SECONDS,
+  READ_MODES,
+  type ReadMode,
+  SUMMARY_LENGTHS,
+  type SummaryLength,
+  TRUNCATE_SECONDS,
+} from "./read-aloud";
+import { ReadingFailed, readingFailedMessage } from "./reading";
+import {
+  type BridgeMode,
+  DIRECTIONS,
+  type DirectionSetting,
+  type Hotkeys,
+  hotkeyId,
+  keyLabel,
+  MACHINES,
+  type Machine,
+  MODEL_SORTS,
+  type ModelSort,
+  SOURCES,
+  type Source,
+} from "./settings";
+import { type Direction, languageLabel, type SampleResult, type SettingName } from "./speech";
 import type { Surface, SurfaceUi } from "./surface";
 import { XAI_MODEL } from "./xai";
 
 export type RowId =
-  | "speak"
-  | "replay"
-  | "history"
-  | "stop"
+  // The main view
+  | "readAloud"
+  | "speechSource"
   | "speechModel"
   | "voice"
-  | "readAloud"
-  | "dictate"
-  | "transcribe"
+  | "transcriptionSource"
   | "transcription"
   | "language"
   | "output"
-  | "audio"
-  | "tools";
+  | "hotkeys"
+  | "bridge"
+  // Hotkeys: the actions
+  | "speak"
+  | "dictate"
+  | "replay"
+  | "history"
+  | "stop"
+  | "transcribe"
+  // Bridge connection
+  | "bridgeMode"
+  | "remoteMachine"
+  | "pairing"
+  // Bridge connection, DIRECTION
+  | "playOn"
+  | "recordOn"
+  | "modelsOn"
+  // Read aloud options
+  | "readMode"
+  | "summarizer"
+  | "summaryLength"
+  | "truncate";
 
-/** What the rows are grouped by: turning text into speech, speech into text, and how the plugin is wired. */
-export type SectionId = "speak" | "listen" | "system";
+/**
+ * The sections of the main view (turning text into speech, speech into text, and the rest), and Bridge
+ * connection's DIRECTION.
+ */
+export type SectionId = "speak" | "listen" | "settings" | "direction";
+
+/** What the panel shows: the main view, or one of its submenus. */
+export type MenuId = "main" | "hotkeys" | "bridge" | "readAloud";
 
 export interface PanelRow {
   id: RowId;
-  section: SectionId;
-  group: "action" | "setting";
+  /** The section of a main-view row; a submenu's rows have none. */
+  section?: SectionId;
   label: string;
-  /** The key that runs an action. */
-  key?: string;
-  /** The value of a setting, as shown (the xai model as xAI Grok). */
+  /** The current value, as shown (the xai model as xAI Grok, a key as Alt+S); none for a submenu row. */
   value?: string;
-  /** A model row: the price per minute of audio, shown first (or what is wrong with it, starting with ✗). */
-  price?: string;
-  /** Secondary facts: the provider of a model, the voice language, the resolved audio route. */
+  /** What is wrong (starting with ✗), or in a submenu what the value means. */
   note?: string;
   /** A shorter note, for when the note does not fit. */
   short?: string;
-  /** Something is wrong or unavailable; the note (or price) says what, starting with ✗. */
+  /** Something is wrong or unavailable; the note says what, starting with ✗. */
   alert?: boolean;
-  /** Enter opens a list to choose from (drawn with ›); the other settings change in place. */
+  /** Enter opens a list or a submenu (drawn with ›); the other settings change in place. */
   opens?: boolean;
 }
 
@@ -85,6 +131,8 @@ export interface PickerView {
   detail?: string;
   /** What the items are, for the count: `models`, `voices`, `messages`. */
   noun: string;
+  /** Draw every column even when all rows share its value (a local model's state must always show). */
+  keepColumns?: boolean;
   query: string;
   cursor: number;
   /** The matches of the query, best first. */
@@ -126,6 +174,12 @@ export interface PanelView {
   title: string;
   /** What speech is doing: ▶ speaking, ● REC m:ss, … transcribing; empty when nothing happens. */
   state: string;
+  /** Which rows these are: the main view's, or a submenu's. */
+  menu: MenuId;
+  /** A submenu: its title, after the panel's (`Speech › Hotkeys`). */
+  crumb?: string;
+  /** The main view: the heading of each section, with its key as Pi has it bound (`SPEAK (Alt+S)`). */
+  headings?: Partial<Record<SectionId, string>>;
   rows: PanelRow[];
   selected: number;
   picker?: PickerView;
@@ -151,15 +205,18 @@ export type NamedKey =
   | "end"
   /** Shift+Tab, the feature filter of a model list. */
   | "backtab"
-  /** Alt+S, the speak composer. */
+  /** The Speak hotkey (Alt+S unless changed): the speak composer. */
   | "speak"
   /** F2, the voice-language key. */
   | "language"
-  /** Alt+Z, the dictation key. */
+  /** The Dictate hotkey (Alt+Z unless changed). */
   | "dictate";
 
-/** A key: a named one, or typed (or pasted) text. */
-export type PanelKey = { key: NamedKey } | { text: string; paste?: boolean };
+/**
+ * A key: a named one (`id` is how Pi names it, such as `alt+s`), typed (or pasted) text, or any other key with
+ * a modifier, by Pi's name (`alt+d`), which only matters while a new hotkey is being chosen.
+ */
+export type PanelKey = { key: NamedKey; id?: string } | { text: string; paste?: boolean } | { combo: string };
 
 const isWordChar = (c: string | undefined) => c !== undefined && /[\p{L}\p{N}]/u.test(c);
 
@@ -221,6 +278,10 @@ export interface PanelDeps {
   changed(): void;
   /** How long a success line stays. */
   successMs?: number;
+  /** The keys Pi has bound to Speak and Dictate (from the settings when the extension loaded). */
+  hotkeys?: Hotkeys;
+  /** How often Bridge connection probes the receiver again while it is open. */
+  pairingMs?: number;
 }
 
 /** A one-line text field: the value and the cursor, in code points. */
@@ -278,7 +339,7 @@ class LineEdit {
 /** The settings chosen from a list. */
 type ListRow = "speechModel" | "transcription" | "voice";
 /** Everything the list view shows: those settings, and the spoken messages of the history. */
-type PickerRow = ListRow | "history";
+type PickerRow = ListRow | "history" | "summarizer";
 
 interface PickerState {
   row: PickerRow;
@@ -290,47 +351,107 @@ interface PickerState {
   show: string;
   edit: LineEdit;
   selected: number;
+  /** A model list of on-device models (the source of its direction is Local). */
+  local?: boolean;
 }
+
+/** A submenu; `capture` while it waits for the new key of Speak or Dictate. */
+type MenuMode = { kind: "menu"; menu: "hotkeys" | "bridge" | "readAloud"; selected: number; capture?: HotkeyName };
+type HotkeyName = keyof Hotkeys;
 
 type Mode =
   | { kind: "list" }
-  | { kind: "picker"; picker: PickerState }
+  | MenuMode
+  | { kind: "picker"; picker: PickerState; back: Mode }
   | { kind: "input"; purpose: "speak"; edit: LineEdit; back: Mode; standalone?: boolean }
   | { kind: "input"; purpose: "language"; voice: string; edit: LineEdit; back: Mode }
-  | { kind: "input"; purpose: "transcribe" | "dictation" | "output"; edit: LineEdit; back: Mode };
+  | { kind: "input"; purpose: "transcribe" | "dictation" | "output"; edit: LineEdit; back: Mode }
+  /** Pairing's first step: the receiver's address. */
+  | { kind: "input"; purpose: "pairAddress"; edit: LineEdit; back: Mode }
+  /** Pairing's second step: the code the receiver at `address` shows on its terminal. */
+  | { kind: "input"; purpose: "pairCode"; address: string; edit: LineEdit; back: Mode };
 
-const ROWS: Array<Pick<PanelRow, "id" | "section" | "group" | "label" | "key" | "opens">> = [
-  { id: "speak", section: "speak", group: "action", label: "Speak…", key: "Alt+S" },
-  { id: "replay", section: "speak", group: "action", label: "Replay last", key: "r" },
-  { id: "history", section: "speak", group: "action", label: "History…", key: "h" },
-  { id: "stop", section: "speak", group: "action", label: "Stop", key: "s" },
-  { id: "speechModel", section: "speak", group: "setting", label: "Speech model", opens: true },
-  { id: "voice", section: "speak", group: "setting", label: "Voice", opens: true },
-  { id: "readAloud", section: "speak", group: "setting", label: "Read replies aloud" },
-  { id: "dictate", section: "listen", group: "action", label: "Dictate", key: "Alt+Z" },
-  { id: "transcribe", section: "listen", group: "action", label: "Transcribe file…", key: "t" },
-  { id: "transcription", section: "listen", group: "setting", label: "Transcription", opens: true },
-  { id: "language", section: "listen", group: "setting", label: "Dictation language", opens: true },
-  { id: "output", section: "listen", group: "setting", label: "Dictation output", opens: true },
-  { id: "audio", section: "system", group: "setting", label: "Play audio on" },
-  { id: "tools", section: "system", group: "setting", label: "Agent tools" },
+type RowBase = Pick<PanelRow, "id" | "section" | "label" | "opens">;
+
+const MAIN: RowBase[] = [
+  { id: "readAloud", section: "speak", label: "Read aloud options", opens: true },
+  { id: "speechSource", section: "speak", label: "Speech source" },
+  { id: "speechModel", section: "speak", label: "Speech model", opens: true },
+  { id: "voice", section: "speak", label: "Voice", opens: true },
+  { id: "transcriptionSource", section: "listen", label: "Transcription source" },
+  { id: "transcription", section: "listen", label: "Transcription model", opens: true },
+  { id: "language", section: "listen", label: "Dictation language" },
+  { id: "output", section: "listen", label: "Dictation output", opens: true },
+  { id: "hotkeys", section: "settings", label: "Hotkeys", opens: true },
+  { id: "bridge", section: "settings", label: "Bridge connection", opens: true },
 ];
 
-/**
- * The lines of the panel as indexes into `rows`: the actions of a section share one line (a toolbar), every
- * setting has its own. ↑↓ move between lines, ←→ within a toolbar.
- */
-export function rowLines(rows: Array<Pick<PanelRow, "group" | "section">>): number[][] {
-  const lines: number[][] = [];
-  rows.forEach((r, i) => {
-    const last = lines.at(-1);
-    const head = last ? rows[last[0]] : undefined;
-    if (last && head && r.group === "action" && head.group === "action" && head.section === r.section) last.push(i);
-    else lines.push([i]);
-  });
-  return lines;
+/** Every action, with its key; Enter runs it. */
+const HOTKEYS: RowBase[] = [
+  { id: "speak", label: "Speak…" },
+  { id: "dictate", label: "Dictate" },
+  { id: "replay", label: "Replay last" },
+  { id: "history", label: "History…" },
+  { id: "stop", label: "Stop" },
+  { id: "transcribe", label: "Transcribe file…" },
+];
+
+/** The bridge mode, the Remote machine's address, and Pairing: whether its receiver answers, and the address to use. */
+const BRIDGE: RowBase[] = [
+  { id: "bridgeMode", label: "Bridge" },
+  { id: "remoteMachine", label: "Remote machine" },
+  { id: "pairing", label: "Pairing" },
+  { id: "playOn", section: "direction", label: "Play audio on" },
+  { id: "recordOn", section: "direction", label: "Record audio on" },
+  { id: "modelsOn", section: "direction", label: "Run models on" },
+];
+const MACHINE_WORDS: Record<Machine, string> = { this: "This machine", remote: "Remote machine" };
+const isDirectionRow = (id: RowId): id is DirectionSetting => (DIRECTIONS as readonly RowId[]).includes(id);
+/** What the address field of Pairing takes. */
+const PAIR_HOW =
+  "The receiver's address: empty for the ssh forward of pi-speech-receiver ssh <pi-host>, or a Tailscale or LAN address of pi-speech-receiver --listen <addr>:47613 --network";
+const URL_FROM =
+  "The Remote machine's address is the one set in Pairing, else PI_SPEECH_BRIDGE_URL (loopback only), else the ssh forward at 127.0.0.1:47613 (or a spare one, 47614-47633)";
+const ADDRESS_HINT = "host:port · empty: the ssh forward · Enter connects, or asks the receiver for a pairing code";
+const CODE_HINT = "the 6 digits the receiver shows on its own terminal";
+
+/** The host:port of a bridge URL, or undefined when it is not one. */
+function hostPort(url: string): string | undefined {
+  try {
+    const u = new URL(url);
+    return u.hostname ? `${u.hostname}:${u.port || (u.protocol === "https:" ? 443 : 80)}` : undefined;
+  } catch {
+    return undefined;
+  }
 }
-const LINES = rowLines(ROWS);
+
+/** Why a probe failed, in a word or two. */
+function pairingFault(reason: string): string {
+  if (/^no bridge token/.test(reason)) return "no token on This machine";
+  if (/\b401\b|check the bridge token/.test(reason)) return "token rejected";
+  if (/not reachable/.test(reason)) return "receiver unreachable";
+  if (/too old/.test(reason)) return "receiver too old";
+  if (/loopback|valid URL|plain http|user name/.test(reason)) return "bridge URL not usable";
+  return "receiver not usable";
+}
+
+/** What read-aloud reads, who summarizes, how long a summary is, and where reading stops. */
+const READ_ALOUD: RowBase[] = [
+  { id: "readMode", label: "Read" },
+  { id: "summarizer", label: "Summarized by", opens: true },
+  { id: "summaryLength", label: "Length" },
+  { id: "truncate", label: "Truncate at" },
+];
+
+const MENUS: Record<MenuMode["menu"], { title: string; rows: RowBase[] }> = {
+  hotkeys: { title: "Hotkeys", rows: HOTKEYS },
+  bridge: { title: "Bridge connection", rows: BRIDGE },
+  readAloud: { title: "Read aloud options", rows: READ_ALOUD },
+};
+
+/** The keys of the actions that only work inside the panel. */
+const LETTERS: Partial<Record<RowId, string>> = { replay: "r", history: "h", stop: "s", transcribe: "t" };
+const HOTKEY_NAMES: Record<HotkeyName, string> = { speak: "Speak", dictate: "Dictate" };
 
 const PICKER_ROWS: ListRow[] = ["speechModel", "transcription", "voice"];
 const isPickerRow = (id: RowId): id is ListRow => (PICKER_ROWS as RowId[]).includes(id);
@@ -344,22 +465,56 @@ const SETTING_OF: Record<ListRow, SettingName> = {
 };
 const LABEL_OF: Record<PickerRow, string> = {
   speechModel: "Speech model",
-  transcription: "Transcription",
+  transcription: "Transcription model",
   voice: "Voice",
   history: "History",
+  summarizer: "Summarized by",
 };
 const LANGUAGE_HINT = "a tag such as ja or pt-BR, or auto";
 const OUTPUT_HINT = "a command; %s is the dictation text · empty uses Pi's input box";
 
-/** The bridge modes in the order ←→ step through them, with the words the panel shows. */
-const AUDIO_MODES: BridgeMode[] = ["auto", "on", "off"];
-const AUDIO_WORDS: Record<BridgeMode, string> = { auto: "auto", on: "bridge", off: "local" };
+/** The bridge modes in the order ←→ step through them. */
+const BRIDGE_MODES: BridgeMode[] = ["auto", "on", "off"];
 
 const PRICE_UNKNOWN = "price unknown";
 /** The name the panel shows for the xai model (the saved id stays xai). */
 export const XAI_LABEL = "xAI Grok";
 
-const onOff = (on: boolean) => (on ? "on" : "off");
+const SOURCE_WORDS: Record<Source, string> = { provider: "Provider", local: "Local" };
+const directionOf = (row: "speechModel" | "transcription" | "speechSource" | "transcriptionSource"): Direction =>
+  row === "speechModel" || row === "speechSource" ? "speech" : "transcription";
+/** A download as its status line says it. */
+function downloadLine(id: string, p: DownloadProgress): string {
+  if (p.phase === "verifying") return `… verifying ${id}`;
+  if (p.phase === "unpacking") return `… unpacking ${id}`;
+  const pct = p.total ? Math.floor((p.done / p.total) * 100) : 0;
+  const what = p.file ? `${id}'s ${p.file}` : id;
+  return `… downloading ${what} ${pct}% (${formatSize(p.done)} of ${formatSize(p.total)})`;
+}
+
+/** The Read values as shown. */
+const READ_WORDS: Record<ReadMode, string> = { off: "Off", summary: "Summary", thinking: "Thinking", all: "All" };
+const LENGTH_WORDS: Record<SummaryLength, string> = {
+  minimum: "Minimum ~15 s",
+  abridged: "Abridged ~30 s",
+  full: "Full ~60 s",
+};
+const truncateWord = (s: number) => (s ? `${s} s` : "Off");
+/** The Summarized by choice that is not a model: the model of the reply, in the same reply. */
+const SAME_MODEL = "same";
+const SAME_MODEL_LABEL = "Same model";
+/** What the highlighted Read value does. */
+const READ_INFO: Record<ReadMode, string> = {
+  off: "Off: nothing is read aloud.",
+  summary: "Reads the model's spoken summary of its reply.",
+  thinking: "Reads a spoken summary of the reasoning, then of the reply.",
+  all: "Reads the whole reply.",
+};
+/** Step through `list` from `current` by `dir`, wrapping. */
+function cycle<T>(list: readonly T[], current: T, dir: 1 | -1): T {
+  const i = list.indexOf(current);
+  return list[(Math.max(0, i) + dir + list.length) % list.length];
+}
 const oneLine = (text: string) => text.replace(/\s+/g, " ").trim();
 /** A model as the panel shows it. */
 const modelLabel = (id: string) => (id === XAI_MODEL ? XAI_LABEL : id);
@@ -422,9 +577,15 @@ function speakError(err: unknown): string {
 
 export class Panel {
   private mode: Mode = { kind: "list" };
+  /** The selected row of the main view. */
   private selected = 0;
-  /** The column ↑↓ return to in a toolbar. */
-  private col = 0;
+  /** The keys Pi has bound (from the settings when the extension loaded). */
+  private readonly bound: Hotkeys;
+  /**
+   * The panel closed on leaving Hotkeys with a changed key: Pi binds an extension's keys when it loads the
+   * extension, so the host reloads it for the new key to work at once.
+   */
+  rebind = false;
   private transcribing = false;
   private status?: Status;
   private statusTimer?: ReturnType<typeof setTimeout>;
@@ -436,6 +597,10 @@ export class Panel {
   private voices?: { model: string; ids?: string[]; error?: string; load: Promise<string[]> };
   private receiver?: BridgeHealth | "checking";
   private probeSeq = 0;
+  /** Bridge connection's Pairing: the latest probe of the receiver, and the timer that repeats it. */
+  private pairing?: BridgeProbe | "checking";
+  private pairSeq = 0;
+  private pairTimer?: ReturnType<typeof setInterval>;
   private sampleSeq = 0;
   /** Speak… and Replay: a newer one, or Stop, replaces the line of an older one. */
   private playSeq = 0;
@@ -445,12 +610,24 @@ export class Panel {
   private readonly inflight = new Set<Promise<unknown>>();
   private unlisten?: () => void;
   private disposed = false;
+  /** The on-device models, of both kinds, with their state. */
+  private localModels?: LocalModel[];
+  private localLoad?: Promise<LocalModel[]>;
+  private localError?: string;
+  /** A model not downloaded that the user chose: the next Enter downloads it. */
+  private offer?: string;
+  /** A downloaded model that the next x deletes. */
+  private deleting?: string;
+  /** The download running, and how far it is. */
+  private downloading?: { id: string; progress?: DownloadProgress };
 
   constructor(
     private readonly engine: Engine,
     private readonly surface: Surface,
     private readonly deps: PanelDeps,
-  ) {}
+  ) {
+    this.bound = { ...(deps.hotkeys ?? engine.speech.settings.hotkeys) };
+  }
 
   private get speech() {
     return this.engine.speech;
@@ -464,6 +641,8 @@ export class Panel {
     });
     this.track(this.loadModels());
     this.track(this.loadVoices());
+    const s = this.speech.settings;
+    if (s.speechSource === "local" || s.transcriptionSource === "local") this.track(this.loadLocal());
     this.probe();
   }
 
@@ -471,12 +650,18 @@ export class Panel {
     this.disposed = true;
     this.unlisten?.();
     if (this.statusTimer) clearTimeout(this.statusTimer);
+    this.stopPairing();
   }
 
   /** Open the repeated-speaking composer. Standalone mode closes on Esc instead of returning to settings. */
   openSpeaker(standalone = false): void {
-    this.mode = { kind: "input", purpose: "speak", edit: new LineEdit(), back: { kind: "list" }, standalone };
+    this.mode = { kind: "input", purpose: "speak", edit: new LineEdit(), back: this.home(), standalone };
     this.changed();
+  }
+
+  /** The main view or the submenu under the current focus (a picker or an input goes back to it). */
+  private home(mode: Mode = this.mode): { kind: "list" } | MenuMode {
+    return mode.kind === "list" || mode.kind === "menu" ? mode : this.home(mode.back);
   }
 
   /** Settles when every operation started so far has finished. */
@@ -494,28 +679,48 @@ export class Panel {
   // ── The view ────────────────────────────────────────────────────────────
 
   view(): PanelView {
+    const home = this.home();
+    const rows = (home.kind === "list" ? MAIN : MENUS[home.menu].rows).map((r) => this.row(r, home));
     const view: PanelView = {
       title: "Speech",
       state: this.engine.indicator.live(),
-      rows: ROWS.map((r) => this.row(r)),
-      selected: this.selected,
+      menu: home.kind === "list" ? "main" : home.menu,
+      rows,
+      selected: home.kind === "list" ? this.selected : home.selected,
       hints: this.hints(),
     };
+    if (home.kind === "list") {
+      view.headings = {
+        speak: `SPEAK (${keyLabel(this.bound.speak)})`,
+        listen: `LISTEN (${keyLabel(this.bound.dictate)})`,
+        settings: "SETTINGS",
+      };
+    } else {
+      view.crumb = MENUS[home.menu].title;
+      if (home.menu === "bridge") view.headings = { direction: "DIRECTION" };
+    }
     if (this.status) view.status = this.status;
+    else if (home.kind === "menu" && home.menu === "readAloud" && this.mode === home) {
+      // One short line on what the highlighted option does.
+      view.status = { tone: "info", text: this.readAloudInfo(READ_ALOUD[home.selected].id) };
+    }
     if (this.mode.kind === "picker") view.picker = this.pickerView(this.mode.picker);
     if (this.mode.kind === "input") {
       const m = this.mode;
+      // Under its row when the row is shown, else under the list.
       const input = (label: string, placeholder: string, under?: RowId): InputView => ({
         label,
         value: m.edit.value,
         cursor: m.edit.cursor,
         placeholder,
-        ...(under ? { under } : {}),
+        ...(under && rows.some((r) => r.id === under) ? { under } : {}),
       });
       switch (m.purpose) {
         case "speak":
           view.title = "Speak";
           view.composer = true;
+          delete view.crumb;
+          delete view.headings;
           view.input = input(
             "",
             this.takesTags()
@@ -539,96 +744,183 @@ export class Panel {
         case "output":
           view.input = input("Dictation output", OUTPUT_HINT, "output");
           break;
+        case "pairAddress":
+          view.input = input("Address", ADDRESS_HINT, "pairing");
+          break;
+        case "pairCode":
+          view.input = input(`Code from ${m.address}`, CODE_HINT, "pairing");
+          break;
       }
       if (m.back.kind === "picker") view.picker = this.pickerView(m.back.picker);
     }
     return view;
   }
 
-  private row(base: (typeof ROWS)[number]): PanelRow {
+  private row(base: RowBase, home: { kind: "list" } | MenuMode = this.home()): PanelRow {
     const s = this.speech.settings;
     const value = (actual: string) => this.pending.get(base.id) ?? actual;
     switch (base.id) {
+      // Only the name of a model or a voice: what it costs and offers is in its picker.
       case "speechModel": {
+        if (s.speechSource === "local") return { ...base, ...this.localRow(s.localSpeechModel) };
         const v = value(s.speechModel);
-        return { ...base, value: modelLabel(v), ...this.modelNote("tts", v) };
+        return { ...base, value: modelLabel(v), ...this.modelAlert("tts", v) };
       }
       case "transcription": {
+        if (s.transcriptionSource === "local") {
+          return { ...base, ...this.localRow(s.localTranscriptionModel) };
+        }
         const v = value(s.transcriptionModel);
-        return { ...base, value: modelLabel(v), ...this.modelNote("stt", v) };
+        return { ...base, value: modelLabel(v), ...this.modelAlert("stt", v) };
       }
       case "voice": {
+        if (s.speechSource === "local")
+          return { ...base, value: value(s.localSpeechVoice ?? "default"), ...this.voiceAlert() };
         const v = value(s.voice);
-        return { ...base, value: v, ...this.voiceRowNote(v) };
-      }
-      case "audio": {
-        const v = value(AUDIO_WORDS[this.engine.routes.mode]);
-        const mode = AUDIO_MODES.find((m) => AUDIO_WORDS[m] === v) ?? "auto";
-        return { ...base, value: v, ...this.audioNote(mode) };
+        return { ...base, value: v, ...this.voiceAlert() };
       }
       case "readAloud":
-        return { ...base, value: onOff(this.engine.readAloud.enabled) };
+      case "readMode":
+        return { ...base, value: READ_WORDS[this.engine.readAloud.mode] };
+      case "summarizer":
+        return { ...base, value: s.readAloud.summarizer ?? SAME_MODEL_LABEL };
+      case "summaryLength":
+        return { ...base, value: LENGTH_WORDS[s.readAloud.length] };
+      case "truncate":
+        return { ...base, value: truncateWord(s.readAloud.truncate) };
+      case "speechSource":
+        return { ...base, value: value(SOURCE_WORDS[s.speechSource]) };
+      case "transcriptionSource":
+        return { ...base, value: value(SOURCE_WORDS[s.transcriptionSource]) };
       case "language":
-        return {
-          ...base,
-          value: value(s.dictationLanguage ?? "auto"),
-          note: s.dictationLanguage ? "sent with dictation and transcribed files" : "the model detects it",
-        };
-      case "tools":
-        return { ...base, value: value(onOff(s.tools)), note: "lets the agent speak and transcribe" };
+        return { ...base, value: value(s.dictationLanguage ?? "auto") };
       case "output":
-        return s.dictationOutput
-          ? { ...base, value: "User-defined", note: s.dictationOutput }
-          : { ...base, value: "Pi", note: "into Pi's input box" };
-      default:
-        return { ...base };
+        return { ...base, value: s.dictationOutput ? "User-defined" : "Pi" };
+      case "speak":
+      case "dictate":
+        return { ...base, ...this.hotkeyValue(base.id, home) };
+      case "bridgeMode": {
+        const v = value(this.engine.routes.mode);
+        const mode = BRIDGE_MODES.find((m) => m === v) ?? "auto";
+        return { ...base, value: v, ...this.bridgeNote(mode) };
+      }
+      case "remoteMachine": {
+        // The address in use: set in Pairing, from the environment, or the ssh forward (a spare one once found).
+        const at = hostPort(this.engine.routes.url);
+        const from = this.addressFrom();
+        if (!at) {
+          return from === "pairing"
+            ? { ...base, value: "not set", note: "✗ the address set in Pairing is not usable", alert: true }
+            : { ...base, value: "not set", note: "✗ PI_SPEECH_BRIDGE_URL is not a URL", alert: true };
+        }
+        const note = { pairing: "set in Pairing", env: "from PI_SPEECH_BRIDGE_URL", default: "ssh forward" }[from];
+        return { ...base, value: at, note };
+      }
+      case "pairing":
+        return { ...base, ...this.pairingValue() };
+      case "playOn":
+      case "recordOn":
+      case "modelsOn":
+        // Without the bridge in use everything runs on This machine, whatever is saved.
+        if (this.engine.routes.route !== "bridge")
+          return { ...base, value: MACHINE_WORDS.this, note: "no bridge in use" };
+        return { ...base, value: value(MACHINE_WORDS[s[base.id]]) };
+      default: {
+        const letter = LETTERS[base.id];
+        return letter ? { ...base, value: letter } : { ...base };
+      }
     }
+  }
+
+  /** The line under Read aloud options for the highlighted row. */
+  private readAloudInfo(id: RowId): string {
+    const o = this.speech.settings.readAloud;
+    switch (id) {
+      case "readMode":
+        return READ_INFO[this.engine.readAloud.mode];
+      case "summarizer":
+        return o.summarizer
+          ? `Extra request to ${o.summarizer} per reply.`
+          : "Same model, same reply. No extra request.";
+      case "summaryLength":
+        return `Best effort: about ${LENGTH_SECONDS[o.length]} s.`;
+      default:
+        return o.truncate ? `Stops at ${o.truncate} s, at a sentence end.` : "Off: length not guaranteed.";
+    }
+  }
+
+  /** The key of Speak or Dictate as saved: a changed one is bound when the user leaves Hotkeys. */
+  private hotkeyValue(name: HotkeyName, home: { kind: "list" } | MenuMode): Pick<PanelRow, "value" | "note"> {
+    if (home.kind === "menu" && home.capture === name) return { value: "press a key…" };
+    return { value: keyLabel(this.speech.settings.hotkeys[name]) };
+  }
+
+  /** A saved key of Speak or Dictate differs from the one Pi has bound. */
+  private hotkeysChanged(): boolean {
+    const saved = this.speech.settings.hotkeys;
+    return saved.speak !== this.bound.speak || saved.dictate !== this.bound.dictate;
   }
 
   /** The value a row shows now, a pending one included. */
   private shown(id: RowId): string | undefined {
-    const base = ROWS.find((r) => r.id === id);
+    const base = [...MAIN, ...HOTKEYS, ...BRIDGE, ...READ_ALOUD].find((r) => r.id === id);
     return base ? this.row(base).value : undefined;
   }
 
-  /** Price and provider of a model, or why it is not offered. */
-  private modelNote(kind: "tts" | "stt", id: string): Pick<PanelRow, "price" | "note" | "alert"> {
-    if (!this.models) return this.modelsError ? { note: "✗ models unavailable", alert: true } : { note: "loading…" };
+  /** Why a model is not usable; nothing when it is (its price and features are in the picker). */
+  private modelAlert(kind: "tts" | "stt", id: string): Pick<PanelRow, "note" | "alert"> {
+    if (!this.models) return this.modelsError ? { note: "✗ models unavailable", alert: true } : {};
     const m = this.models[kind].find((x) => x.id === id);
     if (!m) {
       return id === XAI_MODEL ? { note: "✗ xAI: no login", alert: true } : { note: "✗ not offered", alert: true };
     }
-    const provider = this.speech.providerName(id);
-    if (this.speech.catalogOffline(id)) {
-      return { price: "✗ catalog offline", note: provider, alert: true };
-    }
-    // What the model offers, as far as the catalog says; where it says nothing, who serves it.
-    // `free` is already the price.
-    const features = m.features?.filter((f) => f !== "free");
-    return { price: priceOf(m), note: featureLine({ features, languages: m.languages }) || provider };
+    if (this.speech.catalogOffline(id)) return { note: "✗ catalog offline", alert: true };
+    return {};
   }
 
-  private voiceRowNote(voice: string): Pick<PanelRow, "note" | "alert"> {
-    const model = this.speech.settings.speechModel;
-    const v = this.voices?.model === model ? this.voices : undefined;
+  /** A model row while its source is Local: the chosen on-device model, and why it cannot be used. */
+  private localRow(id: string | undefined): Pick<PanelRow, "value" | "note" | "alert"> {
+    const value = id ?? "none";
+    if (!id) return { value, note: "✗ choose a model", alert: true };
+    if (this.localError) return { value, note: "✗ local models unavailable", alert: true };
+    const m = this.localModels?.find((x) => x.id === id);
+    if (this.localModels && !m?.downloaded) return { value, note: "✗ not downloaded", alert: true };
+    return { value };
+  }
+
+  /** Why the voices are not usable; nothing when they are (a voice's language is in the picker). */
+  private voiceAlert(): Pick<PanelRow, "note" | "alert"> {
+    const v = this.voices?.model === this.voicesKey() ? this.voices : undefined;
     if (v?.error) return { note: "✗ voices unavailable", alert: true };
-    if (model === XAI_MODEL && !v?.ids) return { note: "loading…" };
     if (v?.ids && v.ids.length === 0) return { note: "✗ xAI lists no voices", alert: true };
-    return { note: voiceNote(this.speech.languageOf(model, voice)) };
+    return {};
   }
 
-  /** Where audio goes in a mode: this machine, or the bridge with the receiver's state. */
-  private audioNote(mode: BridgeMode): Pick<PanelRow, "note" | "short" | "alert"> {
+  /** Where audio plays in a mode: This machine, or the Remote machine with the receiver's state. */
+  private bridgeNote(mode: BridgeMode): Pick<PanelRow, "note" | "short" | "alert"> {
     const routes = this.engine.routes;
-    if (routes.routeFor(mode) === "local") {
-      const where = routes.ssh ? "Pi host" : "this machine";
-      return { note: mode === "auto" ? `→ ${where}` : where };
-    }
+    const when = mode === "auto" ? "on over SSH · " : "";
+    if (routes.routeFor(mode) === "local") return { note: `${when}plays on This machine`, short: "This machine" };
     const r = this.receiver;
     const host = routes.url.replace(/^[a-z]+:\/\//, "");
     const state = !r || r === "checking" ? "… checking" : r.ok ? `✓ ${host}` : "✗ receiver unreachable";
     const alert = typeof r === "object" && !r.ok;
-    return { note: mode === "auto" ? `→ bridge ${state}` : state, short: state, ...(alert ? { alert } : {}) };
+    const where = this.speech.settings.playOn === "remote" ? "plays on the Remote machine" : "bridge in use";
+    return { note: `${when}${where} · ${state}`, short: state, ...(alert ? { alert } : {}) };
+  }
+
+  /** Whether the receiver answers: ✓ with where and how fast, or ✗ Re-pair. Enter opens the address field. */
+  private pairingValue(): Pick<PanelRow, "value" | "note" | "opens"> {
+    const p = this.pairing;
+    if (!p || p === "checking") return { value: "… checking", opens: true };
+    if (p.ok) return { value: `✓ Connected to ${p.address}:${p.port} · ${p.ms} ms`, opens: true };
+    return { value: "✗ Re-pair", note: pairingFault(p.reason), opens: true };
+  }
+
+  /** Where the Remote machine's address comes from. */
+  private addressFrom(): "pairing" | "env" | "default" {
+    if (this.speech.settings.bridgeAddress) return "pairing";
+    return bridgeTarget(this.engine.env).from;
   }
 
   /** The models of a model list as the catalog has them (a model it does not list keeps its id). */
@@ -639,11 +931,54 @@ export class Panel {
 
   private pickerItems(p: PickerState): PickerItem[] {
     const s = this.speech.settings;
+    if (p.local && isModelRow(p.row)) {
+      const current = p.row === "speechModel" ? s.localSpeechModel : s.localTranscriptionModel;
+      const models = (p.ids ?? []).flatMap((id) => this.localModels?.find((m) => m.id === id) ?? []);
+      const items = models.map((m): PickerItem => {
+        const d = this.downloading;
+        const state =
+          d?.id === m.id
+            ? d.progress?.phase === "progress" && d.progress.total
+              ? `downloading ${Math.floor((d.progress.done / d.progress.total) * 100)}%`
+              : "downloading"
+            : m.downloaded
+              ? "downloaded"
+              : m.partial
+                ? "partly downloaded"
+                : "not downloaded";
+        const langs = m.languages.length > 4 ? `${m.languages.length} langs` : m.languages.join(" ");
+        return {
+          id: m.id,
+          label: m.id,
+          price: formatSize(m.size),
+          note: `${m.name} ${state}`,
+          cols: [state, langs],
+          current: m.id === current,
+        };
+      });
+      return matchItems(items, p.edit.value, (i) => `${i.label} ${i.note ?? ""}`);
+    }
     if (p.row === "history") {
       const all = (p.messages ?? []).map(
         (m): PickerItem => ({ id: m.file, label: `${m.time}  ${m.title}`, current: false }),
       );
       return matchItems(all, p.edit.value, (i) => i.label);
+    }
+    if (p.row === "summarizer") {
+      const current = s.readAloud.summarizer ?? SAME_MODEL;
+      const all = (p.ids ?? []).map(
+        (id): PickerItem => ({ id, label: id === SAME_MODEL ? SAME_MODEL_LABEL : id, current: id === current }),
+      );
+      return matchItems(all, p.edit.value, (i) => i.label);
+    }
+    if (p.row === "voice" && s.speechSource === "local") {
+      // A local model's voices, in its order: the first is its default.
+      const ids = p.ids ?? [];
+      const current = s.localSpeechVoice ?? ids[0];
+      const all = ids.map(
+        (id, i): PickerItem => ({ id, label: id, cols: [i === 0 ? "default" : ""], current: id === current }),
+      );
+      return matchItems(all, p.edit.value, (i) => i.id);
     }
     if (p.row === "voice") {
       const all = (p.ids ?? []).map(
@@ -683,9 +1018,13 @@ export class Panel {
     const none =
       p.row === "history"
         ? "Nothing spoken yet"
-        : p.row === "voice" && this.speech.settings.speechModel === XAI_MODEL
-          ? "xAI lists no voices"
-          : "None offered";
+        : p.row === "voice" && this.speech.settings.speechSource === "local"
+          ? this.speech.settings.localSpeechModel
+            ? "The model lists no voices"
+            : "Choose a local speech model first"
+          : p.row === "voice" && this.speech.settings.speechModel === XAI_MODEL
+            ? "xAI lists no voices"
+            : "None offered";
     const view: PickerView = {
       title: LABEL_OF[p.row],
       noun: p.row === "voice" ? "voices" : p.row === "history" ? "messages" : "models",
@@ -697,7 +1036,14 @@ export class Panel {
       loading: !p.ids,
       empty: p.ids?.length === 0 ? none : "No matches",
     };
-    if (isModelRow(p.row)) {
+    if (p.local) {
+      view.keepColumns = true;
+      view.detail =
+        this.engine.routes.modelsRoute === "bridge"
+          ? "Runs on the Remote machine (Run models on); download there with pi-speech-receiver models download <id>."
+          : "Runs on This machine, with no network request once downloaded.";
+      if (p.ids?.length === 0) view.empty = "No local models of this kind";
+    } else if (isModelRow(p.row)) {
       const id = items[selected]?.id;
       const m = this.modelOptions({ ...p, row: p.row }).find((x) => x.id === id);
       view.sort = this.speech.settings.modelSort;
@@ -718,12 +1064,30 @@ export class Panel {
     const esc = (action: string): Hint => ({ key: "Esc", action });
     const m = this.mode;
     if (m.kind === "input") {
-      const action = m.purpose === "speak" ? "speak" : m.purpose === "transcribe" ? "transcribe" : "set";
+      const action =
+        m.purpose === "speak"
+          ? "speak"
+          : m.purpose === "transcribe"
+            ? "transcribe"
+            : m.purpose === "pairAddress"
+              ? "connect"
+              : m.purpose === "pairCode"
+                ? "pair"
+                : "set";
       return [{ key: "Enter", action }, esc(m.purpose === "speak" && m.standalone ? "close" : "back")];
     }
     if (m.kind === "picker") {
       const p = m.picker;
       if (!p.ids) return [esc("back")];
+      if (p.local) {
+        if (this.pickerItems(p).length === 0) return [esc("back")];
+        return [
+          { key: "Enter", action: "pick" },
+          { key: "d", action: "download" },
+          { key: "x", action: "delete" },
+          esc("back"),
+        ];
+      }
       const sorting: Hint[] = isModelRow(p.row)
         ? [
             { key: "Tab", action: "sort", optional: true },
@@ -740,21 +1104,15 @@ export class Panel {
         esc("back"),
       ];
     }
+    const home = this.home();
+    if (home.kind === "menu") return this.menuHints(home);
     const close = esc("close");
-    const others: Hint = { key: "←→", action: "more", optional: true };
-    switch (ROWS[this.selected].id) {
-      case "speak":
-        return [{ key: "Enter", action: "type messages to speak" }, others, close];
-      case "replay":
-        return [{ key: "Enter", action: "play the last message again" }, others, close];
-      case "history":
-        return [{ key: "Enter", action: "replay an earlier message" }, others, close];
-      case "stop":
-        return [{ key: "Enter", action: "stop what is playing" }, others, close];
-      case "dictate":
-        return [{ key: "Enter", action: "record, then insert the text" }, others, close];
-      case "transcribe":
-        return [{ key: "Enter", action: "insert the text of an audio file" }, others, close];
+    switch (MAIN[this.selected].id) {
+      case "readAloud":
+        return [{ key: "Enter", action: "what is read and how" }, close];
+      case "speechSource":
+      case "transcriptionSource":
+        return [{ key: "←→", action: "Provider · Local" }, close];
       case "voice":
         return [{ key: "Enter", action: "choose" }, ...this.voiceKeys(), close];
       case "speechModel":
@@ -763,14 +1121,47 @@ export class Panel {
       case "language":
       case "output":
         return [{ key: "Enter", action: "set" }, close];
-      case "audio":
-        return [{ key: "←→", action: AUDIO_MODES.map((mode) => AUDIO_WORDS[mode]).join(" · ") }, close];
+      case "hotkeys":
+        return [{ key: "Enter", action: "run actions, change keys" }, close];
       default:
-        return [{ key: "←→", action: "on/off" }, close];
+        return [{ key: "Enter", action: "where audio plays" }, close];
     }
   }
 
+  private menuHints(m: MenuMode): Hint[] {
+    const back: Hint = { key: "Esc", action: "back" };
+    if (m.capture) {
+      return [
+        { key: "Alt+letter", action: `new key for ${HOTKEY_NAMES[m.capture]}` },
+        { key: "Esc", action: "cancel" },
+      ];
+    }
+    if (m.menu === "bridge") {
+      const id = BRIDGE[m.selected].id;
+      if (id === "bridgeMode") return [{ key: "←→", action: BRIDGE_MODES.join(" · ") }, back];
+      if (id === "remoteMachine") return [{ key: "Enter", action: "where it comes from" }, back];
+      if (isDirectionRow(id)) return [{ key: "←→", action: MACHINES.map((m) => MACHINE_WORDS[m]).join(" · ") }, back];
+      return [{ key: "Enter", action: "address, pair" }, back];
+    }
+    if (m.menu === "readAloud") {
+      const id = READ_ALOUD[m.selected].id;
+      if (id === "summarizer") return [{ key: "Enter", action: "choose a model" }, back];
+      const values =
+        id === "readMode"
+          ? READ_MODES.map((r) => READ_WORDS[r])
+          : id === "summaryLength"
+            ? SUMMARY_LENGTHS.map((l) => LENGTH_WORDS[l].split(" ")[0])
+            : TRUNCATE_SECONDS.map(truncateWord);
+      return [{ key: "←→", action: values.join(" · ") }, back];
+    }
+    const id = HOTKEYS[m.selected].id;
+    const change: Hint[] = id === "speak" || id === "dictate" ? [{ key: "k", action: "change key" }] : [];
+    return [{ key: "Enter", action: "run" }, ...change, back];
+  }
+
   private voiceKeys(): Hint[] {
+    // A local voice has no language to set.
+    if (this.speech.settings.speechSource === "local") return [{ key: "Tab", action: "sample", optional: true }];
     return [
       { key: "Tab", action: "sample", optional: true },
       { key: "F2", action: "language", optional: true },
@@ -782,7 +1173,10 @@ export class Panel {
   /** One key. Never throws: a failure becomes the status line. */
   handle(k: PanelKey): void {
     try {
-      if ("text" in k) this.text(k.text, k.paste === true);
+      const m = this.mode;
+      if (m.kind === "menu" && m.capture) this.capture(m, m.capture, k);
+      else if ("combo" in k) return;
+      else if ("text" in k) this.text(k.text, k.paste === true);
       else this.named(k.key);
     } catch (err) {
       this.setStatus("error", `✗ ${errorMessage(err)}`);
@@ -796,7 +1190,7 @@ export class Panel {
       return;
     }
     if (key === "speak") {
-      // Alt+S: the composer from anywhere; in the composer it changes nothing.
+      // The Speak key: the composer from anywhere; in the composer it changes nothing.
       if (this.mode.kind !== "input" || this.mode.purpose !== "speak") this.openSpeaker();
       return;
     }
@@ -816,15 +1210,22 @@ export class Panel {
       const highlighted = items[Math.min(p.selected, n - 1)];
       if (key === "up" || key === "down") {
         if (n) p.selected = (Math.min(p.selected, n - 1) + (key === "up" ? n - 1 : 1)) % n;
-      } else if (key === "enter") this.pick(p);
-      else if (key === "escape") this.mode = { kind: "list" };
-      else if (key === "tab") {
+        this.offer = undefined;
+        this.deleting = undefined;
+      } else if (key === "enter") this.pick(m);
+      else if (key === "escape") {
+        this.offer = undefined;
+        this.deleting = undefined;
+        this.mode = m.back;
+      } else if (p.local && (key === "tab" || key === "backtab")) {
+        // A local list has no sort or feature filter.
+      } else if (key === "tab") {
         if (p.row === "voice" && highlighted) this.sample(highlighted.id);
         else if (isModelRow(p.row)) this.nextSort(p);
       } else if (key === "backtab") {
         if (isModelRow(p.row)) this.nextShow({ ...p, row: p.row }, p);
       } else if (key === "language") {
-        if (p.row === "voice" && highlighted) this.askLanguage(highlighted.id);
+        if (p.row === "voice" && highlighted && !this.localVoice()) this.askLanguage(highlighted.id);
       } else {
         const before = p.edit.value;
         p.edit.edit(key);
@@ -832,35 +1233,40 @@ export class Panel {
       }
       return;
     }
-    const id = ROWS[this.selected].id;
+    if (m.kind === "menu") {
+      const rows = MENUS[m.menu].rows;
+      const id = rows[m.selected].id;
+      if (key === "up" || key === "down")
+        m.selected = (m.selected + (key === "up" ? rows.length - 1 : 1)) % rows.length;
+      else if (key === "enter") this.activate(id);
+      else if (key === "left" || key === "right") this.step(id, key === "left" ? -1 : 1);
+      else if (key === "escape") {
+        // Leaving Hotkeys with a changed key closes the panel, and the host reloads Pi to bind it.
+        if (m.menu === "hotkeys" && this.hotkeysChanged()) {
+          this.rebind = true;
+          this.deps.close();
+        } else this.mode = { kind: "list" };
+      }
+      return;
+    }
+    const id = MAIN[this.selected].id;
     switch (key) {
       case "up":
-      case "down": {
-        // Line by line; a toolbar is entered at the column it was left at.
-        const at = LINES.findIndex((line) => line.includes(this.selected));
-        const line = LINES[(at + (key === "up" ? LINES.length - 1 : 1)) % LINES.length];
-        this.selected = line[Math.min(this.col, line.length - 1)];
+      case "down":
+        this.selected = (this.selected + (key === "up" ? MAIN.length - 1 : 1)) % MAIN.length;
         return;
-      }
       case "left":
-      case "right": {
-        const line = LINES.find((l) => l.includes(this.selected)) ?? [this.selected];
-        if (line.length === 1) {
-          this.step(id, key === "left" ? -1 : 1);
-          return;
-        }
-        this.col = (line.indexOf(this.selected) + (key === "left" ? line.length - 1 : 1)) % line.length;
-        this.selected = line[this.col];
+      case "right":
+        this.step(id, key === "left" ? -1 : 1);
         return;
-      }
       case "enter":
         this.activate(id);
         return;
       case "tab":
-        if (id === "voice") this.sample(this.speech.settings.voice);
+        if (id === "voice") this.sample(this.localVoice()?.voice ?? this.speech.settings.voice);
         return;
       case "language":
-        if (id === "voice") this.askLanguage(this.speech.settings.voice);
+        if (id === "voice" && !this.localVoice()) this.askLanguage(this.speech.settings.voice);
         return;
       case "escape":
         this.deps.close();
@@ -876,27 +1282,78 @@ export class Panel {
       return;
     }
     if (m.kind === "picker") {
+      // In a list of on-device models, d downloads and x deletes the highlighted one.
+      if (m.picker.local && !paste && (text === "d" || text === "x")) {
+        const item = this.pickerItems(m.picker)[m.picker.selected];
+        if (item) {
+          if (text === "d") this.downloadKey(item.id);
+          else this.deleteKey(item.id);
+        }
+        return;
+      }
       m.picker.edit.insert(text);
       m.picker.selected = 0;
       return;
     }
-    const id = ROWS[this.selected].id;
-    if (isPickerRow(id)) {
-      this.openPicker(id, text);
+    if (m.kind === "list" && isPickerRow(MAIN[this.selected].id)) {
+      this.openPicker(MAIN[this.selected].id as ListRow, text);
       return;
     }
     if (paste) return;
-    // The keys of the actions; on the other rows typing does nothing.
     const ch = [...text][0];
-    if (ch === "s") this.stop();
-    else if (ch === "r") this.replay();
-    else if (ch === "h") this.openPicker("history");
-    else if (ch === "t") this.ask("transcribe");
+    if (m.kind === "menu" && m.menu === "hotkeys" && ch === "k") {
+      const id = HOTKEYS[m.selected].id;
+      if (id === "speak" || id === "dictate") m.capture = id;
+      else this.setStatus("info", "Only Speak and Dictate have keys of their own to change");
+      return;
+    }
+    if (m.kind === "menu" && m.menu !== "hotkeys") return;
+    // The keys of the actions, in the main view and in Hotkeys.
+    const action = (Object.keys(LETTERS) as RowId[]).find((id) => LETTERS[id] === ch);
+    if (action) this.activate(action);
+  }
+
+  /**
+   * The new key of Speak or Dictate, saved in the settings. Pi binds an extension's shortcuts when it loads the
+   * extension: leaving Hotkeys closes the panel and the host reloads Pi, so the key works at once.
+   */
+  private capture(m: MenuMode, name: HotkeyName, k: PanelKey): void {
+    if ("key" in k && k.key === "escape") {
+      m.capture = undefined;
+      return;
+    }
+    const pressed = "combo" in k ? k.combo : "key" in k ? k.id : k.text;
+    if (!pressed) return;
+    m.capture = undefined;
+    const key = hotkeyId(pressed);
+    if (!key) {
+      const shown = pressed.length === 1 ? pressed : keyLabel(pressed);
+      this.setStatus("error", `✗ ${shown} cannot be a hotkey: use Alt with a letter or a digit`);
+      return;
+    }
+    const saved = this.speech.settings.hotkeys;
+    const other: HotkeyName = name === "speak" ? "dictate" : "speak";
+    if (key === saved[other]) {
+      this.setStatus("error", `✗ ${keyLabel(key)} is already the key of ${HOTKEY_NAMES[other]}`);
+      return;
+    }
+    if (key === saved[name]) {
+      this.setStatus("info", `${HOTKEY_NAMES[name]} is already ${keyLabel(key)}`);
+      return;
+    }
+    this.speech.settings.hotkeys = { ...saved, [name]: key };
+    this.speech.save();
+    this.setStatus(
+      "success",
+      key === this.bound[name]
+        ? `✓ ${HOTKEY_NAMES[name]} is ${keyLabel(key)} again`
+        : `✓ ${HOTKEY_NAMES[name]} is ${keyLabel(key)}`,
+    );
   }
 
   /** Ask for the file to transcribe, or the dictation language, on the line under its row. */
   private ask(purpose: "transcribe" | "dictation"): void {
-    this.mode = { kind: "input", purpose, edit: new LineEdit(), back: { kind: "list" } };
+    this.mode = { kind: "input", purpose, edit: new LineEdit(), back: this.home() };
   }
 
   private activate(id: RowId): void {
@@ -926,7 +1383,31 @@ export class Panel {
       case "speechModel":
       case "transcription":
       case "voice":
+      case "summarizer":
         this.openPicker(id);
+        return;
+      case "readAloud":
+        this.mode = { kind: "menu", menu: "readAloud", selected: 0 };
+        return;
+      case "hotkeys":
+        this.mode = { kind: "menu", menu: "hotkeys", selected: 0 };
+        return;
+      case "bridge":
+        this.mode = { kind: "menu", menu: "bridge", selected: 0 };
+        this.probe();
+        this.startPairing();
+        return;
+      case "remoteMachine":
+        this.setStatus("info", URL_FROM);
+        return;
+      case "pairing":
+        this.mode = {
+          kind: "input",
+          purpose: "pairAddress",
+          edit: new LineEdit(this.speech.settings.bridgeAddress ?? ""),
+          back: this.home(),
+        };
+        this.setStatus("info", PAIR_HOW);
         return;
       default:
         this.step(id, 1);
@@ -936,19 +1417,48 @@ export class Panel {
 
   // ── Changes, through the engine's operations ────────────────────────────
 
-  /** ←→ on a setting: toggle, or step through the audio modes. Picker rows have long lists: nothing. */
+  /** Enter or ←→ on a value: cycle it in place. Picker rows have long lists: nothing. */
   private step(id: RowId, dir: 1 | -1): void {
-    if (id === "readAloud") {
-      const on = !this.engine.readAloud.enabled;
-      this.engine.readAloud.enabled = on;
-      this.setStatus("success", `✓ Read replies aloud: ${onOff(on)}`);
-    } else if (id === "tools") {
-      const on = this.shown("tools") !== "on";
-      this.change("tools", onOff(on), async () => `✓ ${await this.engine.setTools(on)}`);
-    } else if (id === "audio") {
-      const i = AUDIO_MODES.findIndex((m) => AUDIO_WORDS[m] === this.shown("audio"));
-      const next = AUDIO_MODES[(i + dir + AUDIO_MODES.length) % AUDIO_MODES.length];
-      this.change("audio", AUDIO_WORDS[next], async () => {
+    // Read aloud options change in place; the line under them says what the new value does.
+    if (id === "readMode") {
+      this.engine.readAloud.mode = cycle(READ_MODES, this.engine.readAloud.mode, dir);
+      this.clearStatus();
+    } else if (id === "summaryLength") {
+      this.engine.setReadAloudOptions({ length: cycle(SUMMARY_LENGTHS, this.speech.settings.readAloud.length, dir) });
+      this.clearStatus();
+    } else if (id === "truncate") {
+      this.engine.setReadAloudOptions({
+        truncate: cycle(TRUNCATE_SECONDS, this.speech.settings.readAloud.truncate, dir),
+      });
+      this.clearStatus();
+    } else if (id === "speechSource" || id === "transcriptionSource") {
+      const direction = directionOf(id);
+      const s = this.speech.settings;
+      const next = cycle(SOURCES, direction === "speech" ? s.speechSource : s.transcriptionSource, dir);
+      const summary = this.speech.setSource(direction, next);
+      if (next === "local") this.track(this.loadLocal());
+      if (direction === "speech") this.track(this.loadVoices());
+      this.setStatus("success", `✓ ${summary}`);
+    } else if (isDirectionRow(id)) {
+      try {
+        const notice = this.engine.setDirection(id, cycle(MACHINES, this.speech.settings[id], dir));
+        this.setStatus(
+          notice.level === "info" ? "success" : "warning",
+          `${notice.level === "info" ? "✓" : "!"} ${notice.message}`,
+        );
+      } catch (err) {
+        this.setStatus("info", errorMessage(err));
+        return;
+      }
+      if (id === "modelsOn") {
+        const s = this.speech.settings;
+        if (s.speechSource === "local" || s.transcriptionSource === "local") this.track(this.loadLocal(true));
+        if (s.speechSource === "local") this.track(this.loadVoices());
+      }
+    } else if (id === "bridgeMode") {
+      const i = BRIDGE_MODES.indexOf(this.shown("bridgeMode") as BridgeMode);
+      const next = BRIDGE_MODES[(i + dir + BRIDGE_MODES.length) % BRIDGE_MODES.length];
+      this.change("bridgeMode", next, async () => {
         const notice = await this.engine.setBridge(next);
         await this.probe();
         return notice.level === "info" ? `✓ ${notice.message}` : { tone: "error", text: `✗ ${notice.message}` };
@@ -974,7 +1484,8 @@ export class Panel {
     this.track(run);
   }
 
-  private pick(p: PickerState): void {
+  private pick(m: Extract<Mode, { kind: "picker" }>): void {
+    const p = m.picker;
     const item = this.pickerItems(p)[p.selected];
     if (!item) return;
     const row = p.row;
@@ -983,7 +1494,16 @@ export class Panel {
       this.replayFile(item.id);
       return;
     }
-    this.mode = { kind: "list" };
+    if (p.local && isModelRow(row)) {
+      this.pickLocal(m, item.id);
+      return;
+    }
+    this.mode = m.back;
+    if (row === "summarizer") {
+      this.engine.setReadAloudOptions({ summarizer: item.id === SAME_MODEL ? undefined : item.id });
+      this.clearStatus();
+      return;
+    }
     this.change(row, item.id, async () => {
       const summary = await this.speech.set(SETTING_OF[row], item.id);
       if (row === "speechModel") this.track(this.loadVoices());
@@ -1009,10 +1529,33 @@ export class Panel {
   /** Open a picker, with `typed` already in its filter; the selection starts at the top. */
   private openPicker(row: PickerRow, typed = ""): void {
     const p: PickerState = { row, edit: new LineEdit(typed), selected: 0, show: "all" };
-    this.mode = { kind: "picker", picker: p };
+    const back = this.home();
+    this.mode = { kind: "picker", picker: p, back };
     if (row === "history") {
       p.messages = this.speech.messages();
       p.ids = p.messages.map((m) => m.file);
+      return;
+    }
+    if (row === "summarizer") {
+      p.ids = [SAME_MODEL, ...this.engine.readAloud.models()];
+      return;
+    }
+    if (isModelRow(row) && this.sourceOf(row) === "local") {
+      p.local = true;
+      const kind = directionOf(row);
+      const of = (all: LocalModel[]) => all.filter((m) => m.kind === kind).map((m) => m.id);
+      if (this.localModels) p.ids = of(this.localModels);
+      this.track(
+        this.loadLocal(true).then(
+          (all) => {
+            p.ids = of(all);
+          },
+          (err) => {
+            if (this.mode.kind === "picker" && this.mode.picker === p) this.mode = back;
+            this.setStatus("error", `✗ Local models: ${errorMessage(err)}`);
+          },
+        ),
+      );
       return;
     }
     const kind = row === "speechModel" ? "tts" : "stt";
@@ -1028,10 +1571,141 @@ export class Panel {
           p.ids = loaded;
         },
         (err) => {
-          if (this.mode.kind === "picker" && this.mode.picker === p) this.mode = { kind: "list" };
+          if (this.mode.kind === "picker" && this.mode.picker === p) this.mode = back;
           this.setStatus("error", `✗ ${errorMessage(err)}`);
         },
       ),
+    );
+  }
+
+  private sourceOf(row: "speechModel" | "transcription"): Source {
+    const s = this.speech.settings;
+    return row === "speechModel" ? s.speechSource : s.transcriptionSource;
+  }
+
+  // ── On-device models ────────────────────────────────────────────────────
+
+  /**
+   * Enter on an on-device model: a downloaded one is chosen; one not downloaded is offered for download (with
+   * its size), and Enter again downloads it and then chooses it.
+   */
+  private pickLocal(m: Extract<Mode, { kind: "picker" }>, id: string): void {
+    const row = m.picker.row as "speechModel" | "transcription";
+    const direction = directionOf(row);
+    const model = this.localModels?.find((x) => x.id === id);
+    if (!model) return;
+    this.deleting = undefined;
+    if (model.downloaded) {
+      this.offer = undefined;
+      this.mode = m.back;
+      const summary = this.speech.setLocalModel(direction, id);
+      if (direction === "speech") this.track(this.loadVoices());
+      this.setStatus("success", `✓ ${summary}`);
+      return;
+    }
+    if (this.offer === id) {
+      this.startDownload(model, { direction, picker: m });
+      return;
+    }
+    this.offer = id;
+    this.setStatus("warning", `! ${id} is not downloaded (${formatSize(model.size)}) · Enter downloads it`);
+  }
+
+  /** d in a local list: download the highlighted model. */
+  private downloadKey(id: string): void {
+    const model = this.localModels?.find((x) => x.id === id);
+    if (!model) return;
+    if (model.downloaded) {
+      this.setStatus("info", `${id} is already downloaded`);
+      return;
+    }
+    this.startDownload(model);
+  }
+
+  /** x in a local list: x once asks, x again deletes the highlighted model. */
+  private deleteKey(id: string): void {
+    const model = this.localModels?.find((x) => x.id === id);
+    if (!model) return;
+    this.offer = undefined;
+    if (!model.downloaded && !model.partial) {
+      this.setStatus("info", `${id} is not downloaded`);
+      return;
+    }
+    if (this.downloading?.id === id) {
+      this.setStatus("info", `${id} is downloading`);
+      return;
+    }
+    if (this.deleting !== id) {
+      this.deleting = id;
+      this.setStatus("warning", `! x again deletes ${id} (${formatSize(model.size)})`);
+      return;
+    }
+    this.deleting = undefined;
+    this.setStatus("busy", `… deleting ${id}`);
+    this.track(
+      this.speech.local
+        .delete(id)
+        .then(async (freed) => {
+          await this.loadLocal(true).catch(() => {});
+          this.setStatus("success", `✓ ${id} deleted · ${formatSize(freed)} freed`);
+        })
+        .catch((err) => this.setStatus("error", `✗ ${id} was not deleted: ${errorMessage(err)}`)),
+    );
+  }
+
+  /**
+   * Download an on-device model with its progress on the status line; when it was chosen from a model list,
+   * it becomes that direction's model once downloaded.
+   */
+  private startDownload(
+    model: LocalModel,
+    chosen?: { direction: Direction; picker: Extract<Mode, { kind: "picker" }> },
+  ): void {
+    this.offer = undefined;
+    if (this.downloading) {
+      this.setStatus("info", `${this.downloading.id} is downloading; one download at a time`);
+      return;
+    }
+    const id = model.id;
+    const state: { id: string; progress?: DownloadProgress } = { id };
+    let result: Promise<unknown>;
+    try {
+      result = this.speech.local.download(id, {
+        onProgress: (p) => {
+          state.progress = p;
+          if (this.downloading === state) this.setStatus("busy", downloadLine(id, p));
+          this.changed();
+        },
+      }).result;
+    } catch (err) {
+      this.setStatus("error", `✗ ${errorMessage(err)}`);
+      return;
+    }
+    this.downloading = state;
+    this.setStatus("busy", `… downloading ${id} (${formatSize(model.size)})`);
+    this.track(
+      result
+        .then(async (r) => {
+          this.downloading = undefined;
+          const done = r as { status: string; done?: number; total?: number };
+          if (done.status === "stopped") {
+            this.setStatus("info", `Download of ${id} stopped; the next download goes on from there`);
+            return;
+          }
+          await this.loadLocal(true).catch(() => {});
+          if (!chosen) {
+            this.setStatus("success", `✓ ${id} downloaded`);
+            return;
+          }
+          const summary = this.speech.setLocalModel(chosen.direction, id);
+          if (this.mode === chosen.picker) this.mode = chosen.picker.back;
+          if (chosen.direction === "speech") this.track(this.loadVoices());
+          this.setStatus("success", `✓ ${id} downloaded · ${summary}`);
+        })
+        .catch((err) => {
+          this.downloading = undefined;
+          this.setStatus("error", `✗ Download of ${id} failed: ${errorMessage(err)}`);
+        }),
     );
   }
 
@@ -1044,7 +1718,7 @@ export class Panel {
       kind: "input",
       purpose: "output",
       edit: new LineEdit(this.speech.settings.dictationOutput ?? ""),
-      back: { kind: "list" },
+      back: this.home(),
     };
   }
 
@@ -1062,8 +1736,17 @@ export class Panel {
       );
       return;
     }
+    if (m.purpose === "pairAddress") {
+      // Empty goes back to the default (the ssh forward), so the empty guard below must not apply here.
+      this.connectTo(m);
+      return;
+    }
     const text = m.edit.value.trim();
     if (!text) return;
+    if (m.purpose === "pairCode") {
+      this.pairWith(m, text.replace(/\s+/g, ""));
+      return;
+    }
     if (m.purpose === "speak") {
       m.edit.clear();
       this.speakText(text);
@@ -1093,6 +1776,72 @@ export class Panel {
           this.setStatus("success", `✓ ${summary}`);
         },
         (err) => this.setStatus("error", `✗ ${errorMessage(err)}`),
+      ),
+    );
+  }
+
+  /** Pairing's address: connect when a token works there, else ask the receiver for a code and ask for it here. */
+  private connectTo(m: Extract<Mode, { kind: "input"; purpose: "pairAddress" }>): void {
+    const address = m.edit.value.trim();
+    this.setStatus("busy", `… connecting to ${address || "the ssh forward"}`);
+    this.track(
+      this.engine.pairAt(address).then(
+        (r) => {
+          if (r.state === "connected") {
+            this.pairing = r.probe;
+            if (this.mode === m) this.mode = m.back;
+            this.setStatus("success", `✓ Connected to ${r.probe.address}:${r.probe.port}, receiver ${r.probe.version}`);
+            void this.probe();
+            return;
+          }
+          if (this.mode === m) {
+            this.mode = { kind: "input", purpose: "pairCode", address: r.address, edit: new LineEdit(), back: m.back };
+          }
+          const minutes = r.expiresIn >= 60 ? `${Math.round(r.expiresIn / 60)} min` : `${r.expiresIn} s`;
+          this.setStatus(
+            "info",
+            `No token of This machine works there: type the code the receiver at ${r.address} shows on its terminal (it expires in ${minutes})`,
+          );
+        },
+        (err) => this.setStatus("error", `✗ ${errorMessage(err)}`),
+      ),
+    );
+  }
+
+  /** Pairing's code: the token it earns is saved; a wrong code may be typed again, an expired one asked anew. */
+  private pairWith(m: Extract<Mode, { kind: "input"; purpose: "pairCode" }>, code: string): void {
+    this.setStatus("busy", "… pairing");
+    this.track(
+      this.engine.pairWithCode(m.address, code).then(
+        (r) => {
+          this.pairing = r.probe;
+          if (this.mode === m) this.mode = m.back;
+          const where = displayUrl(`http://${m.address}`).replace(/^http:\/\//, "");
+          const tail = r.overridden ? " (PI_SPEECH_BRIDGE_TOKEN is set and still wins: unset it)" : "";
+          const tone = r.probe.ok && !r.overridden ? "success" : "warning";
+          this.setStatus(
+            tone,
+            `${tone === "success" ? "✓" : "!"} Paired with ${where}: the token is in ${r.file}${tail}`,
+          );
+          void this.probe();
+        },
+        (err) => {
+          if (err instanceof PairingError && err.kind === "wrong" && err.attemptsLeft !== 0) {
+            m.edit.clear();
+            const left = err.attemptsLeft === undefined ? "" : ` (${err.attemptsLeft} attempts left)`;
+            this.setStatus("error", `✗ ${errorMessage(err)}${left}`);
+            return;
+          }
+          if (err instanceof PairingError && err.kind !== "other") {
+            // The code is void: back to the address, where Enter asks for a new one.
+            if (this.mode === m) {
+              this.mode = { kind: "input", purpose: "pairAddress", edit: new LineEdit(m.address), back: m.back };
+            }
+            this.setStatus("error", `✗ ${errorMessage(err)}: Enter asks for a new code`);
+            return;
+          }
+          this.setStatus("error", `✗ ${errorMessage(err)}`);
+        },
       ),
     );
   }
@@ -1205,10 +1954,16 @@ export class Panel {
     void this.engine.dictation.toggle(this.deps.ui).catch((err) => this.deps.ui.notify(errorMessage(err), "error"));
   }
 
+  /** With Speech source Local, the chosen local voice: a name, or empty for the model's first voice. */
+  private localVoice(): { voice: string } | undefined {
+    const s = this.speech.settings;
+    return s.speechSource === "local" ? { voice: s.localSpeechVoice ?? "" } : undefined;
+  }
+
   /** A sample of `voice` (the `--sample` rules); a newer sample replaces the line of an older one. */
   private sample(voice: string): void {
     const seq = ++this.sampleSeq;
-    this.setStatus("busy", `♪ sampling ${voice}…`);
+    this.setStatus("busy", `♪ sampling ${voice || "default"}…`);
     const mine = () => seq === this.sampleSeq;
     this.track(
       this.speech.sample(voice).then(
@@ -1244,18 +1999,55 @@ export class Panel {
     return this.modelsLoad;
   }
 
-  private currentVoices(): string[] | undefined {
-    const v = this.voices;
-    return v?.model === this.speech.settings.speechModel ? v.ids : undefined;
+  /** The on-device models and their state; `fresh` lists them again (after a download or a delete). */
+  private loadLocal(fresh = false): Promise<LocalModel[]> {
+    if (fresh) this.localLoad = undefined;
+    this.localLoad ??= this.speech.local.list().then(
+      (all) => {
+        this.localModels = all;
+        this.localError = undefined;
+        return all;
+      },
+      (err) => {
+        this.localLoad = undefined;
+        this.localError = errorMessage(err);
+        throw err;
+      },
+    );
+    return this.localLoad;
   }
 
-  /** The voices of the current speech model (for xai the xAI voice list, which also gives the languages). */
+  /** What the voices are of: the speech model, or with Speech source Local `local:<where>:<model>`. */
+  private voicesKey(): string {
+    const s = this.speech.settings;
+    return s.speechSource === "local"
+      ? `local:${this.engine.routes.modelsRoute}:${s.localSpeechModel ?? ""}`
+      : s.speechModel;
+  }
+
+  private currentVoices(): string[] | undefined {
+    const v = this.voices;
+    return v?.model === this.voicesKey() ? v.ids : undefined;
+  }
+
+  /**
+   * The voices of the current speech model (for xai the xAI voice list, which also gives the languages); with
+   * Speech source Local, those the binary lists for the local model (none while no model is chosen).
+   */
   private loadVoices(): Promise<string[]> {
-    const model = this.speech.settings.speechModel;
+    const s = this.speech.settings;
+    const model = this.voicesKey();
     if (this.voices?.model === model && !this.voices.error) return this.voices.load;
+    const local = s.speechSource === "local" ? s.localSpeechModel : undefined;
+    const voices =
+      s.speechSource !== "local"
+        ? this.speech.voicesFor(model)
+        : local
+          ? this.speech.localVoices(local)
+          : Promise.resolve([]);
     const entry: NonNullable<Panel["voices"]> = {
       model,
-      load: this.speech.voicesFor(model).then(
+      load: voices.then(
         (ids) => {
           entry.ids = ids;
           return ids;
@@ -1290,7 +2082,43 @@ export class Panel {
     return done;
   }
 
+  /** Probe the receiver for Pairing now, and again every ~2 s while Bridge connection is open. */
+  private startPairing(): void {
+    this.stopPairing();
+    this.pairing = "checking";
+    this.track(this.pair());
+    this.pairTimer = setInterval(() => {
+      const home = this.home();
+      if (this.disposed || home.kind !== "menu" || home.menu !== "bridge") this.stopPairing();
+      else this.track(this.pair());
+    }, this.deps.pairingMs ?? 2000);
+    this.pairTimer.unref?.();
+  }
+
+  private stopPairing(): void {
+    if (this.pairTimer) clearInterval(this.pairTimer);
+    this.pairTimer = undefined;
+  }
+
+  /** One probe; a newer one wins. The row keeps its last result while the next probe runs. */
+  private async pair(): Promise<void> {
+    const seq = ++this.pairSeq;
+    let r: BridgeProbe;
+    try {
+      r = await this.engine.probeBridge();
+    } catch (err) {
+      r = { ok: false, reason: errorMessage(err) };
+    }
+    if (seq === this.pairSeq) this.pairing = r;
+  }
+
   // ── Plumbing ────────────────────────────────────────────────────────────
+
+  private clearStatus(): void {
+    if (this.statusTimer) clearTimeout(this.statusTimer);
+    this.statusTimer = undefined;
+    this.status = undefined;
+  }
 
   private setStatus(tone: StatusTone, text: string): Status {
     if (this.statusTimer) clearTimeout(this.statusTimer);

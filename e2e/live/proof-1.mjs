@@ -32,11 +32,9 @@ try {
   check(errors(say).length === 0, '/speech succeeds', notes(say));
   const files = ctx.history();
   const wav = files.find((f) => f.endsWith('.wav'));
-  const mp3 = files.find((f) => f.endsWith('.mp3'));
-  check(wav && mp3, '/speech saves a WAV and an MP3', files);
+  check(wav && files.length === 1, '/speech saves the message once, as a WAV', files);
   if (wav) check(ffprobeDuration(path.join(ctx.speechDir, wav)) > 0, 'the WAV is playable (ffprobe duration > 0)', ffprobeDuration(path.join(ctx.speechDir, wav)));
-  if (mp3) check(ffprobeDuration(path.join(ctx.speechDir, mp3)) > 0, 'the MP3 is playable (ffprobe duration > 0)');
-  check(ctx.playerLog().length === 1 && ctx.playerLog()[0].endsWith('.wav'), 'the message is handed to the player as the WAV', ctx.playerLog());
+  check(ctx.playerLog().length === 1 && /^(s16le|wav|mp3)\b/.test(ctx.playerLog()[0]), 'the message is played as a Stream', ctx.playerLog());
 
   const t = await callTool(ctx, s, 'speech_transcribe', { path: fixture });
   const text = t.content.toLowerCase();

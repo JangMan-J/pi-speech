@@ -30,11 +30,9 @@ try {
   check(errors(say).length === 0, '/speech through xai succeeds', scrub(notes(say)));
   const files = ctx.history();
   const wav = files.find((f) => f.endsWith('.wav'));
-  const mp3 = files.find((f) => f.endsWith('.mp3'));
-  check(wav && mp3, 'xai speech is saved as a WAV and an MP3', files);
+  check(wav && files.length === 1, 'xai speech is saved once, as a WAV', files);
   if (wav) check(ffprobeDuration(path.join(ctx.speechDir, wav)) > 0, 'the xai WAV is playable (ffprobe duration > 0)');
-  if (mp3) check(ffprobeDuration(path.join(ctx.speechDir, mp3)) > 0, 'the xai MP3 is playable (ffprobe duration > 0)');
-  check(ctx.playerLog().length === 1 && ctx.playerLog()[0].endsWith('.wav'), 'the message is handed to the player as the WAV', ctx.playerLog());
+  check(ctx.playerLog().length === 1 && /^(s16le|wav|mp3)\b/.test(ctx.playerLog()[0]), 'the message is played as a Stream', ctx.playerLog());
 
   for (const lang of ['ja', 'fr']) {
     await command(s, `/speech --language eve ${lang}`);

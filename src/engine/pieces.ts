@@ -1,11 +1,11 @@
 /**
- * Pieces of a long spoken text, for streamed playback: split at sentence ends so the first piece can play
+ * Pieces of a long spoken text, for a Reading: split at sentence ends so the first piece can play
  * while the rest is synthesized. Put together with single spaces, the pieces are the text (whitespace
  * aside): nothing is lost, repeated or added.
  */
 
 /** Playback-only texts longer than this are spoken in pieces; shorter ones in one request. */
-export const STREAM_MIN_CHARS = 280;
+export const READING_MIN_CHARS = 280;
 /** The first piece: the first sentence or sentences, 40 to 240 characters. */
 export const FIRST_PIECE_MIN = 40;
 export const FIRST_PIECE_MAX = 240;

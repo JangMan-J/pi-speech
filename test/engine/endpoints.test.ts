@@ -10,7 +10,7 @@ import { Panel } from "../../src/engine/panel";
 import { SettingsFile } from "../../src/engine/settings";
 import { Surface, usage } from "../../src/engine/surface";
 import { wavSeconds } from "../../src/engine/wav";
-import { makeEngine, scriptedUi } from "./fixtures";
+import { makeEngine, scriptedUi, until } from "./fixtures";
 
 interface Seen {
   method: string;
@@ -47,12 +47,20 @@ interface ServerOptions {
   key?: string;
   /** Reject WAV by name, as a server that only has MP3 does. */
   mp3Only?: boolean;
+  /** Answer speech with raw PCM (`audio/pcm;rate=24000`) instead of WAV. */
+  pcm?: boolean;
+  /** Send the first half second of each speech answer, then wait for `release()` before the rest. */
+  hold?: boolean;
 }
 
 const servers: Server[] = [];
 
 async function serve(opts: ServerOptions = {}) {
   const seen: Seen[] = [];
+  let release!: () => void;
+  const released = new Promise<void>((r) => {
+    release = r;
+  });
   const server = createServer(async (req, res) => {
     const chunks: Buffer[] = [];
     for await (const c of req) chunks.push(c as Buffer);
@@ -97,9 +105,16 @@ async function serve(opts: ServerOptions = {}) {
       if (opts.mp3Only && entry.json.response_format !== "mp3") {
         return send(400, { error: { message: "response_format must be one of: mp3" } });
       }
-      return opts.mp3Only
-        ? send(200, Buffer.from([0x49, 0x44, 0x33, 4, 0, 0, 0, 0, 0, 0]), "application/octet-stream")
-        : send(200, streamedWav(1), "application/octet-stream");
+      const [audio, audioType] = opts.mp3Only
+        ? [Buffer.concat([Buffer.from([0x49, 0x44, 0x33, 4, 0, 0, 0, 0, 0, 0]), Buffer.alloc(4000)]), "audio/mpeg"]
+        : opts.pcm
+          ? [streamedWav(1).subarray(44), "audio/pcm;rate=24000;channels=1"]
+          : [streamedWav(1), "application/octet-stream"];
+      if (!opts.hold) return send(200, audio, audioType);
+      res.writeHead(200, { "content-type": audioType });
+      res.write(audio.subarray(0, 24000)); // half a second: enough for the start buffer to play "Hi."
+      await released;
+      return res.end(audio.subarray(24000));
     }
     if (entry.path === "/v1/audio/transcriptions") return send(200, { text: " heard through the endpoint " });
     if (entry.path === "/v1/chat/completions" && entry.json.stream) {
@@ -120,7 +135,7 @@ async function serve(opts: ServerOptions = {}) {
   });
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   servers.push(server);
-  return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`, seen };
+  return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`, seen, release };
 }
 
 afterEach(async () => {
@@ -202,6 +217,45 @@ describe("a user-defined endpoint", () => {
     expect(wav.readUInt32LE(40)).toBe(48000);
     expect(wavSeconds(wav)).toBe(1);
     expect(engine.speech.providerName("local:kokoro")).toBe("local");
+  });
+
+  it("plays a WAV as a Stream: the first audio reaches the player before the server has finished", async () => {
+    const { url, release } = await serve({ voices: KOKORO_VOICES, hold: true });
+    const { engine, local } = makeEngine();
+    await engine.speech.setEndpoint("local", url);
+    await engine.speech.set("tts-model", "local:kokoro");
+    const spoken = engine.speech.speak("Hi.");
+    await until(() => local.streams[0]?.chunks.length > 0);
+    expect(local.streams[0].format).toEqual({ codec: "pcm", rate: 24000, channels: 1 });
+    expect(local.streams[0].ended).toBe(false);
+    release();
+    const r = await spoken;
+    expect(r.player).toBe("local");
+    expect(Buffer.concat(local.streams[0].chunks).length).toBe(48000);
+    expect(wavSeconds(readFileSync(r.files[0]))).toBe(1);
+  });
+
+  it("plays raw PCM as a Stream at the rate its content type names", async () => {
+    const { url, release } = await serve({ pcm: true, hold: true });
+    const { engine, local } = makeEngine();
+    await engine.speech.setEndpoint("local", url);
+    await engine.speech.set("tts-model", "local:kokoro");
+    const spoken = engine.speech.speak("Hi.");
+    await until(() => local.streams[0]?.chunks.length > 0);
+    expect(local.streams[0].format).toEqual({ codec: "pcm", rate: 24000, channels: 1 });
+    release();
+    expect(wavSeconds(readFileSync((await spoken).files[0]))).toBe(1);
+  });
+
+  it("plays MP3 as a Stream and saves it as MP3", async () => {
+    const { url } = await serve({ mp3Only: true });
+    const { engine, local, notes } = makeEngine();
+    await engine.speech.setEndpoint("local", url);
+    await engine.speech.set("tts-model", "local:kokoro");
+    const r = await engine.speech.speak("Hi.");
+    expect(local.plays.map((p) => p.stream.format)).toEqual([{ codec: "mp3" }]);
+    expect(r.files[0]).toMatch(/\.mp3$/);
+    expect(notes).toEqual([]);
   });
 
   it("transcribes through POST /audio/transcriptions as multipart file + model + language", async () => {
@@ -384,7 +438,7 @@ describe("endpoints on the /speech surface and in the panel", () => {
     panel.open();
     await panel.idle();
     const row = panel.view().rows.find((r) => r.label === "Speech model");
-    expect(row).toMatchObject({ value: "local:kokoro", price: "free" });
+    expect(row).toMatchObject({ value: "local:kokoro" });
     expect(row?.alert).toBeUndefined();
   });
 });

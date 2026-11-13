@@ -6,10 +6,14 @@
 //! (answered `408` when possible). Failing `accept` calls back off instead of spinning;
 //! out of descriptors, the connection that has waited longest for its head is dropped to
 //! make room.
+//!
+//! One thread waits for all the sockets at once: with `poll` on Unix, with `WSAPoll` on
+//! Windows (its counterpart in Winsock), so the guarantees are the same on both.
 
 use crate::http::{answer_nonblocking, parse_head, Head, Request, Response};
 use std::io::{self, Read};
 use std::net::{TcpListener, TcpStream};
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::time::{Duration, Instant};
 
@@ -33,13 +37,108 @@ struct Pending {
     deadline: Instant,
 }
 
+#[cfg(unix)]
 fn no_descriptors(e: &io::Error) -> bool {
     matches!(e.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
 }
 
-fn timeout_ms(d: Duration) -> libc::c_int {
+/// Out of sockets, or of the buffer space each one needs.
+#[cfg(windows)]
+fn no_descriptors(e: &io::Error) -> bool {
+    use windows_sys::Win32::Networking::WinSock::{WSAEMFILE, WSAENOBUFS};
+    matches!(e.raw_os_error(), Some(WSAEMFILE | WSAENOBUFS))
+}
+
+fn timeout_ms(d: Duration) -> i32 {
     // Round up so a deadline is never polled for twice at the same instant.
-    (d.as_millis() + 1).min(libc::c_int::MAX as u128) as libc::c_int
+    (d.as_millis() + 1).min(i32::MAX as u128) as i32
+}
+
+/// Wait up to `wait` until the listener (`None` while accepting backs off) or any of the
+/// `pending` connections is readable. Returns whether the listener is, and for each
+/// connection whether it is (or has hung up or failed); `None` when the wait failed and
+/// is to be tried again.
+#[cfg(unix)]
+fn wait_readable(
+    listener: Option<&TcpListener>,
+    pending: &[Pending],
+    wait: Duration,
+) -> Option<(bool, Vec<bool>)> {
+    let mut fds = Vec::with_capacity(pending.len() + 1);
+    fds.push(libc::pollfd {
+        fd: match listener {
+            Some(l) => l.as_raw_fd(),
+            None => -1, // ignored by poll while backing off
+        },
+        events: libc::POLLIN,
+        revents: 0,
+    });
+    fds.extend(pending.iter().map(|p| libc::pollfd {
+        fd: p.stream.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    }));
+    let n = unsafe {
+        libc::poll(
+            fds.as_mut_ptr(),
+            fds.len() as libc::nfds_t,
+            timeout_ms(wait),
+        )
+    };
+    if n < 0 {
+        if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            std::thread::sleep(BACKOFF_START);
+        }
+        return None;
+    }
+    let readable = fds[1..]
+        .iter()
+        .map(|f| f.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0)
+        .collect();
+    Some((fds[0].revents & libc::POLLIN != 0, readable))
+}
+
+/// As on Unix, with `WSAPoll`.
+#[cfg(windows)]
+fn wait_readable(
+    listener: Option<&TcpListener>,
+    pending: &[Pending],
+    wait: Duration,
+) -> Option<(bool, Vec<bool>)> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        WSAPoll, POLLERR, POLLHUP, POLLNVAL, POLLRDNORM, SOCKET, WSAPOLLFD,
+    };
+    let entry = |s: SOCKET| WSAPOLLFD {
+        fd: s,
+        events: POLLRDNORM,
+        revents: 0,
+    };
+    let mut fds = Vec::with_capacity(pending.len() + 1);
+    // WSAPoll has no entry it ignores: while backing off, the listener is left out.
+    fds.extend(listener.map(|l| entry(l.as_raw_socket() as SOCKET)));
+    let first = fds.len();
+    fds.extend(
+        pending
+            .iter()
+            .map(|p| entry(p.stream.as_raw_socket() as SOCKET)),
+    );
+    if fds.is_empty() {
+        // WSAPoll refuses an empty set; there is nothing to wait for but the time.
+        std::thread::sleep(wait);
+        return Some((false, Vec::new()));
+    }
+    let n = unsafe { WSAPoll(fds.as_mut_ptr(), fds.len() as u32, timeout_ms(wait)) };
+    if n < 0 {
+        std::thread::sleep(BACKOFF_START);
+        return None;
+    }
+    let incoming = first == 1 && fds[0].revents & POLLRDNORM != 0;
+    let readable = fds[first..]
+        .iter()
+        .map(|f| f.revents & (POLLRDNORM | POLLHUP | POLLERR | POLLNVAL) != 0)
+        .collect();
+    Some((incoming, readable))
 }
 
 /// Run until `stopped` says so. `handoff` takes over connections whose head is complete.
@@ -67,44 +166,16 @@ pub fn run(
         for p in &pending {
             wait = wait.min(p.deadline.saturating_duration_since(now));
         }
-        let mut fds = Vec::with_capacity(pending.len() + 1);
-        fds.push(libc::pollfd {
-            fd: if accept_after.is_none() {
-                listener.as_raw_fd()
-            } else {
-                -1 // ignored by poll while backing off
-            },
-            events: libc::POLLIN,
-            revents: 0,
-        });
-        fds.extend(pending.iter().map(|p| libc::pollfd {
-            fd: p.stream.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        }));
-        let n = unsafe {
-            libc::poll(
-                fds.as_mut_ptr(),
-                fds.len() as libc::nfds_t,
-                timeout_ms(wait),
-            )
-        };
-        if n < 0 {
-            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-                std::thread::sleep(BACKOFF_START);
-            }
+        let listening = accept_after.is_none().then_some(&listener);
+        let Some((incoming, readable)) = wait_readable(listening, &pending, wait) else {
             continue;
-        }
+        };
         if stopped() {
             break;
         }
 
         // Connections first: their descriptors may be what accept is missing.
         let now = Instant::now();
-        let readable: Vec<bool> = fds[1..]
-            .iter()
-            .map(|f| f.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0)
-            .collect();
         let mut keep = Vec::with_capacity(pending.len());
         for (mut p, ready) in pending.into_iter().zip(readable) {
             match step(&mut p, ready, now) {
@@ -126,7 +197,7 @@ pub fn run(
         }
         pending = keep;
 
-        if fds[0].revents & libc::POLLIN != 0 && accept_after.is_none() {
+        if incoming && accept_after.is_none() {
             // Take what is waiting, but not forever: other connections need their turn.
             for _ in 0..64 {
                 match listener.accept() {

@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fetchSpeechCatalog, synthesize, transcribe, wrapPcmAsWav } from "../../src/engine/openrouter";
+import {
+  fetchSpeechCatalog,
+  synthesize,
+  synthesizeStream,
+  transcribe,
+  wrapPcmAsWav,
+} from "../../src/engine/openrouter";
+import { chunkedBody, pcmBytes } from "./fixtures";
 
 const BASE = "https://openrouter.ai/api/v1";
 
@@ -81,6 +88,56 @@ describe("synthesize", () => {
   it("throws a readable error on other failures", async () => {
     stubFetch(() => new Response("nope", { status: 500 }));
     await expect(synthesize("k", "t", "m", "v")).rejects.toThrow(/500.*nope/);
+  });
+});
+
+describe("synthesizeStream", () => {
+  it("hands over the audio of a maker that sends it over time as each chunk arrives", async () => {
+    const b = chunkedBody();
+    stubFetch(() => new Response(b.body, { headers: { "content-type": "audio/pcm;rate=24000;channels=1" } }));
+    const pending = synthesizeStream("k", "t", "x-ai/grok-voice-tts-1.0", "eve");
+    b.send(pcmBytes(16));
+    const s = await pending;
+    expect(s.format).toEqual({ codec: "pcm", rate: 24000, channels: 1 });
+    const it = s.chunks[Symbol.asyncIterator]();
+    expect(Array.from((await it.next()).value as Uint8Array)).toEqual(Array.from(pcmBytes(16)));
+    b.send(pcmBytes(8, 16));
+    expect(Array.from((await it.next()).value as Uint8Array)).toEqual(Array.from(pcmBytes(8, 16)));
+    b.end();
+    expect((await it.next()).done).toBe(true);
+  });
+
+  it("a maker that sends one late burst goes the same way, as one chunk", async () => {
+    stubFetch(() => new Response(pcmBytes(4800), { headers: { "content-type": "audio/pcm;rate=24000;channels=1" } }));
+    const s = await synthesizeStream("k", "t", "elevenlabs/v3", "v");
+    const got: Uint8Array[] = [];
+    for await (const c of s.chunks) got.push(c);
+    expect(Buffer.concat(got).length).toBe(4800);
+  });
+
+  it("a model that refuses PCM is asked for MP3 and streams that", async () => {
+    stubFetch((_u, init) => {
+      const fmt = JSON.parse(String(init?.body)).response_format;
+      if (fmt === "pcm")
+        return new Response('{"error":{"message":"response_format pcm unsupported"}}', { status: 400 });
+      return new Response(new Uint8Array([0xff, 0xfb, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]), {
+        headers: { "content-type": "audio/mpeg" },
+      });
+    });
+    const s = await synthesizeStream("k", "t", "minimax/speech", "v");
+    expect(s.format).toEqual({ codec: "mp3" });
+  });
+
+  it("a response that breaks off is an error naming OpenRouter", async () => {
+    const b = chunkedBody();
+    stubFetch(() => new Response(b.body, { headers: { "content-type": "audio/pcm" } }));
+    const pending = synthesizeStream("k", "t", "m", "v");
+    b.send(pcmBytes(16));
+    const s = await pending;
+    const it = s.chunks[Symbol.asyncIterator]();
+    await it.next();
+    b.fail(new Error("connection reset"));
+    await expect(it.next()).rejects.toThrow(/OpenRouter stopped sending audio: connection reset/);
   });
 });
 

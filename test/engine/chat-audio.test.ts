@@ -1,8 +1,15 @@
 /** Speech and transcription through the chat-completions API, with a stubbed fetch that streams. */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { chatSynthesize, chatTranscribe, READ_ATTEMPTS, sameWords } from "../../src/engine/chat-audio";
+import {
+  chatSynthesize,
+  chatSynthesizeStream,
+  chatTranscribe,
+  READ_ATTEMPTS,
+  sameWords,
+} from "../../src/engine/chat-audio";
 import { wavSeconds } from "../../src/engine/wav";
+import { chunkedBody } from "./fixtures";
 
 const TARGET = { title: "OpenRouter", baseUrl: "https://openrouter.ai/api/v1", key: "sk-or-secret" };
 
@@ -163,6 +170,151 @@ describe("speech through a chat model", () => {
     await expect(chatSynthesize(TARGET, { text: "Hi.", model: "m" })).rejects.toThrow(
       "OpenRouter: Provider disconnected",
     );
+  });
+});
+
+/** A server-sent stream the test sends event by event. */
+function handSse() {
+  const b = chunkedBody();
+  const enc = new TextEncoder();
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => new Response(b.body, { headers: { "content-type": "text/event-stream" } })),
+  );
+  return {
+    audio: (pcm: Buffer) => b.send(enc.encode(`data: ${JSON.stringify(delta({ data: pcm.toString("base64") }))}\n\n`)),
+    said: (words: string) => b.send(enc.encode(`data: ${JSON.stringify(delta({ transcript: words }))}\n\n`)),
+    done: () => {
+      b.send(enc.encode("data: [DONE]\n\n"));
+      b.end();
+    },
+  };
+}
+
+/** Reads a Stream's chunks into `got` in the background; `ended` settles with the error that ended it, if any. */
+function drain(chunks: AsyncIterable<Uint8Array>) {
+  const got: Buffer[] = [];
+  const ended = (async (): Promise<Error | undefined> => {
+    try {
+      for await (const c of chunks) got.push(Buffer.from(c));
+      return undefined;
+    } catch (err) {
+      return err as Error;
+    }
+  })();
+  return { got, ended, bytes: () => Buffer.concat(got).length };
+}
+
+const tick = () => new Promise((r) => setTimeout(r, 15));
+
+describe("speech through a chat model as a Stream", () => {
+  const TEXT = "Turn left at the old bridge, then keep going.";
+
+  it("plays audio as soon as the words said so far are the start of the text", async () => {
+    const sse = handSse();
+    const s = await chatSynthesizeStream(TARGET, { text: TEXT, model: "openai/gpt-audio-mini" });
+    expect(s.format).toEqual({ codec: "pcm", rate: 24000, channels: 1 });
+    const d = drain(s.chunks);
+    sse.said("Turn le");
+    sse.audio(tone(100));
+    sse.said("ft at the");
+    await tick();
+    expect(d.bytes()).toBe(100);
+    sse.said(" old bridge, then keep going.");
+    sse.audio(tone(200, 1));
+    await tick();
+    expect(d.bytes()).toBe(300);
+    sse.done();
+    expect(await d.ended).toBeUndefined();
+  });
+
+  it("holds audio that comes before the words that vouch for it", async () => {
+    const sse = handSse();
+    const s = await chatSynthesizeStream(TARGET, { text: TEXT, model: "m" });
+    const d = drain(s.chunks);
+    sse.audio(tone(100));
+    await tick();
+    expect(d.bytes()).toBe(0);
+    sse.said("Turn left");
+    await tick();
+    expect(d.bytes()).toBe(100);
+    sse.audio(tone(50));
+    await tick();
+    expect(d.bytes()).toBe(100);
+    sse.said(" at the old bridge, then keep going.");
+    sse.done();
+    expect(await d.ended).toBeUndefined();
+    expect(d.bytes()).toBe(150);
+  });
+
+  it("a Stray before any audio is vouched for plays nothing", async () => {
+    const sse = handSse();
+    const s = await chatSynthesizeStream(TARGET, { text: TEXT, model: "m" });
+    const d = drain(s.chunks);
+    sse.audio(tone(100));
+    sse.said("Sure! ");
+    const err = await d.ended;
+    expect(err?.message).toMatch(/did not read the text as written \(it said: "Sure!"\), so nothing was played/);
+    expect(d.bytes()).toBe(0);
+  });
+
+  it("a Stray closes the response: nothing more of it is read", async () => {
+    const b = chunkedBody();
+    const enc = new TextEncoder();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(b.body, { headers: { "content-type": "text/event-stream" } })),
+    );
+    const s = await chatSynthesizeStream(TARGET, { text: TEXT, model: "m" });
+    const d = drain(s.chunks);
+    b.send(enc.encode(`data: ${JSON.stringify(delta({ transcript: "Sure! " }))}\n\n`));
+    await d.ended;
+    expect(b.cancelled).toBe(true);
+  });
+
+  it("a Stray midway ends the Stream; audio after it never plays", async () => {
+    const sse = handSse();
+    const s = await chatSynthesizeStream(TARGET, { text: TEXT, model: "m" });
+    const d = drain(s.chunks);
+    sse.said("Turn left at the old bridge, then");
+    sse.audio(tone(100));
+    sse.said(" turn right instead");
+    sse.audio(tone(100));
+    const err = await d.ended;
+    expect(err?.message).toMatch(/it said: "Turn left at the old bridge, then turn right instead"/);
+    expect(d.bytes()).toBe(0);
+  });
+
+  it("words added after the whole text are a Stray too, even once audio flows freely", async () => {
+    const sse = handSse();
+    const s = await chatSynthesizeStream(TARGET, { text: TEXT, model: "m" });
+    const d = drain(s.chunks);
+    sse.said(TEXT);
+    sse.audio(tone(100));
+    await tick();
+    expect(d.bytes()).toBe(100);
+    sse.said(" Anything else?");
+    expect((await d.ended)?.message).toMatch(/did not read the text as written .*, so playback was stopped/);
+  });
+
+  it("a reading that ends short of the text is a Stray", async () => {
+    const sse = handSse();
+    const s = await chatSynthesizeStream(TARGET, { text: TEXT, model: "m" });
+    const d = drain(s.chunks);
+    sse.said("Turn left");
+    sse.audio(tone(100));
+    sse.done();
+    expect((await d.ended)?.message).toMatch(/it said: "Turn left"/);
+  });
+
+  it("audio without any words to check it against never plays", async () => {
+    const sse = handSse();
+    const s = await chatSynthesizeStream(TARGET, { text: TEXT, model: "m" });
+    const d = drain(s.chunks);
+    sse.audio(tone(100));
+    sse.done();
+    expect((await d.ended)?.message).toMatch(/no transcript to check its reading against/);
+    expect(d.bytes()).toBe(0);
   });
 });
 

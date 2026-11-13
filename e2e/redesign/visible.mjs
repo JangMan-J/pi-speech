@@ -58,7 +58,7 @@ try {
   const slow = path.join(ctx.work, 'slow-player');
   const log = path.join(ctx.work, 'slow.log');
   fs.writeFileSync(slow, `#!/usr/bin/env bash\necho "start $$" >> "${log}"\ntrap 'echo "term $$" >> "${log}"; exit 143' TERM INT\nsleep 6 & wait $!\n`, { mode: 0o755 });
-  s = await ctx.pi({ env: { PI_SPEECH_PLAYER: slow } });
+  s = await ctx.pi({ env: { PI_SPEECH_STREAM_PLAYER: slow } });
   from = s.uiRequests.length;
   await command(s, '/speech the first message plays for a while', 700);
   check(statusOf(s, from).some((e) => /speaking|▶/.test(e.statusText ?? '')), 'the status shows that speech is playing', statusOf(s, from));

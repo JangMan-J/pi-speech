@@ -10,9 +10,13 @@ import { basename } from "node:path";
 import type { DictationUi } from "./dictation";
 import type { Engine } from "./engine";
 import { REPLACED } from "./player";
+import { READ_MODES, type ReadMode } from "./read-aloud";
+import { ReadingFailed, readingFailedMessage } from "./reading";
 import type { BridgeMode } from "./settings";
-import { languageLabel, type SampleResult, SETTING_NAMES, type SpeechResult } from "./speech";
-import { ReadingFailed, readingFailedMessage } from "./stream";
+import { LOCAL_SPEECH_UNAVAILABLE, languageLabel, type SampleResult, SETTING_NAMES, type SpeechResult } from "./speech";
+
+/** Why Voice language… has nothing to set with Speech source Local. */
+export const LOCAL_VOICE_LANGUAGES = "Voice languages are set per provider voice and do not apply to local voices.";
 
 export interface SurfaceUi extends DictationUi {
   /** Base for a relative audio path passed to --transcribe. */
@@ -52,7 +56,12 @@ const ACTIONS: Record<string, ActionSpec> = {
   models: { args: "", help: "list speech and transcription models with prices", min: 0, max: 0 },
   voices: { args: "", help: "list the voices of the speech model", min: 0, max: 0 },
   languages: { args: "", help: "list the voice languages of the speech model", min: 0, max: 0 },
-  "read-aloud": { args: "on|off", help: "speak the final reply of each run", min: 1, max: 1 },
+  "read-aloud": {
+    args: "on|off|summary|thinking|all",
+    help: "speak the final reply of each run, or a spoken summary of it",
+    min: 1,
+    max: 1,
+  },
   bridge: { args: "auto|on|off|status", help: "play and record on your machine through the bridge", min: 1, max: 1 },
   language: { args: "<voice> <tag|auto>", help: "set or remove the language of a voice", min: 2, max: 2 },
   set: { args: `${SETTING_NAMES.join("|")} <value>`, help: "change a setting", min: 2, max: Infinity },
@@ -119,10 +128,9 @@ export function parse(input: string): Parsed {
 
 /** What happened to a message, briefly. */
 export function describeSpoken(r: SpeechResult): { message: string; level: "info" | "warning" } {
-  const note = r.conversionError ? `\nNote: ${r.conversionError}` : "";
   if (r.stopped) return { message: "Stopped.", level: "info" };
-  if (r.player) return { message: `Speaking with ${r.voice} (${r.model})${note}`, level: "info" };
-  return { message: `Saved, but not played: ${r.notPlayed ?? "unknown reason"}${note}`, level: "warning" };
+  if (r.player) return { message: `Speaking with ${r.voice} (${r.model})`, level: "info" };
+  return { message: `Saved, but not played: ${r.notPlayed ?? "unknown reason"}`, level: "warning" };
 }
 
 export function describeSample(r: SampleResult): { message: string; level: "info" | "warning" } {
@@ -200,9 +208,18 @@ export class Surface {
     ui.notify(n.message, n.level);
   }
 
-  setReadAloud(on: boolean, ui: SurfaceUi): void {
-    this.engine.readAloud.enabled = on;
-    ui.notify(`Read-aloud: ${on ? "on (the final reply of each run is spoken)" : "off"}`, "info");
+  /** on: the whole reply, unless a summary mode is already chosen; or a mode by name. */
+  setReadAloud(on: boolean | ReadMode, ui: SurfaceUi): void {
+    const r = this.engine.readAloud;
+    if (typeof on === "boolean") r.enabled = on;
+    else r.mode = on;
+    const what: Record<ReadMode, string> = {
+      off: "off",
+      all: "on (the final reply of each run is spoken)",
+      summary: "summary (a spoken summary of each reply is read)",
+      thinking: "thinking (a spoken summary of the reasoning, then of the reply, is read)",
+    };
+    ui.notify(`Read-aloud: ${what[r.mode]}`, "info");
   }
 
   async set(name: string, value: string, ui: SurfaceUi): Promise<void> {
@@ -250,8 +267,11 @@ export class Surface {
         ui.notify(usage(), "info");
         return;
       case "read-aloud":
-        if (args[0] !== "on" && args[0] !== "off") throw new Error(`Usage: /speech --read-aloud on|off`);
-        return this.setReadAloud(args[0] === "on", ui);
+        if (args[0] === "on" || args[0] === "off") return this.setReadAloud(args[0] === "on", ui);
+        if (!READ_MODES.includes(args[0] as ReadMode)) {
+          throw new Error(`Usage: /speech --read-aloud on|off|summary|thinking|all`);
+        }
+        return this.setReadAloud(args[0] as ReadMode, ui);
       case "bridge":
         return this.setBridge(args[0], ui);
       case "language":
@@ -357,6 +377,7 @@ export class Surface {
       {
         label: `Voice language: ${s.voice} is ${languageLabel(vl)}…`,
         run: async (ui) => {
+          if (s.speechSource === "local") return done(ui.notify(LOCAL_VOICE_LANGUAGES, "info"));
           const voice = await this.pickVoice(ui, "Voice language of", true);
           if (!voice) return "back";
           const tag = (await ui.input(`Language of ${voice}: a tag such as ja or pt-BR, or auto`, "auto"))?.trim();
@@ -400,6 +421,14 @@ export class Surface {
   }
 
   private async pickVoice(ui: SurfaceUi, title: string, withLanguage = false): Promise<string | undefined> {
+    const s = this.speech.settings;
+    if (s.speechSource === "local") {
+      const local = s.localSpeechModel;
+      if (!local) throw new Error(LOCAL_SPEECH_UNAVAILABLE);
+      const voices = await this.speech.localVoices(local);
+      const chosen = await ui.pick(`${title} (${local}, local)`, voices, s.localSpeechVoice ?? voices[0]);
+      return chosen === undefined || !voices.includes(chosen) ? undefined : chosen;
+    }
     const model = this.speech.settings.speechModel;
     const voices = await this.speech.voicesFor(model);
     const labels = voices.map((v) => (withLanguage ? `${v}  ${languageLabel(this.speech.languageOf(model, v))}` : v));

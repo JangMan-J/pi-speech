@@ -1,5 +1,7 @@
 //! Running out of file descriptors: no busy loop, and service resumes. This file holds a
 //! single test because it lowers the descriptor limit of the whole test process.
+//! Unix only: it uses setrlimit and getrusage.
+#![cfg(unix)]
 
 mod support;
 

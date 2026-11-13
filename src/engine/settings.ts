@@ -4,21 +4,71 @@
  * Earlier versions kept three files there: `settings.json` without a version, `bridge.json`, and
  * `language-overrides.json`. Loading migrates whatever of them is present: it reads them into the
  * settings, writes the versioned file, and removes the earlier ones at once, so afterwards only the
- * versioned file remains. Read-aloud is not a setting: it starts off in every session.
+ * versioned file remains. What read-aloud reads is not a setting (it starts Off in every session); its options are.
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { EndpointConfig } from "./endpoints";
+import {
+  DEFAULT_READ_ALOUD,
+  type ReadAloudOptions,
+  SUMMARY_LENGTHS,
+  type SummaryLength,
+  TRUNCATE_SECONDS,
+} from "./read-aloud";
 
 export const SETTINGS_VERSION = 1;
 
 /** auto: the bridge when Pi runs over SSH, else local. on: always the bridge. off: always local. */
 export type BridgeMode = "auto" | "on" | "off";
 
+/**
+ * Where something runs while the bridge is in use: This machine (Pi's) or the Remote machine (the receiver's).
+ * Without the bridge everything runs on This machine, whatever is saved.
+ */
+export type Machine = "this" | "remote";
+export const MACHINES: Machine[] = ["this", "remote"];
+
+/** Where speech or transcription comes from: a provider over the network, or a model on This machine. */
+export type Source = "provider" | "local";
+export const SOURCES: Source[] = ["provider", "local"];
+
 /** How the model lists of the panel are ordered. */
 export type ModelSort = "price" | "provider" | "features" | "newest" | "name";
 export const MODEL_SORTS: ModelSort[] = ["price", "provider", "features", "newest", "name"];
+
+/** The keys of the two Pi shortcuts, as Pi names them (`alt+s`). Pi binds them when the extension loads. */
+export interface Hotkeys {
+  /** Opens the speak composer. */
+  speak: string;
+  /** Starts and stops dictation. */
+  dictate: string;
+}
+
+export const DEFAULT_HOTKEYS: Readonly<Hotkeys> = Object.freeze({ speak: "alt+s", dictate: "alt+z" });
+
+/**
+ * A key a hotkey may be set to, in Pi's spelling, or undefined: Alt with a letter or a digit, optionally with
+ * Ctrl or Shift as well (`alt+d`, `ctrl+alt+d`). Pi keeps Ctrl alone and Alt with other keys for itself.
+ */
+export function hotkeyId(key: string): string | undefined {
+  const parts = key.trim().toLowerCase().split("+");
+  const base = parts.pop() ?? "";
+  if (!/^[a-z0-9]$/.test(base)) return undefined;
+  const mods = new Set(parts);
+  if (!mods.has("alt") || mods.size !== parts.length || [...mods].some((m) => !["ctrl", "alt", "shift"].includes(m)))
+    return undefined;
+  return [...["ctrl", "alt", "shift"].filter((m) => mods.has(m)), base].join("+");
+}
+
+/** A key as the panel shows it: `alt+s` as Alt+S. */
+export function keyLabel(key: string): string {
+  return key
+    .split("+")
+    .map((p) => (p.length === 1 ? p.toUpperCase() : p[0].toUpperCase() + p.slice(1)))
+    .join("+");
+}
 
 /** Language overrides by speech model, then voice: a language tag such as "ja" or "pt-BR". */
 export type LanguageOverrides = Record<string, Record<string, string>>;
@@ -39,6 +89,30 @@ export interface Settings {
   modelSort: ModelSort;
   /** User-defined OpenAI-compatible speech endpoints, by name (src/engine/endpoints.ts). */
   endpoints: Record<string, EndpointConfig>;
+  /** The keys of Speak and Dictate; a change applies when Pi next loads the extension. */
+  hotkeys: Hotkeys;
+  /** Who summarizes for read-aloud, how long a summary is, and where reading stops. */
+  readAloud: ReadAloudOptions;
+  /** Where speech comes from; Local uses `localSpeechModel`. */
+  speechSource: Source;
+  /** Where transcription comes from; Local uses `localTranscriptionModel`. */
+  transcriptionSource: Source;
+  /** The on-device speech model (an id of `pi-speech-receiver models list`). */
+  localSpeechModel?: string;
+  /** A voice of the local speech model (a name of `speak <id> --list-voices`); unset is the model's first voice. */
+  localSpeechVoice?: string;
+  /** The on-device transcription model. */
+  localTranscriptionModel?: string;
+  /** With the bridge in use: where audio plays. */
+  playOn: Machine;
+  /** With the bridge in use: where dictation records. */
+  recordOn: Machine;
+  /** With the bridge in use: where Local sources run their models. */
+  modelsOn: Machine;
+  /** The receiver's address typed in Bridge connection's Pairing (`host:port`); unset: PI_SPEECH_BRIDGE_URL or the ssh forwards. */
+  bridgeAddress?: string;
+  /** macOS: the notice that Option+letter reached Pi as a character has been shown (once per install). */
+  optionKeyHintShown?: boolean;
 }
 
 export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
@@ -50,7 +124,18 @@ export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
   languages: {},
   modelSort: "price",
   endpoints: {},
+  hotkeys: DEFAULT_HOTKEYS,
+  readAloud: DEFAULT_READ_ALOUD,
+  speechSource: "provider",
+  transcriptionSource: "provider",
+  playOn: "remote",
+  recordOn: "remote",
+  modelsOn: "remote",
 });
+
+/** The saved directions, in the order the panel shows them. */
+export const DIRECTIONS = ["playOn", "recordOn", "modelsOn"] as const;
+export type DirectionSetting = (typeof DIRECTIONS)[number];
 
 const LEGACY_FILES = ["bridge.json", "language-overrides.json"];
 
@@ -68,6 +153,8 @@ function readJson(file: string): Json | undefined {
 const str = (v: unknown): string | undefined => (typeof v === "string" && v ? v : undefined);
 const isMode = (v: unknown): v is BridgeMode => v === "auto" || v === "on" || v === "off";
 const isSort = (v: unknown): v is ModelSort => MODEL_SORTS.includes(v as ModelSort);
+const isSource = (v: unknown): v is Source => SOURCES.includes(v as Source);
+const isMachine = (v: unknown): v is Machine => MACHINES.includes(v as Machine);
 
 function languagesFrom(raw: unknown): LanguageOverrides {
   const out: LanguageOverrides = {};
@@ -107,8 +194,41 @@ function endpointsFrom(raw: unknown): Record<string, EndpointConfig> {
   return out;
 }
 
+/** Saved hotkeys over the defaults; a key that is not a valid hotkey, or both on one key, keeps the default. */
+function hotkeysFrom(raw: unknown): Hotkeys {
+  const out = { ...DEFAULT_HOTKEYS };
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  const r = raw as Json;
+  const speak = typeof r.speak === "string" ? hotkeyId(r.speak) : undefined;
+  const dictate = typeof r.dictate === "string" ? hotkeyId(r.dictate) : undefined;
+  if (speak) out.speak = speak;
+  if (dictate) out.dictate = dictate;
+  return out.speak === out.dictate ? { ...DEFAULT_HOTKEYS } : out;
+}
+
+/** Saved read-aloud options over the defaults; a value that is not one of the choices keeps the default. */
+function readAloudFrom(raw: unknown): ReadAloudOptions {
+  const out: ReadAloudOptions = { ...DEFAULT_READ_ALOUD };
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  const r = raw as Json;
+  const summarizer = str(r.summarizer);
+  if (summarizer) out.summarizer = summarizer;
+  if (SUMMARY_LENGTHS.includes(r.length as SummaryLength)) out.length = r.length as SummaryLength;
+  if (typeof r.truncate === "number" && TRUNCATE_SECONDS.includes(r.truncate)) out.truncate = r.truncate;
+  return out;
+}
+
+const sameReadAloud = (a: ReadAloudOptions, b: ReadAloudOptions) =>
+  a.summarizer === b.summarizer && a.length === b.length && a.truncate === b.truncate;
+
 function copyDefaults(): Settings {
-  return { ...DEFAULT_SETTINGS, languages: {}, endpoints: {} };
+  return {
+    ...DEFAULT_SETTINGS,
+    languages: {},
+    endpoints: {},
+    hotkeys: { ...DEFAULT_HOTKEYS },
+    readAloud: { ...DEFAULT_READ_ALOUD },
+  };
 }
 
 export class SettingsFile {
@@ -136,6 +256,20 @@ export class SettingsFile {
       if (output) s.dictationOutput = output;
       if (isSort(raw.modelSort)) s.modelSort = raw.modelSort;
       s.endpoints = endpointsFrom(raw.endpoints);
+      s.hotkeys = hotkeysFrom(raw.hotkeys);
+      s.readAloud = readAloudFrom(raw.readAloud);
+      if (isSource(raw.speechSource)) s.speechSource = raw.speechSource;
+      if (isSource(raw.transcriptionSource)) s.transcriptionSource = raw.transcriptionSource;
+      const localSpeech = str(raw.localSpeechModel);
+      if (localSpeech) s.localSpeechModel = localSpeech;
+      const localVoice = str(raw.localSpeechVoice);
+      if (localVoice) s.localSpeechVoice = localVoice;
+      const localTranscription = str(raw.localTranscriptionModel);
+      if (localTranscription) s.localTranscriptionModel = localTranscription;
+      if (raw.optionKeyHintShown === true) s.optionKeyHintShown = true;
+      const address = str(raw.bridgeAddress);
+      if (address) s.bridgeAddress = address;
+      for (const d of DIRECTIONS) if (isMachine(raw[d])) s[d] = raw[d];
     } else if (raw) {
       // settings.json without a version
       legacy = true;
@@ -180,6 +314,18 @@ export class SettingsFile {
       ...(s.dictationOutput ? { dictationOutput: s.dictationOutput } : {}),
       ...(s.modelSort !== DEFAULT_SETTINGS.modelSort ? { modelSort: s.modelSort } : {}),
       ...(Object.keys(s.endpoints).length ? { endpoints: s.endpoints } : {}),
+      ...(s.hotkeys.speak !== DEFAULT_HOTKEYS.speak || s.hotkeys.dictate !== DEFAULT_HOTKEYS.dictate
+        ? { hotkeys: { speak: s.hotkeys.speak, dictate: s.hotkeys.dictate } }
+        : {}),
+      ...(sameReadAloud(s.readAloud, DEFAULT_READ_ALOUD) ? {} : { readAloud: s.readAloud }),
+      ...(s.speechSource !== "provider" ? { speechSource: s.speechSource } : {}),
+      ...(s.transcriptionSource !== "provider" ? { transcriptionSource: s.transcriptionSource } : {}),
+      ...(s.localSpeechModel ? { localSpeechModel: s.localSpeechModel } : {}),
+      ...(s.localSpeechVoice ? { localSpeechVoice: s.localSpeechVoice } : {}),
+      ...(s.localTranscriptionModel ? { localTranscriptionModel: s.localTranscriptionModel } : {}),
+      ...(s.optionKeyHintShown ? { optionKeyHintShown: true } : {}),
+      ...(s.bridgeAddress ? { bridgeAddress: s.bridgeAddress } : {}),
+      ...Object.fromEntries(DIRECTIONS.filter((d) => s[d] !== DEFAULT_SETTINGS[d]).map((d) => [d, s[d]])),
     };
     const tmp = `${this.file}.${process.pid}.tmp`;
     writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`);

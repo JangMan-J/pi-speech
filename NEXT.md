@@ -1,104 +1,190 @@
 # NEXT
 
-Written 2026-11-12 at the end of a session on `decent-spider` (Pi over SSH), for whoever picks this up on
-the user's laptop. Live state is in `git log`, `package.json` and the registry; this file holds what those
-do not say.
+Handoff written 2026-11-13 on `decent-spider` (Pi runs here now; the laptop is `agent-jail`, reachable with
+`ssh agent-jail`). Read this, then `GLOSSARY.md`, then the pad of the thread you take up (`.pad/<thread>/`,
+gitignored, on this machine and on agent-jail). `VECTORS/` is retired: write no new vectors; handoff state lives here.
 
-## The goal
+## Where the code is
 
-**Streaming audio playback.** When pi-speech speaks (read-aloud, `/speech <text>`, `speech_synthesize`),
-sound starts as soon as the provider has produced the first audio and keeps playing while the rest arrives.
-Today nothing plays until a whole clip (or the whole first piece of a long text) has been generated,
-downloaded and handed to a player as a file.
+- Branch `portable-3` (checked out), draft PR #5 against GitHub `main` (`7b04463`); nothing is released (npm has
+  0.1.0). Merging PR #5 is the user's call. The local branch `main` is only the agents' landing branch and equals
+  `portable-3`; never push it. **A pushed `v*` tag publishes to npm**: push only with
+  `git push origin HEAD:refs/heads/portable-3`, never tags.
+- Done before the redesign and confirmed by ear: streaming playback, the receiver's own audio engine, one history
+  file per message, Linux/macOS/Windows builds.
 
-The user's words: "what I want, primarily, is streaming audio playback", and "I have an xAI subscription,
-if that'll do it". It was their answer to an offer of realtime dictation, so dictation over a realtime
-protocol is not the goal.
+## Resume point (2026-11-13 ~13:30)
 
-How the user wants it handled:
+`portable-3` is pushed at the commit that wrote this; local `main` equals it. Its CI run is the check for the
+macOS ssh-test fix (the socket falls back outside a long `XDG_RUNTIME_DIR`); `93ea0b2` was green except that test.
 
-- Build the thing asked for. Earlier in the session a request for the unsupported endpoint types was
-  answered with something adjacent (direct vendor endpoints), and they had to ask whether the answer was no.
-- "If you can't do it just say you can't. I'd prefer admission of inability."
-- Say what a live measurement will cost before running it. The session spent about $1.20 of their
-  OpenRouter credit on measurements without asking first.
+**The one open item** (obligation obl-a733abf1f2491519): the Windows VM checks on agent-jail `~/vms/win11`
+(see Test rigs): `transcribe`, `models` (list/download/delete, including the new `.lock` files), `speak`, and
+`ssh` with its pre-session `sftp -b` pairing fallback, plus whether a SIGTERM reaches `ssh`. Use the Windows
+CI artifact `pi-speech-receiver-Windows-X64` of the latest green `portable-3` run. Blocked on 2026-11-13: the laptop slept
+(offline on Tailscale). The user wants this run.
 
-## Why the work moved to the laptop
+Optional, the user's call: a listening check with Pi on `decent-spider` through `pi-speech-receiver ssh` from the
+laptop. The by-ear overlap check of two sessions was skipped by the user (tests cover it). The macOS Option-key
+hint stays pty-checked only (Mac testing ended).
 
-On `decent-spider` audio reaches the user through the playback bridge: the extension uploads a finished
-file to `pi-speech-receiver` on the laptop. Streaming over that path needs a new receiver, which can only
-be installed and heard on the laptop. With Pi on the laptop, playback is local and the bridge is not in
-the way.
+### Earlier (2026-11-13 ~12:55)
 
-Open question for the user before designing: is local playback on the laptop enough, or must streaming
-also work when Pi runs on `decent-spider`? The second needs the bridge change below.
+`portable-3` at `e837ecd`. Landed: several Pi clients per receiver plus
+address pairing (`2036f9e`..`e837ecd`, rebased onto `1c46544`), full gate passed (npm check, cargo fmt/clippy/test
+run 3 times, e2e all). Fixed while gating: the shared receiver lingered forever when its state directory was removed
+(every ssh test leaked one; it now stops), test scripts are written by `cp` (a sibling test's fork made them "Text
+file busy"), e2e panel expects `127.0.0.1:47613 · ssh forward` when nothing is set.
 
-## What is measured (2026-11-12, a 253-character text, about 15 s of audio)
+Obligations moved to Director node-6dc34e1c71181838 (the old node's can no longer be updated).
 
-- **xAI direct** (`POST https://api.x.ai/v1/tts`, the user's login in Pi): with `output_format.codec` `pcm`
-  or `mp3` the body arrives progressively, first byte at 0.30 s, all of it at 1.0 s. With `wav`, which
-  `src/engine/xai.ts` asks for (`OUTPUT_FORMAT`), it arrives in one burst at 1.2 s.
-- **OpenRouter `/audio/speech`**: no server-sent events; `stream` and `stream_format` are ignored. The body
-  is raw audio, chunked. Whether it arrives over time depends on the maker (one model each, first byte →
-  last byte):
-  - over time: `x-ai/grok-voice-tts-1.0` 0.4 → 1.4 s, `deepgram/aura-2` 0.4 → 7.1, `fish-audio` 0.5 → 5.6,
-    `mistralai/voxtral-mini-tts` 0.7 → 3.2, `qwen` 1.5 → 3.2, `assemblyai` 0.7 → 2.1, `heygen` 0.4 → 1.3,
-    `minimax` (MP3 only) 0.7 → 1.6
-  - one burst when generation ends: `elevenlabs` 2.6 s, `google/gemini-*-tts` 3.3, `canopylabs/orpheus` 4.9,
-    `bytedance-seed` 19, `hexgrad/kokoro` 0.4, `microsoft/mai-voice-2.1-flash` 1.0 to 1.4, `speechify` 0.4 to 0.9
-- **OpenRouter `/chat/completions`** (`openai/gpt-audio`, `gpt-audio-mini`): real SSE, first audio at 0.57 s.
-  `src/engine/chat-audio.ts` collects the whole reading first, because it checks the model's transcript
-  against the text before anything plays. Streaming there needs that check done on the transcript as a
-  prefix, stopping playback when it strays.
-- The user's saved speech model was `microsoft/mai-voice-2.1` (voice `ko-KR-Haena:MAI-Voice-2.1`); the
-  sampled Flash variant sends one burst. Streaming means selecting `xai`, or an OpenRouter maker from the
-  first list.
-- Long texts already start early: above 280 characters `src/engine/pieces.ts` and `stream.ts` split the text,
-  ask for two pieces at a time, and play each as its own file once it is whole.
+Landed after it (2026-11-13 afternoon), CI green on Linux/macOS/Windows at `7cacec6`:
+- protocol/bridge.md "Subcommand notes: models" (`lexicon` field, progress `file`); downloads of the same lexicon
+  or model archive take turns under `<name>.lock` / `<dir>.lock` (removed at the end; dev/ino check on Unix).
+- Release Linux binaries build on ubuntu-22.04 / 22.04-arm (glibc 2.35; unchecked until a release run). README
+  release steps. local-input with a built binary: not reproduced (22/22, 671/671).
+- CI fixes: surface local-voices test Unix only; transcribe stand-in strips macOS `wc -c` padding.
+- Pairing over the session's own ssh connection (user's decision): on Linux/macOS a first session runs ssh as a
+  ControlMaster on a private socket and uploads the token over it, so a new host key or password auth pairs.
+  Windows and user-set multiplexing fall back to the pre-session `sftp -b`. See protocol/bridge.md "SSH sessions".
+  Checked for real against a scratch user sshd on localhost: an unknown host key answered in the session, the token
+  arrived mid-session, paired-hosts written, socket and receiver dirs removed, the second session did not pair.
+  Password auth not checkable here (non-root sshd has no PAM).
+- User decisions: by-ear overlap check skipped (tests cover it); Windows VM checks wanted (the open item above).
 
-## What has to change
+### Earlier (2026-11-13 ~11:35)
 
-1. **Synthesis that yields audio as it arrives.** `SpeechProvider.synthesize` returns a finished
-   `{ audio, format }`. xAI needs `codec: "pcm"`; OpenRouter needs the response body read as it comes
-   (`response_format: "pcm"`, 24 kHz mono 16-bit).
-2. **An output that plays a stream.** `AudioOutput.play(file, kind)` in `src/engine/audio.ts` takes a file,
-   and `src/engine/local-output.ts` runs `<player> <file>`, which is also the contract of
-   `PI_SPEECH_PLAYER`. A stream needs a player fed on stdin with raw PCM, for example
-   `pacat --playback --format=s16le --rate=24000 --channels=1`, `pw-cat -p`, or
-   `ffplay -f s16le -ar 24000 -ac 1 -nodisp -autoexit -i -`.
-3. **The player's rules, kept.** One playback at a time, the claim ticket, stop and replace
-   (`src/engine/player.ts`), a failure never falling back to another provider, and the message saved to
-   the history as WAV once the stream has ended.
-4. **The bridge, only if streaming must work with Pi on another host.** `protocol/bridge.md` version 1 has
-   `POST /v1/play` require a `Content-Length` and refuse a chunked body; the receiver stores the file and
-   then starts the player (`play` and `start_playback` in `receiver/src/server.rs`). Streaming needs a new
-   capability in the protocol and the receiver. `AGENTS.md` says not to change `protocol/bridge.md`; the
-   user was asked whether to lift that and chose to move to the laptop instead. Ask again before touching it.
+`portable-3` at `1de6eea`. Landed then:
 
-Done when: with `xai` selected on the laptop, a text of a few sentences starts sounding while its response
-is still arriving, stop works mid-stream, the message is in the history afterwards, `npm run check` passes,
-and the user has confirmed it by ear. Time to first sound can be measured; whether it sounds right cannot.
+- 09 Direction (`dbb9df6`): DIRECTION rows Play audio on, Record audio on, Run models on; receiver model endpoints
+  GET /v1/models, GET /v1/voices, POST /v1/transcribe, POST /v1/speak (one model run at a time, 409 otherwise).
+  Full gate passed (npm run check, cargo fmt/clippy/test, every e2e suite).
+- Read-aloud Length default Minimum ~15 s (`526d229`, `1de6eea`).
 
-## State of the repository
+**(Landed at `e837ecd`; history follows.) 2026-11-13 resume: the leaf was lost; the Director rebased its 4 commits onto `0650c15` as branch `mc-rebase`
+(worktree `/var/tmp/ps-mc/wt`) and is gating them.** Was: leaf node-c1c58883f416e441 "multi-client-pairing" (branch `jing/ra8608ded0857`, worktree
+`/tmp/jing-stage/51bf5b3b33e9/ra8608ded0857`, based on `526d229`). Spec: obligation obl-00ea6c5704619d1b and below.
+Its panel e2e may fail "Enter cycles Length" until it is rebased onto `1de6eea`. If it is lost to "lost contact",
+its commits stay on its branch: gate and land them as 09 was.
 
-- Public at `github.com/JangMan-J/pi-speech`; `@jangmanj/pi-speech@0.1.0` is on npm, published by CI with
-  provenance. A release is `npm version patch && git push --follow-tags`.
-- Nothing for streaming is built.
-- 0.1.0 holds this session's other work: the redesigned `/speech` panel, the dictation output command, chat
-  models on OpenRouter (`src/engine/chat-audio.ts`), and OpenAI-compatible endpoints
-  (`src/engine/endpoints.ts`).
+e2e environment on decent-spider:
+- `/tmp` is a tmpfs with a per-user quota that is nearly full (`Disk quota exceeded` in e2e). Run e2e with
+  `TMPDIR=/var/tmp/<dir>` (main disk). Not under `$HOME`: `~/.agents/skills` makes Pi ask "Trust project folder?"
+  for any cwd below it (the TUI suites now pass `--no-approve`, so this only matters for older checkouts).
+- e2e/lib/receiver.mjs now builds into one cargo target dir per tree (a shared one handed one tree another tree's
+  older receiver binary).
 
-Open items, none of them blocking the goal:
+Several Pi clients per receiver plus address pairing (spec, also in obligation obl-00ea6c5704619d1b):
+- Streams from different sessions may OVERLAP (the user may simulate a conversation): a client id header per Pi
+  process; the receiver replaces only the same client's play, and the OS mixer blends the others.
+- /v1/stop with the header stops only the caller's plays. Client stop()/shutdown cancel only their own ids.
+- Recording stays single.
+- Remote model runs from several clients queue instead of 409.
+- One shared receiver per user (lock file and leases).
+- Each ssh session forwards 47613 plus a spare port from 47614-47633. Pi tries 47613, then the range, caches the
+  one that works and probes again after a failure.
+- Make token creation atomic; lock paired-hosts.
+- Pairing row = an input box for an address (the ssh forward's, or Tailscale/LAN; the receiver listens there only
+  with --listen). Enter probes it; if needed, POST /v1/pair, the receiver prints a 6-digit code on its terminal
+  (user's choice: terminal only), the user types it, and the token is returned and saved as bridge.token. Codes
+  expire after about 2 min; attempts are limited. README: LAN traffic is unencrypted, Tailscale encrypts.
+- Critical tests: one Pi's stop or exit leaves another's audio alone; two clients' Streams overlap and both
+  complete; a disconnected Pi finds the next forward; closing the first of two ssh sessions keeps the second's
+  audio; queued model runs.
+- By ear: two sessions speaking at once overlap.
 
-- Dependabot opened four pull requests; the dev-tools group one fails CI.
-- `e2e/panel/visible.mjs` still asserts the panel layout from before the redesign and fails. `e2e/run core`
-  has not been run since the chat models and endpoints went in.
-- The direct endpoints were only tested against a local server. The Fireworks key in Pi is refused by
-  Fireworks' audio hosts (plain `curl` gets the same 401), so no real vendor has been through them.
+Lesson: watch leaves while waiting (jing_status of each child, not only mail); a leaf lost to "lost contact" leaves
+its commits on its branch. The user is fixing that in Jing systematically.
+
+## Thread `redesign` (active): `.pad/redesign/plan.md`, slices 01-10
+
+The user's own words on the design are in `.pad/redesign/design-conversation.txt`; the agreed mockups are at the
+end of slice 01's file.
+
+Landed and pushed on `portable-3` (CI green on Linux, macOS, Windows at `575b27b`; the tip after it is unchecked):
+
+- 01 panel layout; hotkey change reloads Pi silently when leaving Hotkeys.
+- 02 Read aloud options (Off, Summary, Thinking, All; Summarized by; Length; Truncate at). The marked summary is
+  removed by message_end replacement before it is stored (also true in Pi 1.5.2, checked in its dist).
+- 03 engines (`transcribe`), 04 model downloads (`models list|download|delete`).
+- 05 Speech source and Transcription source (Provider | Local); local transcription with no network request.
+- 06 local speech: `pi-speech-receiver speak <id>` streams s16le PCM at the model rate (format line on stderr;
+  Kokoro 24000 Hz, Piper 22050 Hz), sentence by sentence; Speech source Local speaks through it as a Stream.
+  Follow-ups: English Piper voices download sherpa-onnx's lexicon-en-us.txt (6,305,773
+  bytes, SHA-256 8b67ae54...ef73a) with them; de/fr/es Piper voices removed (sherpa-onnx 2.0 has no espeak-ng and
+  no other lexicon exists; easy to undo); local voice picker (settings.localSpeechVoice). Measured on decent-spider
+  under load: Kokoro first audio 4.7 s (1.6 s load + ~3 s first sentence), Piper 1.65 s.
+- 07 every playback a Stream; `POST /v1/play` and `PI_SPEECH_PLAYER` gone.
+- 08 non-panel: `pi-speech-receiver ssh [ssh-args] <host>` (pairs the token with `sftp -b` on first use, runs a
+  receiver for the session, `-R 127.0.0.1:47613:...`, passes the exit code) and `pair <host>`; `probeBridge` in
+  `src/bridge/client.ts`. Panel rows: Bridge, Remote machine (read-only, from PI_SPEECH_BRIDGE_URL), Pairing
+  (`✓ Connected to <addr>:<port> · N ms` / `✗ Re-pair ›` explaining how to pair). README setup uses `ssh`.
+- 10 platform packages: `npm/platforms.mjs`; optionalDependencies stamped at publish, not committed. First release
+  needs a version bump (0.1.0 is on npm) and `npm run bootstrap:npm` once (5 trusted publishers, user's 2FA).
+- Mac fixes: a real input giving only exact zeros is an error (checked on the Mac over ssh with the `575b27b`
+  binary); `models download` help says it stops when stdin closes; test stand-ins use `#!${process.execPath}`
+  (CI runs tests with node off PATH).
+- macOS Option-key hint (user's decision: keep Alt+S/Alt+Z defaults): when the Option character of the bound key
+  (Ω, ß) is typed into an empty editor on darwin, a one-time notice (settings.optionKeyHintShown) explains "Use
+  Option as Meta key" and its cost to accented letters; the character is never swallowed. Skipped when Pi has no
+  `ctx.ui.onTerminalInput`.
+
+Not done: only the Windows VM checks (see the resume point). The earlier loose ends (local speech docs, 08 pairing
+limits, slice 10 follow-ups) landed on 2026-11-13.
+
+## The Mac (`moms-macbook`, macOS 26.6 arm64; the user's mother's; user sits at it for sound tests)
+
+Setup, no sudo: Node v26.13.1 in `~/.local/node` (PATH via `~/.zshenv`), Pi fork release `next-cda143063b13` in
+`~/.local/share/pi-fork` with `~/.local/bin/pi`, source copied (rsync, not a clone) to `~/Projects/pi-speech` at
+`5b2102e` (rsync again before testing), CI binary (`575b27b`) in `receiver/target/release` and `~/bracket/`,
+`~/.pi/agent/settings.json` package `../../Projects/pi-speech`, logins copied from here (user's choice). Parakeet
+v3 int8 downloaded there. pi-speech settings there: xAI speech (eve) and transcription; optionKeyHintShown was
+reset (absent) so the hint can be tried again. Test scripts in `~/bracket/`: `pi-drive.mjs` (RPC commands with
+pauses), `live.mjs <mode> <question>` (read-aloud check with OpenRouter DeepSeek chat, prints timings),
+`ptytest.py` (Pi in a pty, sends Ω), `*.command` (open in Terminal).
+
+Checked by ear with the user: speed/pitch bracket; models download with interrupt/resume; transcribe;
+recording from Terminal; in Pi (xAI): speak, replay, a Reading, stop mid-sentence (cut at once, clean),
+dictation with `/speech --dictate`; Read aloud Summary with the same model and Summarized by DeepSeek (paid
+check approved, under $0.02): only the summary is read, absent from the transcript and the session file. Timing:
+reply done 5.4 s, summary speech starts 14.2 s (extra request + xAI), the Abridged summary lasted ~30 s (user did
+not answer whether Minimum ~15 s should be the default).
+
+Mac testing ended 2026-11-13 (user: the primitives are confirmed; no more Mac tests). Never checked on a real Mac:
+the Option+Z hint by a real keypress (the one try suspended Pi, probably Ctrl+Z; a pty test sending Ω shows the
+notice and keeps Ω), local speech (Kokoro, Piper) by ear, local transcription inside Pi. The logins copied to the Mac are in a separate account the user made for this work; nothing to remove.
+
+Learned there: macOS gives a process started over ssh no microphone (TCC); a Terminal.app first started by `open`
+over ssh inherits `SSH_CONNECTION` (start it with `env -i ... open`); quitting Terminal with a busy window stalls
+on a dialog (kill the processes instead); stock Terminal sends Ω/ß for Option+Z/S.
+
+## Waiting on the user
+
+- Merging PR #5; the first release (version bump, bootstrap:npm 2FA).
+
+## Test rigs (on agent-jail)
+
+- `~/Projects/pi-speech/.proto/portable-probe/`: `bracket.py <binary>` (same clip at 1.00/0.75/1.25/1.00x), `capture.sh`,
+  `rectest.py`, `measure.py`.
+- `~/vms/win11/`: Windows 11 LTSC eval VM. `run.sh install|wav|listen|none`, SSH `-i vm_key -p 22622 pi@127.0.0.1`,
+  `kit/`, `analyze.py audio.wav [skip_s]`.
+- Models for the real-recording tests are on decent-spider in `~/.cache/pi-speech/models/` (Parakeet v3 int8,
+  Whisper small): `PI_SPEECH_TEST_MODELS=~/.cache/pi-speech/models cargo test --release --test transcribe`.
+
+## Rules learned the hard way
+
+- Never let a test reach a real audio device: export `PI_SPEECH_AUDIO_NULL=1` for receiver tests.
+- Never put a write and something that depends on it in one parallel tool batch: they race.
+- `pgrep -f <pattern>` matches its own shell; check processes with `ps -eo comm`.
+- Quote the cost before any paid live check; the user approves. xAI is included in the user's plan.
+- On Windows: PowerShell 5.1 pipes text (binary stdin via `cmd /c ... <`); .NET uses its own current directory.
+- Agents under Jing: the first worktrees were cut from a stale local `main`; keep local `main` equal to
+  `portable-3` before delegating. An agent that asks for a file outside its lease is shut down with nothing
+  kept, and two agents were lost to a contact timeout: say in the brief never to ask for more files, and to commit
+  often.
+- Tests that start a script as a program (shebang) or use Unix absolute paths fail on Windows: skip or gate them.
 
 ## Checks
 
-- `npm run check` (typecheck, lint, 470 tests), `npm run smoke:pack`, and in `receiver/`:
-  `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`. CI runs all of them.
-- `e2e/chat-models/live.test.ts` measures the chat models against live OpenRouter and costs about 15 US
-  cents a run; `e2e/README.md` has the command.
+`npm run check`; in `receiver/` with `PI_SPEECH_AUDIO_NULL=1`: `cargo fmt --check`, `cargo clippy --all-targets
+-- -D warnings`, `cargo test`; `e2e/run all`.

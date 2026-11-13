@@ -1,27 +1,25 @@
 //! Bearer token handling: loading, creating, and comparing.
+//!
+//! On Unix the token file is created 0600 in a 0700 directory, and a token file that group
+//! or others may read is refused. Windows has no such modes: the file and its directory
+//! (under the user's profile) get the default ACLs of where they are made, which give
+//! access to the user, administrators and the system only; no permission check is made.
 
-use std::fs::{DirBuilder, File, OpenOptions};
+use crate::private;
+use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 pub const MIN_TOKEN_LEN: usize = 32;
 
 /// Fill `buf` from the operating system's random source.
 pub fn random_bytes(buf: &mut [u8]) -> io::Result<()> {
-    let mut done = 0;
-    while done < buf.len() {
-        let r = unsafe { libc::getrandom(buf[done..].as_mut_ptr().cast(), buf.len() - done, 0) };
-        if r < 0 {
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(e);
-        }
-        done += r as usize;
-    }
-    Ok(())
+    getrandom::fill(buf).map_err(|e| match e.raw_os_error() {
+        Some(code) => io::Error::from_raw_os_error(code),
+        None => io::Error::other(e.to_string()),
+    })
 }
 
 /// `n` random bytes as lowercase hex.
@@ -58,7 +56,8 @@ fn bad(msg: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }
 
-/// Read and validate the token in `path`. Refuses a file readable by group or others.
+/// Read and validate the token in `path`. Refuses a file readable by group or others
+/// (on Unix).
 pub fn read_token(path: &Path) -> io::Result<String> {
     let mut f = File::open(path)
         .map_err(|e| io::Error::new(e.kind(), format!("token file {}: {e}", path.display())))?;
@@ -69,6 +68,7 @@ pub fn read_token(path: &Path) -> io::Result<String> {
             path.display()
         )));
     }
+    #[cfg(unix)]
     if meta.mode() & 0o077 != 0 {
         return Err(bad(format!(
             "token file {} is readable by group or others (mode {:03o}); run: chmod 600 {}",
@@ -90,17 +90,28 @@ pub fn read_token(path: &Path) -> io::Result<String> {
 }
 
 /// Create `path` (mode 0600) holding a new random token. Parent directories are made 0700.
+/// (On Windows both get the default ACLs of the user's profile.) Atomic: the token is
+/// written whole to a file of its own, then linked to `path` only if `path` does not
+/// exist, so a receiver started at the same moment reads either no file or the whole
+/// token, and two that create it at once agree on one token (`AlreadyExists` for the
+/// later).
 fn create_token(path: &Path) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
-        DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-    }
-    let mut f = OpenOptions::new()
+    let dir = path.parent().unwrap_or(Path::new("."));
+    private::dir().recursive(true).create(dir)?;
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = dir.join(format!(".{name}.{}-{}", std::process::id(), random_hex(4)?));
+    let written = private::file()
         .write(true)
         .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    f.write_all(random_hex(32)?.as_bytes())?;
-    f.write_all(b"\n")
+        .open(&tmp)
+        .and_then(|mut f| {
+            f.write_all(random_hex(32)?.as_bytes())?;
+            f.write_all(b"\n")?;
+            f.sync_all()
+        });
+    let linked = written.and_then(|()| std::fs::hard_link(&tmp, path));
+    let _ = std::fs::remove_file(&tmp);
+    linked
 }
 
 /// The token to serve with. An explicit `--token-file` must exist. The default file is
@@ -128,6 +139,7 @@ pub fn load_token(explicit: Option<&Path>) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     fn scratch(name: &str) -> PathBuf {
@@ -146,6 +158,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn group_readable_token_file_is_refused() {
         let d = scratch("mode");
         let p = d.join("t");
@@ -162,6 +175,7 @@ mod tests {
         let d = scratch("short");
         let p = d.join("t");
         std::fs::write(&p, "short\n").unwrap();
+        #[cfg(unix)]
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(read_token(&p).is_err());
         std::fs::remove_dir_all(d).ok();
@@ -172,18 +186,48 @@ mod tests {
         let d = scratch("create");
         let p = d.join("sub").join("receiver.token");
         create_token(&p).unwrap();
-        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-        let dmode = std::fs::metadata(p.parent().unwrap())
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(dmode, 0o700);
+        #[cfg(unix)]
+        {
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+            let dmode = std::fs::metadata(p.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(dmode, 0o700);
+        }
         assert!(read_token(&p).unwrap().len() >= MIN_TOKEN_LEN);
         assert!(
             create_token(&p).is_err(),
             "never overwrites an existing token"
+        );
+        std::fs::remove_dir_all(d).ok();
+    }
+
+    #[test]
+    fn receivers_creating_the_token_at_once_all_read_the_same_whole_token() {
+        let d = scratch("race");
+        let p = d.join("receiver.token");
+        let tokens: Vec<String> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..8)
+                .map(|_| {
+                    s.spawn(|| {
+                        match create_token(&p) {
+                            Ok(()) => {}
+                            Err(e) => assert_eq!(e.kind(), io::ErrorKind::AlreadyExists),
+                        }
+                        read_token(&p).unwrap()
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(tokens.iter().all(|t| t == &tokens[0]));
+        assert_eq!(
+            std::fs::read_dir(&d).unwrap().count(),
+            1,
+            "no file left over"
         );
         std::fs::remove_dir_all(d).ok();
     }

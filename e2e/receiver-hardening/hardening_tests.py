@@ -68,7 +68,7 @@ tok = "fdtok" + os.urandom(20).hex()
 tf = os.path.join(d, "token")
 open(tf, "w").write(tok)
 os.chmod(tf, 0o600)
-env = dict(os.environ, PI_SPEECH_RECEIVER_PLAYER=os.path.join(HERE, "fake-player"), PI_SPEECH_RECEIVER_RECORDER=os.path.join(HERE, "fake-recorder"), FAKE_DIR=d)
+env = dict(os.environ, PI_SPEECH_RECEIVER_STREAM_PLAYER=os.path.join(HERE, "fake-player"), PI_SPEECH_RECEIVER_RECORDER=os.path.join(HERE, "fake-recorder"), FAKE_DIR=d)
 proc = subprocess.Popen([BIN, "--listen", "127.0.0.1:0", "--token-file", tf], env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                         preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (48, 48)))
 line = proc.stdout.readline().decode().strip()

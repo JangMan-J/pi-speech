@@ -1,4 +1,4 @@
-// Held-out acceptance: streamed reading, edge cases.
+// Held-out acceptance: a Reading (a long text read in pieces), edge cases.
 import fs from 'node:fs';
 import path from 'node:path';
 import { callTool, check, command, errors, finish, notes, setup } from '../lib/lib.mjs';
@@ -21,7 +21,7 @@ const MS = 8;
     for (let i = 0; i < 100 && ctx.playerLog().length < 1; i++) await sleep(100);
     await sleep(MS * text.length * 0.7 + 2000);
     const inputs = ctx.speechRequests().slice(from).map((r) => r.body?.input ?? '');
-    check(inputs.length >= 3 && norm(inputs.join(' ')) === norm(text), '/speech <long text> is streamed too and holds every word', inputs.length);
+    check(inputs.length >= 3 && norm(inputs.join(' ')) === norm(text), '/speech <long text> is read in pieces too and holds every word', inputs.length);
     check(ctx.or.maxInflight() <= 2, 'at most 2 speech requests are in flight at once', ctx.or.maxInflight());
 
     from = ctx.speechRequests().length;
@@ -44,14 +44,14 @@ const MS = 8;
     const s = await ctx.pi();
     await command(s, '/speech --set tts-model hexgrad/kokoro-82m'); await command(s, '/speech --set voice af_heart');
     await command(s, '/speech --read-aloud on');
-    ctx.or.failNext(1, 500, { error: { message: 'injected stream failure', code: 500 } });
+    ctx.or.failNext(1, 500, { error: { message: 'injected reading failure', code: 500 } });
     const from = s.uiRequests.length;
     const reqFrom = ctx.speechRequests().length;
     ctx.llm.script([{ text: make('failing') }]);
     await s.prompt('go', 60000);
     await sleep(MS * 300 + 3000);
     const errs = errors(s.uiRequests.slice(from).filter((u) => u.method === 'notify'));
-    check(errs.length === 1 && /injected stream failure|500/.test(errs[0].message), 'one visible error with the reason', errs.map((e) => e.message));
+    check(errs.length === 1 && /injected reading failure|500/.test(errs[0].message), 'one visible error with the reason', errs.map((e) => e.message));
     check(/not saved|nothing was saved|no audio/i.test(errs[0]?.message ?? ''), 'the error says the reply was not saved', errs[0]?.message);
     check(ctx.speechRequests().length - reqFrom <= 3, 'no further pieces are requested after a failure', ctx.speechRequests().length - reqFrom);
     check(ctx.history().length === 0, 'nothing is saved', ctx.history());
@@ -86,7 +86,7 @@ const MS = 8;
   } finally { await ctx.close(); ctx.cleanup(); }
 }
 
-// 4. over the bridge the pieces play one after another on the receiver
+// 4. over the bridge the Reading plays as one Stream on the receiver
 const rcv = await startReceiver();
 {
   const ctx = await setup({ msPerChar: MS, env: { PI_SPEECH_BRIDGE_URL: rcv.url, PI_SPEECH_BRIDGE_TOKEN: rcv.token } });
@@ -102,7 +102,8 @@ const rcv = await startReceiver();
     const inputs = ctx.speechRequests().slice(reqFrom).map((r) => r.body?.input ?? '');
     const plays = rcv.starts('player');
     check(inputs.length >= 3 && norm(inputs.join(' ')) === norm(text), 'the whole reply is requested over the bridge route', inputs.length);
-    check(plays.length === inputs.length, 'the receiver played one file per piece', [plays.length, inputs.length]);
+    check(plays.length === 1 && rcv.lastArgs() === 's16le 24000 1', 'the receiver played the whole Reading as one Stream', [plays, rcv.lastArgs()]);
+    check(rcv.lastPlayed()?.equals(ctx.savedAudio(ctx.history().find((f) => f.endsWith('.wav')) ?? '')), 'with the audio that was saved', rcv.lastPlayed()?.length);
     check(ctx.playerLog().length === 0, 'nothing played on the Pi host');
     const wavs = ctx.history().filter((f) => f.endsWith('.wav'));
     check(wavs.length === 1, 'one message in the history', ctx.history());
@@ -110,7 +111,7 @@ const rcv = await startReceiver();
   } finally { await ctx.close(); ctx.cleanup(); await rcv.stop(); rcv.cleanup(); }
 }
 
-// 5. xai streams too
+// 5. xai is read in pieces too
 {
   const ctx = await setup({ xai: true });
   try {
@@ -122,13 +123,13 @@ const rcv = await startReceiver();
     await s.prompt('go', 60000);
     await sleep(3000);
     const inputs = ctx.xai.tts().map((r) => r.body?.text ?? '');
-    check(inputs.length >= 3 && norm(inputs.join(' ')) === norm(text), 'a xai reply is streamed in pieces that hold every word', inputs.length);
+    check(inputs.length >= 3 && norm(inputs.join(' ')) === norm(text), 'a xai reply is read in pieces that hold every word', inputs.length);
     check(ctx.speechRequests().length === 0, 'OpenRouter is not used');
     check(ctx.history().filter((f) => f.endsWith('.wav')).length === 1, 'one message in the history');
     await s.close();
   } finally { await ctx.close(); ctx.cleanup(); }
 }
-// 6. a later piece that cannot be made into WAV is a failure, never a replay of the whole text
+// 6. a later piece that is not a readable WAV is a failure, never a replay of the whole text
 {
   const ctx = await setup({ msPerChar: MS, mismatchAt: 2 });
   try {

@@ -1,16 +1,21 @@
 //! The playback bridge: endpoints, playback and recording state.
 
 use crate::front::{self, Ready};
-use crate::http::{answer_nonblocking, json_str, BodyError, Conn, Request, Response};
+use crate::http::{answer_nonblocking, json_str, BodyFault, Conn, Framing, Request, Response};
+use crate::pair::{self, Notice, Pairing};
+use crate::private;
 use crate::proc::{self, lock, start_thread, Exit, ProcCtl};
+use crate::remote_models::{self, Jobs, MODELS_ENV};
+use crate::stream::{self, Format};
 use crate::token::{ct_eq, random_hex};
-use crate::wav::{self, Kind};
-use std::fs::{self, DirBuilder, OpenOptions};
+use crate::wav;
+use std::fs;
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{ChildStdin, Command};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -28,51 +33,54 @@ const SETTLE: Duration = Duration::from_secs(6);
 const MAX_CONNECTIONS: usize = 512;
 pub const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 const KEPT_PLAYBACKS: usize = 64;
+/// How long a Stream waits for its audio request to begin.
+pub const STREAM_START: Duration = Duration::from_secs(120);
+/// The longest a Stream's audio may go without any byte before it counts as broken off.
+pub const STREAM_IDLE: Duration = Duration::from_secs(120);
+/// The largest body of `POST /v1/play/stream`; a valid one is far smaller.
+const MAX_STREAM_REQUEST: u64 = 4096;
+/// The largest body of `POST /v1/pair`.
+const MAX_PAIR_REQUEST: u64 = 4096;
+/// The header that names the Pi process a request comes from: its plays replace only its
+/// own, and `POST /v1/stop` stops only its own.
+pub const CLIENT_HEADER: &str = "x-pi-speech-client";
 
-pub const PLAYER_ENV: &str = "PI_SPEECH_RECEIVER_PLAYER";
+pub const STREAM_PLAYER_ENV: &str = "PI_SPEECH_RECEIVER_STREAM_PLAYER";
 pub const RECORDER_ENV: &str = "PI_SPEECH_RECEIVER_RECORDER";
-
-const PLAYERS: [(&str, &[&str]); 4] = [
-    ("pw-play", &[]),
-    ("paplay", &[]),
-    ("mpv", &["--no-video", "--really-quiet", "--no-terminal"]),
-    ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "quiet"]),
-];
-const RECORDERS: [(&str, &[&str]); 3] = [
-    (
-        "pw-record",
-        &["--rate", "16000", "--channels", "1", "--format", "s16"],
-    ),
-    (
-        "parecord",
-        &[
-            "--rate=16000",
-            "--channels=1",
-            "--format=s16le",
-            "--file-format=wav",
-        ],
-    ),
-    (
-        "arecord",
-        &["-q", "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "wav"],
-    ),
-];
+const NO_ENGINE: &str =
+    "the built-in audio engine is not available: the receiver cannot find its own executable";
 
 pub struct Config {
     pub listen: SocketAddr,
     pub token: String,
     /// The receiver's private directory for audio files; removed on shutdown.
     pub tmp_dir: PathBuf,
-    /// Player executable from the environment; `None` means search for a known player.
-    pub player: Option<PathBuf>,
-    /// Recorder executable from the environment; `None` means search for a known recorder.
+    /// Stream player executable from the environment; `None` means the built-in engine.
+    pub stream_player: Option<PathBuf>,
+    /// Recorder executable from the environment; `None` means the built-in engine.
     pub recorder: Option<PathBuf>,
+    /// The program that runs local models (`models list`, `speak`, `transcribe`) for the
+    /// model endpoints; `None` means this program (the built-in engine).
+    pub models: Option<PathBuf>,
+    /// The built-in audio engine: this program, run as `<engine> play ...` and
+    /// `<engine> record <file>`. `None` when it cannot be found.
+    pub engine: Option<PathBuf>,
     pub max_body: u64,
     pub max_record_seconds: u64,
     /// How long a finished recording waits to be collected.
     pub pickup: Duration,
     /// How long a client has to send its whole request head.
     pub head_timeout: Duration,
+    /// How long a Stream waits for its audio request to begin.
+    pub stream_start: Duration,
+    /// How long a Stream's audio may go without any byte.
+    pub stream_idle: Duration,
+    /// Listen on an address that is not loopback (`--network`).
+    pub network: bool,
+    /// How long a pairing code is valid.
+    pub pair_ttl: Duration,
+    /// Where pairing codes are shown: the receiver's own terminal.
+    pub notice: Notice,
 }
 
 impl Config {
@@ -86,12 +94,19 @@ impl Config {
             listen,
             token,
             tmp_dir,
-            player: from_env(PLAYER_ENV),
+            stream_player: from_env(STREAM_PLAYER_ENV),
             recorder: from_env(RECORDER_ENV),
+            models: from_env(MODELS_ENV),
+            engine: std::env::current_exe().ok(),
             max_body: MAX_BODY,
             max_record_seconds: MAX_RECORD_SECONDS,
             pickup: Duration::from_secs(PICKUP_SECONDS),
             head_timeout: HEAD_TIMEOUT,
+            stream_start: STREAM_START,
+            stream_idle: STREAM_IDLE,
+            network: false,
+            pair_ttl: pair::PAIR_TTL,
+            notice: pair::stderr_notice(),
         }
     }
 }
@@ -107,7 +122,9 @@ pub fn check_loopback(addr: &SocketAddr) -> Result<(), String> {
     }
 }
 
-/// Create the receiver's private (0700) temporary directory under a generated name.
+/// Create the receiver's private (0700) temporary directory under a generated name. On
+/// Windows it is made in the user's own temporary directory (`%TEMP%`, in the profile),
+/// whose default ACLs keep it private; there are no modes to set.
 pub fn private_tmp_dir() -> io::Result<PathBuf> {
     let base = match std::env::var_os("XDG_RUNTIME_DIR") {
         Some(v) if !v.is_empty() && Path::new(&v).is_dir() => PathBuf::from(v),
@@ -118,7 +135,7 @@ pub fn private_tmp_dir() -> io::Result<PathBuf> {
         std::process::id(),
         random_hex(8)?
     ));
-    DirBuilder::new().mode(0o700).create(&dir)?;
+    private::dir().create(&dir)?;
     Ok(dir)
 }
 
@@ -141,11 +158,22 @@ impl PlayState {
     }
 }
 
+/// Where a playback's audio comes from.
+enum Feed {
+    /// A Stream whose audio request has not begun: the player's input, kept open.
+    Waiting(ChildStdin),
+    /// A Stream whose input was taken: by its audio request, or closed when it ended.
+    Taken,
+}
+
 struct Play {
     id: String,
+    /// The `X-Pi-Speech-Client` of the request that started it, if it had one.
+    client: Option<String>,
     state: PlayState,
     error: Option<String>,
     ctl: Arc<ProcCtl>,
+    feed: Feed,
 }
 
 impl Play {
@@ -173,6 +201,10 @@ struct Rec {
     id: String,
     path: PathBuf,
     ctl: Arc<ProcCtl>,
+    /// The built-in recorder's input, open while it records; it stops when this closes,
+    /// should the receiver go away without stopping it. (On Windows the recorder's
+    /// `ProcCtl` keeps it instead, and this is `None`.)
+    input: Option<ChildStdin>,
     phase: RecPhase,
     /// Set when the recorder failed while it ran; the audio is then already deleted.
     error: Option<String>,
@@ -195,6 +227,9 @@ struct Shared {
     rec_lock: Mutex<()>,
     down: AtomicBool,
     conns: AtomicUsize,
+    /// The one model run (transcription or speech) at a time, and those waiting for it.
+    jobs: Jobs,
+    pairing: Pairing,
 }
 
 pub struct Server {
@@ -205,10 +240,14 @@ pub struct Server {
 impl Server {
     /// Bind the listener and start serving on background threads.
     pub fn start(cfg: Config) -> io::Result<Server> {
-        check_loopback(&cfg.listen).map_err(io::Error::other)?;
+        if !cfg.network {
+            check_loopback(&cfg.listen).map_err(io::Error::other)?;
+        }
         let listener = TcpListener::bind(cfg.listen)?;
         let addr = listener.local_addr()?;
+        let pairing = Pairing::new(cfg.pair_ttl, Arc::clone(&cfg.notice));
         let shared = Arc::new(Shared {
+            pairing,
             cfg,
             inner: Mutex::new(Inner::default()),
             cv: Condvar::new(),
@@ -216,6 +255,7 @@ impl Server {
             rec_lock: Mutex::new(()),
             down: AtomicBool::new(false),
             conns: AtomicUsize::new(0),
+            jobs: Jobs::default(),
         });
         let sh = Arc::clone(&shared);
         let started = start_thread("accept", move || accept_loop(sh, listener)).and_then(|_| {
@@ -303,7 +343,9 @@ fn serve(sh: &Arc<Shared>, ready: Ready) {
     let Ok(mut conn) = Conn::resume(stream, ahead, &req) else {
         return;
     };
-    let resp = if !sh.authorized(&req) {
+    // Pairing is how a client without the token gets it, so it needs none.
+    let pairing = req.method == "POST" && req.path == "/v1/pair";
+    let resp = if !pairing && !sh.authorized(&req) {
         Response::error(401, "unauthorized")
     } else if sh.down.load(Ordering::SeqCst) {
         Response::error(503, "the receiver is shutting down")
@@ -317,6 +359,49 @@ fn not_found() -> Response {
     Response::error(404, "not found")
 }
 
+/// The optional `X-Pi-Speech-Kind` header must be `message` or `sample`.
+fn check_kind(req: &Request) -> Result<(), Response> {
+    match req.header("x-pi-speech-kind").unwrap_or("message") {
+        "message" | "sample" => Ok(()),
+        _ => Err(Response::error(
+            400,
+            "X-Pi-Speech-Kind must be message or sample",
+        )),
+    }
+}
+
+/// The optional `X-Pi-Speech-Client` header: a client id of 1 to 64 letters, digits, `-`,
+/// `_` or `.`.
+fn client_of(req: &Request) -> Result<Option<String>, Response> {
+    match req.header(CLIENT_HEADER) {
+        None => Ok(None),
+        Some(v)
+            if req.header_count(CLIENT_HEADER) == 1
+                && (1..=64).contains(&v.len())
+                && v.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) =>
+        {
+            Ok(Some(v.to_string()))
+        }
+        Some(_) => Err(Response::error(
+            400,
+            "X-Pi-Speech-Client must be 1 to 64 letters, digits, -, _ or .",
+        )),
+    }
+}
+
+/// Forget the oldest ended playbacks beyond the ones kept.
+fn prune(g: &mut Inner) {
+    while g.plays.len() > KEPT_PLAYBACKS {
+        match g.plays.iter().position(|p| p.state != PlayState::Playing) {
+            Some(i) => {
+                g.plays.remove(i);
+            }
+            None => break,
+        }
+    }
+}
+
 /// Text for a failure message: the program's own words when it said any.
 fn with_note(what: &str, note: &str) -> String {
     if note.is_empty() {
@@ -326,6 +411,7 @@ fn with_note(what: &str, note: &str) -> String {
     }
 }
 
+#[cfg(unix)]
 fn find_in_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
@@ -336,29 +422,188 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
         })
 }
 
-/// The configured program, or the first known one found on PATH.
-fn resolve(
-    configured: &Option<PathBuf>,
-    known: &[(&str, &[&str])],
-    what: &str,
-) -> Result<(PathBuf, Vec<String>), String> {
-    if let Some(p) = configured {
-        let p = if p.components().count() == 1 {
-            find_in_path(&p.to_string_lossy()).unwrap_or_else(|| p.clone())
-        } else {
-            p.clone()
-        };
-        return Ok((p, Vec::new()));
+/// Windows has no execute bit: see [`windows_program::find`]. A name found nowhere is left
+/// to the system's own search, which also tries it with `.exe`.
+#[cfg(windows)]
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let pathext = std::env::var_os("PATHEXT");
+    windows_program::find(
+        name,
+        &path.to_string_lossy(),
+        pathext.as_ref().map(|e| e.to_string_lossy()).as_deref(),
+        |p| p.metadata().is_ok_and(|m| m.is_file()),
+    )
+}
+
+/// How Windows programs are found, as the extension finds them (`findExecutable` in
+/// `src/engine/env.ts`): a program is a file with an extension from PATHEXT that is `.exe`
+/// or `.com` (by default `.COM;.EXE`), named with or without it; a `.cmd` or `.bat`
+/// script never is. Pure, so that it is tested on every system.
+#[cfg(any(windows, test))]
+mod windows_program {
+    use std::path::{Path, PathBuf};
+
+    /// The extension of `name` (from its last dot, with no path separator after it), in
+    /// lowercase.
+    fn extension(name: &str) -> Option<String> {
+        let ext = &name[name.rfind('.')?..];
+        (ext.len() > 1 && !ext.contains(['\\', '/'])).then(|| ext.to_ascii_lowercase())
     }
-    known
-        .iter()
-        .find_map(|(name, args)| {
-            find_in_path(name).map(|p| (p, args.iter().map(|a| a.to_string()).collect()))
+
+    /// A `.cmd` or `.bat` script, which is never run as a program.
+    pub fn is_script(name: &str) -> bool {
+        matches!(extension(name).as_deref(), Some(".cmd" | ".bat"))
+    }
+
+    /// The directories of a Windows PATH: split at semicolons outside double quotes, the
+    /// quotes removed, empty entries skipped (as `std::env::split_paths` does on Windows).
+    fn dirs(path: &str) -> Vec<String> {
+        let mut dirs = vec![String::new()];
+        let mut quoted = false;
+        for c in path.chars() {
+            match c {
+                '"' => quoted = !quoted,
+                ';' if !quoted => dirs.push(String::new()),
+                c => dirs.last_mut().unwrap().push(c),
+            }
+        }
+        dirs.retain(|d| !d.is_empty());
+        dirs
+    }
+
+    /// The program a bare `name` names on `path` (a PATH value), with `pathext` (a PATHEXT
+    /// value, if set); `is_file` tells whether a file exists at a path.
+    pub fn find(
+        name: &str,
+        path: &str,
+        pathext: Option<&str>,
+        is_file: impl Fn(&Path) -> bool,
+    ) -> Option<PathBuf> {
+        if is_script(name) {
+            return None;
+        }
+        let exts: Vec<String> = pathext
+            .unwrap_or(".COM;.EXE")
+            .split(';')
+            .map(|e| e.trim().to_ascii_lowercase())
+            .filter(|e| e == ".exe" || e == ".com")
+            .collect();
+        // The name itself when it already has a program extension, else the name with each.
+        let names: Vec<String> = match extension(name) {
+            Some(ext) if exts.contains(&ext) => vec![name.to_string()],
+            _ => exts
+                .iter()
+                .flat_map(|e| [format!("{name}{e}"), format!("{name}{}", e.to_uppercase())])
+                .collect(),
+        };
+        dirs(path).iter().find_map(|d| {
+            names
+                .iter()
+                .map(|n| Path::new(d).join(n))
+                .find(|p| is_file(p))
         })
-        .ok_or_else(|| {
-            let names: Vec<&str> = known.iter().map(|(n, _)| *n).collect();
-            format!("no {what} program found (tried {})", names.join(", "))
-        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// `is_file` for a directory holding exactly `names`.
+        fn files<'a>(dir: &'a str, names: &'a [&str]) -> impl Fn(&Path) -> bool + 'a {
+            move |p| names.iter().any(|n| p == Path::new(dir).join(n))
+        }
+
+        const DIR: &str = r"C:\tools";
+
+        #[test]
+        fn finds_a_bare_name_with_the_program_extensions_of_pathext() {
+            let is_file = files(DIR, &["player.EXE", "rec.com"]);
+            let path = format!(r"C:\nowhere;;{DIR}");
+            let pathext = Some(".COM;.EXE;.BAT;.CMD");
+            let found = |name| find(name, &path, pathext, &is_file);
+            let player = Some(Path::new(DIR).join("player.EXE"));
+            assert_eq!(found("player"), player);
+            assert_eq!(found("player.EXE"), player);
+            assert_eq!(found("rec"), Some(Path::new(DIR).join("rec.com")));
+            assert_eq!(found("missing"), None);
+            // Only .exe and .com of PATHEXT count.
+            assert_eq!(find("player", &path, Some(".BAT;.COM"), &is_file), None);
+        }
+
+        #[test]
+        fn never_takes_a_cmd_or_bat_script() {
+            let is_file = files(DIR, &["script.cmd", "other.bat", "other.BAT.exe"]);
+            let pathext = Some(".COM;.EXE;.BAT;.CMD");
+            assert_eq!(find("script", DIR, pathext, &is_file), None);
+            assert_eq!(find("script.cmd", DIR, pathext, &is_file), None);
+            assert_eq!(find("other.BAT", DIR, pathext, &is_file), None);
+            assert!(is_script("script.cmd") && is_script(r"C:\x\OTHER.Bat"));
+            assert!(!is_script("player.exe") && !is_script(r"C:\x.cmd\player"));
+        }
+
+        #[test]
+        fn uses_com_and_exe_when_pathext_is_not_set() {
+            let is_file = files(DIR, &["tool.exe"]);
+            assert_eq!(
+                find("tool", DIR, None, &is_file),
+                Some(Path::new(DIR).join("tool.exe"))
+            );
+        }
+
+        #[test]
+        fn splits_path_at_semicolons_outside_quotes() {
+            assert_eq!(
+                dirs(r#"C:\a;;"C:\b;c";C:\d"#),
+                [r"C:\a", r"C:\b;c", r"C:\d"]
+            );
+            let is_file = files(r"C:\b;c", &["tool.exe"]);
+            assert_eq!(
+                find("tool", r#""C:\b;c""#, None, &is_file),
+                Some(Path::new(r"C:\b;c").join("tool.exe"))
+            );
+        }
+    }
+}
+
+/// A configured program: a bare name is looked up on PATH. On Windows a `.cmd` or `.bat`
+/// script is refused, as the extension refuses it, rather than run through `cmd.exe`.
+fn configured_program(p: &Path) -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    if windows_program::is_script(&p.to_string_lossy()) {
+        return Err(format!(
+            "cannot start {}: a program is an .exe or .com file, not a .cmd or .bat script",
+            p.display()
+        ));
+    }
+    Ok(if p.components().count() == 1 {
+        find_in_path(&p.to_string_lossy()).unwrap_or_else(|| p.to_path_buf())
+    } else {
+        p.to_path_buf()
+    })
+}
+
+/// A player or recorder to run, and the arguments it takes before its own.
+struct Program {
+    path: PathBuf,
+    args: Vec<String>,
+    /// The built-in engine rather than a configured program.
+    builtin: bool,
+}
+
+impl Program {
+    fn command(&self) -> Command {
+        let mut cmd = Command::new(&self.path);
+        cmd.args(&self.args);
+        cmd
+    }
+
+    fn name(&self) -> String {
+        self.path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
 }
 
 fn query_wait(query: Option<&str>) -> Result<f64, ()> {
@@ -375,6 +620,25 @@ fn query_wait(query: Option<&str>) -> Result<f64, ()> {
 }
 
 impl Shared {
+    /// The configured program, or the built-in engine's `subcommand`.
+    fn program(&self, configured: &Option<PathBuf>, subcommand: &str) -> Result<Program, String> {
+        if let Some(p) = configured {
+            return Ok(Program {
+                path: configured_program(p)?,
+                args: Vec::new(),
+                builtin: false,
+            });
+        }
+        match &self.cfg.engine {
+            Some(engine) => Ok(Program {
+                path: engine.clone(),
+                args: vec![subcommand.to_string()],
+                builtin: true,
+            }),
+            None => Err(NO_ENGINE.into()),
+        }
+    }
+
     fn authorized(&self, req: &Request) -> bool {
         let presented = match (
             req.header("authorization"),
@@ -390,197 +654,348 @@ impl Shared {
         ok && !presented.is_empty()
     }
 
+    /// Answer with `f` given the program that runs local models, or 503 without one.
+    fn with_models(&self, f: impl FnOnce(&Path) -> Response) -> Response {
+        match self.cfg.models.as_ref().or(self.cfg.engine.as_ref()) {
+            Some(p) => f(p),
+            None => Response::error(503, NO_ENGINE),
+        }
+    }
+
+    fn models_ctx<'a>(&'a self, program: &'a Path) -> remote_models::Ctx<'a> {
+        remote_models::Ctx {
+            program,
+            tmp_dir: &self.cfg.tmp_dir,
+            max_body: self.cfg.max_body,
+            idle: self.cfg.stream_idle,
+            jobs: &self.jobs,
+            down: &self.down,
+        }
+    }
+
     fn route(self: &Arc<Self>, conn: &mut Conn, req: &Request) -> Response {
         let segs: Vec<&str> = req.path.trim_start_matches('/').split('/').collect();
         match (req.method.as_str(), segs.as_slice()) {
             ("GET", ["v1", "health"]) => Response::json(
                 200,
                 format!(
-                    "{{\"protocol\": 1, \"name\": \"pi-speech-receiver\", \"version\": {}, \"capabilities\": [\"play\", \"record\"]}}",
+                    "{{\"protocol\": 1, \"name\": \"pi-speech-receiver\", \"version\": {}, \"capabilities\": [\"play\", \"record\", \"stream\", \"models\"]}}",
                     json_str(env!("CARGO_PKG_VERSION"))
                 ),
             ),
-            ("POST", ["v1", "play"]) => self.play(conn, req),
+            ("POST", ["v1", "play", "stream"]) => self.play_stream(conn, req),
+            ("POST", ["v1", "play", id, "audio"]) => self.stream_audio(conn, req, id),
             ("GET", ["v1", "play", id]) => match query_wait(req.query.as_deref()) {
                 Ok(w) => self.get_play(id, w),
                 Err(()) => Response::error(400, "wait must be a number of seconds"),
             },
             ("POST", ["v1", "play", id, "cancel"]) => self.cancel_play(id),
             ("POST", ["v1", "stop"]) => {
+                let client = match client_of(req) {
+                    Ok(c) => c,
+                    Err(resp) => return resp,
+                };
                 let _p = lock(&self.play_lock);
-                let n = self.stop_playing();
+                // With the header only that client's playbacks; without it, every one.
+                let n = self.stop_playing(|p| client.is_none() || p.client == client);
                 Response::json(200, format!("{{\"stopped\": {n}}}"))
             }
+            ("POST", ["v1", "pair"]) => self.pair(conn, req),
             ("POST", ["v1", "record", "start"]) => self.start_recording(),
             ("POST", ["v1", "record", id, "stop"]) => self.stop_recording(id),
             ("POST", ["v1", "record", id, "cancel"]) => self.cancel_recording(id),
+            ("GET", ["v1", "models"]) => self.with_models(remote_models::list),
+            ("GET", ["v1", "voices"]) => self.with_models(|p| remote_models::voices(p, req)),
+            ("POST", ["v1", "transcribe"]) => {
+                self.with_models(|p| remote_models::transcribe(&self.models_ctx(p), conn, req))
+            }
+            ("POST", ["v1", "speak"]) => {
+                self.with_models(|p| remote_models::speak(&self.models_ctx(p), conn, req))
+            }
             _ => not_found(),
         }
     }
 
     // ---- playback ----
 
-    fn play(self: &Arc<Self>, conn: &mut Conn, req: &Request) -> Response {
-        match req.header("x-pi-speech-kind").unwrap_or("message") {
-            "message" | "sample" => {}
-            _ => return Response::error(400, "X-Pi-Speech-Kind must be message or sample"),
-        }
-        if req.header("transfer-encoding").is_some() {
-            return Response::error(400, "send the audio with Content-Length, not chunked");
-        }
-        let len = match (
-            req.header("content-length"),
-            req.header_count("content-length"),
-        ) {
-            (Some(v), 1) => match v.parse::<u64>() {
-                Ok(n) => n,
-                Err(_) => return Response::error(400, "invalid Content-Length"),
-            },
-            _ => return Response::error(400, "exactly one Content-Length is required"),
+    /// Mark playback `id` by how its player ended.
+    fn player_ended(&self, id: &str, exit: &Exit) {
+        let (state, error) = if let Some(why) = &exit.failure {
+            (PlayState::Failed, Some(why.clone()))
+        } else if exit.stop_requested {
+            (PlayState::Cancelled, None)
+        } else if exit.success() {
+            (PlayState::Completed, None)
+        } else {
+            (
+                PlayState::Failed,
+                Some(with_note(
+                    &format!("player {}", exit.describe()),
+                    &exit.stderr_tail,
+                )),
+            )
         };
-        if len > self.cfg.max_body {
-            return Response::error(
-                413,
-                &format!("body larger than the limit of {} bytes", self.cfg.max_body),
-            );
+        let mut g = lock(&self.inner);
+        if let Some(p) = g.plays.iter_mut().find(|p| p.id == id) {
+            p.state = state;
+            p.error = error;
+            if let Feed::Waiting(_) = p.feed {
+                p.feed = Feed::Taken; // closes the input nobody will write to now
+            }
         }
-        let ctype = req.header("content-type").unwrap_or("");
-        let kind = match ctype
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "audio/wav" => Kind::Wav,
-            "audio/mpeg" => Kind::Mp3,
-            _ => return Response::error(415, "Content-Type must be audio/wav or audio/mpeg"),
+        self.cv.notify_all();
+    }
+
+    // ---- Streams ----
+
+    /// `POST /v1/play/stream`: start a player that reads a Stream from its input.
+    fn play_stream(self: &Arc<Self>, conn: &mut Conn, req: &Request) -> Response {
+        if let Err(resp) = check_kind(req) {
+            return resp;
+        }
+        let client = match client_of(req) {
+            Ok(c) => c,
+            Err(resp) => return resp,
+        };
+        let framing = match Framing::of(req) {
+            Ok(f) => f,
+            Err(e) => return Response::error(400, e),
         };
         conn.send_continue(req);
-        let body = match conn.read_body(len) {
-            Ok(b) => b,
-            Err(BodyError::Short) => {
-                return Response::error(400, "body shorter than its Content-Length")
-            }
-            Err(BodyError::Io(_)) => return Response::error(400, "could not read the body"),
+        let mut body = Vec::new();
+        let read = conn.read_pieces(framing, MAX_STREAM_REQUEST, self.cfg.stream_idle, |p| {
+            body.extend_from_slice(p)
+        });
+        if let Err(e) = read {
+            return Response::error(400, &format!("unusable Stream request: {}", e.describe()));
+        }
+        match Format::parse(&body) {
+            Ok(format) => self.start_stream(format, client),
+            Err(e) => Response::error(400, &e),
+        }
+    }
+
+    /// The Stream player for `format`: the configured one, or the built-in engine.
+    fn stream_player(&self, format: Format) -> Result<Program, String> {
+        let mut program = self.program(&self.cfg.stream_player, "play")?;
+        program.args.extend(stream::player_args(format));
+        Ok(program)
+    }
+
+    /// `POST /v1/pair`: a new pairing code, or the token for the right one.
+    fn pair(&self, conn: &mut Conn, req: &Request) -> Response {
+        let bodiless =
+            req.header("content-length").is_none() && req.header("transfer-encoding").is_none();
+        let framing = match Framing::of(req) {
+            Ok(f) => f,
+            Err(_) if bodiless => Framing::Length(0),
+            Err(e) => return Response::error(400, e),
         };
-        if !wav::matches(kind, &body) {
-            return Response::error(415, "the body is not WAV or MP3 audio of the declared type");
+        conn.send_continue(req);
+        let mut body = Vec::new();
+        let read = conn.read_pieces(framing, MAX_PAIR_REQUEST, self.cfg.stream_idle, |p| {
+            body.extend_from_slice(p)
+        });
+        if let Err(e) = read {
+            return Response::error(400, &format!("unusable pairing request: {}", e.describe()));
         }
-        self.start_playback(kind, &body)
+        self.pairing.answer(&body, &self.cfg.token)
     }
 
-    fn store(&self, prefix: &str, ext: &str, bytes: &[u8]) -> io::Result<PathBuf> {
-        let path = self
-            .cfg
-            .tmp_dir
-            .join(format!("{prefix}-{}.{ext}", random_hex(8)?));
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)?;
-        if let Err(e) = f.write_all(bytes).and_then(|_| f.flush()) {
-            let _ = fs::remove_file(&path);
-            return Err(e);
-        }
-        Ok(path)
-    }
-
-    fn start_playback(self: &Arc<Self>, kind: Kind, audio: &[u8]) -> Response {
-        // Shutdown takes this lock before it deletes the directory, so audio is only
-        // ever stored while the receiver is known to be up.
+    /// Start a Stream player for `client`; it replaces what that client plays, and only that.
+    fn start_stream(self: &Arc<Self>, format: Format, client: Option<String>) -> Response {
         let _p = lock(&self.play_lock);
         if self.down.load(Ordering::SeqCst) {
             return Response::error(503, "the receiver is shutting down");
         }
-        let path = match self.store("play", kind.extension(), audio) {
-            Ok(p) => p,
-            Err(e) => return Response::error(503, &format!("cannot store the audio: {e}")),
-        };
-        let fail = |status: u16, msg: String| {
-            let _ = fs::remove_file(&path);
-            Response::error(status, &msg)
-        };
-        self.stop_playing();
-        let (program, args) = match resolve(&self.cfg.player, &PLAYERS, "player") {
+        // Without a Stream player the client sends the audio as a file later; until
+        // then, what plays now keeps playing.
+        let program = match self.stream_player(format) {
             Ok(x) => x,
-            Err(e) => return fail(503, e),
+            Err(e) => return Response::error(503, &e),
         };
-        let mut cmd = Command::new(&program);
-        cmd.args(&args).arg(&path);
         let id = match random_hex(8) {
             Ok(id) => id,
-            Err(e) => return fail(503, format!("no random source: {e}")),
+            Err(e) => return Response::error(503, &format!("no random source: {e}")),
         };
+        self.stop_playing(|p| p.client == client);
+        let cmd = program.command();
         let sh = Arc::clone(self);
-        let (done_id, done_path) = (id.clone(), path.clone());
+        let done_id = id.clone();
         // Hold the lock across spawn so the exit callback cannot run before the entry exists.
         let mut g = lock(&self.inner);
-        let spawned = proc::spawn(cmd, move |exit| {
-            let _ = fs::remove_file(&done_path);
-            let (state, error) = if exit.stop_requested {
-                (PlayState::Cancelled, None)
-            } else if exit.success() {
-                (PlayState::Completed, None)
-            } else {
-                (
-                    PlayState::Failed,
-                    Some(with_note(
-                        &format!("player {}", exit.describe()),
-                        &exit.stderr_tail,
-                    )),
-                )
-            };
-            let mut g = lock(&sh.inner);
-            if let Some(p) = g.plays.iter_mut().find(|p| p.id == done_id) {
-                p.state = state;
-                p.error = error;
-            }
-            sh.cv.notify_all();
-        });
-        let ctl = match spawned {
-            Ok(c) => c,
+        let spawned = proc::spawn_with_input(cmd, move |exit| sh.player_ended(&done_id, &exit));
+        let (ctl, input) = match spawned {
+            Ok(x) => x,
             Err(e) => {
                 drop(g);
-                let name = program
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned());
-                return fail(
+                return Response::error(
                     503,
-                    format!("cannot start the player {}: {e}", name.unwrap_or_default()),
+                    &format!("cannot start the Stream player {}: {e}", program.name()),
                 );
             }
         };
+        let (sh, wait_id, wait_ctl) = (Arc::clone(self), id.clone(), Arc::clone(&ctl));
+        if let Err(e) = start_thread("stream-start", move || sh.await_audio(&wait_id, &wait_ctl)) {
+            // Not yet listed, so the exit callback has nothing to update; the lock must be
+            // released first because that callback takes it.
+            drop(g);
+            ctl.stop();
+            drop(input);
+            return Response::error(503, &format!("cannot start the Stream timer: {e}"));
+        }
         g.plays.push(Play {
             id: id.clone(),
+            client,
             state: PlayState::Playing,
             error: None,
             ctl,
+            feed: Feed::Waiting(input),
         });
-        while g.plays.len() > KEPT_PLAYBACKS {
-            match g.plays.iter().position(|p| p.state != PlayState::Playing) {
-                Some(i) => {
-                    g.plays.remove(i);
-                }
-                None => break,
-            }
-        }
+        prune(&mut g);
         Response::json(202, format!("{{\"id\": {}}}", json_str(&id)))
     }
 
-    /// Stop every playback in progress and wait until they are marked. The caller holds
-    /// `play_lock`. Returns how many were playing.
-    fn stop_playing(&self) -> usize {
-        let ctls: Vec<Arc<ProcCtl>> = lock(&self.inner)
+    /// Fail Stream `id` when its audio request has not begun in time.
+    fn await_audio(&self, id: &str, ctl: &ProcCtl) {
+        let waiting = |g: &Inner| {
+            !self.down.load(Ordering::SeqCst)
+                && g.plays.iter().any(|p| {
+                    p.id == id
+                        && p.state == PlayState::Playing
+                        && matches!(p.feed, Feed::Waiting(_))
+                })
+        };
+        let g = lock(&self.inner);
+        let (mut g, _) = self
+            .cv
+            .wait_timeout_while(g, self.cfg.stream_start, |g| waiting(g))
+            .unwrap_or_else(|e| e.into_inner());
+        if !waiting(&g) {
+            return;
+        }
+        // Taken out under the lock, so no audio request can have it any more.
+        let input = g
+            .plays
+            .iter_mut()
+            .find(|p| p.id == id)
+            .map(|p| std::mem::replace(&mut p.feed, Feed::Taken));
+        drop(g);
+        // Stopped before its input closes, so the player cannot end as `completed`.
+        ctl.fail(&format!(
+            "no audio arrived within {} s",
+            self.cfg.stream_start.as_secs_f64()
+        ));
+        drop(input);
+    }
+
+    /// `POST /v1/play/<id>/audio`: write the body to Stream `id`'s player as it arrives.
+    fn stream_audio(&self, conn: &mut Conn, req: &Request, id: &str) -> Response {
+        let framing = match Framing::of(req) {
+            Ok(f) => f,
+            Err(e) => return Response::error(400, e),
+        };
+        let (ctl, input) = {
+            let mut g = lock(&self.inner);
+            let Some(p) = g.plays.iter_mut().find(|p| p.id == id) else {
+                return Response::error(404, "unknown playback id");
+            };
+            let playing = p.state == PlayState::Playing && !p.ctl.stopping();
+            let input = match std::mem::replace(&mut p.feed, Feed::Taken) {
+                Feed::Waiting(input) if playing => input,
+                other => {
+                    let msg = match other {
+                        _ if !playing => "the playback is no longer playing",
+                        _ => "the Stream already has its audio request",
+                    };
+                    p.feed = other;
+                    return Response::error(409, msg);
+                }
+            };
+            let ctl = Arc::clone(&p.ctl);
+            self.cv.notify_all(); // the start timer stops waiting
+            (ctl, input)
+        };
+        let limit = self.cfg.max_body;
+        let too_large = format!("the audio is larger than the limit of {limit} bytes");
+        if matches!(framing, Framing::Length(n) if n > limit) {
+            self.fail_stream(id, &ctl, Some(input), &too_large);
+            return Response::error(413, &too_large);
+        }
+        conn.send_continue(req);
+        // `None` once the player takes no more: a stop was asked for, or it closed its
+        // input (`lost`). The rest of the body is then read and dropped.
+        let mut input = Some(input);
+        let mut lost = false;
+        let read = conn.read_pieces(framing, limit, self.cfg.stream_idle, |piece| {
+            if let Some(w) = input.as_mut() {
+                if ctl.stopping() {
+                    input = None;
+                } else if w.write_all(piece).is_err() {
+                    // EPIPE from a player that has gone (SIGPIPE is ignored).
+                    input = None;
+                    lost = true;
+                }
+            }
+        });
+        match read {
+            Ok(_) => {
+                // Closing the input lets the player play the rest and exit.
+                drop(input);
+            }
+            Err(BodyFault::TooLarge) => {
+                self.fail_stream(id, &ctl, input, &too_large);
+                return Response::error(413, &too_large);
+            }
+            Err(fault) => {
+                let why = format!("the audio broke off: {}", fault.describe());
+                self.fail_stream(id, &ctl, input, &why);
+                return Response::error(400, &why);
+            }
+        }
+        if lost || ctl.stopping() {
+            // Ending or being stopped: answer with the state that results.
+            self.settle_play(id);
+        }
+        match lock(&self.inner).plays.iter().find(|p| p.id == id) {
+            Some(p) => p.json(),
+            None => Response::error(404, "unknown playback id"),
+        }
+    }
+
+    /// Stop Stream `id` as failed, unless it was already stopped or ended, then close its
+    /// input and wait until it is marked.
+    fn fail_stream(&self, id: &str, ctl: &ProcCtl, input: Option<ChildStdin>, why: &str) {
+        // Stopped before its input closes, so the player cannot end as `completed`.
+        ctl.fail(why);
+        drop(input);
+        self.settle_play(id);
+    }
+
+    /// Wait (bounded) until playback `id` is no longer playing.
+    fn settle_play(&self, id: &str) {
+        self.settle(|g| {
+            g.plays
+                .iter()
+                .all(|p| p.id != id || p.state != PlayState::Playing)
+        });
+    }
+
+    /// Stop the playbacks in progress that `which` picks and wait until they are marked.
+    /// The caller holds `play_lock`. Returns how many were playing.
+    fn stop_playing(&self, which: impl Fn(&Play) -> bool) -> usize {
+        let (ids, ctls): (Vec<String>, Vec<Arc<ProcCtl>>) = lock(&self.inner)
             .plays
             .iter()
-            .filter(|p| p.state == PlayState::Playing)
-            .map(|p| Arc::clone(&p.ctl))
-            .collect();
+            .filter(|p| p.state == PlayState::Playing && which(p))
+            .map(|p| (p.id.clone(), Arc::clone(&p.ctl)))
+            .unzip();
         let stopped = stop_all(&ctls);
-        self.settle(|g| g.plays.iter().all(|p| p.state != PlayState::Playing));
+        self.settle(|g| {
+            g.plays
+                .iter()
+                .all(|p| p.state != PlayState::Playing || !ids.contains(&p.id))
+        });
         stopped
     }
 
@@ -615,11 +1030,7 @@ impl Shared {
             None => return Response::error(404, "unknown playback id"),
         };
         ctl.stop();
-        self.settle(|g| {
-            g.plays
-                .iter()
-                .all(|p| p.id != id || p.state != PlayState::Playing)
-        });
+        self.settle_play(id);
         match lock(&self.inner).plays.iter().find(|p| p.id == id) {
             Some(p) => p.json(),
             None => Response::error(404, "unknown playback id"),
@@ -640,7 +1051,7 @@ impl Shared {
         {
             return Response::error(409, "a recording is already active");
         }
-        let (program, args) = match resolve(&self.cfg.recorder, &RECORDERS, "recorder") {
+        let program = match self.program(&self.cfg.recorder, "record") {
             Ok(x) => x,
             Err(e) => return Response::error(503, &e),
         };
@@ -649,26 +1060,23 @@ impl Shared {
             _ => return Response::error(503, "no random source"),
         };
         let path = self.cfg.tmp_dir.join(name);
-        let mut cmd = Command::new(&program);
-        cmd.args(&args).arg(&path);
+        let mut cmd = program.command();
+        cmd.arg(&path);
 
         let sh = Arc::clone(self);
         let done_id = id.clone();
         let mut g = lock(&self.inner);
-        let spawned = proc::spawn(cmd, move |exit| sh.recorder_ended(&done_id, &exit));
-        let ctl = match spawned {
-            Ok(c) => c,
+        let on_exit = move |exit: Exit| sh.recorder_ended(&done_id, &exit);
+        // The built-in recorder also ends when its input closes; a configured one keeps
+        // the closed input it always had (on Unix; see `proc::spawn_recorder`).
+        let spawned = proc::spawn_recorder(cmd, program.builtin, on_exit);
+        let (ctl, input) = match spawned {
+            Ok(x) => x,
             Err(e) => {
                 drop(g);
-                let name = program
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned());
                 return Response::error(
                     503,
-                    &format!(
-                        "cannot start the recorder {}: {e}",
-                        name.unwrap_or_default()
-                    ),
+                    &format!("cannot start the recorder {}: {e}", program.name()),
                 );
             }
         };
@@ -691,6 +1099,7 @@ impl Shared {
             id: id.clone(),
             path: path.clone(),
             ctl: Arc::clone(&ctl),
+            input,
             phase: RecPhase::Recording,
             error: None,
             note: String::new(),
@@ -747,6 +1156,7 @@ impl Shared {
         let mut g = lock(&self.inner);
         if let Some(r) = g.recs.iter_mut().find(|r| r.id == id) {
             r.phase = RecPhase::Ended;
+            r.input = None;
             r.finished = Some(Instant::now());
             if error.is_some() {
                 let _ = fs::remove_file(&r.path);
@@ -833,6 +1243,7 @@ impl Shared {
 
     fn shutdown(&self) {
         self.down.store(true, Ordering::SeqCst);
+        self.jobs.stop();
         let _p = lock(&self.play_lock);
         let _r = lock(&self.rec_lock);
         let ctls: Vec<Arc<ProcCtl>> = {

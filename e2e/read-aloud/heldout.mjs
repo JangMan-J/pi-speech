@@ -9,7 +9,7 @@ try {
   const slow = path.join(ctx.work, 'slow-player');
   const slowLog = path.join(ctx.work, 'slow.log');
   fs.writeFileSync(slow, `#!/usr/bin/env bash\necho "start $$ $1" >> "${slowLog}"\ntrap 'echo "term $$" >> "${slowLog}"; exit 143' TERM INT\nsleep 6 & wait $!\necho "end $$" >> "${slowLog}"\n`, { mode: 0o755 });
-  let s = await ctx.pi({ env: { PI_SPEECH_PLAYER: slow } });
+  let s = await ctx.pi({ env: { PI_SPEECH_STREAM_PLAYER: slow } });
 
   let n = await command(s, '/speech --replay');
   check(errors(n).length > 0, 'replay with nothing to replay is an error', notes(n));
@@ -53,13 +53,13 @@ try {
   const plays = ctx.playerLog().length;
   n = await command(s, '/speech --replay', 800);
   const played = ctx.playerLog().slice(plays);
-  check(played.length === 1 && path.basename(played[0]).replace(/\.(wav|mp3)$/, '') === newest.replace(/\.(wav|mp3)$/, ''), 'after a restart replay plays the newest history message', [played, newest]);
+  check(played.length === 1 && ctx.played(-1)?.equals(ctx.savedAudio(newest)), 'after a restart replay plays the newest history message', [played, newest]);
 
   // player failure during read-aloud is notified
   const bad = path.join(ctx.work, 'bad-player');
   fs.writeFileSync(bad, '#!/usr/bin/env bash\necho "cannot open device" >&2\nexit 4\n', { mode: 0o755 });
   await s.close();
-  s = await ctx.pi({ env: { PI_SPEECH_PLAYER: bad } });
+  s = await ctx.pi({ env: { PI_SPEECH_STREAM_PLAYER: bad } });
   await command(s, '/speech --read-aloud on');
   const f2 = s.uiRequests.length;
   ctx.llm.script([{ text: 'Player will fail.' }]);

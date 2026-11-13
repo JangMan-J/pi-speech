@@ -2,9 +2,9 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { runDictationOutput } from "../../src/engine/dictation-output";
+import { outputCommand, runDictationOutput } from "../../src/engine/dictation-output";
 
-describe("the dictation output command", () => {
+describe.skipIf(process.platform === "win32")("the dictation output command", () => {
   const dirs: string[] = [];
   const tmp = () => {
     const d = mkdtempSync(join(tmpdir(), "pi-speech-out-"));
@@ -59,5 +59,17 @@ describe("the dictation output command", () => {
 
   it("rejects when the command times out", async () => {
     await expect(runDictationOutput("sleep 5", "x", env, 50)).rejects.toThrow(/timed out/);
+  });
+});
+
+describe("how the dictation output command is run", () => {
+  it("on Unix by sh, %s standing for the quoted variable", () => {
+    expect(outputCommand("notify-send %s", "linux")).toEqual(["sh", ["-c", 'notify-send "$DICTATION_TEXT"']]);
+  });
+
+  it("on Windows by PowerShell 7 when installed, else Windows PowerShell; %s is the variable, read at run time", () => {
+    const args = ["-NoProfile", "-NonInteractive", "-Command", "Set-Clipboard $env:DICTATION_TEXT"];
+    expect(outputCommand("Set-Clipboard %s", "win32", () => true)).toEqual(["pwsh.exe", args]);
+    expect(outputCommand("Set-Clipboard %s", "win32", () => false)).toEqual(["powershell.exe", args]);
   });
 });

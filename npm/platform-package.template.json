@@ -1,0 +1,11 @@
+{
+  "name": "@jangmanj/pi-speech-{{target}}",
+  "version": "{{version}}",
+  "description": "The pi-speech-receiver binary of @jangmanj/pi-speech for {{target}}; installed by @jangmanj/pi-speech, not by hand",
+  "os": ["{{os}}"],
+  "cpu": ["{{cpu}}"],
+  "files": ["bin", "README.md", "LICENSE"],
+  "publishConfig": {
+    "access": "public"
+  }
+}
