@@ -62,9 +62,9 @@ describe("wavSeconds", () => {
 
 // The fakes here are shell scripts, which Windows cannot run. Windows coverage of playback and recording
 // comes with the bundled binary (portable-package slice 4), run on the null audio device.
-const unixOnly = process.platform === "win32";
+const onWindows = process.platform === "win32";
 
-describe.skipIf(unixOnly)("chooseRecorder", () => {
+describe.skipIf(onWindows)("chooseRecorder", () => {
   it("prefers PI_SPEECH_RECORDER and reports one that is not executable", () => {
     const r = recorder("mine", "");
     expect(chooseRecorder({ ...base, PI_SPEECH_RECORDER: r })).toMatchObject({ ok: true, name: r });
@@ -90,7 +90,7 @@ describe.skipIf(unixOnly)("chooseRecorder", () => {
   });
 });
 
-describe.skipIf(unixOnly)("LocalInput", () => {
+describe.skipIf(onWindows)("LocalInput", () => {
   const good = () =>
     recorder(
       "good",

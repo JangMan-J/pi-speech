@@ -67,9 +67,9 @@ describe("how the dictation output command is run", () => {
     expect(outputCommand("notify-send %s", "linux")).toEqual(["sh", ["-c", 'notify-send "$DICTATION_TEXT"']]);
   });
 
-  it("on Windows by PowerShell, %s standing for the variable, read when the command runs (never pasted in)", () => {
-    const [bin, args] = outputCommand("Set-Clipboard %s", "win32");
-    expect(bin).toBe("powershell.exe");
-    expect(args).toEqual(["-NoProfile", "-NonInteractive", "-Command", "Set-Clipboard $env:DICTATION_TEXT"]);
+  it("on Windows by PowerShell 7 when installed, else Windows PowerShell; %s is the variable, read at run time", () => {
+    const args = ["-NoProfile", "-NonInteractive", "-Command", "Set-Clipboard $env:DICTATION_TEXT"];
+    expect(outputCommand("Set-Clipboard %s", "win32", () => true)).toEqual(["pwsh.exe", args]);
+    expect(outputCommand("Set-Clipboard %s", "win32", () => false)).toEqual(["powershell.exe", args]);
   });
 });

@@ -5,16 +5,22 @@
  */
 
 import { spawn } from "node:child_process";
-import { childEnv, type Env } from "./env";
+import { childEnv, type Env, findExecutable } from "./env";
 
 /**
  * The program and arguments that run `command`: sh on Unix, PowerShell on Windows. Both read %s's variable when
  * the command runs, so dictated text is never parsed as part of it (cmd.exe would paste it in first).
+ * PowerShell 7 (`pwsh`) is preferred: Windows PowerShell 5.1 does not escape a `"` in an argument it passes to
+ * another program, so text with quotes can arrive there as more than one argument.
  */
-export function outputCommand(command: string, platform: NodeJS.Platform = process.platform): [string, string[]] {
+export function outputCommand(
+  command: string,
+  platform: NodeJS.Platform = process.platform,
+  hasPwsh: () => boolean = () => findExecutable("pwsh", process.env) !== undefined,
+): [string, string[]] {
   if (platform === "win32") {
     const script = command.replace(/%s/g, "$env:DICTATION_TEXT");
-    return ["powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script]];
+    return [hasPwsh() ? "pwsh.exe" : "powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script]];
   }
   return ["sh", ["-c", command.replace(/%s/g, '"$DICTATION_TEXT"')]];
 }

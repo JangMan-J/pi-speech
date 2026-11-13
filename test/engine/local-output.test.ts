@@ -53,9 +53,9 @@ const alive = (pid: number) => {
 
 // The fakes here are shell scripts, which Windows cannot run. Windows coverage of playback and recording
 // comes with the bundled binary (portable-package slice 4), run on the null audio device.
-const unixOnly = process.platform === "win32";
+const onWindows = process.platform === "win32";
 
-describe.skipIf(unixOnly)("local playback", () => {
+describe.skipIf(onWindows)("local playback", () => {
   let dir: string;
   const exe = (name: string, body = "exit 0") => {
     const p = join(dir, name);
