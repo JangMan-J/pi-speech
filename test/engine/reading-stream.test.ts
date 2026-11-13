@@ -80,7 +80,7 @@ function harness(pieces: string[]) {
     signal: caller.signal,
     save: async (audio): Promise<SavedMessage> => {
       saved.push(audio);
-      return { files: ["/history/message.wav"], wav: "/history/message.wav" };
+      return { files: ["/history/message.wav"] };
     },
   });
   const played = () => Buffer.concat(out.streams[0]?.chunks ?? []);

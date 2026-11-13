@@ -9,7 +9,6 @@ import type { AudioInput, AudioOutput } from "./audio";
 import { Dictation } from "./dictation";
 import { runDictationOutput } from "./dictation-output";
 import type { Env } from "./env";
-import type { Converter } from "./history";
 import { Indicator } from "./indicator";
 import type { SpeechCatalog } from "./openrouter";
 import { Player } from "./player";
@@ -23,7 +22,6 @@ export interface EngineOptions {
   agentDir: string;
   env: Env;
   home?: string;
-  convert?: Converter;
   fetchCatalog?: () => Promise<SpeechCatalog>;
   bridge?: BridgeAudio;
   localOutput?: AudioOutput;
@@ -72,7 +70,6 @@ export class Engine {
       player: this.player,
       env: opts.env,
       home: opts.home,
-      convert: opts.convert,
       fetchCatalog: opts.fetchCatalog,
     });
     this.speech.onWarning = (message) => this.notify(message, "warning");

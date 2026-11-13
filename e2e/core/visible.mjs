@@ -22,8 +22,8 @@ try {
   check(req && req.headers.authorization === `Bearer ${ctx.key}`, 'synthesis request carries the OpenRouter key', req?.headers?.authorization?.slice(0, 20));
   check(req && req.body?.input === text, 'synthesis request carries the text', req?.body);
   const files = ctx.history();
-  const wavs = files.filter((f) => f.endsWith('.wav')), mp3s = files.filter((f) => f.endsWith('.mp3'));
-  check(wavs.length === 1 && mp3s.length === 1, 'one message saved as WAV and MP3', files);
+  const wavs = files.filter((f) => f.endsWith('.wav'));
+  check(files.length === 1 && wavs.length === 1, 'one message saved once, as a WAV', files);
   if (wavs[0]) check(isWav(fs.readFileSync(path.join(ctx.speechDir, wavs[0]))), 'saved WAV is a valid WAV file');
   if (wavs[0]) check(content.includes(path.join(ctx.speechDir, wavs[0])), 'tool result names the saved WAV', content.slice(0, 300));
   await new Promise((r) => setTimeout(r, 500));
@@ -76,10 +76,9 @@ try {
   }
   await new Promise((r) => setTimeout(r, 500));
   const h = ctx.history();
-  const hw = h.filter((f) => f.endsWith('.wav')), hm = h.filter((f) => f.endsWith('.mp3'));
-  check(hw.length === 10 && hm.length === 10, 'history holds ten WAV and ten MP3 files', h.length);
-  check(hw.every((f) => hm.includes(f.replace(/\.wav$/, '.mp3'))), 'each kept WAV has its MP3');
-  check(early.length === 4 && early.every((f) => !h.includes(f)), 'the two oldest messages were removed', early);
+  const hw = h.filter((f) => f.endsWith('.wav'));
+  check(h.length === 10 && hw.length === 10, 'history holds ten messages, one WAV each', h.length);
+  check(early.length === 2 && early.every((f) => !h.includes(f)), 'the two oldest messages were removed', early);
 } finally {
   await ctx.close();
   ctx.cleanup();

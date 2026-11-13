@@ -186,7 +186,6 @@ export function makeEngine(
     agentDir: join(work, "agent"),
     env: { OPENROUTER_API_KEY: "sk-test", PI_SPEECH_DIR: join(work, "history"), ...env },
     home: join(work, "home"),
-    convert: async () => false,
     fetchCatalog: async () => catalog,
     bridge,
     localOutput: local,

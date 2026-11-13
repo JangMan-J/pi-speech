@@ -119,10 +119,9 @@ export function parse(input: string): Parsed {
 
 /** What happened to a message, briefly. */
 export function describeSpoken(r: SpeechResult): { message: string; level: "info" | "warning" } {
-  const note = r.conversionError ? `\nNote: ${r.conversionError}` : "";
   if (r.stopped) return { message: "Stopped.", level: "info" };
-  if (r.player) return { message: `Speaking with ${r.voice} (${r.model})${note}`, level: "info" };
-  return { message: `Saved, but not played: ${r.notPlayed ?? "unknown reason"}${note}`, level: "warning" };
+  if (r.player) return { message: `Speaking with ${r.voice} (${r.model})`, level: "info" };
+  return { message: `Saved, but not played: ${r.notPlayed ?? "unknown reason"}`, level: "warning" };
 }
 
 export function describeSample(r: SampleResult): { message: string; level: "info" | "warning" } {

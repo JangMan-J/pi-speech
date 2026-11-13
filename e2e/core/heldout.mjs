@@ -1,7 +1,7 @@
 // Held-out acceptance for pi-speech core.
 import fs from 'node:fs';
 import path from 'node:path';
-import { callTool, check, command, errors, finish, isWav, notes, setup, wavBytes } from '../lib/lib.mjs';
+import { callTool, check, command, errors, finish, notes, setup, wavBytes } from '../lib/lib.mjs';
 
 function walk(dir, out = []) {
   if (!fs.existsSync(dir)) return out;
@@ -93,9 +93,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     await command(s, '/speech mp3 only model');
     await sleep(300);
     const h = ctx.history();
-    check(h.some((f) => f.endsWith('.mp3')) && h.some((f) => f.endsWith('.wav')), 'an MP3-only model is saved as MP3 and WAV', h);
-    const wav = h.find((f) => f.endsWith('.wav'));
-    if (wav) check(isWav(fs.readFileSync(path.join(ctx.speechDir, wav))), 'the converted WAV is valid');
+    check(h.length === 1 && h[0].endsWith('.mp3'), 'an MP3-only model is saved once, as its MP3', h);
 
     fs.rmSync(ctx.speechDir, { recursive: true, force: true });
     const played0 = ctx.playerLog().length;
@@ -128,10 +126,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     await command(s2, '/speech --set voice af_heart');
     const r = await callTool(ctx, s2, 'speech_synthesize', { text: 'conversion will fail', play: false });
     const h2 = ctx.history();
-    check(h2.filter((x) => x.endsWith('.wav')).length === 1 && !h2.some((x) => x.endsWith('.mp3')), 'without ffmpeg only the WAV exists', h2);
+    check(h2.length === 1 && h2[0].endsWith('.wav'), 'with a broken ffmpeg on PATH the message is saved once, as a WAV', h2);
     const named = [...r.content.matchAll(/(\/[^\s"'`,)]+\.(?:wav|mp3))/g)].map((m) => m[1]);
     check(named.length > 0 && named.every((p) => fs.existsSync(p)), 'the result names only files that exist', named);
-    check(/mp3|convert|ffmpeg/i.test(r.content), 'the result says the MP3 conversion failed', r.content.slice(0, 300));
+    check(!/convert|ffmpeg/i.test(r.content), 'the result says nothing about converting (no ffmpeg is used)', r.content.slice(0, 300));
   } finally { await ctx.close(); ctx.cleanup(); }
 }
 

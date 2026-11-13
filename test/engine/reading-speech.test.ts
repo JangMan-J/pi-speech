@@ -98,7 +98,7 @@ describe("playback-only speech of a long text", () => {
     expect(local.plays.map((p) => p.stream?.format)).toEqual([{ codec: "mp3" }]);
   });
 
-  it("where a Stream cannot play, speaks the text in one request when the pieces cannot be WAV (MP3 without a converter)", async () => {
+  it("where a Stream cannot play, an MP3-only model is read in pieces as MP3 files and saved as one MP3", async () => {
     const inputs: string[] = [];
     vi.stubGlobal(
       "fetch",
@@ -110,15 +110,12 @@ describe("playback-only speech of a long text", () => {
     const { engine, work, bridgeOut } = makeEngine();
     await engine.setBridge("on");
     const r = await engine.speech.say(LONG);
-    expect(inputs.at(-1)).toBe(LONG);
-    expect(r.files.length).toBe(1);
+    expect(inputs.length).toBeGreaterThanOrEqual(2);
+    expect(norm(inputs.join(" "))).toBe(norm(LONG));
+    expect(r.files).toHaveLength(1);
     expect(r.files[0].endsWith(".mp3")).toBe(true);
     expect(readdirSync(join(work, "history"))).toEqual([r.files[0].split("/").at(-1)]);
-    expect(bridgeOut.plays.map((p) => p.file)).toEqual([r.files[0]]);
-    // The next long text goes straight to one request.
-    inputs.length = 0;
-    await engine.speech.say(LONG);
-    expect(inputs).toEqual([LONG]);
+    expect(bridgeOut.plays[0].file?.endsWith(".mp3")).toBe(true);
   });
 
   it("an output that turns out not to play a Stream (an older receiver) reads in pieces as files, asking for each piece once", async () => {

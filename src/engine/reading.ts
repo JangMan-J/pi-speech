@@ -1,21 +1,20 @@
 /**
  * A Reading: a long text spoken in pieces (see pieces.ts). One request per piece, the first asked
  * first and at most IN_FLIGHT at once; each piece plays once it is ready and the one before has finished,
- * all of them as one reading of the player. Once every piece is synthesized their WAV data is joined and
- * saved as one message.
+ * all of them as one reading of the player. Every piece must come in the first piece's format (a WAV of the
+ * same sample format, or MP3); once every piece is synthesized they are joined (WAV data under one header, MP3
+ * frames one after another) and saved as one message.
  *
- * Whether the text can be read in pieces is decided from the first piece alone, before anything plays: when it
- * cannot be WAV the reading ends unplayed and the caller speaks the text in one request. From then on any
- * problem (a failed request, a piece that cannot be converted or comes in another format) is a failure:
- * no later piece plays and nothing is saved. A stop or newer audio cancels the rest and saves nothing.
+ * Any problem (a failed request, a piece that is not a readable WAV or MP3, or comes in another format) is a
+ * failure: no later piece plays and nothing is saved. A stop or newer audio cancels the rest and saves nothing.
  * Pieces live in a private temporary directory, removed when the reading has ended.
  */
 
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Playback, PlayOutcome, PlayStart } from "./audio";
 import { errorMessage } from "./env";
-import type { Converter, SavedMessage } from "./history";
+import type { SavedMessage } from "./history";
 import type { Player, Reading } from "./player";
 import { REPLACED } from "./player";
 import type { SynthesizedAudio } from "./provider";
@@ -29,10 +28,8 @@ export interface ReadingDeps {
   /** One speech request; throws a readable error (the provider's status or message). */
   synthesize(text: string, signal: AbortSignal, index: number): Promise<SynthesizedAudio>;
   player: Player;
-  /** Converts an MP3 piece to WAV (format from the file extension); false when it cannot. */
-  convert: Converter;
-  /** Saves the joined WAV as one message in the history. */
-  save(wav: Uint8Array): Promise<SavedMessage>;
+  /** Saves the joined pieces as one message in the history. */
+  save(audio: SynthesizedAudio): Promise<SavedMessage>;
   /** Where the reading's private temporary directory is made. */
   tmpRoot: string;
   /** Aborting it stops the reading, until the reading has ended. */
@@ -43,9 +40,7 @@ export type ReadingResult =
   /** Every piece was synthesized and the message saved; `player` once the first piece started. */
   | { state: "saved"; saved: SavedMessage; player?: string; notPlayed?: string }
   /** Stopped or replaced before every piece was synthesized: nothing saved. */
-  | { state: "stopped" }
-  /** The first piece cannot be WAV: decided before anything played, nothing saved; speak the text in one request. */
-  | { state: "unchunkable"; reason: string };
+  | { state: "stopped" };
 
 /** A reading ended by a failure: no later piece plays and nothing was saved. `reason` says what failed. */
 export class ReadingFailed extends Error {
@@ -83,15 +78,34 @@ function deferred<T>(): Deferred<T> {
   return d;
 }
 
-type Failure = { reason: string; unchunkable?: boolean };
+type Failure = { reason: string };
+
+/** What every piece must match: the first piece's file format, and for a WAV its `fmt ` chunk. */
+type PieceKind = { format: "mp3" } | { format: "wav"; fmt: Buffer };
+
+function kindOf(audio: SynthesizedAudio): PieceKind | undefined {
+  if (audio.format === "mp3") return { format: "mp3" };
+  const fmt = wavFormat(audio.audio);
+  return fmt ? { format: "wav", fmt } : undefined;
+}
+
+const sameKind = (a: PieceKind, b: PieceKind) =>
+  a.format === b.format && (a.format === "mp3" || (b.format === "wav" && a.fmt.equals(b.fmt)));
+
+/** The pieces as one message: WAV data under one header, or MP3 frames one after another. */
+function joinPieces(pieces: SynthesizedAudio[]): SynthesizedAudio | undefined {
+  if (pieces[0].format === "mp3") return { audio: Buffer.concat(pieces.map((p) => p.audio)), format: "mp3" };
+  const wav = joinWav(pieces.map((p) => p.audio));
+  return wav ? { audio: wav, format: "wav" } : undefined;
+}
 
 class Run {
   private readonly reading: Reading;
   private readonly halt = new AbortController();
   private readonly halted: Promise<"halted">;
-  private readonly slots: Deferred<Uint8Array>[];
-  /** The WAV format of the first piece, once it is known: every piece must have it. */
-  private readonly format = deferred<Buffer>();
+  private readonly slots: Deferred<SynthesizedAudio>[];
+  /** The first piece's kind, once it is known: every piece must have it. */
+  private readonly kind = deferred<PieceKind>();
   private readonly firstStart = deferred<PlayStart | undefined>();
   private readonly dir: string;
   private failure?: Failure;
@@ -112,7 +126,7 @@ class Run {
     this.reading.signal.addEventListener("abort", () => {
       if (!this.ended) this.halt.abort();
     });
-    this.slots = d.pieces.map(() => deferred<Uint8Array>());
+    this.slots = d.pieces.map(() => deferred<SynthesizedAudio>());
     this.playing = this.play();
   }
 
@@ -126,18 +140,15 @@ class Run {
   async synthesizeAndSave(): Promise<ReadingResult> {
     await Promise.all(Array.from({ length: IN_FLIGHT }, () => this.worker()));
     await Promise.all(this.checks);
-    const wavs = this.slots.map((s) => s.value);
-    const all = wavs.every((w) => w !== undefined);
-    const joined = all && !this.failure ? joinWav(wavs as Uint8Array[]) : undefined;
-    if (all && !this.failure && !joined) this.fail({ reason: "the pieces could not be joined into one WAV" });
+    const pieces = this.slots.map((s) => s.value);
+    const all = pieces.every((p) => p !== undefined);
+    const joined = all && !this.failure ? joinPieces(pieces as SynthesizedAudio[]) : undefined;
+    if (all && !this.failure && !joined) this.fail({ reason: "the pieces could not be joined into one message" });
     if (!joined) {
       this.end();
       const f = this.failure;
-      if (f && !f.unchunkable) throw new ReadingFailed(f.reason);
-      // Nothing plays now; the reading is over before the caller speaks the text another way.
-      await this.playing;
-      this.removeDir();
-      return f ? { state: "unchunkable", reason: f.reason } : { state: "stopped" };
+      if (f) throw new ReadingFailed(f.reason);
+      return { state: "stopped" };
     }
     const saved = await this.d.save(joined);
     const started = await this.firstStart.promise;
@@ -170,16 +181,16 @@ class Run {
   private async worker(): Promise<void> {
     while (this.next < this.slots.length && !this.stopped) {
       const i = this.next++;
-      const wav = await this.synthesizePiece(i);
-      if (wav === undefined) return;
-      if (i === 0) this.acceptFirst(wav);
-      // A later piece waits for the first one's format without holding up the next request.
-      else this.checks.push(this.acceptLater(i, wav));
+      const audio = await this.synthesizePiece(i);
+      if (audio === undefined) return;
+      if (i === 0) this.acceptFirst(audio);
+      // A later piece waits for the first one's kind without holding up the next request.
+      else this.checks.push(this.acceptLater(i, audio));
     }
   }
 
-  /** Piece `i` synthesized and made WAV when it was MP3; undefined when the reading stopped or failed. */
-  private async synthesizePiece(i: number): Promise<Uint8Array | null | undefined> {
+  /** Piece `i` synthesized; undefined when the reading stopped or failed. */
+  private async synthesizePiece(i: number): Promise<SynthesizedAudio | undefined> {
     let audio: SynthesizedAudio;
     try {
       audio = await this.d.synthesize(this.d.pieces[i], this.halt.signal, i);
@@ -187,58 +198,41 @@ class Run {
       return this.fail({ reason: errorMessage(err) });
     }
     if (this.stopped) return;
-    const wav = audio.format === "wav" ? audio.audio : await this.toWav(i, audio.audio);
-    if (this.stopped) return;
-    return wav ?? null;
+    return audio;
   }
 
-  /** The first piece decides whether the text can be read in pieces at all. */
-  private acceptFirst(wav: Uint8Array | null): void {
-    const format = wav && wavFormat(wav);
-    if (!wav || !format) {
-      this.fail({ reason: "the first piece could not be made into WAV", unchunkable: true });
+  /** The first piece sets the kind every piece must have. */
+  private acceptFirst(audio: SynthesizedAudio): void {
+    const kind = kindOf(audio);
+    if (!kind) {
+      this.fail({ reason: "the first piece is not a readable WAV" });
       return;
     }
-    this.format.resolve(format);
-    this.slots[0].resolve(wav);
+    this.kind.resolve(kind);
+    this.slots[0].resolve(audio);
   }
 
-  /** A later piece must be WAV in the first piece's format; anything else is a failure. */
-  private async acceptLater(i: number, wav: Uint8Array | null): Promise<void> {
-    const first = await Promise.race([this.format.promise, this.halted]);
+  /** A later piece must have the first piece's kind; anything else is a failure. */
+  private async acceptLater(i: number, audio: SynthesizedAudio): Promise<void> {
+    const first = await Promise.race([this.kind.promise, this.halted]);
     if (first === "halted") return;
-    const format = wav && wavFormat(wav);
-    if (!wav || !format) this.fail({ reason: "a piece could not be converted to WAV" });
-    else if (!format.equals(first)) this.fail({ reason: "a piece came back in a different audio format" });
-    else this.slots[i].resolve(wav);
-  }
-
-  /** An MP3 piece as WAV through the converter, or undefined when it cannot be converted. */
-  private async toWav(i: number, mp3: Uint8Array): Promise<Uint8Array | undefined> {
-    const from = join(this.dir, `convert-${i}.mp3`);
-    const to = join(this.dir, `convert-${i}.wav`);
-    try {
-      writeFileSync(from, mp3, { flag: "wx" });
-      return (await this.d.convert(from, to)) ? readFileSync(to) : undefined;
-    } catch {
-      return undefined;
-    } finally {
-      rmSync(from, { force: true });
-      rmSync(to, { force: true });
-    }
+    const kind = kindOf(audio);
+    if (!kind) this.fail({ reason: "a piece is not a readable WAV" });
+    else if (!sameKind(kind, first)) this.fail({ reason: "a piece came back in a different audio format" });
+    else this.slots[i].resolve(audio);
   }
 
   private async play(): Promise<void> {
     let previous: Promise<PlayOutcome> | undefined;
     try {
       for (let i = 0; i < this.slots.length; i++) {
-        const wav = await Promise.race([this.slots[i].promise, this.halted]);
-        if (wav === "halted" || this.stopped) return;
+        const audio = await Promise.race([this.slots[i].promise, this.halted]);
+        if (audio === "halted" || this.stopped) return;
         if (previous) {
           const outcome = await Promise.race([previous, this.halted]);
           if (outcome === "halted" || outcome.state !== "completed" || this.stopped) return;
         }
-        const started = await this.playPiece(i, wav);
+        const started = await this.playPiece(i, audio);
         if (i === 0) this.firstStart.resolve(started);
         if (!started.ok) return;
         this.playingPiece = started;
@@ -254,10 +248,10 @@ class Run {
     }
   }
 
-  private async playPiece(i: number, wav: Uint8Array): Promise<PlayStart> {
-    const file = join(this.dir, `piece-${i}.wav`);
+  private async playPiece(i: number, audio: SynthesizedAudio): Promise<PlayStart> {
+    const file = join(this.dir, `piece-${i}.${audio.format}`);
     try {
-      writeFileSync(file, wav, { flag: "wx" });
+      writeFileSync(file, audio.audio, { flag: "wx" });
       return await this.reading.play(file, () => rmSync(file, { force: true }));
     } catch (err) {
       rmSync(file, { force: true });

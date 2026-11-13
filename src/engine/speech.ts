@@ -14,7 +14,7 @@ import type { KeyRegistry } from "./credentials";
 import { buildEndpoints, type Endpoint, endpointNameProblem, PRESETS } from "./endpoints";
 import { type Env, errorMessage } from "./env";
 import { featureLine } from "./features";
-import { type Converter, ffmpegConvert, History, type HistoryMessage, historyDir, type SavedMessage } from "./history";
+import { History, type HistoryMessage, historyDir, type SavedMessage } from "./history";
 import {
   DEFAULT_VOICE,
   fetchSpeechCatalog,
@@ -87,7 +87,6 @@ export interface SpeechResult {
   player?: string;
   /** Why the message was not played. */
   notPlayed?: string;
-  conversionError?: string;
   /** A reading stopped or replaced before every piece was synthesized: nothing was saved (`files` is empty). */
   stopped?: boolean;
 }
@@ -112,7 +111,6 @@ export interface SpeechOptions {
   player: Player;
   env: Env;
   home?: string;
-  convert?: Converter;
   fetchCatalog?: () => Promise<SpeechCatalog>;
 }
 
@@ -151,10 +149,7 @@ export class Speech {
   private samples = 0;
   /** Reasons a Stream could not play, each told once per session. */
   private readonly streamWarnings = new Set<string>();
-  /** Models whose texts could not be read in pieces in this session (e.g. MP3 without a converter). */
-  private readonly unchunkable = new Set<string>();
   private readonly history: History;
-  private readonly convert: Converter;
   private readonly player: Player;
   private readonly store: SettingsFile;
   private readonly fetchCatalog: () => Promise<SpeechCatalog>;
@@ -176,8 +171,7 @@ export class Speech {
     this.xai = new XaiProvider(() => this.registry);
     this.store = opts.settingsFile;
     this.player = opts.player;
-    this.convert = opts.convert ?? ffmpegConvert;
-    this.history = new History(historyDir(opts.env, opts.home ?? homedir()), this.convert);
+    this.history = new History(historyDir(opts.env, opts.home ?? homedir()));
     this.fetchCatalog = opts.fetchCatalog ?? (() => fetchSpeechCatalog());
     this.settings = this.store.load();
   }
@@ -708,7 +702,6 @@ export class Speech {
   private spoken(saved: SavedMessage, model: string, voice: string, started: PlayStart): SpeechResult {
     this.lastSaved = saved.files;
     const result: SpeechResult = { files: saved.files, model, voice };
-    if (saved.conversionError) result.conversionError = saved.conversionError;
     if (started.ok) result.player = started.player;
     else result.notPlayed = started.reason;
     return result;
@@ -723,7 +716,6 @@ export class Speech {
   async say(text: string, opts: CallOptions = {}): Promise<SpeechResult> {
     if (text.trim().length <= READING_MIN_CHARS) return this.speak(text, opts);
     const { model, voice } = await this.choose();
-    if (this.unchunkable.has(model)) return this.speak(text, opts);
     const provider = this.provider(model);
     await provider.ensureCredential();
     const via = this.via("tts", model);
@@ -743,7 +735,7 @@ export class Speech {
         who: provider.name,
         signal: opts.signal,
       });
-      if (s.state !== "files") return this.readingResult(s, text, model, voice, opts);
+      if (s.state !== "files") return this.readingResult(s, model, voice);
       // It cannot play as a Stream after all: read in pieces as files, taking the pieces already asked for.
       this.warnStream(s.reason);
       asFiles = (piece, signal, i) => s.requested(i, signal) ?? one(piece, signal);
@@ -754,30 +746,18 @@ export class Speech {
       pieces,
       synthesize: asFiles,
       player: this.player,
-      convert: this.convert,
-      save: (wav) => this.history.save(text, wav, "wav"),
+      save: (audio) => this.history.save(text, audio.audio, audio.format),
       tmpRoot: tmpdir(),
       signal: opts.signal,
     });
-    return this.readingResult(r, text, model, voice, opts);
+    return this.readingResult(r, model, voice);
   }
 
-  /** The result of a Reading; one whose pieces cannot be WAV is spoken in one request instead. */
-  private async readingResult(
-    r: ReadingResult,
-    text: string,
-    model: string,
-    voice: string,
-    opts: CallOptions,
-  ): Promise<SpeechResult> {
-    if (r.state === "unchunkable") {
-      this.unchunkable.add(model);
-      return this.speak(text, opts);
-    }
+  /** The result of a Reading. */
+  private readingResult(r: ReadingResult, model: string, voice: string): SpeechResult {
     if (r.state === "stopped") return { files: [], model, voice, stopped: true };
     this.lastSaved = r.saved.files;
     const result: SpeechResult = { files: r.saved.files, model, voice };
-    if (r.saved.conversionError) result.conversionError = r.saved.conversionError;
     if (r.player) result.player = r.player;
     else result.notPlayed = r.notPlayed;
     return result;

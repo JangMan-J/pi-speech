@@ -24,8 +24,7 @@ Or load it for one run: `pi -e ./index.ts`. pi-speech registers only the `/speec
 `speech_synthesize` and `speech_transcribe` tools, so it can be installed next to pi-openrouter-multimodal.
 
 You need an OpenRouter API key or an xAI login in Pi (see [Credentials](#credentials)), and for playback on the Pi host one of
-`mpv`, `ffplay`, `paplay`, `pw-play`, `mpg123` (or `PI_SPEECH_PLAYER`). `ffmpeg` adds the second history
-format. Speech plays as it arrives (a Stream) through one of `pacat`, `pw-cat`, `ffplay`, `mpv`, `aplay`
+`mpv`, `ffplay`, `paplay`, `pw-play`, `mpg123` (or `PI_SPEECH_PLAYER`). Speech plays as it arrives (a Stream) through one of `pacat`, `pw-cat`, `ffplay`, `mpv`, `aplay`
 (MP3 through `ffplay`, `mpv`, `mpg123`), or `PI_SPEECH_STREAM_PLAYER`; without one, or with only
 `PI_SPEECH_PLAYER` set, it plays once it has fully arrived.
 
@@ -229,12 +228,11 @@ at most two at a time. The pieces play as one Stream on one player, each straigh
 with the first audio of the first piece; `--stop` or newer audio ends it at once. Once every piece has arrived
 the reading is saved as one message; one that is stopped, replaced, or fails before then saves nothing, and a
 failed request is reported once, without trying another provider. Where speech cannot play as it arrives, each
-piece plays as a file once it is synthesized; when the first piece cannot be made into WAV there (an MP3-only
-model without `ffmpeg`), the text is spoken in one request instead.
+piece plays as a file once it is synthesized.
 
 Each spoken message (from `/speech <text>`, read-aloud, or the `speech_synthesize` tool) is saved in the history
-as WAV and MP3 (`ffmpeg` converts; an MP3-only model is saved as MP3 and converted to WAV). Playback starts
-before the conversion. Only the newest ten messages are kept. Voice samples and dictation never reach the
+once, in the format it came in: WAV, or MP3 from a model that only gives MP3. Only the newest ten messages are
+kept. Voice samples and dictation never reach the
 history.
 
 ## Voices and languages

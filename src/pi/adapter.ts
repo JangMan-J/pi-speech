@@ -50,7 +50,6 @@ export function describeForTool(r: SpeechResult): string {
     `Saved: ${r.files.join(", ")}`,
     `Model: ${r.model}, voice: ${r.voice}`,
     r.player ? `Playing with ${r.player}` : `Not played: ${r.notPlayed ?? "unknown reason"}`,
-    ...(r.conversionError ? [`Note: ${r.conversionError}`] : []),
   ].join("\n");
 }
 
@@ -199,7 +198,7 @@ export function registerPi(pi: ExtensionAPI, engine: Engine, env: NodeJS.Process
     label: "Speech Synthesize",
     description:
       "Speak text aloud with the selected speech provider (OpenRouter, an OpenAI-compatible endpoint, or xai through the xAI login in Pi). Uses the saved speech model and voice unless given. " +
-      "Saves the message as WAV and MP3 in the speech history (newest 10 kept) and plays it unless play is false.",
+      "Saves the message in the speech history (newest 10 kept) and plays it unless play is false.",
     promptGuidelines: ["Use speech_synthesize when the user asks to say, read aloud, or speak text."],
     parameters: Type.Object({
       text: Type.String({ description: "Text to speak" }),

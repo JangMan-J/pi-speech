@@ -24,7 +24,7 @@ interface Request {
 }
 
 /** A Reading over a fake output and a fake speech service answered by hand. */
-function harness(opts: { convert?: (from: string, to: string) => Promise<boolean>; refuse?: string } = {}) {
+function harness(opts: { refuse?: string } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "pi-speech-reading-"));
   const plays: string[] = [];
   const playedBytes: Buffer[] = [];
@@ -56,7 +56,7 @@ function harness(opts: { convert?: (from: string, to: string) => Promise<boolean
   const states: boolean[] = [];
   const player = new Player(() => output, { onChange: (s) => states.push(s) });
   const requests: Request[] = [];
-  const saved: Uint8Array[] = [];
+  const saved: SynthesizedAudio[] = [];
   let saving: Promise<void> | undefined;
   const deps = (pieces: string[]): ReadingDeps => ({
     pieces,
@@ -67,15 +67,10 @@ function harness(opts: { convert?: (from: string, to: string) => Promise<boolean
         requests.push(req);
         signal.addEventListener("abort", () => reject(new Error("This operation was aborted")));
       }),
-    convert:
-      opts.convert ??
-      (async () => {
-        throw new Error("no conversion expected");
-      }),
-    save: async (w): Promise<SavedMessage> => {
+    save: async (audio): Promise<SavedMessage> => {
       await saving;
-      saved.push(w);
-      return { files: ["m.wav", "m.mp3"], wav: "m.wav", mp3: "m.mp3" };
+      saved.push(audio);
+      return { files: [`m.${audio.format}`] };
     },
     tmpRoot: dir,
   });
@@ -175,65 +170,52 @@ describe("speaking a text in pieces", () => {
     expect(h.saved).toEqual([]);
     await h.answer(2);
     const r = await run;
-    expect(r).toMatchObject({ state: "saved", saved: { files: ["m.wav", "m.mp3"] } });
+    expect(r).toMatchObject({ state: "saved", saved: { files: ["m.wav"] } });
     expect(h.saved.length).toBe(1);
-    const b = Buffer.from(h.saved[0]);
+    expect(h.saved[0].format).toBe("wav");
+    const b = Buffer.from(h.saved[0].audio);
     expect(b.readUInt32LE(40)).toBe(30);
     expect([...b.subarray(44)]).toEqual([...pcm(0), ...pcm(1), ...pcm(2)]);
   });
 
-  it("converts MP3 pieces to WAV with the converter", async () => {
-    const h = harness({
-      convert: async (from, to) => {
-        expect(from.endsWith(".mp3")).toBe(true);
-        writeFileSync(to, wav(Number(readFileSync(from)[0])));
-        return true;
-      },
-    });
+  it("plays MP3 pieces as MP3 files and saves them as one MP3, the frames one after another", async () => {
+    const h = harness();
     const run = speakInPieces(h.deps(PIECES.slice(0, 2)));
     await tick();
-    await h.answer(0, { audio: new Uint8Array([0]), format: "mp3" });
-    await h.answer(1, { audio: new Uint8Array([1]), format: "mp3" });
+    await h.answer(0, { audio: new Uint8Array([0xff, 0xfb, 0]), format: "mp3" });
+    await h.answer(1, { audio: new Uint8Array([0xff, 0xfb, 1]), format: "mp3" });
     const r = await run;
-    expect(r.state).toBe("saved");
-    expect([...Buffer.from(h.saved[0]).subarray(44)]).toEqual([...pcm(0), ...pcm(1)]);
+    expect(r).toMatchObject({ state: "saved", saved: { files: ["m.mp3"] } });
+    expect(h.plays[0].endsWith(".mp3")).toBe(true);
+    expect(h.saved[0].format).toBe("mp3");
+    expect([...h.saved[0].audio]).toEqual([0xff, 0xfb, 0, 0xff, 0xfb, 1]);
     await h.finish(0);
     await h.finish(1);
+    expect(h.plays[1].endsWith(".mp3")).toBe(true);
     expect(h.tempFiles()).toEqual([]);
   });
 
-  it("cannot be read in pieces when the first piece cannot become WAV: nothing plays, nothing is left", async () => {
-    const h = harness({ convert: async () => false });
-    const run = speakInPieces(h.deps(PIECES));
+  it("a first piece that is not a readable WAV is a failure: nothing plays, nothing is saved", async () => {
+    const h = harness();
+    const run = failing(speakInPieces(h.deps(PIECES)));
     await tick();
-    await h.answer(0, { audio: new Uint8Array([0]), format: "mp3" });
-    const r = await run;
-    expect(r.state).toBe("unchunkable");
+    await h.answer(0, { audio: new Uint8Array([1, 2, 3]), format: "wav" });
+    await expect(run).rejects.toThrow(/not a readable WAV/);
     expect(h.plays).toEqual([]);
     expect(h.saved).toEqual([]);
     expect(h.requests[1].signal.aborted).toBe(true);
     expect(h.tempFiles()).toEqual([]);
   });
 
-  it("decides from the first piece only: a later piece that cannot become WAV before it is a failure", async () => {
-    const h = harness({ convert: async () => false });
+  it("a later piece in another file format than the first is a failure, decided once the first is known", async () => {
+    const h = harness();
     const run = failing(speakInPieces(h.deps(PIECES)));
     await tick();
-    await h.answer(1, { audio: new Uint8Array([1]), format: "mp3" });
+    await h.answer(1, { audio: new Uint8Array([0xff, 0xfb, 1]), format: "mp3" });
     expect(h.requests[0].signal.aborted).toBe(false);
     await h.answer(0);
-    await expect(run).rejects.toThrow(ReadingFailed);
+    await expect(run).rejects.toThrow(/different audio format/);
     expect(h.saved).toEqual([]);
-  });
-
-  it("cannot be read in pieces when the first piece cannot become WAV, even after a later piece could not", async () => {
-    const h = harness({ convert: async () => false });
-    const run = speakInPieces(h.deps(PIECES));
-    await tick();
-    await h.answer(1, { audio: new Uint8Array([1]), format: "mp3" });
-    await h.answer(0, { audio: new Uint8Array([0]), format: "mp3" });
-    expect((await run).state).toBe("unchunkable");
-    expect(h.plays).toEqual([]);
   });
 
   it("plays the pieces from a private temporary directory, removed at the end", async () => {
@@ -435,27 +417,6 @@ describe("a failed request ends the reading", () => {
     await h.answer(1, { audio: wav(1, 16000), format: "wav" });
     await expect(run).rejects.toThrow(/different audio format/);
     expect(h.requests.slice(2).every((r) => r.signal.aborted)).toBe(true);
-    await h.finish(0);
-    expect(h.plays.length).toBe(1);
-    expect(h.saved).toEqual([]);
-    expect(h.tempFiles()).toEqual([]);
-  });
-
-  it("after the first piece started, a piece whose conversion fails is a failure: no later piece plays", async () => {
-    const h = harness({
-      convert: async (from, to) => {
-        const i = Number(readFileSync(from)[0]);
-        if (i !== 0) return false;
-        writeFileSync(to, wav(i));
-        return true;
-      },
-    });
-    const run = failing(speakInPieces(h.deps(PIECES)));
-    await tick();
-    await h.answer(0, { audio: new Uint8Array([0]), format: "mp3" });
-    expect(h.plays.length).toBe(1);
-    await h.answer(1, { audio: new Uint8Array([1]), format: "mp3" });
-    await expect(run).rejects.toThrow(/could not be converted to WAV/);
     await h.finish(0);
     expect(h.plays.length).toBe(1);
     expect(h.saved).toEqual([]);
