@@ -22,7 +22,8 @@ gitignored, on this machine and on agent-jail). `VECTORS/` is retired: write no 
   Full gate passed (npm run check, cargo fmt/clippy/test, every e2e suite).
 - Read-aloud Length default Minimum ~15 s (`526d229`, `1de6eea`).
 
-**Running: leaf node-c1c58883f416e441 "multi-client-pairing"** (branch `jing/ra8608ded0857`, worktree
+**2026-11-13 resume: the leaf was lost; the Director rebased its 4 commits onto `0650c15` as branch `mc-rebase`
+(worktree `/var/tmp/ps-mc/wt`) and is gating them.** Was: leaf node-c1c58883f416e441 "multi-client-pairing" (branch `jing/ra8608ded0857`, worktree
 `/tmp/jing-stage/51bf5b3b33e9/ra8608ded0857`, based on `526d229`). Spec: obligation obl-00ea6c5704619d1b and below.
 Its panel e2e may fail "Enter cycles Length" until it is rebased onto `1de6eea`. If it is lost to "lost contact",
 its commits stay on its branch: gate and land them as 09 was.
