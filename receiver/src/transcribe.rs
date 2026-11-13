@@ -160,8 +160,11 @@ mod tests {
         assert_eq!(e, "no audio file at /no/such/audio.wav");
         let dir = std::env::temp_dir();
         let e = load_audio(&dir).unwrap_err();
+        // Opening a directory fails outright on Windows, and on reading elsewhere.
         assert!(
-            e.contains("cannot read the audio file") || e.contains("is a directory"),
+            e.contains("cannot read the audio file")
+                || e.contains("is a directory")
+                || e.starts_with("no audio file at"),
             "{e}"
         );
         let p = dir.join(format!(
