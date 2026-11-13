@@ -146,6 +146,21 @@ jobs:
           bytes=$(wc -c < "$bin")
           echo "release binary: $bin, $bytes bytes ($((bytes / 1048576)) MiB)"
           echo "Receiver release binary on ${{ runner.os }}: $bytes bytes ($((bytes / 1048576)) MiB)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Smoke-test the release binary (models list prints JSON lines)
+        run: |
+          bin=target/release/pi-speech-receiver
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          "$bin" models list > models.jsonl
+          cat models.jsonl
+          node -e '
+            const lines = require("fs").readFileSync("models.jsonl", "utf8").split(/\r?\n/).filter(Boolean);
+            if (!lines.length) throw new Error("models list printed nothing");
+            for (const line of lines) {
+              const model = JSON.parse(line);
+              if (typeof model?.id !== "string") throw new Error("not a model line: " + line);
+            }
+            console.log("models list: " + lines.length + " JSON lines");
+          '
       - name: Check the Windows binary needs no Visual C++ runtime DLL
         if: runner.os == 'Windows'
         run: |
