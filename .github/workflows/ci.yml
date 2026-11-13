@@ -67,17 +67,45 @@ jobs:
       - name: Install the packed tarball and load it in Pi
         run: npm run smoke:pack
 
-  # The playback-machine receiver (Rust), which the package ships as source.
+  # The extension on the other desktop systems (the Node and Pi matrix above runs on Linux).
+  check-os:
+    name: Extension on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+  # The receiver and audio engine (Rust), on every desktop system it ships for.
   receiver:
-    name: Receiver
-    runs-on: ubuntu-latest
+    name: Receiver on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      # Tests never reach a real audio device; an unknown value would fail, not fall back.
+      PI_SPEECH_AUDIO_NULL: "1"
     defaults:
       run:
         working-directory: receiver
+        shell: bash
     steps:
       - uses: actions/checkout@v7
       - name: Install the ALSA development library (the audio engine links it)
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - run: cargo fmt --check
+        if: runner.os == 'Linux'
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
