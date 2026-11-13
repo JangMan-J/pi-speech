@@ -28,7 +28,8 @@ Built and committed (`bdb4955`..`5f21dce`), `npm run check` and the receiver's f
    `gpt-audio-mini` reading, approved): the transcript leads the audio by 0.3 to 1.6 s of speech, so the
    check delays the first audio by 47 ms (first audio at about 1.0 s) and catches a Stray before it is heard.
 5. A Reading (texts over 280 characters) plays as one Stream on one player, pieces requested two at a time.
-   Checked live with xAI through a logging player (22 s of audio over 1 s, one player).
+   Checked live with xAI through a logging player (22 s of audio over 1 s, one player). **Confirmed by ear**
+   by the user: "played perfectly", no gap between pieces.
 6. The bridge: protocol capability `stream` (`protocol/bridge.md`, "Playing a Stream"), the client, and
    receiver 0.2.0. Checked live on the laptop: real receiver, real Pi with `--bridge on`, xAI.
 
@@ -38,8 +39,8 @@ files, and no piece is asked for twice.
 
 ## Open, for the user
 
-- **By ear**: a long text (no gap between pieces), and Pi on `decent-spider` through the bridge. The bridge
-  was only run with Pi and the receiver both on the laptop; the SSH forward was not in the path.
+- **By ear**: Pi on `decent-spider` through the bridge. The bridge was only run with Pi and the receiver both
+  on the laptop; the SSH forward was not in the path.
 - **Decide**: a message stopped after its audio has fully arrived (about 1 s for xAI, while it plays for
   ten) is still saved in the history. Kept that way for now, as a Reading already did.
 - `GLOSSARY.md` lists unresolved terms (piece/part/chunk, lowercase reading, Stream player, a burst as a
