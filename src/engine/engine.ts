@@ -12,7 +12,7 @@ import type { Env } from "./env";
 import { Indicator } from "./indicator";
 import type { SpeechCatalog } from "./openrouter";
 import { Player } from "./player";
-import { type Notify, ReadAloud } from "./read-aloud";
+import { type Notify, ReadAloud, type ReadAloudOptions } from "./read-aloud";
 import { type Notice, Routes } from "./routes";
 import { type BridgeMode, SettingsFile } from "./settings";
 import { Speech } from "./speech";
@@ -81,14 +81,18 @@ export class Engine {
       output: (text) => runDictationOutput(this.speech.settings.dictationOutput ?? "", text, opts.env),
       onChange: () => this.indicator.update(),
     });
-    this.readAloud = new ReadAloud(this.speech, (m, l) => this.notify(m, l));
+    this.readAloud = new ReadAloud(
+      this.speech,
+      (m, l) => this.notify(m, l),
+      () => this.speech.settings.readAloud,
+    );
   }
 
   /** A session starts: reload the settings, load the catalog, and turn read-aloud off. */
   start(): void {
     this.speech.start();
     this.routes.mode = this.speech.settings.bridge;
-    this.readAloud.enabled = false;
+    this.readAloud.mode = "off";
     this.announced = false;
     this.indicator.update();
   }
@@ -108,6 +112,14 @@ export class Engine {
     return notice;
   }
 
+  /** Change read-aloud's options and save them. */
+  setReadAloudOptions(change: Partial<ReadAloudOptions>): void {
+    const next = { ...this.speech.settings.readAloud, ...change };
+    if ("summarizer" in change && !change.summarizer) delete next.summarizer;
+    this.speech.settings.readAloud = next;
+    this.speech.save();
+  }
+
   async setTools(on: boolean): Promise<string> {
     const summary = await this.speech.set("tools", on ? "on" : "off");
     this.onToolsChanged();
@@ -120,7 +132,7 @@ export class Engine {
     return [
       ...(await this.speech.statusLines()),
       this.routes.audioLine(),
-      `Read-aloud: ${this.readAloud.enabled ? "on" : "off"}`,
+      `Read-aloud: ${this.readAloud.enabled ? `on (${this.readAloud.mode})` : "off"}`,
       `Dictation: ${d} (Alt+Z; records on ${this.routes.inputRoute === "bridge" ? "your machine through the bridge" : "this host"})`,
     ].join("\n");
   }

@@ -20,6 +20,14 @@ import type { HistoryMessage } from "./history";
 import type { ModelOption, SpeechCatalog } from "./openrouter";
 import { REPLACED } from "./player";
 import { priceValue } from "./pricing";
+import {
+  LENGTH_SECONDS,
+  READ_MODES,
+  type ReadMode,
+  SUMMARY_LENGTHS,
+  type SummaryLength,
+  TRUNCATE_SECONDS,
+} from "./read-aloud";
 import { ReadingFailed, readingFailedMessage } from "./reading";
 import { type BridgeMode, type Hotkeys, hotkeyId, keyLabel, MODEL_SORTS, type ModelSort } from "./settings";
 import { languageLabel, type SampleResult, type SettingName } from "./speech";
@@ -46,13 +54,18 @@ export type RowId =
   | "stop"
   | "transcribe"
   // Bridge connection
-  | "bridgeMode";
+  | "bridgeMode"
+  // Read aloud options
+  | "readMode"
+  | "summarizer"
+  | "summaryLength"
+  | "truncate";
 
 /** The sections of the main view: turning text into speech, speech into text, and the rest. */
 export type SectionId = "speak" | "listen" | "settings";
 
 /** What the panel shows: the main view, or one of its submenus. */
-export type MenuId = "main" | "hotkeys" | "bridge";
+export type MenuId = "main" | "hotkeys" | "bridge" | "readAloud";
 
 export interface PanelRow {
   id: RowId;
@@ -299,7 +312,7 @@ class LineEdit {
 /** The settings chosen from a list. */
 type ListRow = "speechModel" | "transcription" | "voice";
 /** Everything the list view shows: those settings, and the spoken messages of the history. */
-type PickerRow = ListRow | "history";
+type PickerRow = ListRow | "history" | "summarizer";
 
 interface PickerState {
   row: PickerRow;
@@ -314,7 +327,7 @@ interface PickerState {
 }
 
 /** A submenu; `capture` while it waits for the new key of Speak or Dictate. */
-type MenuMode = { kind: "menu"; menu: "hotkeys" | "bridge"; selected: number; capture?: HotkeyName };
+type MenuMode = { kind: "menu"; menu: "hotkeys" | "bridge" | "readAloud"; selected: number; capture?: HotkeyName };
 type HotkeyName = keyof Hotkeys;
 
 type Mode =
@@ -328,7 +341,7 @@ type Mode =
 type RowBase = Pick<PanelRow, "id" | "section" | "label" | "opens">;
 
 const MAIN: RowBase[] = [
-  { id: "readAloud", section: "speak", label: "Read aloud options" },
+  { id: "readAloud", section: "speak", label: "Read aloud options", opens: true },
   { id: "speechSource", section: "speak", label: "Speech source" },
   { id: "speechModel", section: "speak", label: "Speech model", opens: true },
   { id: "voice", section: "speak", label: "Voice", opens: true },
@@ -352,9 +365,18 @@ const HOTKEYS: RowBase[] = [
 
 const BRIDGE: RowBase[] = [{ id: "bridgeMode", label: "Bridge" }];
 
+/** What read-aloud reads, who summarizes, how long a summary is, and where reading stops. */
+const READ_ALOUD: RowBase[] = [
+  { id: "readMode", label: "Read" },
+  { id: "summarizer", label: "Summarized by", opens: true },
+  { id: "summaryLength", label: "Length" },
+  { id: "truncate", label: "Truncate at" },
+];
+
 const MENUS: Record<MenuMode["menu"], { title: string; rows: RowBase[] }> = {
   hotkeys: { title: "Hotkeys", rows: HOTKEYS },
   bridge: { title: "Bridge connection", rows: BRIDGE },
+  readAloud: { title: "Read aloud options", rows: READ_ALOUD },
 };
 
 /** The keys of the actions that only work inside the panel. */
@@ -376,6 +398,7 @@ const LABEL_OF: Record<PickerRow, string> = {
   transcription: "Transcription model",
   voice: "Voice",
   history: "History",
+  summarizer: "Summarized by",
 };
 const LANGUAGE_HINT = "a tag such as ja or pt-BR, or auto";
 const OUTPUT_HINT = "a command; %s is the dictation text · empty uses Pi's input box";
@@ -387,8 +410,29 @@ const PRICE_UNKNOWN = "price unknown";
 /** The name the panel shows for the xai model (the saved id stays xai). */
 export const XAI_LABEL = "xAI Grok";
 
-/** Read aloud options: Off or All for now (the whole reply is read). */
-const readAloudWord = (on: boolean) => (on ? "All" : "Off");
+/** The Read values as shown. */
+const READ_WORDS: Record<ReadMode, string> = { off: "Off", summary: "Summary", thinking: "Thinking", all: "All" };
+const LENGTH_WORDS: Record<SummaryLength, string> = {
+  minimum: "Minimum ~15 s",
+  abridged: "Abridged ~30 s",
+  full: "Full ~60 s",
+};
+const truncateWord = (s: number) => (s ? `${s} s` : "Off");
+/** The Summarized by choice that is not a model: the model of the reply, in the same reply. */
+const SAME_MODEL = "same";
+const SAME_MODEL_LABEL = "Same model";
+/** What the highlighted Read value does. */
+const READ_INFO: Record<ReadMode, string> = {
+  off: "Off: nothing is read aloud.",
+  summary: "Reads the model's spoken summary of its reply.",
+  thinking: "Reads a spoken summary of the reasoning, then of the reply.",
+  all: "Reads the whole reply.",
+};
+/** Step through `list` from `current` by `dir`, wrapping. */
+function cycle<T>(list: readonly T[], current: T, dir: 1 | -1): T {
+  const i = list.indexOf(current);
+  return list[(Math.max(0, i) + dir + list.length) % list.length];
+}
 const oneLine = (text: string) => text.replace(/\s+/g, " ").trim();
 /** A model as the panel shows it. */
 const modelLabel = (id: string) => (id === XAI_MODEL ? XAI_LABEL : id);
@@ -554,6 +598,10 @@ export class Panel {
       };
     } else view.crumb = MENUS[home.menu].title;
     if (this.status) view.status = this.status;
+    else if (home.kind === "menu" && home.menu === "readAloud" && this.mode === home) {
+      // One short line on what the highlighted option does.
+      view.status = { tone: "info", text: this.readAloudInfo(READ_ALOUD[home.selected].id) };
+    }
     if (this.mode.kind === "picker") view.picker = this.pickerView(this.mode.picker);
     if (this.mode.kind === "input") {
       const m = this.mode;
@@ -618,7 +666,14 @@ export class Panel {
         return { ...base, value: v, ...this.voiceAlert() };
       }
       case "readAloud":
-        return { ...base, value: readAloudWord(this.engine.readAloud.enabled) };
+      case "readMode":
+        return { ...base, value: READ_WORDS[this.engine.readAloud.mode] };
+      case "summarizer":
+        return { ...base, value: s.readAloud.summarizer ?? SAME_MODEL_LABEL };
+      case "summaryLength":
+        return { ...base, value: LENGTH_WORDS[s.readAloud.length] };
+      case "truncate":
+        return { ...base, value: truncateWord(s.readAloud.truncate) };
       case "speechSource":
       case "transcriptionSource":
         return { ...base, value: "Provider" };
@@ -641,6 +696,23 @@ export class Panel {
     }
   }
 
+  /** The line under Read aloud options for the highlighted row. */
+  private readAloudInfo(id: RowId): string {
+    const o = this.speech.settings.readAloud;
+    switch (id) {
+      case "readMode":
+        return READ_INFO[this.engine.readAloud.mode];
+      case "summarizer":
+        return o.summarizer
+          ? `Extra request to ${o.summarizer} per reply.`
+          : "Same model, same reply. No extra request.";
+      case "summaryLength":
+        return `Best effort: about ${LENGTH_SECONDS[o.length]} s.`;
+      default:
+        return o.truncate ? `Stops at ${o.truncate} s, at a sentence end.` : "Off: length not guaranteed.";
+    }
+  }
+
   /** The key of Speak or Dictate as saved: a changed one is bound when the user leaves Hotkeys. */
   private hotkeyValue(name: HotkeyName, home: { kind: "list" } | MenuMode): Pick<PanelRow, "value" | "note"> {
     if (home.kind === "menu" && home.capture === name) return { value: "press a key…" };
@@ -655,7 +727,7 @@ export class Panel {
 
   /** The value a row shows now, a pending one included. */
   private shown(id: RowId): string | undefined {
-    const base = [...MAIN, ...HOTKEYS, ...BRIDGE].find((r) => r.id === id);
+    const base = [...MAIN, ...HOTKEYS, ...BRIDGE, ...READ_ALOUD].find((r) => r.id === id);
     return base ? this.row(base).value : undefined;
   }
 
@@ -702,6 +774,13 @@ export class Panel {
     if (p.row === "history") {
       const all = (p.messages ?? []).map(
         (m): PickerItem => ({ id: m.file, label: `${m.time}  ${m.title}`, current: false }),
+      );
+      return matchItems(all, p.edit.value, (i) => i.label);
+    }
+    if (p.row === "summarizer") {
+      const current = s.readAloud.summarizer ?? SAME_MODEL;
+      const all = (p.ids ?? []).map(
+        (id): PickerItem => ({ id, label: id === SAME_MODEL ? SAME_MODEL_LABEL : id, current: id === current }),
       );
       return matchItems(all, p.edit.value, (i) => i.label);
     }
@@ -805,7 +884,7 @@ export class Panel {
     const close = esc("close");
     switch (MAIN[this.selected].id) {
       case "readAloud":
-        return [{ key: "←→", action: "Off · All" }, close];
+        return [{ key: "Enter", action: "what is read and how" }, close];
       case "speechSource":
       case "transcriptionSource":
         return [{ key: "←→", action: "Provider, the only source so far" }, close];
@@ -833,6 +912,17 @@ export class Panel {
       ];
     }
     if (m.menu === "bridge") return [{ key: "←→", action: BRIDGE_MODES.join(" · ") }, back];
+    if (m.menu === "readAloud") {
+      const id = READ_ALOUD[m.selected].id;
+      if (id === "summarizer") return [{ key: "Enter", action: "choose a model" }, back];
+      const values =
+        id === "readMode"
+          ? READ_MODES.map((r) => READ_WORDS[r])
+          : id === "summaryLength"
+            ? SUMMARY_LENGTHS.map((l) => LENGTH_WORDS[l].split(" ")[0])
+            : TRUNCATE_SECONDS.map(truncateWord);
+      return [{ key: "←→", action: values.join(" · ") }, back];
+    }
     const id = HOTKEYS[m.selected].id;
     const change: Hint[] = id === "speak" || id === "dictate" ? [{ key: "k", action: "change key" }] : [];
     return [{ key: "Enter", action: "run" }, ...change, back];
@@ -1044,7 +1134,11 @@ export class Panel {
       case "speechModel":
       case "transcription":
       case "voice":
+      case "summarizer":
         this.openPicker(id);
+        return;
+      case "readAloud":
+        this.mode = { kind: "menu", menu: "readAloud", selected: 0 };
         return;
       case "hotkeys":
         this.mode = { kind: "menu", menu: "hotkeys", selected: 0 };
@@ -1063,10 +1157,18 @@ export class Panel {
 
   /** Enter or ←→ on a value: cycle it in place. Picker rows have long lists: nothing. */
   private step(id: RowId, dir: 1 | -1): void {
-    if (id === "readAloud") {
-      const on = !this.engine.readAloud.enabled;
-      this.engine.readAloud.enabled = on;
-      this.setStatus("success", `✓ Read aloud: ${readAloudWord(on)}`);
+    // Read aloud options change in place; the line under them says what the new value does.
+    if (id === "readMode") {
+      this.engine.readAloud.mode = cycle(READ_MODES, this.engine.readAloud.mode, dir);
+      this.clearStatus();
+    } else if (id === "summaryLength") {
+      this.engine.setReadAloudOptions({ length: cycle(SUMMARY_LENGTHS, this.speech.settings.readAloud.length, dir) });
+      this.clearStatus();
+    } else if (id === "truncate") {
+      this.engine.setReadAloudOptions({
+        truncate: cycle(TRUNCATE_SECONDS, this.speech.settings.readAloud.truncate, dir),
+      });
+      this.clearStatus();
     } else if (id === "speechSource" || id === "transcriptionSource") {
       this.setStatus("info", "Provider is the only source so far");
     } else if (id === "bridgeMode") {
@@ -1109,6 +1211,11 @@ export class Panel {
       return;
     }
     this.mode = m.back;
+    if (row === "summarizer") {
+      this.engine.setReadAloudOptions({ summarizer: item.id === SAME_MODEL ? undefined : item.id });
+      this.clearStatus();
+      return;
+    }
     this.change(row, item.id, async () => {
       const summary = await this.speech.set(SETTING_OF[row], item.id);
       if (row === "speechModel") this.track(this.loadVoices());
@@ -1139,6 +1246,10 @@ export class Panel {
     if (row === "history") {
       p.messages = this.speech.messages();
       p.ids = p.messages.map((m) => m.file);
+      return;
+    }
+    if (row === "summarizer") {
+      p.ids = [SAME_MODEL, ...this.engine.readAloud.models()];
       return;
     }
     const kind = row === "speechModel" ? "tts" : "stt";
@@ -1417,6 +1528,12 @@ export class Panel {
   }
 
   // ── Plumbing ────────────────────────────────────────────────────────────
+
+  private clearStatus(): void {
+    if (this.statusTimer) clearTimeout(this.statusTimer);
+    this.statusTimer = undefined;
+    this.status = undefined;
+  }
 
   private setStatus(tone: StatusTone, text: string): Status {
     if (this.statusTimer) clearTimeout(this.statusTimer);

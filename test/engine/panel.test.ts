@@ -159,6 +159,7 @@ describe("the panel view model: the main view", () => {
       .rows.filter((r) => r.opens)
       .map((r) => r.label);
     expect(opens).toEqual([
+      "Read aloud options",
       "Speech model",
       "Voice",
       "Transcription model",
@@ -243,19 +244,94 @@ describe("the panel view model: keys in the main view", () => {
     }
   });
 
-  it("Read aloud options cycles Off and All in place with ←→ and Enter", async () => {
+  it("Read aloud options is a submenu: Read, Summarized by, Length, Truncate at", async () => {
     const p = open();
-    await p.press("right");
-    expect(p.row("Read aloud options")?.value).toBe("All");
-    expect(p.engine.readAloud.enabled).toBe(true);
-    expect(p.panel.view().status?.text).toBe("✓ Read aloud: All");
+    expect(p.row("Read aloud options")).toMatchObject({ value: "Off", opens: true });
+    await p.press("enter");
+    const v = p.panel.view();
+    expect(v.menu).toBe("readAloud");
+    expect(v.crumb).toBe("Read aloud options");
+    expect(v.rows.map((r) => [r.label, r.value, !!r.opens])).toEqual([
+      ["Read", "Off", false],
+      ["Summarized by", "Same model", true],
+      ["Length", "Abridged ~30 s", false],
+      ["Truncate at", "Off", false],
+    ]);
+    expect(v.status).toEqual({ tone: "info", text: "Off: nothing is read aloud." });
+    expect(p.hint()).toBe("←→ Off · Summary · Thinking · All · Esc back");
+    await p.press("escape");
+    expect(p.panel.view().menu).toBe("main");
+    expect(p.selectedLabel()).toBe("Read aloud options");
+  });
+
+  it("Read cycles Off, Summary, Thinking and All in place with Enter and ←→; one line says what it does", async () => {
+    const p = open();
+    await p.press("enter");
+    const lines: Array<[string | undefined, string | undefined]> = [];
+    for (let i = 0; i < 4; i++) {
+      await p.press(i === 3 ? "enter" : "right");
+      lines.push([p.row("Read")?.value, p.panel.view().status?.text]);
+    }
+    expect(lines).toEqual([
+      ["Summary", "Reads the model's spoken summary of its reply."],
+      ["Thinking", "Reads a spoken summary of the reasoning, then of the reply."],
+      ["All", "Reads the whole reply."],
+      ["Off", "Off: nothing is read aloud."],
+    ]);
     await p.press("left");
-    expect(p.row("Read aloud options")?.value).toBe("Off");
-    await p.press("enter");
-    expect(p.engine.readAloud.enabled).toBe(true);
-    await p.press("enter");
-    expect(p.engine.readAloud.enabled).toBe(false);
+    expect(p.engine.readAloud.mode).toBe("all");
+    await p.press("escape");
+    expect(p.row("Read aloud options")?.value).toBe("All");
     expect(p.notes).toEqual([]);
+  });
+
+  it("Length and Truncate at cycle in place, are saved, and their lines say what they promise", async () => {
+    const p = open();
+    await p.press("enter", "down", "down");
+    expect(p.panel.view().status?.text).toBe("Best effort: about 30 s.");
+    expect(p.hint()).toBe("←→ Minimum · Abridged · Full · Esc back");
+    await p.press("right");
+    expect(p.row("Length")?.value).toBe("Full ~60 s");
+    expect(p.panel.view().status?.text).toBe("Best effort: about 60 s.");
+    await p.press("enter");
+    expect(p.row("Length")?.value).toBe("Minimum ~15 s");
+    await p.press("down");
+    expect(p.panel.view().status?.text).toBe("Off: length not guaranteed.");
+    expect(p.hint()).toBe("←→ Off · 15 s · 30 s · 60 s · 120 s · Esc back");
+    await p.press("right", "right");
+    expect(p.row("Truncate at")?.value).toBe("30 s");
+    expect(p.panel.view().status?.text).toBe("Stops at 30 s, at a sentence end.");
+    await p.press("left", "left", "left");
+    expect(p.row("Truncate at")?.value).toBe("120 s");
+    const saved = JSON.parse(readFileSync(join(p.work, "agent", "pi-speech", "settings.json"), "utf8"));
+    expect(saved.readAloud).toEqual({ length: "minimum", truncate: 120 });
+  });
+
+  it("Summarized by opens a picker of Same model and the user's Pi models", async () => {
+    const p = open();
+    p.engine.readAloud.models = () => ["anthropic/claude-haiku", "openai/gpt-mini"];
+    await p.press("enter", "down");
+    expect(p.panel.view().status?.text).toBe("Same model, same reply. No extra request.");
+    expect(p.hint()).toBe("Enter choose a model · Esc back");
+    await p.press("right");
+    expect(p.panel.view().picker).toBeUndefined();
+    await p.press("enter");
+    const picker = p.panel.view().picker;
+    expect(picker?.title).toBe("Summarized by");
+    expect(picker?.items.map((i) => [i.label, i.current])).toEqual([
+      ["Same model", true],
+      ["anthropic/claude-haiku", false],
+      ["openai/gpt-mini", false],
+    ]);
+    await p.type("haiku");
+    await p.press("enter");
+    expect(p.panel.view().picker).toBeUndefined();
+    expect(p.row("Summarized by")?.value).toBe("anthropic/claude-haiku");
+    expect(p.panel.view().status?.text).toBe("Extra request to anthropic/claude-haiku per reply.");
+    expect(p.engine.speech.settings.readAloud.summarizer).toBe("anthropic/claude-haiku");
+    await p.press("enter", "enter");
+    expect(p.row("Summarized by")?.value).toBe("Same model");
+    expect(p.engine.speech.settings.readAloud.summarizer).toBeUndefined();
   });
 
   it("the source rows stay Provider, the only source so far, and say so", async () => {
@@ -365,7 +441,7 @@ describe("the panel view model: keys in the main view", () => {
   it("the hints follow the row; Esc is last", async () => {
     const p = open();
     const hints: Record<string, string> = {
-      "Read aloud options": "←→ Off · All · Esc close",
+      "Read aloud options": "Enter what is read and how · Esc close",
       "Speech source": "←→ Provider, the only source so far · Esc close",
       "Speech model": "Enter browse, sort and filter · Esc close",
       Voice: "Enter choose · Tab sample · F2 language · Esc close",

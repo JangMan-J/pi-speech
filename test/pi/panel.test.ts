@@ -117,7 +117,7 @@ describe("the panel in Pi's terminal UI", () => {
     await vi.waitFor(() => expect(engine.speech.settings.voice).toBe("eve"));
     const MOCKUP = [
       "SPEAK (Alt+S)",
-      "  ▸ Read aloud options   Off",
+      "  ▸ Read aloud options   Off ›",
       "    Speech source        Provider",
       "    Speech model         x-ai/grok-voice-tts-1.0 ›",
       "    Voice                eve ›",
@@ -140,7 +140,7 @@ describe("the panel in Pi's terminal UI", () => {
       const lines = raw.map((l) => stripVTControlCharacters(l).trimEnd());
       expect(lines[0]).toBe(` Speech ${"─".repeat(w - 7)}`);
       expect(lines.slice(1, 14)).toEqual(MOCKUP.map((l) => ` ${l}`));
-      expect(lines.slice(14)).toEqual(["", "", "   ←→ Off · All · Esc close", ` ${"─".repeat(w)}`]);
+      expect(lines.slice(14)).toEqual(["", "", "   Enter what is read and how · Esc close", ` ${"─".repeat(w)}`]);
     }
     f.overlay.component.handleInput("\x1b");
     await done;
@@ -323,9 +323,14 @@ describe("the panel in Pi's terminal UI", () => {
     await f.emit("session_start");
     const done = f.commands.get("speech").handler("", f.ctx);
     const c = f.overlay.component;
-    c.handleInput("\x1b[C"); // right: Read aloud options
-    expect(engine.readAloud.enabled).toBe(true);
-    expect(stripVTControlCharacters(f.screen())).toMatch(/Read aloud options\s+All/);
+    c.handleInput("\r"); // Read aloud options
+    c.handleInput("\x1b[C"); // right: Read Summary
+    expect(engine.readAloud.mode).toBe("summary");
+    expect(stripVTControlCharacters(f.screen())).toMatch(
+      /Read aloud options ─[\s\S]*Read\s+Summary[\s\S]*Reads the model's spoken summary of its reply\./,
+    );
+    c.handleInput("\x1b"); // back to the main view
+    expect(stripVTControlCharacters(f.screen())).toMatch(/Read aloud options\s+Summary ›/);
     c.handleInput("\x1b[A"); // up: wraps to Bridge connection
     c.handleInput("\r");
     c.handleInput("\x1b[C"); // right: Bridge on

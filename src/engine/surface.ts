@@ -10,6 +10,7 @@ import { basename } from "node:path";
 import type { DictationUi } from "./dictation";
 import type { Engine } from "./engine";
 import { REPLACED } from "./player";
+import { READ_MODES, type ReadMode } from "./read-aloud";
 import { ReadingFailed, readingFailedMessage } from "./reading";
 import type { BridgeMode } from "./settings";
 import { languageLabel, type SampleResult, SETTING_NAMES, type SpeechResult } from "./speech";
@@ -52,7 +53,12 @@ const ACTIONS: Record<string, ActionSpec> = {
   models: { args: "", help: "list speech and transcription models with prices", min: 0, max: 0 },
   voices: { args: "", help: "list the voices of the speech model", min: 0, max: 0 },
   languages: { args: "", help: "list the voice languages of the speech model", min: 0, max: 0 },
-  "read-aloud": { args: "on|off", help: "speak the final reply of each run", min: 1, max: 1 },
+  "read-aloud": {
+    args: "on|off|summary|thinking|all",
+    help: "speak the final reply of each run, or a spoken summary of it",
+    min: 1,
+    max: 1,
+  },
   bridge: { args: "auto|on|off|status", help: "play and record on your machine through the bridge", min: 1, max: 1 },
   language: { args: "<voice> <tag|auto>", help: "set or remove the language of a voice", min: 2, max: 2 },
   set: { args: `${SETTING_NAMES.join("|")} <value>`, help: "change a setting", min: 2, max: Infinity },
@@ -199,9 +205,18 @@ export class Surface {
     ui.notify(n.message, n.level);
   }
 
-  setReadAloud(on: boolean, ui: SurfaceUi): void {
-    this.engine.readAloud.enabled = on;
-    ui.notify(`Read-aloud: ${on ? "on (the final reply of each run is spoken)" : "off"}`, "info");
+  /** on: the whole reply, unless a summary mode is already chosen; or a mode by name. */
+  setReadAloud(on: boolean | ReadMode, ui: SurfaceUi): void {
+    const r = this.engine.readAloud;
+    if (typeof on === "boolean") r.enabled = on;
+    else r.mode = on;
+    const what: Record<ReadMode, string> = {
+      off: "off",
+      all: "on (the final reply of each run is spoken)",
+      summary: "summary (a spoken summary of each reply is read)",
+      thinking: "thinking (a spoken summary of the reasoning, then of the reply, is read)",
+    };
+    ui.notify(`Read-aloud: ${what[r.mode]}`, "info");
   }
 
   async set(name: string, value: string, ui: SurfaceUi): Promise<void> {
@@ -249,8 +264,11 @@ export class Surface {
         ui.notify(usage(), "info");
         return;
       case "read-aloud":
-        if (args[0] !== "on" && args[0] !== "off") throw new Error(`Usage: /speech --read-aloud on|off`);
-        return this.setReadAloud(args[0] === "on", ui);
+        if (args[0] === "on" || args[0] === "off") return this.setReadAloud(args[0] === "on", ui);
+        if (!READ_MODES.includes(args[0] as ReadMode)) {
+          throw new Error(`Usage: /speech --read-aloud on|off|summary|thinking|all`);
+        }
+        return this.setReadAloud(args[0] as ReadMode, ui);
       case "bridge":
         return this.setBridge(args[0], ui);
       case "language":

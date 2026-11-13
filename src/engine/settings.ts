@@ -4,12 +4,19 @@
  * Earlier versions kept three files there: `settings.json` without a version, `bridge.json`, and
  * `language-overrides.json`. Loading migrates whatever of them is present: it reads them into the
  * settings, writes the versioned file, and removes the earlier ones at once, so afterwards only the
- * versioned file remains. Read-aloud is not a setting: it starts off in every session.
+ * versioned file remains. What read-aloud reads is not a setting (it starts Off in every session); its options are.
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { EndpointConfig } from "./endpoints";
+import {
+  DEFAULT_READ_ALOUD,
+  type ReadAloudOptions,
+  SUMMARY_LENGTHS,
+  type SummaryLength,
+  TRUNCATE_SECONDS,
+} from "./read-aloud";
 
 export const SETTINGS_VERSION = 1;
 
@@ -73,6 +80,8 @@ export interface Settings {
   endpoints: Record<string, EndpointConfig>;
   /** The keys of Speak and Dictate; a change applies when Pi next loads the extension. */
   hotkeys: Hotkeys;
+  /** Who summarizes for read-aloud, how long a summary is, and where reading stops. */
+  readAloud: ReadAloudOptions;
 }
 
 export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
@@ -85,6 +94,7 @@ export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
   modelSort: "price",
   endpoints: {},
   hotkeys: DEFAULT_HOTKEYS,
+  readAloud: DEFAULT_READ_ALOUD,
 });
 
 const LEGACY_FILES = ["bridge.json", "language-overrides.json"];
@@ -154,8 +164,29 @@ function hotkeysFrom(raw: unknown): Hotkeys {
   return out.speak === out.dictate ? { ...DEFAULT_HOTKEYS } : out;
 }
 
+/** Saved read-aloud options over the defaults; a value that is not one of the choices keeps the default. */
+function readAloudFrom(raw: unknown): ReadAloudOptions {
+  const out: ReadAloudOptions = { ...DEFAULT_READ_ALOUD };
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  const r = raw as Json;
+  const summarizer = str(r.summarizer);
+  if (summarizer) out.summarizer = summarizer;
+  if (SUMMARY_LENGTHS.includes(r.length as SummaryLength)) out.length = r.length as SummaryLength;
+  if (typeof r.truncate === "number" && TRUNCATE_SECONDS.includes(r.truncate)) out.truncate = r.truncate;
+  return out;
+}
+
+const sameReadAloud = (a: ReadAloudOptions, b: ReadAloudOptions) =>
+  a.summarizer === b.summarizer && a.length === b.length && a.truncate === b.truncate;
+
 function copyDefaults(): Settings {
-  return { ...DEFAULT_SETTINGS, languages: {}, endpoints: {}, hotkeys: { ...DEFAULT_HOTKEYS } };
+  return {
+    ...DEFAULT_SETTINGS,
+    languages: {},
+    endpoints: {},
+    hotkeys: { ...DEFAULT_HOTKEYS },
+    readAloud: { ...DEFAULT_READ_ALOUD },
+  };
 }
 
 export class SettingsFile {
@@ -184,6 +215,7 @@ export class SettingsFile {
       if (isSort(raw.modelSort)) s.modelSort = raw.modelSort;
       s.endpoints = endpointsFrom(raw.endpoints);
       s.hotkeys = hotkeysFrom(raw.hotkeys);
+      s.readAloud = readAloudFrom(raw.readAloud);
     } else if (raw) {
       // settings.json without a version
       legacy = true;
@@ -231,6 +263,7 @@ export class SettingsFile {
       ...(s.hotkeys.speak !== DEFAULT_HOTKEYS.speak || s.hotkeys.dictate !== DEFAULT_HOTKEYS.dictate
         ? { hotkeys: { speak: s.hotkeys.speak, dictate: s.hotkeys.dictate } }
         : {}),
+      ...(sameReadAloud(s.readAloud, DEFAULT_READ_ALOUD) ? {} : { readAloud: s.readAloud }),
     };
     const tmp = `${this.file}.${process.pid}.tmp`;
     writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`);

@@ -1,7 +1,8 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { registerPi } from "../../src/pi/adapter";
+import { GUIDELINE_PREFIX } from "../../src/engine/read-aloud";
+import { piModels, registerPi, summarizeWith } from "../../src/pi/adapter";
 import { fakeOpenRouter, makeEngine } from "../engine/fixtures";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -40,7 +41,9 @@ function fakePi() {
     },
   };
   const emit = async (e: string, event: any = {}) => {
-    for (const fn of handlers.get(e) ?? []) await fn(event, ctx);
+    const results: unknown[] = [];
+    for (const fn of handlers.get(e) ?? []) results.push(await fn(event, ctx));
+    return results;
   };
   return { pi, ctx, commands, tools, shortcuts, emit, notes, statuses, active: () => active };
 }
@@ -120,6 +123,54 @@ describe("the Pi adapter", () => {
     expect(complete("--bridge a").map((c: any) => c.value)).toEqual(["--bridge auto"]);
     expect(complete("--t").map((c: any) => c.value)).toEqual(["--type", "--transcribe"]);
     expect(complete("hello")).toBeNull();
+  });
+
+  it("read-aloud Summary: a guideline asks for the marked summary; message_end removes it; it is read", async () => {
+    const requests = fakeOpenRouter();
+    const f = fakePi();
+    const { engine } = makeEngine();
+    registerPi(f.pi, engine);
+    await f.emit("session_start");
+    await f.commands.get("speech").handler("--read-aloud summary", f.ctx);
+    const promptGuidelines = ["Use read to examine files.", `${GUIDELINE_PREFIX} an old one`];
+    await f.emit("before_agent_start", { systemPromptOptions: { promptGuidelines } });
+    expect(promptGuidelines).toHaveLength(2);
+    expect(promptGuidelines[0]).toBe("Use read to examine files.");
+    expect(promptGuidelines[1]).toMatch(/^pi-speech read-aloud: end every final reply .*<spoken_summary>/);
+    const message = {
+      role: "assistant",
+      content: [{ type: "text", text: "The long answer.\n\n<spoken_summary>In short: yes.</spoken_summary>" }],
+    };
+    const [r] = (await f.emit("message_end", { message })) as Array<{ message: typeof message }>;
+    expect(r.message.content).toEqual([{ type: "text", text: "The long answer." }]);
+    expect(await f.emit("message_end", { message: { role: "user", content: "hi" } })).toEqual([undefined]);
+    const before = requests.length;
+    await f.emit("agent_end", { messages: [r.message] });
+    await vi.waitFor(() => expect(requests.length).toBe(before + 1));
+    expect(requests.at(-1)?.body.input).toBe("In short: yes.");
+    // Off: the guideline goes.
+    await f.commands.get("speech").handler("--read-aloud off", f.ctx);
+    await f.emit("before_agent_start", { systemPromptOptions: { promptGuidelines } });
+    expect(promptGuidelines).toEqual(["Use read to examine files."]);
+  });
+
+  it("asks another Pi model for a summary with one request, and lists the user's Pi models", async () => {
+    const complete = vi.fn(async () => ({ stopReason: "stop", content: [{ type: "text", text: "Short." }] }));
+    const model = { provider: "anthropic", id: "claude-haiku" };
+    const registry = {
+      find: (p: string, id: string) => (p === "anthropic" && id === "claude-haiku" ? model : undefined),
+      complete,
+      getAvailable: () => [model, { provider: "openai", id: "gpt-mini" }],
+    };
+    const ctx: any = { modelRegistry: registry, scopedModels: [] };
+    expect(await summarizeWith(ctx, "anthropic/claude-haiku", "Summarize this")).toBe("Short.");
+    expect(complete).toHaveBeenCalledTimes(1);
+    expect((complete.mock.calls[0] as any[])[1].messages[0]).toMatchObject({ role: "user", content: "Summarize this" });
+    await expect(summarizeWith(ctx, "nobody/none", "x")).rejects.toThrow(/not one of your Pi models/);
+    complete.mockResolvedValueOnce({ stopReason: "error", content: [], errorMessage: "rate limited" } as never);
+    await expect(summarizeWith(ctx, "anthropic/claude-haiku", "x")).rejects.toThrow("rate limited");
+    expect(piModels(ctx)).toEqual(["anthropic/claude-haiku", "openai/gpt-mini"]);
+    expect(piModels({ ...ctx, scopedModels: [{ model }] })).toEqual(["anthropic/claude-haiku"]);
   });
 
   it("the synthesize tool names the saved files and whether it plays", async () => {

@@ -44,7 +44,7 @@ const ACTIONS = [
   "help",
 ];
 const ACTION_VALUES: Record<string, string[]> = {
-  "read-aloud": ["on", "off"],
+  "read-aloud": ["on", "off", "summary", "thinking", "all"],
   bridge: ["auto", "on", "off", "status"],
   set: ["tts-model", "voice", "stt-model", "stt-language", "tools", "dictation-output"],
 };
@@ -85,6 +85,37 @@ export function tintRecordingDot(
   return text?.startsWith("●") ? theme.fg("error", "●") + text.slice(1) : text;
 }
 
+/** The user's Pi models as `provider/id`: the scoped ones when the session has them, else every available one. */
+export function piModels(ctx: Pick<ExtensionContext, "scopedModels" | "modelRegistry">): string[] {
+  const scoped = ctx.scopedModels ?? [];
+  const models = scoped.length ? scoped.map((s) => s.model) : ctx.modelRegistry.getAvailable();
+  return [...new Set(models.map((m) => `${m.provider}/${m.id}`))];
+}
+
+/** One request to the Pi model `ref` (`provider/id`) with `prompt`: resolves to its answer's text. */
+export async function summarizeWith(
+  ctx: Pick<ExtensionContext, "modelRegistry">,
+  ref: string,
+  prompt: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const slash = ref.indexOf("/");
+  const model = slash > 0 ? ctx.modelRegistry.find(ref.slice(0, slash), ref.slice(slash + 1)) : undefined;
+  if (!model) throw new Error(`${ref} is not one of your Pi models`);
+  const reply = await ctx.modelRegistry.complete(
+    model,
+    { messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
+    { signal },
+  );
+  if (reply.stopReason === "error" || reply.stopReason === "aborted") {
+    throw new Error(reply.errorMessage || `the request was ${reply.stopReason === "error" ? "refused" : "stopped"}`);
+  }
+  return reply.content
+    .filter((p): p is { type: "text"; text: string } => p.type === "text")
+    .map((p) => p.text)
+    .join("\n");
+}
+
 /** Pi has a terminal UI here (not RPC or print mode). */
 const hasTerminal = (ctx: ExtensionContext) => ctx.mode === "tui" && ctx.hasUI;
 
@@ -93,9 +124,12 @@ export function registerPi(pi: ExtensionAPI, engine: Engine, env: NodeJS.Process
   let ui: ExtensionContext["ui"] | undefined;
   /** The settings panel while it is open: engine notifications go to its status line instead of toasts. */
   let panel: Panel | undefined;
+  /** The latest context: its model registry has the user's Pi models. */
+  let latest: ExtensionContext | undefined;
 
   /** Follow the latest context: its UI hears notifications and shows the status; its registry has the key. */
   const attach = (ctx: ExtensionContext) => {
+    latest = ctx;
     engine.speech.registry = ctx.modelRegistry;
     if (ctx.ui === ui) return;
     ui = ctx.ui;
@@ -133,6 +167,25 @@ export function registerPi(pi: ExtensionAPI, engine: Engine, env: NodeJS.Process
 
   pi.on("session_shutdown", async () => {
     await engine.shutdown();
+  });
+
+  // Read-aloud: the user's Pi models summarize when chosen (one extra request per reply).
+  engine.readAloud.models = () => (latest ? piModels(latest) : []);
+  engine.readAloud.summarize = (ref, prompt, signal) => {
+    if (!latest) return Promise.reject(new Error("Pi's models are not available yet"));
+    return summarizeWith(latest, ref, prompt, signal);
+  };
+
+  // Summary and Thinking with the same model: a guideline asks for a marked summary at the end of each reply.
+  pi.on("before_agent_start", async (event, ctx) => {
+    attach(ctx);
+    engine.readAloud.onRunStart(event.systemPromptOptions.promptGuidelines);
+  });
+
+  // The marked summary is taken out of the finished message, so it is neither shown nor kept in the session.
+  pi.on("message_end", async (event) => {
+    const message = engine.readAloud.onMessageEnd(event.message);
+    return message ? { message } : undefined;
   });
 
   pi.on("agent_end", async (event, ctx) => {

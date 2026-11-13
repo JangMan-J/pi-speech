@@ -23,7 +23,20 @@ describe("the settings file", () => {
       modelSort: "price",
       endpoints: {},
       hotkeys: { speak: "alt+s", dictate: "alt+z" },
+      readAloud: { length: "abridged", truncate: 0 },
     });
+  });
+
+  it("saves the read-aloud options that differ from the defaults, and ignores values that are not choices", () => {
+    const f = new SettingsFile(dir);
+    const s = f.load();
+    f.save(s);
+    expect(JSON.parse(readFileSync(f.file, "utf8")).readAloud).toBeUndefined();
+    s.readAloud = { summarizer: "anthropic/claude-haiku", length: "full", truncate: 60 };
+    f.save(s);
+    expect(f.load().readAloud).toEqual({ summarizer: "anthropic/claude-haiku", length: "full", truncate: 60 });
+    writeFileSync(f.file, JSON.stringify({ version: 1, readAloud: { length: "huge", truncate: 7, summarizer: 3 } }));
+    expect(f.load().readAloud).toEqual({ length: "abridged", truncate: 0 });
   });
 
   it("saves one versioned file and reads it back", () => {
