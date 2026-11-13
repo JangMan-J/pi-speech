@@ -34,8 +34,10 @@ describe("findExecutable", () => {
     it("finds a bare name with the program extensions of PATHEXT, on a PATH split at semicolons", () => {
       const p = file("player.EXE");
       const env = { PATH: `C:\\nowhere;${dir}`, PATHEXT: ".COM;.EXE;.BAT;.CMD" };
-      expect(findExecutable("player", env, "win32")).toBe(p);
-      expect(findExecutable("player.EXE", env, "win32")).toBe(p);
+      // On a filesystem that ignores case (macOS, Windows) the lowercase spelling names the same file.
+      const same = (found: string | undefined) => found?.toLowerCase() === p.toLowerCase();
+      expect(same(findExecutable("player", env, "win32"))).toBe(true);
+      expect(same(findExecutable("player.EXE", env, "win32"))).toBe(true);
     });
 
     it("never takes a .cmd or .bat script, which Node cannot start without a shell", () => {
