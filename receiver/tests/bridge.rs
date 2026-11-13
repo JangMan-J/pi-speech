@@ -612,7 +612,7 @@ fn only_loopback_addresses_are_accepted() {
 
 // ---- hardening ----
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::time::Instant;
 
@@ -646,11 +646,17 @@ fn a_request_head_dripped_byte_by_byte_is_cut_off_at_the_deadline_with_408() {
     let mut buf = [0u8; 512];
     loop {
         // Each byte arrives well inside any per-read timeout; only a whole-head deadline stops it.
-        let _ = s.write_all(b"X");
+        // Once the reply has begun, writing more into the closed connection makes Windows reset it, which can
+        // throw away the reply's unread bytes: stop dripping then.
+        if raw.is_empty() {
+            let _ = s.write_all(b"X");
+        }
         match s.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => raw.extend_from_slice(&buf[..n]),
-            Err(_) => {}
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            // A reset (how Windows can report the close) ends the connection as well.
+            Err(_) => break,
         }
         assert!(t0.elapsed() < Duration::from_secs(5), "never cut off");
     }
