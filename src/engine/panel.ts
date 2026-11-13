@@ -17,6 +17,7 @@ import type { Engine } from "./engine";
 import { errorMessage } from "./env";
 import { FEATURES, featureLine, type ModelKind, modelColumns, vendorOf } from "./features";
 import type { HistoryMessage } from "./history";
+import { type DownloadProgress, formatSize, type LocalModel } from "./local-models";
 import type { ModelOption, SpeechCatalog } from "./openrouter";
 import { REPLACED } from "./player";
 import { priceValue } from "./pricing";
@@ -29,8 +30,17 @@ import {
   TRUNCATE_SECONDS,
 } from "./read-aloud";
 import { ReadingFailed, readingFailedMessage } from "./reading";
-import { type BridgeMode, type Hotkeys, hotkeyId, keyLabel, MODEL_SORTS, type ModelSort } from "./settings";
-import { languageLabel, type SampleResult, type SettingName } from "./speech";
+import {
+  type BridgeMode,
+  type Hotkeys,
+  hotkeyId,
+  keyLabel,
+  MODEL_SORTS,
+  type ModelSort,
+  SOURCES,
+  type Source,
+} from "./settings";
+import { type Direction, languageLabel, type SampleResult, type SettingName } from "./speech";
 import type { Surface, SurfaceUi } from "./surface";
 import { XAI_MODEL } from "./xai";
 
@@ -324,6 +334,8 @@ interface PickerState {
   show: string;
   edit: LineEdit;
   selected: number;
+  /** A model list of on-device models (the source of its direction is Local). */
+  local?: boolean;
 }
 
 /** A submenu; `capture` while it waits for the new key of Speak or Dictate. */
@@ -409,6 +421,17 @@ const BRIDGE_MODES: BridgeMode[] = ["auto", "on", "off"];
 const PRICE_UNKNOWN = "price unknown";
 /** The name the panel shows for the xai model (the saved id stays xai). */
 export const XAI_LABEL = "xAI Grok";
+
+const SOURCE_WORDS: Record<Source, string> = { provider: "Provider", local: "Local" };
+const directionOf = (row: "speechModel" | "transcription" | "speechSource" | "transcriptionSource"): Direction =>
+  row === "speechModel" || row === "speechSource" ? "speech" : "transcription";
+/** A download as its status line says it. */
+function downloadLine(id: string, p: DownloadProgress): string {
+  if (p.phase === "verifying") return `… verifying ${id}`;
+  if (p.phase === "unpacking") return `… unpacking ${id}`;
+  const pct = p.total ? Math.floor((p.done / p.total) * 100) : 0;
+  return `… downloading ${id} ${pct}% (${formatSize(p.done)} of ${formatSize(p.total)})`;
+}
 
 /** The Read values as shown. */
 const READ_WORDS: Record<ReadMode, string> = { off: "Off", summary: "Summary", thinking: "Thinking", all: "All" };
@@ -524,6 +547,16 @@ export class Panel {
   private readonly inflight = new Set<Promise<unknown>>();
   private unlisten?: () => void;
   private disposed = false;
+  /** The on-device models, of both kinds, with their state. */
+  private localModels?: LocalModel[];
+  private localLoad?: Promise<LocalModel[]>;
+  private localError?: string;
+  /** A model not downloaded that the user chose: the next Enter downloads it. */
+  private offer?: string;
+  /** A downloaded model that the next x deletes. */
+  private deleting?: string;
+  /** The download running, and how far it is. */
+  private downloading?: { id: string; progress?: DownloadProgress };
 
   constructor(
     private readonly engine: Engine,
@@ -545,6 +578,8 @@ export class Panel {
     });
     this.track(this.loadModels());
     this.track(this.loadVoices());
+    const s = this.speech.settings;
+    if (s.speechSource === "local" || s.transcriptionSource === "local") this.track(this.loadLocal());
     this.probe();
   }
 
@@ -654,10 +689,14 @@ export class Panel {
     switch (base.id) {
       // Only the name of a model or a voice: what it costs and offers is in its picker.
       case "speechModel": {
+        if (s.speechSource === "local") return { ...base, ...this.localRow("speech", s.localSpeechModel) };
         const v = value(s.speechModel);
         return { ...base, value: modelLabel(v), ...this.modelAlert("tts", v) };
       }
       case "transcription": {
+        if (s.transcriptionSource === "local") {
+          return { ...base, ...this.localRow("transcription", s.localTranscriptionModel) };
+        }
         const v = value(s.transcriptionModel);
         return { ...base, value: modelLabel(v), ...this.modelAlert("stt", v) };
       }
@@ -675,8 +714,9 @@ export class Panel {
       case "truncate":
         return { ...base, value: truncateWord(s.readAloud.truncate) };
       case "speechSource":
+        return { ...base, value: value(SOURCE_WORDS[s.speechSource]) };
       case "transcriptionSource":
-        return { ...base, value: "Provider" };
+        return { ...base, value: value(SOURCE_WORDS[s.transcriptionSource]) };
       case "language":
         return { ...base, value: value(s.dictationLanguage ?? "auto") };
       case "output":
@@ -742,6 +782,17 @@ export class Panel {
     return {};
   }
 
+  /** A model row while its source is Local: the chosen on-device model, and why it cannot be used. */
+  private localRow(kind: Direction, id: string | undefined): Pick<PanelRow, "value" | "note" | "alert"> {
+    const value = id ?? "none";
+    if (kind === "speech") return { value, note: "✗ local speech not available yet", alert: true };
+    if (this.localError) return { value, note: "✗ local models unavailable", alert: true };
+    if (!id) return { value, note: "✗ choose a model", alert: true };
+    const m = this.localModels?.find((x) => x.id === id);
+    if (this.localModels && !m?.downloaded) return { value, note: "✗ not downloaded", alert: true };
+    return { value };
+  }
+
   /** Why the voices are not usable; nothing when they are (a voice's language is in the picker). */
   private voiceAlert(): Pick<PanelRow, "note" | "alert"> {
     const model = this.speech.settings.speechModel;
@@ -771,6 +822,33 @@ export class Panel {
 
   private pickerItems(p: PickerState): PickerItem[] {
     const s = this.speech.settings;
+    if (p.local && isModelRow(p.row)) {
+      const current = p.row === "speechModel" ? s.localSpeechModel : s.localTranscriptionModel;
+      const models = (p.ids ?? []).flatMap((id) => this.localModels?.find((m) => m.id === id) ?? []);
+      const items = models.map((m): PickerItem => {
+        const d = this.downloading;
+        const state =
+          d?.id === m.id
+            ? d.progress?.phase === "progress" && d.progress.total
+              ? `downloading ${Math.floor((d.progress.done / d.progress.total) * 100)}%`
+              : "downloading"
+            : m.downloaded
+              ? "downloaded"
+              : m.partial
+                ? "partly downloaded"
+                : "not downloaded";
+        const langs = m.languages.length > 4 ? `${m.languages.length} langs` : m.languages.join(" ");
+        return {
+          id: m.id,
+          label: m.id,
+          price: formatSize(m.size),
+          note: `${m.name} ${state}`,
+          cols: [state, langs],
+          current: m.id === current,
+        };
+      });
+      return matchItems(items, p.edit.value, (i) => `${i.label} ${i.note ?? ""}`);
+    }
     if (p.row === "history") {
       const all = (p.messages ?? []).map(
         (m): PickerItem => ({ id: m.file, label: `${m.time}  ${m.title}`, current: false }),
@@ -836,7 +914,10 @@ export class Panel {
       loading: !p.ids,
       empty: p.ids?.length === 0 ? none : "No matches",
     };
-    if (isModelRow(p.row)) {
+    if (p.local) {
+      view.detail = "Runs on This machine, with no network request once downloaded.";
+      if (p.ids?.length === 0) view.empty = "No local models of this kind";
+    } else if (isModelRow(p.row)) {
       const id = items[selected]?.id;
       const m = this.modelOptions({ ...p, row: p.row }).find((x) => x.id === id);
       view.sort = this.speech.settings.modelSort;
@@ -863,6 +944,15 @@ export class Panel {
     if (m.kind === "picker") {
       const p = m.picker;
       if (!p.ids) return [esc("back")];
+      if (p.local) {
+        if (this.pickerItems(p).length === 0) return [esc("back")];
+        return [
+          { key: "Enter", action: "pick" },
+          { key: "d", action: "download" },
+          { key: "x", action: "delete" },
+          esc("back"),
+        ];
+      }
       const sorting: Hint[] = isModelRow(p.row)
         ? [
             { key: "Tab", action: "sort", optional: true },
@@ -887,7 +977,7 @@ export class Panel {
         return [{ key: "Enter", action: "what is read and how" }, close];
       case "speechSource":
       case "transcriptionSource":
-        return [{ key: "←→", action: "Provider, the only source so far" }, close];
+        return [{ key: "←→", action: "Provider · Local" }, close];
       case "voice":
         return [{ key: "Enter", action: "choose" }, ...this.voiceKeys(), close];
       case "speechModel":
@@ -977,9 +1067,16 @@ export class Panel {
       const highlighted = items[Math.min(p.selected, n - 1)];
       if (key === "up" || key === "down") {
         if (n) p.selected = (Math.min(p.selected, n - 1) + (key === "up" ? n - 1 : 1)) % n;
+        this.offer = undefined;
+        this.deleting = undefined;
       } else if (key === "enter") this.pick(m);
-      else if (key === "escape") this.mode = m.back;
-      else if (key === "tab") {
+      else if (key === "escape") {
+        this.offer = undefined;
+        this.deleting = undefined;
+        this.mode = m.back;
+      } else if (p.local && (key === "tab" || key === "backtab")) {
+        // A local list has no sort or feature filter.
+      } else if (key === "tab") {
         if (p.row === "voice" && highlighted) this.sample(highlighted.id);
         else if (isModelRow(p.row)) this.nextSort(p);
       } else if (key === "backtab") {
@@ -1042,6 +1139,15 @@ export class Panel {
       return;
     }
     if (m.kind === "picker") {
+      // In a list of on-device models, d downloads and x deletes the highlighted one.
+      if (m.picker.local && !paste && (text === "d" || text === "x")) {
+        const item = this.pickerItems(m.picker)[m.picker.selected];
+        if (item) {
+          if (text === "d") this.downloadKey(item.id);
+          else this.deleteKey(item.id);
+        }
+        return;
+      }
       m.picker.edit.insert(text);
       m.picker.selected = 0;
       return;
@@ -1170,7 +1276,14 @@ export class Panel {
       });
       this.clearStatus();
     } else if (id === "speechSource" || id === "transcriptionSource") {
-      this.setStatus("info", "Provider is the only source so far");
+      const direction = directionOf(id);
+      const s = this.speech.settings;
+      const next = cycle(SOURCES, direction === "speech" ? s.speechSource : s.transcriptionSource, dir);
+      const summary = this.speech.setSource(direction, next);
+      if (next === "local") this.track(this.loadLocal());
+      // Local speech is listed but cannot speak yet: say so plainly.
+      if (direction === "speech" && next === "local") this.setStatus("warning", `! ${summary}`);
+      else this.setStatus("success", `✓ ${summary}`);
     } else if (id === "bridgeMode") {
       const i = BRIDGE_MODES.indexOf(this.shown("bridgeMode") as BridgeMode);
       const next = BRIDGE_MODES[(i + dir + BRIDGE_MODES.length) % BRIDGE_MODES.length];
@@ -1208,6 +1321,10 @@ export class Panel {
     if (row === "history") {
       // The list stays open: several messages can be replayed one after another.
       this.replayFile(item.id);
+      return;
+    }
+    if (p.local && isModelRow(row)) {
+      this.pickLocal(m, item.id);
       return;
     }
     this.mode = m.back;
@@ -1252,6 +1369,24 @@ export class Panel {
       p.ids = [SAME_MODEL, ...this.engine.readAloud.models()];
       return;
     }
+    if (isModelRow(row) && this.sourceOf(row) === "local") {
+      p.local = true;
+      const kind = directionOf(row);
+      const of = (all: LocalModel[]) => all.filter((m) => m.kind === kind).map((m) => m.id);
+      if (this.localModels) p.ids = of(this.localModels);
+      this.track(
+        this.loadLocal(true).then(
+          (all) => {
+            p.ids = of(all);
+          },
+          (err) => {
+            if (this.mode.kind === "picker" && this.mode.picker === p) this.mode = back;
+            this.setStatus("error", `✗ Local models: ${errorMessage(err)}`);
+          },
+        ),
+      );
+      return;
+    }
     const kind = row === "speechModel" ? "tts" : "stt";
     const ids = row === "voice" ? this.currentVoices() : this.models?.[kind].map((m) => m.id);
     if (ids) {
@@ -1269,6 +1404,138 @@ export class Panel {
           this.setStatus("error", `✗ ${errorMessage(err)}`);
         },
       ),
+    );
+  }
+
+  private sourceOf(row: "speechModel" | "transcription"): Source {
+    const s = this.speech.settings;
+    return row === "speechModel" ? s.speechSource : s.transcriptionSource;
+  }
+
+  // ── On-device models ────────────────────────────────────────────────────
+
+  /**
+   * Enter on an on-device model: a downloaded one is chosen; one not downloaded is offered for download (with
+   * its size), and Enter again downloads it and then chooses it.
+   */
+  private pickLocal(m: Extract<Mode, { kind: "picker" }>, id: string): void {
+    const row = m.picker.row as "speechModel" | "transcription";
+    const direction = directionOf(row);
+    const model = this.localModels?.find((x) => x.id === id);
+    if (!model) return;
+    this.deleting = undefined;
+    if (model.downloaded) {
+      this.offer = undefined;
+      this.mode = m.back;
+      const summary = this.speech.setLocalModel(direction, id);
+      if (direction === "speech") this.setStatus("warning", `! ${summary} · local speech is not available yet`);
+      else this.setStatus("success", `✓ ${summary}`);
+      return;
+    }
+    if (this.offer === id) {
+      this.startDownload(model, { direction, picker: m });
+      return;
+    }
+    this.offer = id;
+    this.setStatus("warning", `! ${id} is not downloaded (${formatSize(model.size)}) · Enter downloads it`);
+  }
+
+  /** d in a local list: download the highlighted model. */
+  private downloadKey(id: string): void {
+    const model = this.localModels?.find((x) => x.id === id);
+    if (!model) return;
+    if (model.downloaded) {
+      this.setStatus("info", `${id} is already downloaded`);
+      return;
+    }
+    this.startDownload(model);
+  }
+
+  /** x in a local list: x once asks, x again deletes the highlighted model. */
+  private deleteKey(id: string): void {
+    const model = this.localModels?.find((x) => x.id === id);
+    if (!model) return;
+    this.offer = undefined;
+    if (!model.downloaded && !model.partial) {
+      this.setStatus("info", `${id} is not downloaded`);
+      return;
+    }
+    if (this.downloading?.id === id) {
+      this.setStatus("info", `${id} is downloading`);
+      return;
+    }
+    if (this.deleting !== id) {
+      this.deleting = id;
+      this.setStatus("warning", `! x again deletes ${id} (${formatSize(model.size)})`);
+      return;
+    }
+    this.deleting = undefined;
+    this.setStatus("busy", `… deleting ${id}`);
+    this.track(
+      this.speech.local
+        .delete(id)
+        .then(async (freed) => {
+          await this.loadLocal(true).catch(() => {});
+          this.setStatus("success", `✓ ${id} deleted · ${formatSize(freed)} freed`);
+        })
+        .catch((err) => this.setStatus("error", `✗ ${id} was not deleted: ${errorMessage(err)}`)),
+    );
+  }
+
+  /**
+   * Download an on-device model with its progress on the status line; when it was chosen from a model list,
+   * it becomes that direction's model once downloaded.
+   */
+  private startDownload(
+    model: LocalModel,
+    chosen?: { direction: Direction; picker: Extract<Mode, { kind: "picker" }> },
+  ): void {
+    this.offer = undefined;
+    if (this.downloading) {
+      this.setStatus("info", `${this.downloading.id} is downloading; one download at a time`);
+      return;
+    }
+    const id = model.id;
+    const state: { id: string; progress?: DownloadProgress } = { id };
+    let result: Promise<unknown>;
+    try {
+      result = this.speech.local.download(id, {
+        onProgress: (p) => {
+          state.progress = p;
+          if (this.downloading === state) this.setStatus("busy", downloadLine(id, p));
+          this.changed();
+        },
+      }).result;
+    } catch (err) {
+      this.setStatus("error", `✗ ${errorMessage(err)}`);
+      return;
+    }
+    this.downloading = state;
+    this.setStatus("busy", `… downloading ${id} (${formatSize(model.size)})`);
+    this.track(
+      result
+        .then(async (r) => {
+          this.downloading = undefined;
+          const done = r as { status: string; done?: number; total?: number };
+          if (done.status === "stopped") {
+            this.setStatus("info", `Download of ${id} stopped; the next download goes on from there`);
+            return;
+          }
+          await this.loadLocal(true).catch(() => {});
+          if (!chosen) {
+            this.setStatus("success", `✓ ${id} downloaded`);
+            return;
+          }
+          const summary = this.speech.setLocalModel(chosen.direction, id);
+          if (this.mode === chosen.picker) this.mode = chosen.picker.back;
+          if (chosen.direction === "speech") {
+            this.setStatus("warning", `! ${id} downloaded · ${summary} · local speech is not available yet`);
+          } else this.setStatus("success", `✓ ${id} downloaded · ${summary}`);
+        })
+        .catch((err) => {
+          this.downloading = undefined;
+          this.setStatus("error", `✗ Download of ${id} failed: ${errorMessage(err)}`);
+        }),
     );
   }
 
@@ -1479,6 +1746,24 @@ export class Panel {
       },
     );
     return this.modelsLoad;
+  }
+
+  /** The on-device models and their state; `fresh` lists them again (after a download or a delete). */
+  private loadLocal(fresh = false): Promise<LocalModel[]> {
+    if (fresh) this.localLoad = undefined;
+    this.localLoad ??= this.speech.local.list().then(
+      (all) => {
+        this.localModels = all;
+        this.localError = undefined;
+        return all;
+      },
+      (err) => {
+        this.localLoad = undefined;
+        this.localError = errorMessage(err);
+        throw err;
+      },
+    );
+    return this.localLoad;
   }
 
   private currentVoices(): string[] | undefined {

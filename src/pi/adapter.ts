@@ -46,7 +46,7 @@ const ACTIONS = [
 const ACTION_VALUES: Record<string, string[]> = {
   "read-aloud": ["on", "off", "summary", "thinking", "all"],
   bridge: ["auto", "on", "off", "status"],
-  set: ["tts-model", "voice", "stt-model", "stt-language", "tools", "dictation-output"],
+  set: ["tts-model", "voice", "stt-model", "stt-language", "tools", "dictation-output", "tts-source", "stt-source"],
 };
 
 /** The tool result for a synthesis: files, model and voice, and whether it plays. Never contains the key. */

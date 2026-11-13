@@ -182,6 +182,24 @@ export function makeEngine(
   return { engine, work, local, bridgeOut, notes };
 }
 
+/** A short silent 16 kHz mono WAV. */
+export function wavFixture(samples = 1600): Buffer {
+  const h = Buffer.alloc(44);
+  h.write("RIFF", 0);
+  h.writeUInt32LE(36 + samples * 2, 4);
+  h.write("WAVEfmt ", 8);
+  h.writeUInt32LE(16, 16);
+  h.writeUInt16LE(1, 20);
+  h.writeUInt16LE(1, 22);
+  h.writeUInt32LE(16000, 24);
+  h.writeUInt32LE(32000, 28);
+  h.writeUInt16LE(2, 32);
+  h.writeUInt16LE(16, 34);
+  h.write("data", 36);
+  h.writeUInt32LE(samples * 2, 40);
+  return Buffer.concat([h, Buffer.alloc(samples * 2)]);
+}
+
 /** A stand-in binary is a script started as a program (shebang), which Windows cannot do. */
 export const STAND_IN_BINARY = process.platform !== "win32";
 

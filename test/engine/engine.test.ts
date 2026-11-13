@@ -1,8 +1,11 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { AudioInput } from "../../src/engine/audio";
+import { LOCAL_SPEECH_UNAVAILABLE } from "../../src/engine/speech";
 import { Surface } from "../../src/engine/surface";
-import { CATALOG, fakeOpenRouter, makeEngine, scriptedUi } from "./fixtures";
+import { CATALOG, fakeOpenRouter, fakeReceiver, makeEngine, STAND_IN_BINARY, scriptedUi, wavFixture } from "./fixtures";
 
 afterEach(() => vi.unstubAllGlobals());
 const tick = () => new Promise((r) => setTimeout(r, 0));
@@ -164,5 +167,69 @@ describe("the engine is Pi-independent", () => {
         expect(text, `${dir}/${f}`).not.toMatch(/from "\.\.\/pi\//);
       }
     }
+  });
+});
+
+describe.skipIf(!STAND_IN_BINARY)("Speech source and Transcription source in one session", () => {
+  /** A microphone on This machine that records one short WAV. */
+  const mic: AudioInput = {
+    name: "local",
+    start: async () => ({ stop: async () => ({ audio: wavFixture(), format: "wav" }), cancel: async () => {} }),
+  };
+  const engineWithReceiver = () => {
+    const bin = fakeReceiver(mkdtempSync(join(tmpdir(), "pi-speech-receiver-")));
+    const made = makeEngine({ PI_SPEECH_BINARY: bin.path, PI_SPEECH_LOCAL_MIC: "1" }, mic);
+    const calls = () => (existsSync(bin.log) ? readFileSync(bin.log, "utf8").trim().split("\n") : []);
+    return { ...made, calls };
+  };
+
+  it("dictation transcribes with a local model and no network request; Provider speech still works", async () => {
+    const requests = fakeOpenRouter("from the provider");
+    const { engine, calls } = engineWithReceiver();
+    engine.speech.setSource("transcription", "local");
+    engine.speech.setLocalModel("transcription", "parakeet-v3");
+    const before = requests.length;
+    const { ui, pasted } = scriptedUi();
+    await engine.dictation.toggle(ui);
+    await engine.dictation.toggle(ui);
+    await vi.waitFor(() => expect(pasted).toEqual(["local words from parakeet-v3"]));
+    expect(requests.length).toBe(before);
+    expect(calls().at(-1)).toMatch(/^transcribe parakeet-v3 .*audio.wav$/);
+    // Transcribe file… too, from the file itself.
+    const file = join(engine.speech.historyDir, "..", "note.wav");
+    writeFileSync(file, wavFixture());
+    expect(await engine.speech.transcribeFile(file, { cwd: "/" })).toBe("local words from parakeet-v3");
+    expect(requests.length).toBe(before);
+    // Provider speech in the same session.
+    const r = await engine.speech.speak("still spoken by the provider");
+    expect(r.files).toHaveLength(1);
+    expect(requests.at(-1)?.body.input).toBe("still spoken by the provider");
+  });
+
+  it("a local model that is not downloaded fails plainly, without falling back to the provider", async () => {
+    const requests = fakeOpenRouter();
+    const { engine } = engineWithReceiver();
+    engine.speech.setSource("transcription", "local");
+    await expect(engine.speech.transcribeAudio(wavFixture(), "wav")).rejects.toThrow(
+      /Choose a local transcription model/,
+    );
+    engine.speech.setLocalModel("transcription", "whisper-small");
+    await expect(engine.speech.transcribeAudio(wavFixture(), "wav")).rejects.toThrow(
+      "Transcription failed: whisper-small is not downloaded",
+    );
+    expect(requests.filter((r) => r.url.endsWith("/audio/transcriptions"))).toEqual([]);
+  });
+
+  it("Local speech says plainly that it is not available yet; Provider transcription still works", async () => {
+    const requests = fakeOpenRouter("from the provider");
+    const { engine, calls } = engineWithReceiver();
+    engine.speech.setSource("speech", "local");
+    await expect(engine.speech.speak("hello")).rejects.toThrow(LOCAL_SPEECH_UNAVAILABLE);
+    await expect(engine.speech.say("hello")).rejects.toThrow(LOCAL_SPEECH_UNAVAILABLE);
+    await expect(engine.speech.sample()).rejects.toThrow(LOCAL_SPEECH_UNAVAILABLE);
+    expect(requests.filter((r) => r.url.endsWith("/audio/speech"))).toEqual([]);
+    expect(await engine.speech.transcribeAudio(wavFixture(), "wav")).toBe("from the provider");
+    expect(calls().filter((c) => c.startsWith("transcribe"))).toEqual([]);
+    expect(await engine.status()).toMatch(/Speech model: none chosen \(local\); local speech is not available yet/);
   });
 });

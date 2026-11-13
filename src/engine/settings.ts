@@ -23,6 +23,10 @@ export const SETTINGS_VERSION = 1;
 /** auto: the bridge when Pi runs over SSH, else local. on: always the bridge. off: always local. */
 export type BridgeMode = "auto" | "on" | "off";
 
+/** Where speech or transcription comes from: a provider over the network, or a model on This machine. */
+export type Source = "provider" | "local";
+export const SOURCES: Source[] = ["provider", "local"];
+
 /** How the model lists of the panel are ordered. */
 export type ModelSort = "price" | "provider" | "features" | "newest" | "name";
 export const MODEL_SORTS: ModelSort[] = ["price", "provider", "features", "newest", "name"];
@@ -82,6 +86,14 @@ export interface Settings {
   hotkeys: Hotkeys;
   /** Who summarizes for read-aloud, how long a summary is, and where reading stops. */
   readAloud: ReadAloudOptions;
+  /** Where speech comes from; Local uses `localSpeechModel`. */
+  speechSource: Source;
+  /** Where transcription comes from; Local uses `localTranscriptionModel`. */
+  transcriptionSource: Source;
+  /** The on-device speech model (an id of `pi-speech-receiver models list`). */
+  localSpeechModel?: string;
+  /** The on-device transcription model. */
+  localTranscriptionModel?: string;
 }
 
 export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
@@ -95,6 +107,8 @@ export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
   endpoints: {},
   hotkeys: DEFAULT_HOTKEYS,
   readAloud: DEFAULT_READ_ALOUD,
+  speechSource: "provider",
+  transcriptionSource: "provider",
 });
 
 const LEGACY_FILES = ["bridge.json", "language-overrides.json"];
@@ -113,6 +127,7 @@ function readJson(file: string): Json | undefined {
 const str = (v: unknown): string | undefined => (typeof v === "string" && v ? v : undefined);
 const isMode = (v: unknown): v is BridgeMode => v === "auto" || v === "on" || v === "off";
 const isSort = (v: unknown): v is ModelSort => MODEL_SORTS.includes(v as ModelSort);
+const isSource = (v: unknown): v is Source => SOURCES.includes(v as Source);
 
 function languagesFrom(raw: unknown): LanguageOverrides {
   const out: LanguageOverrides = {};
@@ -216,6 +231,12 @@ export class SettingsFile {
       s.endpoints = endpointsFrom(raw.endpoints);
       s.hotkeys = hotkeysFrom(raw.hotkeys);
       s.readAloud = readAloudFrom(raw.readAloud);
+      if (isSource(raw.speechSource)) s.speechSource = raw.speechSource;
+      if (isSource(raw.transcriptionSource)) s.transcriptionSource = raw.transcriptionSource;
+      const localSpeech = str(raw.localSpeechModel);
+      if (localSpeech) s.localSpeechModel = localSpeech;
+      const localTranscription = str(raw.localTranscriptionModel);
+      if (localTranscription) s.localTranscriptionModel = localTranscription;
     } else if (raw) {
       // settings.json without a version
       legacy = true;
@@ -264,6 +285,10 @@ export class SettingsFile {
         ? { hotkeys: { speak: s.hotkeys.speak, dictate: s.hotkeys.dictate } }
         : {}),
       ...(sameReadAloud(s.readAloud, DEFAULT_READ_ALOUD) ? {} : { readAloud: s.readAloud }),
+      ...(s.speechSource !== "provider" ? { speechSource: s.speechSource } : {}),
+      ...(s.transcriptionSource !== "provider" ? { transcriptionSource: s.transcriptionSource } : {}),
+      ...(s.localSpeechModel ? { localSpeechModel: s.localSpeechModel } : {}),
+      ...(s.localTranscriptionModel ? { localTranscriptionModel: s.localTranscriptionModel } : {}),
     };
     const tmp = `${this.file}.${process.pid}.tmp`;
     writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`);

@@ -24,7 +24,27 @@ describe("the settings file", () => {
       endpoints: {},
       hotkeys: { speak: "alt+s", dictate: "alt+z" },
       readAloud: { length: "abridged", truncate: 0 },
+      speechSource: "provider",
+      transcriptionSource: "provider",
     });
+  });
+
+  it("saves each source and local model, independently; an unknown source keeps Provider", () => {
+    const f = new SettingsFile(dir);
+    const s = f.load();
+    s.transcriptionSource = "local";
+    s.localTranscriptionModel = "parakeet-v3";
+    f.save(s);
+    const saved = JSON.parse(readFileSync(f.file, "utf8"));
+    expect(saved).toMatchObject({ transcriptionSource: "local", localTranscriptionModel: "parakeet-v3" });
+    expect(saved.speechSource).toBeUndefined();
+    expect(f.load()).toMatchObject({
+      speechSource: "provider",
+      transcriptionSource: "local",
+      localTranscriptionModel: "parakeet-v3",
+    });
+    writeFileSync(f.file, JSON.stringify({ version: 1, speechSource: "cloud", transcriptionSource: "local" }));
+    expect(f.load()).toMatchObject({ speechSource: "provider", transcriptionSource: "local" });
   });
 
   it("saves the read-aloud options that differ from the defaults, and ignores values that are not choices", () => {

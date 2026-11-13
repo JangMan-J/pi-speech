@@ -1,11 +1,12 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Engine } from "../../src/engine/engine";
 import { matchItems, Panel, type PanelKey, type PanelView } from "../../src/engine/panel";
 import type { Hotkeys } from "../../src/engine/settings";
 import { Surface } from "../../src/engine/surface";
-import { fakeOpenRouter, makeEngine, scriptedUi } from "./fixtures";
+import { fakeOpenRouter, fakeReceiver, makeEngine, STAND_IN_BINARY, scriptedUi } from "./fixtures";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -334,14 +335,42 @@ describe("the panel view model: keys in the main view", () => {
     expect(p.engine.speech.settings.readAloud.summarizer).toBeUndefined();
   });
 
-  it("the source rows stay Provider, the only source so far, and say so", async () => {
-    const p = open();
-    for (const label of ["Speech source", "Transcription source"]) {
-      await p.goTo(label);
-      await p.press("right", "enter");
-      expect(p.row(label)?.value).toBe("Provider");
-      expect(p.panel.view().status).toMatchObject({ tone: "info", text: "Provider is the only source so far" });
-    }
+  it("the source rows cycle Provider and Local, each on its own, saved at once", async () => {
+    const p = open({ PI_SPEECH_BINARY: join(tmpdir(), "no-such-receiver") });
+    await p.goTo("Transcription source");
+    await p.press("right");
+    expect(p.row("Transcription source")?.value).toBe("Local");
+    expect(p.row("Speech source")?.value).toBe("Provider");
+    expect(p.panel.view().status).toEqual({ tone: "success", text: "✓ Transcription source: Local" });
+    expect(settingsOf(p.work)).toMatchObject({ transcriptionSource: "local" });
+    expect(settingsOf(p.work).speechSource).toBeUndefined();
+    await p.goTo("Speech source");
+    await p.press("enter");
+    expect(p.row("Speech source")?.value).toBe("Local");
+    expect(p.panel.view().status).toEqual({
+      tone: "warning",
+      text: "! Speech source: Local · local speech is not available yet",
+    });
+    expect(p.row("Speech model")).toMatchObject({
+      value: "none",
+      note: "✗ local speech not available yet",
+      alert: true,
+    });
+    // Without the binary the local model rows say so.
+    expect(p.row("Transcription model")).toMatchObject({ value: "none", note: "✗ local models unavailable" });
+    await p.press("left");
+    expect(p.row("Speech source")?.value).toBe("Provider");
+    expect(p.row("Speech model")?.value).toBe("google/gemini-3.8-flash-tts");
+    expect(settingsOf(p.work)).toMatchObject({ transcriptionSource: "local" });
+  });
+
+  it("a Local model list without the binary goes back and says why", async () => {
+    const p = open({ PI_SPEECH_BINARY: join(tmpdir(), "no-such-receiver") });
+    p.engine.speech.setSource("transcription", "local");
+    await p.goTo("Transcription model");
+    await p.press("enter");
+    expect(p.panel.view().picker).toBeUndefined();
+    expect(p.panel.view().status?.text).toMatch(/^✗ Local models: PI_SPEECH_BINARY .* is not an executable$/);
   });
 
   it("←→ on a picker row do nothing", async () => {
@@ -442,10 +471,10 @@ describe("the panel view model: keys in the main view", () => {
     const p = open();
     const hints: Record<string, string> = {
       "Read aloud options": "Enter what is read and how · Esc close",
-      "Speech source": "←→ Provider, the only source so far · Esc close",
+      "Speech source": "←→ Provider · Local · Esc close",
       "Speech model": "Enter browse, sort and filter · Esc close",
       Voice: "Enter choose · Tab sample · F2 language · Esc close",
-      "Transcription source": "←→ Provider, the only source so far · Esc close",
+      "Transcription source": "←→ Provider · Local · Esc close",
       "Transcription model": "Enter browse, sort and filter · Esc close",
       "Dictation language": "Enter set · Esc close",
       "Dictation output": "Enter set · Esc close",
@@ -1133,5 +1162,108 @@ describe("the panel view model: history, files, and the dictation language", () 
     expect(p.row("Dictation output")?.value).toBe("User-defined");
     expect(p.row("Dictation output")?.note).toBeUndefined();
     expect(settingsOf(p.work).dictationOutput).toBe("wl-copy %s");
+  });
+});
+
+describe.skipIf(!STAND_IN_BINARY)("the panel view model: Local sources", () => {
+  const local = () => {
+    const bin = fakeReceiver(mkdtempSync(join(tmpdir(), "pi-speech-receiver-")));
+    const p = open({ PI_SPEECH_BINARY: bin.path });
+    return { ...p, bin, calls: () => readFileSync(bin.log, "utf8").trim().split("\n") };
+  };
+
+  it("lists the on-device transcription models with size and state; a downloaded one is chosen at once", async () => {
+    const p = local();
+    await p.goTo("Transcription source");
+    await p.press("right");
+    await p.goTo("Transcription model");
+    expect(p.row("Transcription model")).toMatchObject({ value: "none", note: "✗ choose a model", alert: true });
+    await p.press("enter");
+    const picker = p.panel.view().picker;
+    expect(picker).toMatchObject({ title: "Transcription model", noun: "models", total: 2, loading: false });
+    expect(picker?.sort).toBeUndefined();
+    expect(picker?.items.map((i) => [i.label, i.price, i.cols?.[0]])).toEqual([
+      ["parakeet-v3", "640 MB", "downloaded"],
+      ["whisper-small", "639 MB", "not downloaded"],
+    ]);
+    expect(p.hint()).toBe("Enter pick · d download · x delete · Esc back");
+    await p.press("enter");
+    expect(p.panel.view().picker).toBeUndefined();
+    expect(p.row("Transcription model")).toEqual(expect.objectContaining({ value: "parakeet-v3" }));
+    expect(p.row("Transcription model")?.note).toBeUndefined();
+    expect(p.panel.view().status?.text).toBe("✓ Transcription model: parakeet-v3 (local)");
+    expect(settingsOf(p.work)).toMatchObject({ transcriptionSource: "local", localTranscriptionModel: "parakeet-v3" });
+    // The provider model is kept for when the source goes back to Provider.
+    expect(settingsOf(p.work).transcriptionModel).toBe("openai/whisper-large-v3-turbo");
+  });
+
+  it("choosing a model not downloaded offers the download; Enter again downloads it with progress and chooses it", async () => {
+    const p = local();
+    p.engine.speech.setSource("transcription", "local");
+    const lines: string[] = [];
+    p.changed.mockImplementation(() => {
+      const t = p.panel.view().status?.text;
+      if (t && lines.at(-1) !== t) lines.push(t);
+    });
+    await p.goTo("Transcription model");
+    await p.press("enter");
+    await p.press("down", "enter");
+    expect(p.panel.view().status).toEqual({
+      tone: "warning",
+      text: "! whisper-small is not downloaded (639 MB) · Enter downloads it",
+    });
+    expect(p.panel.view().picker).toBeDefined();
+    await p.press("enter");
+    expect(p.panel.view().picker).toBeUndefined();
+    expect(lines).toEqual(
+      expect.arrayContaining([
+        "… downloading whisper-small 50% (320 MB of 639 MB)",
+        "… verifying whisper-small",
+        "… unpacking whisper-small",
+        "✓ whisper-small downloaded · Transcription model: whisper-small (local)",
+      ]),
+    );
+    expect(p.row("Transcription model")?.value).toBe("whisper-small");
+    expect(p.calls()).toContain("models download whisper-small");
+  });
+
+  it("in the list d downloads and x (twice) deletes the highlighted model", async () => {
+    const p = local();
+    p.engine.speech.setSource("transcription", "local");
+    await p.goTo("Transcription model");
+    await p.press("enter");
+    await p.press("down");
+    await p.type("d");
+    expect(p.panel.view().status?.text).toBe("✓ whisper-small downloaded");
+    expect(p.panel.view().picker?.items[1].cols?.[0]).toBe("downloaded");
+    await p.type("x");
+    expect(p.panel.view().status?.text).toBe("! x again deletes whisper-small (639 MB)");
+    expect(p.calls()).not.toContain("models delete whisper-small");
+    await p.type("x");
+    expect(p.panel.view().status?.text).toBe("✓ whisper-small deleted · 1.2 KB freed");
+    expect(p.panel.view().picker?.items[1].cols?.[0]).toBe("not downloaded");
+    await p.type("x");
+    expect(p.panel.view().status?.text).toBe("whisper-small is not downloaded");
+    // Other letters still filter.
+    await p.type("par");
+    expect(p.panel.view().picker?.items.map((i) => i.id)).toEqual(["parakeet-v3"]);
+  });
+
+  it("Local speech lists the on-device speech models but says plainly that it cannot speak yet", async () => {
+    const p = local();
+    await p.goTo("Speech source");
+    await p.press("right");
+    await p.goTo("Speech model");
+    await p.press("enter");
+    expect(p.panel.view().picker?.items.map((i) => [i.id, i.cols?.[0]])).toEqual([["kokoro", "not downloaded"]]);
+    await p.press("escape");
+    await p.goTo("Hotkeys");
+    await p.press("enter", "enter");
+    await p.type("hello");
+    await p.press("enter");
+    expect(p.panel.view().status?.text).toBe(
+      "✗ Local speech is not available yet: set Speech source to Provider in /speech to speak",
+    );
+    expect(p.requests.filter((r) => r.url.endsWith("/audio/speech"))).toEqual([]);
   });
 });

@@ -15,6 +15,7 @@ import { buildEndpoints, type Endpoint, endpointNameProblem, PRESETS } from "./e
 import { type Env, errorMessage } from "./env";
 import { featureLine } from "./features";
 import { History, type HistoryMessage, historyDir, type SavedMessage } from "./history";
+import { LocalModels } from "./local-models";
 import {
   DEFAULT_VOICE,
   fetchSpeechCatalog,
@@ -27,7 +28,7 @@ import { type Player, REPLACED } from "./player";
 import type { SpeechProvider, SynthesisRequest } from "./provider";
 import type { ReadingResult } from "./reading";
 import { streamReading } from "./reading-stream";
-import { DEFAULT_SETTINGS, type ModelSort, type Settings, type SettingsFile } from "./settings";
+import { DEFAULT_SETTINGS, type ModelSort, type Settings, type SettingsFile, SOURCES, type Source } from "./settings";
 import { streamAndPlay } from "./stream-play";
 import { XAI_MODEL, XAI_PRICE, XaiProvider } from "./xai";
 
@@ -65,7 +66,15 @@ const AUDIO_FORMATS: Record<string, string> = {
   aac: "aac",
 };
 
-export type SettingName = "tts-model" | "voice" | "stt-model" | "stt-language" | "tools" | "dictation-output";
+export type SettingName =
+  | "tts-model"
+  | "voice"
+  | "stt-model"
+  | "stt-language"
+  | "tools"
+  | "dictation-output"
+  | "tts-source"
+  | "stt-source";
 export const SETTING_NAMES: SettingName[] = [
   "tts-model",
   "voice",
@@ -73,7 +82,16 @@ export const SETTING_NAMES: SettingName[] = [
   "stt-language",
   "tools",
   "dictation-output",
+  "tts-source",
+  "stt-source",
 ];
+
+/** What speaking says while the Speech source is Local: the binary has no speech synthesis yet. */
+export const LOCAL_SPEECH_UNAVAILABLE =
+  "Local speech is not available yet: set Speech source to Provider in /speech to speak";
+
+/** The direction of a source: speech (text to speech) or transcription. */
+export type Direction = "speech" | "transcription";
 
 /** A language tag as transcription services take it: `ja`, `pt-BR`. */
 const LANGUAGE_TAG = /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/;
@@ -112,6 +130,8 @@ export interface SpeechOptions {
   env: Env;
   home?: string;
   fetchCatalog?: () => Promise<SpeechCatalog>;
+  /** The on-device models (default: through the bundled binary). */
+  local?: LocalModels;
 }
 
 /** The voice that stays when it is offered, else the preferred one when offered, else the first. */
@@ -139,6 +159,8 @@ export class Speech {
   settings: Settings;
   /** Pi's credential store; set by the adapter. */
   registry?: KeyRegistry;
+  /** The on-device models of This machine. */
+  readonly local: LocalModels;
   /** Hears warnings found while loading, such as a replaced model. */
   onWarning: (message: string) => void = () => {};
   private catalog: SpeechCatalog = FALLBACK_CATALOG;
@@ -170,6 +192,7 @@ export class Speech {
     this.player = opts.player;
     this.history = new History(historyDir(opts.env, opts.home ?? homedir()));
     this.fetchCatalog = opts.fetchCatalog ?? (() => fetchSpeechCatalog());
+    this.local = opts.local ?? new LocalModels(opts.env);
     this.settings = this.store.load();
   }
 
@@ -462,10 +485,12 @@ export class Speech {
   async statusLines(): Promise<string[]> {
     await this.ready();
     const s = this.settings;
+    const local = (id?: string) => `${id ?? "none chosen"} (local)`;
     return [
-      `Speech model: ${s.speechModel}`,
-      `Voice: ${s.voice}`,
-      `Transcription model: ${s.transcriptionModel}`,
+      ...(s.speechSource === "local"
+        ? [`Speech model: ${local(s.localSpeechModel)}; local speech is not available yet`]
+        : [`Speech model: ${s.speechModel}`, `Voice: ${s.voice}`]),
+      `Transcription model: ${s.transcriptionSource === "local" ? local(s.localTranscriptionModel) : s.transcriptionModel}`,
       `Tools: ${s.tools ? "on" : "off"}`,
       `History: ${this.history.dir}`,
       ...(this.live ? [] : ["(OpenRouter model catalog not loaded; showing built-in lists)"]),
@@ -534,6 +559,12 @@ export class Speech {
         this.save();
         return `Tools: ${value}`;
       }
+      case "tts-source":
+      case "stt-source": {
+        if (!SOURCES.includes(value as Source))
+          throw new Error(`${name} must be provider or local, not ${value || "empty"}`);
+        return this.setSource(name === "tts-source" ? "speech" : "transcription", value as Source);
+      }
       case "dictation-output": {
         const cmd = value.trim();
         if (cmd) s.dictationOutput = cmd;
@@ -544,6 +575,40 @@ export class Speech {
       default:
         throw new Error(`unknown setting ${name || "(none)"}; choose one of: ${list(SETTING_NAMES)}`);
     }
+  }
+
+  // ── Sources ─────────────────────────────────────────────────────────────
+
+  /** Change and save where speech or transcription comes from; each direction on its own. */
+  setSource(direction: Direction, source: Source): string {
+    if (direction === "speech") this.settings.speechSource = source;
+    else this.settings.transcriptionSource = source;
+    this.save();
+    const name = direction === "speech" ? "Speech source" : "Transcription source";
+    const word = source === "local" ? "Local" : "Provider";
+    return direction === "speech" && source === "local"
+      ? `${name}: ${word} · local speech is not available yet`
+      : `${name}: ${word}`;
+  }
+
+  /** Choose and save the on-device model of a direction (an id of the local catalogue). */
+  setLocalModel(direction: Direction, id: string): string {
+    if (direction === "speech") this.settings.localSpeechModel = id;
+    else this.settings.localTranscriptionModel = id;
+    this.save();
+    return `${direction === "speech" ? "Speech" : "Transcription"} model: ${id} (local)`;
+  }
+
+  /** Speaking needs the Provider source: local speech does not exist yet. */
+  private requireProviderSpeech(): void {
+    if (this.settings.speechSource === "local") throw new Error(LOCAL_SPEECH_UNAVAILABLE);
+  }
+
+  /** The local transcription model to use; throws when none is chosen. */
+  private localTranscription(model?: string): string {
+    const id = model || this.settings.localTranscriptionModel;
+    if (!id) throw new Error("Choose a local transcription model first: /speech, Transcription model");
+    return id;
   }
 
   // ── Voice languages ─────────────────────────────────────────────────────
@@ -664,6 +729,7 @@ export class Speech {
     opts: CallOptions & { model?: string; voice?: string; play?: boolean } = {},
   ): Promise<SpeechResult> {
     if (!text.trim()) throw new Error("Nothing to say: the text is empty");
+    this.requireProviderSpeech();
     const { model, voice } = await this.choose(opts.model, opts.voice);
     const play = opts.play !== false;
     const provider = this.provider(model);
@@ -698,6 +764,7 @@ export class Speech {
    * ReadingFailed with the provider's message.
    */
   async say(text: string, opts: CallOptions = {}): Promise<SpeechResult> {
+    this.requireProviderSpeech();
     if (text.trim().length <= READING_MIN_CHARS) return this.speak(text, opts);
     const { model, voice } = await this.choose();
     const provider = this.provider(model);
@@ -729,6 +796,7 @@ export class Speech {
 
   /** A short sample of a voice of the current model in its voice language; never saved in the history. */
   async sample(voice?: string, opts: CallOptions = {}): Promise<SampleResult> {
+    this.requireProviderSpeech();
     await this.ready();
     const model = this.settings.speechModel;
     const v = voice || this.settings.voice;
@@ -791,6 +859,15 @@ export class Speech {
     const format = AUDIO_FORMATS[extname(full).slice(1).toLowerCase()];
     if (!format)
       throw new Error(`Unsupported audio file ${path}; use one of: ${Object.keys(AUDIO_FORMATS).join(", ")}`);
+    if (this.settings.transcriptionSource === "local") {
+      // On This machine: the binary reads the file; nothing goes over the network.
+      const id = this.localTranscription(opts.model);
+      try {
+        return await this.local.transcribeFile(id, full, opts.signal);
+      } catch (err) {
+        throw new Error(`Transcription failed: ${errorMessage(err)}`);
+      }
+    }
     await this.provider(opts.model || this.settings.transcriptionModel).ensureCredential();
     let audio: Buffer;
     try {
@@ -807,6 +884,14 @@ export class Speech {
     format: string,
     opts: CallOptions & { model?: string; language?: string } = {},
   ): Promise<string> {
+    if (this.settings.transcriptionSource === "local") {
+      const id = this.localTranscription(opts.model);
+      try {
+        return await this.local.transcribe(id, audio, format, opts.signal);
+      } catch (err) {
+        throw new Error(`Transcription failed: ${errorMessage(err)}`);
+      }
+    }
     const model = opts.model || this.settings.transcriptionModel;
     const provider = this.provider(model);
     await provider.ensureCredential();

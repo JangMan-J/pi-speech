@@ -10,6 +10,7 @@ import { Dictation } from "./dictation";
 import { runDictationOutput } from "./dictation-output";
 import type { Env } from "./env";
 import { Indicator } from "./indicator";
+import type { LocalModels } from "./local-models";
 import type { SpeechCatalog } from "./openrouter";
 import { Player } from "./player";
 import { type Notify, ReadAloud, type ReadAloudOptions } from "./read-aloud";
@@ -26,6 +27,8 @@ export interface EngineOptions {
   bridge?: BridgeAudio;
   localOutput?: AudioOutput;
   localInput?: AudioInput;
+  /** The on-device models (default: through the bundled binary). */
+  local?: LocalModels;
 }
 
 export class Engine {
@@ -71,6 +74,7 @@ export class Engine {
       env: opts.env,
       home: opts.home,
       fetchCatalog: opts.fetchCatalog,
+      local: opts.local,
     });
     this.speech.onWarning = (message) => this.notify(message, "warning");
     this.dictation = new Dictation({

@@ -77,7 +77,7 @@ describe("parsing /speech", () => {
       "--read-aloud on|off",
       "--bridge auto|on|off|status",
       "--language <voice> <tag|auto>",
-      "--set tts-model|voice|stt-model|stt-language|tools|dictation-output <value>",
+      "--set tts-model|voice|stt-model|stt-language|tools|dictation-output|tts-source|stt-source <value>",
     ]) {
       expect(u).toContain(a);
     }
