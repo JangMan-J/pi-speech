@@ -1056,11 +1056,16 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 name = "pi-speech-receiver"
 version = "0.3.0"
 dependencies = [
+ "bzip2 0.6.1",
  "cpal",
  "getrandom 0.3.4",
  "libc",
+ "serde_json",
+ "sha2",
  "sherpa-onnx",
  "symphonia",
+ "tar",
+ "ureq",
  "windows-sys 0.61.2",
 ]
 

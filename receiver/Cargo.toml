@@ -24,6 +24,13 @@ symphonia = { version = "0.6.1", default-features = false, features = ["pcm", "w
 sherpa-onnx = { version = "2.0.1", default-features = false, features = ["static"] }
 # Random bytes (tokens, ids, file names) from the operating system, on every system.
 getrandom = "0.3"
+# Model downloads (`models`): HTTPS with rustls and bundled roots (no system TLS library),
+# pure-Rust bzip2 and tar, and SHA-256 checks. The catalogue and the output are JSON.
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+bzip2 = "0.6"
+tar = { version = "0.4", default-features = false }
+sha2 = "0.11"
+serde_json = "1"
 
 [target.'cfg(unix)'.dependencies]
 # Signals, process groups, poll.
