@@ -13,15 +13,54 @@ gitignored, on this machine and on agent-jail). `VECTORS/` is retired: write no 
 - Done before the redesign and confirmed by ear: streaming playback, the receiver's own audio engine, one history
   file per message, Linux/macOS/Windows builds.
 
-## Resume point (2026-11-13 ~08:30, before a planned Jing restart)
+## Resume point (2026-11-13 ~10:50, before a Zellij restart)
 
-**First action:** check CI for the tip of `portable-3` (`gh run list --branch portable-3 --limit 1`): it holds the
-local-speech follow-ups (`e6aa4ec`..`5112a93`) and this file. Before pushing, the full gate passed on `5112a93`
-(`npm run check` 655, cargo test, `e2e/run all` 14/14). Then the Mac items below, one at a time.
+`portable-3` at `10fe543` is pushed (CI green at `8319239`; the surface fix `a94b898` and two NEXT.md commits came
+after). Local `main` equals it. The working tree is clean. No Jing leaf is running.
 
-No Jing leaf is running; every submission is signed off and landed. Checkout: `~/Projects/pi-speech` on
-`portable-3`; local `main` equals it. Stale worktrees that can be removed: `~/Projects/pi-wt/pi-speech-01-panel`,
-`~/Projects/pi-wt/pi-speech-07` (both landed), `/tmp/jing-stage/51bf5b3b33e9/slice03` (jing/slice03-verify).
+**First action: slice 09 (Direction).** Its leaf (node-f4005445712f78a3) was closed by Jing for lost contact about
+15 min after it started and never reported, but its branch `jing/rfbda332d19c1` holds 5 finished commits
+(`25ea34a`..`3f5679f`):
+
+- receiver/src/remote_models.rs: GET /v1/models, GET /v1/voices, POST /v1/transcribe, POST /v1/speak (streaming
+  PCM), one model run at a time (409 otherwise);
+- DIRECTION rows Play audio on, Record audio on, Run models on, saved; routes follow them while the bridge is in
+  use; a failing "This machine" choice names the row and the way out;
+- tests for the eight combinations; protocol/bridge.md and README.
+  A gate was started in a worktree at `/tmp/pi-wt-09` (log `/tmp/pi-bg-tasks-1000/f56442.log`, e2e log
+  `/tmp/gate09-e2e.log`); it likely died with the restart. Rerun: in `/tmp/pi-wt-09` (or a fresh `git worktree add`
+  of that branch, with node_modules symlinked from the checkout) run `npm run check`, then in receiver/
+  `PI_SPEECH_AUDIO_NULL=1` cargo fmt --check, clippy -D warnings, cargo test, then `e2e/run all`. If it passes, read
+  the diff (`git diff main...jing/rfbda332d19c1`), merge it into `portable-3` (fast-forward after a rebase, or
+  jing_land the branch), push with `git push origin HEAD:refs/heads/portable-3`, and remove the worktree.
+
+**Then, in parallel, two leaves (they share files with 09, so only after 09 is in):**
+
+1. Read-aloud Length default Minimum ~15 s (user). src/engine/read-aloud.ts:44 'abridged' -> 'minimum'; tests
+   test/engine/read-aloud.test.ts ~101-133, settings.test.ts:26,75, panel.test.ts:262; README.md:104.
+2. Several Pi clients per receiver plus address pairing. The full spec is the Jing obligation obl-00ea6c5704619d1b
+   and is repeated here. The user's framing: ONE user who multiplexes Pi sessions (tmux/Zellij panes, several Pi
+   processes connected at once, panes outliving their ssh session, reconnects). No multi-user hardening.
+   - Streams from different sessions may OVERLAP (the user may simulate a conversation): a client id header per Pi
+     process; the receiver replaces only the same client's play, and the OS mixer blends the others.
+   - /v1/stop with the header stops only the caller's plays. Client stop()/shutdown cancel only their own ids.
+   - Recording stays single.
+   - Remote model runs from several clients queue instead of 409.
+   - One shared receiver per user (lock file and leases).
+   - Each ssh session forwards 47613 plus a spare port from 47614-47633. Pi tries 47613, then the range, caches the
+     one that works and probes again after a failure.
+   - Make token creation atomic; lock paired-hosts.
+   - Pairing row = an input box for an address (the ssh forward's, or Tailscale/LAN; the receiver listens there only
+     with --listen). Enter probes it; if needed, POST /v1/pair, the receiver prints a 6-digit code on its terminal
+     (user's choice: terminal only), the user types it, and the token is returned and saved as bridge.token. Codes
+     expire after about 2 min; attempts are limited. README: LAN traffic is unencrypted, Tailscale encrypts.
+   - Critical tests: one Pi's stop or exit leaves another's audio alone; two clients' Streams overlap and both
+     complete; a disconnected Pi finds the next forward; closing the first of two ssh sessions keeps the second's
+     audio; queued model runs.
+   - By ear: two sessions speaking at once overlap.
+
+Lesson: watch leaves while waiting (jing_status of each child, not only mail); a leaf lost to "lost contact" leaves
+its commits on its branch. The user is fixing that in Jing systematically.
 
 ## Thread `redesign` (active): `.pad/redesign/plan.md`, slices 01-10
 
@@ -98,8 +137,6 @@ on a dialog (kill the processes instead); stock Terminal sends Ω/ß for Option+
 
 ## Waiting on the user
 
-- Default read-aloud Length: Abridged ~30 s (now) or Minimum ~15 s.
-- Pairing limits and the second-session question (above).
 - Merging PR #5; the first release (version bump, bootstrap:npm 2FA).
 
 ## Test rigs (on agent-jail)
