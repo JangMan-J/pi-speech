@@ -36,7 +36,7 @@ In flight:
   resolver (`src/engine/binary.ts`), adaptive start buffer, replay and Reading as Streams, `POST /v1/play` and
   `PI_SPEECH_PLAYER` removed. The agent was still updating e2e suites, with uncommitted edits in the worktree,
   some in files it does not own (`e2e/panel`, `e2e/redesign`, `e2e/samples`, `e2e/xai`): review those against
-  slice 01's panel suite. It had not reported. To finish: rebase the branch on `portable-3` (01 and 04 landed
+  slice 01's panel suite. Its uncommitted edits at wrap-up are kept as branch `wip/07-stream-only-snapshot` (a stash commit on the tip). It had not reported. To finish: rebase the branch on `portable-3` (01 and 04 landed
   since; expect conflicts in `test/engine/chat-models.test.ts` and `endpoints.test.ts`, each a one-line change
   here), run every check below and `e2e/run all`, read the diff, then land and push.
 
