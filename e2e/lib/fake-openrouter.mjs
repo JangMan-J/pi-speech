@@ -40,7 +40,7 @@ export async function startFakeOpenRouter(opts = {}) {
   let failures = [];
   const msPerChar = opts.msPerChar ?? 0;
   let speechCount = 0;
-  const mismatchAt = opts.mismatchAt ?? 0; // the Nth speech request answers bytes that are not audio (they cannot be converted to WAV)
+  const mismatchAt = opts.mismatchAt ?? 0; // the Nth speech request answers bytes that are not audio (not a readable WAV)
   let inflight = 0, maxInflight = 0;
   if (opts.logFile) fs.writeFileSync(opts.logFile, '', { flag: 'a' });
 

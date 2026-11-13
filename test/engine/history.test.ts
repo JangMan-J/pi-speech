@@ -47,11 +47,9 @@ describe("History", () => {
     const h = new History(dir);
     const a = await h.save("Hello, world!", wav, "wav");
     const b = await h.save("An MP3 message", mp3, "mp3");
-    expect(a.files).toHaveLength(1);
-    expect(a.files[0].endsWith(".wav")).toBe(true);
-    expect(b.files).toHaveLength(1);
-    expect(b.files[0].endsWith(".mp3")).toBe(true);
-    expect(readdirSync(dir).sort()).toEqual([a.files[0], b.files[0]].map((f) => f.split("/").at(-1)).sort());
+    expect(a.file.endsWith(".wav")).toBe(true);
+    expect(b.file.endsWith(".mp3")).toBe(true);
+    expect(readdirSync(dir).sort()).toEqual([a.file, b.file].map((f) => f.split("/").at(-1)).sort());
   });
 
   it("runs onWritten once the file exists", async () => {
@@ -59,7 +57,7 @@ describe("History", () => {
     const r = await new History(dir).save("x", wav, "wav", (file) => {
       seen = existsSync(file) ? file : undefined;
     });
-    expect(seen).toBe(r.files[0]);
+    expect(seen).toBe(r.file);
   });
 
   it("keeps names unique when the same text is spoken twice within one second", async () => {
@@ -67,7 +65,7 @@ describe("History", () => {
     const h = new History(dir, () => now);
     const a = await h.save("same", wav, "wav");
     const b = await h.save("same", wav, "wav");
-    expect(a.files[0]).not.toBe(b.files[0]);
+    expect(a.file).not.toBe(b.file);
     expect(readdirSync(dir)).toHaveLength(2);
   });
 
@@ -75,7 +73,7 @@ describe("History", () => {
     const now = new Date(2026, 9, 31, 10, 0, 0, 500);
     const a = await new History(dir, () => now).save("same", wav, "wav");
     const b = await new History(dir, () => now).save("same", wav, "wav");
-    expect(a.files[0]).not.toBe(b.files[0]);
+    expect(a.file).not.toBe(b.file);
   });
 
   it(`keeps only the newest ${HISTORY_KEEP} messages, in spoken order`, async () => {
@@ -85,8 +83,8 @@ describe("History", () => {
     const saved = [];
     for (let i = 1; i <= 12; i++) saved.push(await h.save(`message number ${i}`, wav, "wav"));
     expect(readdirSync(dir)).toHaveLength(10);
-    for (const r of saved.slice(0, 2)) expect(existsSync(r.files[0])).toBe(false);
-    for (const r of saved.slice(2)) expect(existsSync(r.files[0])).toBe(true);
+    for (const r of saved.slice(0, 2)) expect(existsSync(r.file)).toBe(false);
+    for (const r of saved.slice(2)) expect(existsSync(r.file)).toBe(true);
   });
 
   it("reads a history saved in both formats: one message each, both files pruned together", async () => {

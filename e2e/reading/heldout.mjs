@@ -128,7 +128,7 @@ const rcv = await startReceiver();
     await s.close();
   } finally { await ctx.close(); ctx.cleanup(); }
 }
-// 6. a later piece that cannot be made into WAV is a failure, never a replay of the whole text
+// 6. a later piece that is not a readable WAV is a failure, never a replay of the whole text
 {
   const ctx = await setup({ msPerChar: MS, mismatchAt: 2 });
   try {

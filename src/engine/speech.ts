@@ -692,7 +692,6 @@ export class Speech {
       audio = await this.synthesize(text, model, voice, "auto", opts.signal);
     }
     const saved = await this.history.save(text, audio.audio, audio.format, async (file) => {
-      // Playback starts before the conversion to the other format.
       started ??= await this.player.play(file, "message", { ticket });
     });
     return this.spoken(saved, model, voice, started ?? { ok: false, reason: "playback did not start" });
@@ -700,8 +699,8 @@ export class Speech {
 
   /** The result of a message saved in the history, played by `started` or not. */
   private spoken(saved: SavedMessage, model: string, voice: string, started: PlayStart): SpeechResult {
-    this.lastSaved = saved.files;
-    const result: SpeechResult = { files: saved.files, model, voice };
+    this.lastSaved = [saved.file];
+    const result: SpeechResult = { files: [saved.file], model, voice };
     if (started.ok) result.player = started.player;
     else result.notPlayed = started.reason;
     return result;
@@ -756,8 +755,8 @@ export class Speech {
   /** The result of a Reading. */
   private readingResult(r: ReadingResult, model: string, voice: string): SpeechResult {
     if (r.state === "stopped") return { files: [], model, voice, stopped: true };
-    this.lastSaved = r.saved.files;
-    const result: SpeechResult = { files: r.saved.files, model, voice };
+    this.lastSaved = [r.saved.file];
+    const result: SpeechResult = { files: [r.saved.file], model, voice };
     if (r.player) result.player = r.player;
     else result.notPlayed = r.notPlayed;
     return result;

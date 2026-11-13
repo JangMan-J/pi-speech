@@ -78,13 +78,16 @@ function deferred<T>(): Deferred<T> {
   return d;
 }
 
-type Failure = { reason: string };
-
 /** What every piece must match: the first piece's file format, and for a WAV its `fmt ` chunk. */
 type PieceKind = { format: "mp3" } | { format: "wav"; fmt: Buffer };
 
+/** An MP3 starts with an ID3 tag or an MPEG frame sync. */
+const isMp3 = (b: Uint8Array) =>
+  (b[0] === 0x49 && b[1] === 0x44 && b[2] === 0x33) || (b[0] === 0xff && ((b[1] ?? 0) & 0xe0) === 0xe0);
+
+/** The kind of a piece, or undefined when it is not a readable WAV or MP3. */
 function kindOf(audio: SynthesizedAudio): PieceKind | undefined {
-  if (audio.format === "mp3") return { format: "mp3" };
+  if (audio.format === "mp3") return isMp3(audio.audio) ? { format: "mp3" } : undefined;
   const fmt = wavFormat(audio.audio);
   return fmt ? { format: "wav", fmt } : undefined;
 }
@@ -108,7 +111,7 @@ class Run {
   private readonly kind = deferred<PieceKind>();
   private readonly firstStart = deferred<PlayStart | undefined>();
   private readonly dir: string;
-  private failure?: Failure;
+  private failure?: string;
   private next = 0;
   /** Later pieces waiting for the first one's format. */
   private readonly checks: Promise<void>[] = [];
@@ -143,11 +146,10 @@ class Run {
     const pieces = this.slots.map((s) => s.value);
     const all = pieces.every((p) => p !== undefined);
     const joined = all && !this.failure ? joinPieces(pieces as SynthesizedAudio[]) : undefined;
-    if (all && !this.failure && !joined) this.fail({ reason: "the pieces could not be joined into one message" });
+    if (all && !this.failure && !joined) this.fail("the pieces could not be joined into one message");
     if (!joined) {
       this.end();
-      const f = this.failure;
-      if (f) throw new ReadingFailed(f.reason);
+      if (this.failure !== undefined) throw new ReadingFailed(this.failure);
       return { state: "stopped" };
     }
     const saved = await this.d.save(joined);
@@ -167,8 +169,8 @@ class Run {
   }
 
   /** The first failure ends the reading; one after a stop is only the stop's aftermath. */
-  private fail(f: Failure): undefined {
-    if (!this.halt.signal.aborted) this.failure = f;
+  private fail(reason: string): undefined {
+    if (!this.halt.signal.aborted) this.failure = reason;
     this.end();
     return undefined;
   }
@@ -195,7 +197,7 @@ class Run {
     try {
       audio = await this.d.synthesize(this.d.pieces[i], this.halt.signal, i);
     } catch (err) {
-      return this.fail({ reason: errorMessage(err) });
+      return this.fail(errorMessage(err));
     }
     if (this.stopped) return;
     return audio;
@@ -205,7 +207,7 @@ class Run {
   private acceptFirst(audio: SynthesizedAudio): void {
     const kind = kindOf(audio);
     if (!kind) {
-      this.fail({ reason: "the first piece is not a readable WAV" });
+      this.fail(`the first piece is not a readable ${audio.format.toUpperCase()}`);
       return;
     }
     this.kind.resolve(kind);
@@ -217,8 +219,8 @@ class Run {
     const first = await Promise.race([this.kind.promise, this.halted]);
     if (first === "halted") return;
     const kind = kindOf(audio);
-    if (!kind) this.fail({ reason: "a piece is not a readable WAV" });
-    else if (!sameKind(kind, first)) this.fail({ reason: "a piece came back in a different audio format" });
+    if (!kind) this.fail(`a piece is not a readable ${audio.format.toUpperCase()}`);
+    else if (!sameKind(kind, first)) this.fail("a piece came back in a different audio format");
     else this.slots[i].resolve(audio);
   }
 

@@ -175,7 +175,7 @@ describe("xai with an xAI login", () => {
     expect((await run("hello")).error).toMatch(/no voices/i);
   });
 
-  it("speaks: text, voice_id, language auto, WAV and MP3 in the history, played as a Stream, no OpenRouter", async () => {
+  it("speaks: text, voice_id, language auto, saved once as a WAV, played as a Stream, no OpenRouter", async () => {
     const svc = fakeServices();
     const { run, engine, local } = setup({ env: { OPENROUTER_API_KEY: "" } });
     await run("--set tts-model xai");

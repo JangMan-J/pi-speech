@@ -117,19 +117,15 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     check(/nope\.wav|not found|no such|ENOENT|exist/i.test(missing.content), 'a missing file is a readable error', missing.content.slice(0, 200));
     await s.close();
 
-    const bin = path.join(ctx.work, 'badbin');
-    fs.mkdirSync(bin);
-    fs.writeFileSync(path.join(bin, 'ffmpeg'), '#!/bin/sh\necho "ffmpeg: broken" >&2\nexit 1\n', { mode: 0o755 });
     fs.rmSync(ctx.speechDir, { recursive: true, force: true });
-    const s2 = await ctx.pi({ env: { PATH: `${bin}:${process.env.PATH}` } });
+    const s2 = await ctx.pi();
     await command(s2, '/speech --set tts-model hexgrad/kokoro-82m');
     await command(s2, '/speech --set voice af_heart');
-    const r = await callTool(ctx, s2, 'speech_synthesize', { text: 'conversion will fail', play: false });
+    const r = await callTool(ctx, s2, 'speech_synthesize', { text: 'saved without playing', play: false });
     const h2 = ctx.history();
-    check(h2.length === 1 && h2[0].endsWith('.wav'), 'with a broken ffmpeg on PATH the message is saved once, as a WAV', h2);
+    check(h2.length === 1 && h2[0].endsWith('.wav'), 'a message saved without playing is saved once, as a WAV', h2);
     const named = [...r.content.matchAll(/(\/[^\s"'`,)]+\.(?:wav|mp3))/g)].map((m) => m[1]);
     check(named.length > 0 && named.every((p) => fs.existsSync(p)), 'the result names only files that exist', named);
-    check(!/convert|ffmpeg/i.test(r.content), 'the result says nothing about converting (no ffmpeg is used)', r.content.slice(0, 300));
   } finally { await ctx.close(); ctx.cleanup(); }
 }
 

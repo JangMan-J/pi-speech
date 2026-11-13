@@ -70,7 +70,7 @@ function harness(opts: { refuse?: string } = {}) {
     save: async (audio): Promise<SavedMessage> => {
       await saving;
       saved.push(audio);
-      return { files: [`m.${audio.format}`] };
+      return { file: `m.${audio.format}` };
     },
     tmpRoot: dir,
   });
@@ -170,7 +170,7 @@ describe("speaking a text in pieces", () => {
     expect(h.saved).toEqual([]);
     await h.answer(2);
     const r = await run;
-    expect(r).toMatchObject({ state: "saved", saved: { files: ["m.wav"] } });
+    expect(r).toMatchObject({ state: "saved", saved: { file: "m.wav" } });
     expect(h.saved.length).toBe(1);
     expect(h.saved[0].format).toBe("wav");
     const b = Buffer.from(h.saved[0].audio);
@@ -185,7 +185,7 @@ describe("speaking a text in pieces", () => {
     await h.answer(0, { audio: new Uint8Array([0xff, 0xfb, 0]), format: "mp3" });
     await h.answer(1, { audio: new Uint8Array([0xff, 0xfb, 1]), format: "mp3" });
     const r = await run;
-    expect(r).toMatchObject({ state: "saved", saved: { files: ["m.mp3"] } });
+    expect(r).toMatchObject({ state: "saved", saved: { file: "m.mp3" } });
     expect(h.plays[0].endsWith(".mp3")).toBe(true);
     expect(h.saved[0].format).toBe("mp3");
     expect([...h.saved[0].audio]).toEqual([0xff, 0xfb, 0, 0xff, 0xfb, 1]);
@@ -205,6 +205,16 @@ describe("speaking a text in pieces", () => {
     expect(h.saved).toEqual([]);
     expect(h.requests[1].signal.aborted).toBe(true);
     expect(h.tempFiles()).toEqual([]);
+  });
+
+  it("an MP3 piece that is not MP3 is a failure", async () => {
+    const h = harness();
+    const run = failing(speakInPieces(h.deps(PIECES)));
+    await tick();
+    await h.answer(0, { audio: new Uint8Array([60, 104, 116, 109, 108]), format: "mp3" });
+    await expect(run).rejects.toThrow(/not a readable MP3/);
+    expect(h.plays).toEqual([]);
+    expect(h.saved).toEqual([]);
   });
 
   it("a later piece in another file format than the first is a failure, decided once the first is known", async () => {

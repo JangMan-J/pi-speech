@@ -1,7 +1,8 @@
 /**
  * The history of spoken messages. Derived from pi-openrouter-multimodal (MIT).
  * Each message is kept once, as `<stem>.wav` or `<stem>.mp3` in the format it came in; only the newest
- * HISTORY_KEEP messages stay. A history from earlier versions, with both files per message, still reads.
+ * HISTORY_KEEP messages stay. A history from earlier versions, with both files per message, still lists and
+ * prunes.
  */
 
 import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
@@ -17,7 +18,7 @@ export function historyDir(env: Record<string, string | undefined>, home: string
 
 export interface SavedMessage {
   /** The message's file. */
-  files: [string];
+  file: string;
 }
 
 /** A spoken message of the history, for replaying it. */
@@ -70,7 +71,7 @@ export class History {
     writeFileSync(file, audio);
     await onWritten?.(file);
     this.prune();
-    return { files: [file] };
+    return { file };
   }
 
   private newStem(text: string): string {
@@ -105,8 +106,7 @@ export class History {
       .sort()
       .at(-1);
     if (!stem) return undefined;
-    const files = entries.filter((e) => e.stem === stem).map((e) => e.file);
-    return join(this.dir, files.find((f) => f.endsWith(".mp3")) ?? files[0]);
+    return this.fileOf(entries, stem);
   }
 
   /** The messages of the history, the newest first. */
@@ -114,15 +114,20 @@ export class History {
     const entries = this.entries();
     const stems = [...new Set(entries.map((e) => e.stem))].sort().reverse();
     return stems.map((stem) => {
-      const files = entries.filter((e) => e.stem === stem).map((e) => e.file);
       const t = /^\d{4}-(\d{2}-\d{2})_(\d{2})-(\d{2})/.exec(stem);
       const title = stem.slice(stem.indexOf("_", 11) + 1);
       return {
-        file: join(this.dir, files.find((f) => f.endsWith(".mp3")) ?? files[0]),
+        file: this.fileOf(entries, stem),
         time: t ? `${t[1]} ${t[2]}:${t[3]}` : "",
         title: stem.indexOf("_", 11) === -1 ? "(no words)" : title.replace(/-/g, " "),
       };
     });
+  }
+
+  /** The file of message `stem`: its only one, or the MP3 of a message an earlier version saved twice. */
+  private fileOf(entries: { file: string; stem: string }[], stem: string): string {
+    const files = entries.filter((e) => e.stem === stem).map((e) => e.file);
+    return join(this.dir, files.find((f) => f.endsWith(".mp3")) ?? files[0]);
   }
 
   /** Delete every message except the newest HISTORY_KEEP (every file of each). */
