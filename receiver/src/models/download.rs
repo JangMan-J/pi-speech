@@ -11,7 +11,10 @@
 //! A stop (the `stop` flag) leaves the `.part` as it is, to be resumed by the next download.
 //!
 //! A shared lexicon (see [`lexicon`]) is fetched the same way into `<name>.part` in the cache
-//! root, checked, and renamed to `<name>`.
+//! root, checked, and renamed to `<name>`. Downloads of different voices may need the same
+//! lexicon at the same time (in other processes), so a fetch holds `<name>.lock` locked (the
+//! system's file lock, released when the process ends however it ends); another waits for it,
+//! then finds the lexicon in place or resumes the part the first one left.
 
 use super::cache;
 use super::catalog::{Entry, Lexicon};
@@ -119,8 +122,8 @@ pub fn download(
 }
 
 /// Download the shared `lexicon` into the cache at `root` unless it is there; returns its path.
-/// Reports `Event::LexiconProgress` only while it fetches. Plain `http://` only when
-/// `allow_http`.
+/// Reports `Event::LexiconProgress` only while it fetches, or waits for another download's fetch
+/// of it (see [`lock_lexicon`]). Plain `http://` only when `allow_http`.
 pub fn lexicon(
     lexicon: &Lexicon,
     root: &Path,
@@ -141,6 +144,12 @@ pub fn lexicon(
     fs::create_dir_all(root)
         .map_err(|e| format!("cannot create the model cache {}: {e}", root.display()))?;
     let part = cache::lexicon_part_path(root, lexicon);
+    // Held until the lexicon is in place, or the fetch has ended and left its part.
+    let _lock = lock_lexicon(lexicon, root, &part, stop, emit)?;
+    if target.is_file() {
+        // Another download fetched it while this one waited.
+        return Ok(target);
+    }
     let source = Source {
         what: format!("the lexicon {}", lexicon.name),
         file: format!("the lexicon {}", lexicon.name),
@@ -166,6 +175,65 @@ pub fn lexicon(
             target.display()
         ))),
     }
+}
+
+/// How often a download waiting for another's fetch of a lexicon looks again.
+const LOCK_POLL: Duration = Duration::from_millis(50);
+
+/// Lock the `lexicon`'s lock file in `root`, waiting while another download holds it. While it
+/// waits it reports the other's progress (the bytes in `part`), and once the other has put the
+/// lexicon in place, the whole of it. A stop while waiting leaves everything as it is.
+fn lock_lexicon(
+    lexicon: &Lexicon,
+    root: &Path,
+    part: &Path,
+    stop: &AtomicBool,
+    emit: &mut dyn FnMut(Event),
+) -> Result<File, Failure> {
+    let path = cache::lexicon_lock_path(root, lexicon);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    let total = lexicon.size;
+    let mut progress = |done: u64| {
+        emit(Event::LexiconProgress {
+            name: lexicon.name.clone(),
+            done,
+            total,
+        })
+    };
+    let mut waited = false;
+    let mut last: Option<Instant> = None;
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) => {}
+            Err(fs::TryLockError::Error(e)) => {
+                return Err(Failure::Failed(format!(
+                    "cannot lock {}: {e}",
+                    path.display()
+                )))
+            }
+        }
+        let done = fs::metadata(part).map_or(0, |m| m.len().min(total));
+        if stop.load(Ordering::SeqCst) {
+            return Err(Failure::Stopped { done });
+        }
+        if last.is_none_or(|t| t.elapsed() >= PROGRESS_EVERY) {
+            progress(done);
+            last = Some(Instant::now());
+        }
+        waited = true;
+        std::thread::sleep(LOCK_POLL);
+    }
+    if waited && cache::lexicon_path(root, lexicon).is_file() {
+        progress(total);
+    }
+    Ok(file)
 }
 
 /// A file to fetch: an archive or a lexicon.
@@ -473,6 +541,40 @@ mod tests {
         format!("http://{addr}/lexicon-xx.txt")
     }
 
+    /// Serve `body` over HTTP on 127.0.0.1 to one request for each of `pauses` (the whole of it,
+    /// whatever the range asked), slowly: 16 KiB at a time, that request's pause apart.
+    fn serve_slowly(body: Vec<u8>, pauses: &[Duration]) -> String {
+        use std::io::{BufRead, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let pauses = pauses.to_vec();
+        std::thread::spawn(move || {
+            for (stream, pause) in listener.incoming().zip(pauses) {
+                let mut stream = stream.unwrap();
+                let body = body.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+                        line.clear();
+                    }
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    for piece in body.chunks(16 * 1024) {
+                        if stream.write_all(piece).is_err() {
+                            return;
+                        }
+                        std::thread::sleep(pause);
+                    }
+                });
+            }
+        });
+        format!("http://{addr}/lexicon-xx.txt")
+    }
+
     fn scratch(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "pisr-{name}-{}",
@@ -527,6 +629,101 @@ mod tests {
             Err(Failure::Failed(e)) => assert!(e.contains("plain HTTP"), "{e}"),
             r => panic!("{r:?}"),
         }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn two_downloads_of_the_same_lexicon_at_once_both_get_the_whole_checked_file() {
+        let body: Vec<u8> = (0..256 * 1024u32).map(|i| (i * 31 % 251) as u8).collect();
+        let total = body.len() as u64;
+        let root = scratch("lexicon-twice");
+        let lexicon = Lexicon {
+            name: "lexicon-xx.txt".into(),
+            // A second request (there is none with the lock) would be the slower.
+            url: serve_slowly(
+                body.clone(),
+                &[Duration::from_millis(10), Duration::from_millis(100)],
+            ),
+            size: total,
+            sha256: hex(&Sha256::digest(&body)),
+        };
+        // Each returns what was at the path the moment it got it.
+        let run = || {
+            let (lexicon, root) = (lexicon.clone(), root.clone());
+            std::thread::spawn(move || {
+                let stop = AtomicBool::new(false);
+                let mut events = Vec::new();
+                let r = super::lexicon(&lexicon, &root, true, &stop, &mut |e| events.push(e));
+                let got = r.as_ref().ok().map(|p| fs::read(p).unwrap());
+                (r, got, events)
+            })
+        };
+        let first = run();
+        // The second starts while the first is midway. Without the lock it would begin the
+        // shared part again (the server sends the whole file whatever the range asked), and
+        // the first would put it in place before the second had rewritten its start.
+        let part = cache::lexicon_part_path(&root, &lexicon);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while fs::metadata(&part).map_or(0, |m| m.len()) < 128 * 1024 {
+            assert!(Instant::now() < deadline, "the first fetch did not start");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let second = run();
+        for run in [first, second] {
+            let (r, got, events) = run.join().unwrap();
+            assert_eq!(r, Ok(root.join("lexicon-xx.txt")));
+            assert!(got.as_deref() == Some(&body[..]), "not the whole lexicon");
+            assert_eq!(
+                events.last(),
+                Some(&Event::LexiconProgress {
+                    name: "lexicon-xx.txt".into(),
+                    done: total,
+                    total
+                })
+            );
+        }
+        assert!(!part.exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_download_waiting_for_another_fetch_of_its_lexicon_can_be_stopped() {
+        let root = scratch("lexicon-wait");
+        let lexicon = Lexicon {
+            name: "lexicon-xx.txt".into(),
+            url: "http://127.0.0.1:1/lexicon-xx.txt".into(),
+            size: 10,
+            sha256: "00".repeat(32),
+        };
+        fs::create_dir_all(&root).unwrap();
+        // Another download is fetching it: it holds the lock and has 4 bytes in the part.
+        let held = File::create(cache::lexicon_lock_path(&root, &lexicon)).unwrap();
+        held.lock().unwrap();
+        fs::write(cache::lexicon_part_path(&root, &lexicon), b"abcd").unwrap();
+        let stop = AtomicBool::new(false);
+        let mut events = Vec::new();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(150));
+                stop.store(true, Ordering::SeqCst);
+            });
+            let r = super::lexicon(&lexicon, &root, true, &stop, &mut |e| events.push(e));
+            assert_eq!(r, Err(Failure::Stopped { done: 4 }));
+        });
+        assert_eq!(
+            events.first(),
+            Some(&Event::LexiconProgress {
+                name: "lexicon-xx.txt".into(),
+                done: 4,
+                total: 10
+            })
+        );
+        // The other's part is left as it was.
+        assert_eq!(
+            fs::read(cache::lexicon_part_path(&root, &lexicon)).unwrap(),
+            b"abcd"
+        );
+        drop(held);
         fs::remove_dir_all(&root).unwrap();
     }
 

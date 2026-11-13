@@ -8,7 +8,9 @@
 //! unpacked); `<dir>.part` is a download in progress or interrupted; `.unpack-<dir>-*` is a
 //! directory being unpacked (left behind only by a hard kill, and removed by the next download).
 //! A shared lexicon (a Piper voice's) is the file `<name>` in the cache root, and `<name>.part`
-//! while it is being downloaded.
+//! while it is being downloaded. `<name>.lock` is an empty file that a download of the lexicon
+//! holds locked while it fetches, so that two downloads of voices that share it never write the
+//! same `<name>.part` at once; it stays in the cache (deleting it could let two locks coexist).
 
 use super::catalog::{Entry, Lexicon};
 use std::ffi::OsString;
@@ -91,6 +93,11 @@ pub fn lexicon_path(root: &Path, lexicon: &Lexicon) -> PathBuf {
 
 pub fn lexicon_part_path(root: &Path, lexicon: &Lexicon) -> PathBuf {
     root.join(format!("{}.part", lexicon.name))
+}
+
+/// The file a download of the shared `lexicon` holds locked while it fetches it.
+pub fn lexicon_lock_path(root: &Path, lexicon: &Lexicon) -> PathBuf {
+    root.join(format!("{}.lock", lexicon.name))
 }
 
 /// Whether `entry` can be used: it is downloaded, and so is the lexicon it needs, if any.
