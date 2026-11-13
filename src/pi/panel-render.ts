@@ -4,27 +4,18 @@
  * `width`, and every state reads the same without colour (symbols and words carry it).
  *
  * The panel is a dock in the place of Pi's editor, so it stays small: one header line that is also the top
- * rule; then the sections SPEAK, LISTEN and SYSTEM, each a quiet heading on its own line above its actions
- * (one toolbar line) and its settings; one status line; and the key hints. The settings of every section
- * share one label column, so their values line up, and each value's facts (price, then note) flow tight
- * right after it, ending with › for a row that opens a list — nothing floats off in a far column.
+ * rule; then, in the main view, the sections SPEAK (Alt+S), LISTEN (Alt+Z) and SETTINGS, each a quiet heading
+ * on its own line above its rows (in a submenu, its rows alone); one status line; and the key hints. The rows
+ * share one label column, so their values line up. A value is only the current value (a model or a voice by
+ * name: what it costs and offers is in its picker), followed by a note where something is wrong or a submenu
+ * explains it, and by › on a row that opens a picker or a submenu.
  *
- * What gives way when the width shrinks, first to last: the blank lines between sections and the headings;
- * then, per row, the note, `/min` of the price, the price, and only then the value itself (cut with …).
+ * What gives way when the width shrinks, first to last: the headings; then, per row, the note, and only then
+ * the value itself (cut with …).
  */
 
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import {
-  type Hint,
-  type InputView,
-  type PanelRow,
-  type PanelView,
-  type PickerItem,
-  type PickerView,
-  rowLines,
-  type SectionId,
-  type StatusTone,
-} from "../engine/panel";
+import type { Hint, InputView, PanelRow, PanelView, PickerItem, PickerView, StatusTone } from "../engine/panel";
 
 export interface PanelStyle {
   accent(text: string): string;
@@ -59,13 +50,13 @@ export const MAX_WIDTH = 96;
 export const MIN_WIDTH = 40;
 /** Picker rows shown at once. */
 export const PICKER_ROWS = 8;
-/** Each section is named by a quiet heading on its own line, above its rows. */
-const SECTIONS: Record<SectionId, string> = { speak: "SPEAK", listen: "LISTEN", system: "SYSTEM" };
 
 const MARKER = "▸ ";
 const NO_MARKER = "  ";
 const GAP = 2;
-/** The mark at the end of a row whose Enter opens a list. */
+/** The label column: one space after the longest label, and never narrower than this. */
+const MIN_LABEL = 19;
+/** The mark at the end of a row whose Enter opens a list or a submenu. */
 const OPENS = " ›";
 /** Where the input under a row starts. */
 const INPUT_INDENT = "    ";
@@ -150,10 +141,9 @@ function hintLine(hints: Hint[], w: number, s: PanelStyle): string {
 
 // ── Values and their notes ───────────────────────────────────────────────
 
-/** A value and what is said after it: a price, then a note (or its short form); all optional. */
+/** A value and what is said after it: a note (or its short form); all optional. */
 interface Entry {
   value: string;
-  price?: string;
   note?: string;
   short?: string;
   alert?: boolean;
@@ -166,14 +156,13 @@ interface Drawn {
   width: number;
 }
 
-/** The separator between a value and its facts, and between facts: `value · price · note`. */
+/** The separator between a value and its note: `value · note`. */
 const SEP = " · ";
 
 /**
- * One value drawn tight in `room` columns: `value · price · note ›`, the facts in dim right after the value so
- * nothing floats off in a far column. When it does not fit the note goes first, then `/min`, then the price;
- * only then is the value itself cut with …. A row that opens a list keeps its › at the end; an alert keeps its
- * ✗ beside the value when its facts are gone.
+ * One value drawn tight in `room` columns: `value · note ›`, the note in dim right after the value. When it does
+ * not fit the note gives way to its short form, then goes; only then is the value itself cut with …. A row that
+ * opens a list keeps its › at the end; an alert keeps its ✗ beside the value when its note is gone.
  */
 function drawEntry(e: Entry, room: number, s: PanelStyle, valueStyle: (t: string) => string): Drawn {
   const chev = e.opens ? OPENS : "";
@@ -187,9 +176,7 @@ function drawEntry(e: Entry, room: number, s: PanelStyle, valueStyle: (t: string
     const text = parts.length ? SEP + parts.join(SEP) : "";
     tails.push({ plain: text, styled: text ? factStyle(text) : "" });
   };
-  fact([e.price, e.note].filter((x): x is string => !!x));
-  if (e.price && e.note) fact([e.price]);
-  if (e.price) fact([e.price.replace(/\/min$/, "")]);
+  if (e.note) fact([e.note]);
   if (e.short) fact([e.short]);
   if (e.alert) tails.push({ plain: " ✗", styled: s.error(" ✗") });
   fact([]);
@@ -215,38 +202,23 @@ interface Line {
 const keep = (text: string): Line => ({ text });
 const optional = (drop: number, text = ""): Line => ({ text, drop });
 
-/** The actions of a section side by side, wrapped when they do not fit: `▸ Speak… (Alt+S)   Replay last (r)`. */
-function toolbarLines(rows: PanelRow[], indexes: number[], selected: number, w: number, s: PanelStyle): string[] {
-  const lines: string[] = [];
-  let line = "";
-  let used = 0;
-  for (const i of indexes) {
-    const r = rows[i];
-    const key = r.key ? ` (${r.key})` : "";
-    const cell = MARKER.length + width(r.label + key);
-    if (used > 0 && used + GAP + cell > w) {
-      lines.push(line);
-      line = "";
-      used = 0;
-    }
-    const gap = used > 0 ? spaces(GAP) : "";
-    const drawn = i === selected ? s.selected(MARKER + r.label + key) : NO_MARKER + r.label + s.dim(key);
-    line += gap + drawn;
-    used += gap.length + cell;
-  }
-  if (line) lines.push(line);
-  return lines;
-}
-
-function settingLines(rows: PanelRow[], selected: number, w: number, s: PanelStyle): string[] {
-  const labelW = Math.max(...rows.map((r) => width(r.label))) + GAP;
+/** The rows, their labels in one column and their values lined up after it. */
+function rowTexts(rows: PanelRow[], selected: number, w: number, s: PanelStyle): string[] {
+  const labelW = Math.max(MIN_LABEL, ...rows.map((r) => width(r.label) + 1));
   const room = Math.max(0, w - MARKER.length - labelW);
   return rows.map((r, i) => {
     const on = i === selected;
     const marker = on ? s.accent(MARKER) : NO_MARKER;
-    const label = on ? s.bold(pad(r.label, labelW)) : s.dim(pad(r.label, labelW));
+    const labelStyle = on ? s.bold : s.dim;
+    // A submenu row has no value: its › stands right after the label.
+    if (r.value === undefined) {
+      const label = cut(r.label, w - MARKER.length - (r.opens ? width(OPENS) : 0));
+      const line = marker + labelStyle(label) + (r.opens ? s.dim(OPENS) : "");
+      return on ? s.selected(pad(line, w)) : line;
+    }
+    const label = labelStyle(pad(cut(r.label, labelW - 1), labelW));
     const entry = drawEntry(
-      { value: r.value ?? "", price: r.price, note: r.note, short: r.short, alert: r.alert, opens: r.opens },
+      { value: r.value, note: r.note, short: r.short, alert: r.alert, opens: r.opens },
       room,
       s,
       on ? s.bold : same,
@@ -292,31 +264,23 @@ function inputLine(input: InputView, w: number, s: PanelStyle): string {
 }
 
 /**
- * The sections, each under a quiet heading on its own line: the actions as a toolbar, then the settings. The
- * settings of every section share one label column, so their values line up; the blank line between sections
- * and the headings give way first on a short terminal.
+ * The rows: in the main view each section under its heading (which carries its hotkey); in a submenu, the rows
+ * alone. The headings give way first on a short terminal.
  */
 const BODY = "  ";
 function homeLines(view: PanelView, w: number, s: PanelStyle): Line[] {
   const cw = Math.max(0, w - BODY.length);
-  const settings = view.rows.filter((r) => r.group === "setting");
-  const drawn = settingLines(settings, settings.indexOf(view.rows[view.selected]), cw, s);
+  const drawn = rowTexts(view.rows, view.selected, cw, s);
   const input = view.input;
   const out: Line[] = [];
-  let section: SectionId | undefined;
-  for (const line of rowLines(view.rows)) {
-    const first = view.rows[line[0]];
-    if (first.section !== section) {
-      if (section !== undefined) out.push(optional(2));
-      out.push(optional(3, s.dim(SECTIONS[first.section])));
-      section = first.section;
-    }
-    const texts =
-      first.group === "action" ? toolbarLines(view.rows, line, view.selected, cw, s) : [drawn[settings.indexOf(first)]];
-    for (const text of texts) out.push(keep(BODY + text));
-    if (input?.under && line.some((i) => view.rows[i].id === input.under))
-      out.push(keep(BODY + inputLine(input, cw, s)));
-  }
+  let section: string | undefined;
+  view.rows.forEach((row, i) => {
+    const heading = row.section && view.headings?.[row.section];
+    if (heading && row.section !== section) out.push(optional(3, s.dim(cut(heading, w))));
+    section = row.section;
+    out.push(keep(BODY + drawn[i]));
+    if (input?.under === row.id) out.push(keep(BODY + inputLine(input, cw, s)));
+  });
   return out;
 }
 
@@ -435,7 +399,8 @@ function pickerLines(p: PickerView, w: number, s: PanelStyle, rows: number): Lin
 
 /** The title, a rule to the right edge, and what speech is doing: `Speech › Voice ─────── ▶ speaking`. */
 function headerLine(view: PanelView, w: number, s: PanelStyle): string {
-  const crumb = view.picker ? ` › ${view.picker.title}` : "";
+  const sub = view.picker?.title ?? view.crumb;
+  const crumb = sub ? ` › ${sub}` : "";
   const state = cut(view.state, Math.max(0, w - 8));
   const taken = state ? width(state) + 1 : 0;
   const title = cut(view.title + crumb, w - taken);
@@ -483,7 +448,7 @@ export function renderPanel(view: PanelView, total: number, s: PanelStyle = PLAI
     keep(headerLine(view, w, s)),
     ...body,
     ...slot,
-    keep(hintLine(view.hints, w, s)),
+    keep(BODY + hintLine(view.hints, w - BODY.length, s)),
     optional(4, s.dim("─".repeat(w))),
   ];
   for (let level = 1; lines.length > height && level <= 5; level++) {

@@ -4,6 +4,7 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { KeyId } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import type { Engine } from "../engine/engine";
 import { errorMessage } from "../engine/env";
@@ -134,7 +135,24 @@ export function registerPi(pi: ExtensionAPI, engine: Engine, env: NodeJS.Process
     void engine.readAloud.onRunEnd(event.messages ?? []);
   });
 
-  pi.registerShortcut("alt+z", {
+  // Pi binds an extension's shortcuts when it loads the extension: a key changed in Hotkeys applies from the
+  // next /reload or start of Pi, and until then these stay bound.
+  const hotkeys = { ...engine.speech.settings.hotkeys };
+  const open = (ctx: ExtensionContext, speak: boolean) =>
+    openPanel(
+      ctx,
+      engine,
+      surface,
+      surfaceUi(ctx),
+      env,
+      (p) => {
+        panel = p;
+      },
+      speak,
+      hotkeys,
+    );
+
+  pi.registerShortcut(hotkeys.dictate as KeyId, {
     description: "Dictate: record, then press again to insert the transcript at the cursor (never sends)",
     handler: async (ctx) => {
       attach(ctx);
@@ -142,21 +160,11 @@ export function registerPi(pi: ExtensionAPI, engine: Engine, env: NodeJS.Process
     },
   });
 
-  pi.registerShortcut("alt+s", {
+  pi.registerShortcut(hotkeys.speak as KeyId, {
     description: "Speak messages: Enter speaks and clears the composer, ready for the next; Esc closes",
     handler: async (ctx) => {
       attach(ctx);
-      await openPanel(
-        ctx,
-        engine,
-        surface,
-        surfaceUi(ctx),
-        env,
-        (p) => {
-          panel = p;
-        },
-        true,
-      );
+      await open(ctx, true);
     },
   });
 
@@ -181,9 +189,7 @@ export function registerPi(pi: ExtensionAPI, engine: Engine, env: NodeJS.Process
       try {
         // With a terminal UI, /speech alone opens the settings panel; elsewhere (RPC) the menu of dialogs.
         if (parse(args).kind === "menu" && hasTerminal(ctx)) {
-          await openPanel(ctx, engine, surface, surfaceUi(ctx), env, (p) => {
-            panel = p;
-          });
+          await open(ctx, false);
           return;
         }
         await surface.run(args, surfaceUi(ctx));

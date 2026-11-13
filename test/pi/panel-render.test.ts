@@ -3,88 +3,85 @@ import { describe, expect, it } from "vitest";
 import type { Hint, PanelRow, PanelView, PickerItem, PickerView } from "../../src/engine/panel";
 import { type PanelStyle, PLAIN, renderPanel } from "../../src/pi/panel-render";
 
-const ACTIONS = ["Speak…", "Replay last", "History…", "Stop", "Dictate", "Transcribe file…"];
-const SETTINGS = [
-  "Speech model",
-  "Voice",
-  "Read replies aloud",
-  "Transcription",
-  "Dictation language",
-  "Play audio on",
-  "Agent tools",
-];
-/** Every row in the order it is drawn. */
-const ORDER = [...ACTIONS.slice(0, 4), ...SETTINGS.slice(0, 3), ...ACTIONS.slice(4), ...SETTINGS.slice(3)];
-const PICKER_ROWS = ["Speech model", "Voice", "Transcription", "Dictation language"];
-const TOGGLE_ROWS = ["Play audio on", "Read replies aloud", "Agent tools"];
-
+/** The main view as in the agreed mockup. */
 const rows: PanelRow[] = [
-  { id: "speak", section: "speak", group: "action", label: "Speak…", key: "Alt+S" },
-  { id: "replay", section: "speak", group: "action", label: "Replay last", key: "r" },
-  { id: "history", section: "speak", group: "action", label: "History…", key: "h" },
-  { id: "stop", section: "speak", group: "action", label: "Stop", key: "s" },
-  {
-    id: "speechModel",
-    section: "speak",
-    group: "setting",
-    label: "Speech model",
-    value: "google/gemini-3.8-flash-tts",
-    price: "~$0.014/min",
-    note: "tags · fast",
-    opens: true,
-  },
-  {
-    id: "voice",
-    section: "speak",
-    group: "setting",
-    label: "Voice",
-    value: "Kore",
-    note: "multilingual · documented",
-    opens: true,
-  },
-  { id: "readAloud", section: "speak", group: "setting", label: "Read replies aloud", value: "off" },
-  { id: "dictate", section: "listen", group: "action", label: "Dictate", key: "Alt+Z" },
-  { id: "transcribe", section: "listen", group: "action", label: "Transcribe file…", key: "t" },
+  { id: "readAloud", section: "speak", label: "Read aloud options", value: "Off" },
+  { id: "speechSource", section: "speak", label: "Speech source", value: "Provider" },
+  { id: "speechModel", section: "speak", label: "Speech model", value: "x-ai/grok-voice-tts-1.0", opens: true },
+  { id: "voice", section: "speak", label: "Voice", value: "eve", opens: true },
+  { id: "transcriptionSource", section: "listen", label: "Transcription source", value: "Provider" },
   {
     id: "transcription",
     section: "listen",
-    group: "setting",
-    label: "Transcription",
+    label: "Transcription model",
     value: "openai/whisper-large-v3-turbo",
-    price: "$0.0002/min",
-    note: "99+ langs · fast",
     opens: true,
   },
-  {
-    id: "language",
-    section: "listen",
-    group: "setting",
-    label: "Dictation language",
-    value: "auto",
-    note: "the model detects it",
-    opens: true,
-  },
-  { id: "audio", section: "system", group: "setting", label: "Play audio on", value: "auto", note: "→ this machine" },
-  { id: "tools", section: "system", group: "setting", label: "Agent tools", value: "on" },
+  { id: "language", section: "listen", label: "Dictation language", value: "auto" },
+  { id: "output", section: "listen", label: "Dictation output", value: "Pi", opens: true },
+  { id: "hotkeys", section: "settings", label: "Hotkeys", opens: true },
+  { id: "bridge", section: "settings", label: "Bridge connection", opens: true },
 ];
+const LABELS = rows.map((r) => r.label);
 /** Where rows are in `rows`, for `selected`. */
 const at = (id: PanelRow["id"]) => rows.findIndex((r) => r.id === id);
-const VALUES = SETTINGS.map((l) => rows.find((r) => r.label === l)?.value ?? "");
+
+const HEADINGS = { speak: "SPEAK (Alt+S)", listen: "LISTEN (Alt+Z)", settings: "SETTINGS" };
 
 function view(over: Partial<PanelView> = {}): PanelView {
   return {
     title: "Speech",
     state: "",
+    menu: "main",
+    headings: HEADINGS,
     rows,
     selected: 0,
     hints: [
-      { key: "Enter", action: "type messages to speak" },
-      { key: "←→", action: "more", optional: true },
+      { key: "←→", action: "Off · All" },
       { key: "Esc", action: "close" },
     ],
     ...over,
   };
 }
+
+const hotkeyRows: PanelRow[] = [
+  { id: "speak", label: "Speak…", value: "Alt+S" },
+  { id: "dictate", label: "Dictate", value: "Alt+Z" },
+  { id: "replay", label: "Replay last", value: "r" },
+  { id: "history", label: "History…", value: "h" },
+  { id: "stop", label: "Stop", value: "s" },
+  { id: "transcribe", label: "Transcribe file…", value: "t" },
+];
+
+function hotkeys(over: Partial<PanelView> = {}): PanelView {
+  return {
+    title: "Speech",
+    state: "",
+    menu: "hotkeys",
+    crumb: "Hotkeys",
+    rows: hotkeyRows,
+    selected: 0,
+    hints: [
+      { key: "Enter", action: "run" },
+      { key: "k", action: "change key" },
+      { key: "Esc", action: "back" },
+    ],
+    ...over,
+  };
+}
+
+const bridge = (note: string, alert = false): PanelView => ({
+  title: "Speech",
+  state: "",
+  menu: "bridge",
+  crumb: "Bridge connection",
+  rows: [{ id: "bridgeMode", label: "Bridge", value: "auto", note, short: "✗ receiver unreachable", alert }],
+  selected: 0,
+  hints: [
+    { key: "←→", action: "auto · on · off" },
+    { key: "Esc", action: "back" },
+  ],
+});
 
 const VOICE_HINTS: Hint[] = [
   { key: "Enter", action: "pick" },
@@ -94,9 +91,8 @@ const VOICE_HINTS: Hint[] = [
   { key: "Esc", action: "back" },
 ];
 
-/** The row containing `label`; settings start with it, while toolbar actions share a line. */
-const row = (lines: string[], label: string) =>
-  lines.find((l) => l.replace(/^[\s▸>]+/, "").startsWith(label)) ?? lines.find((l) => l.includes(label));
+/** The row starting with `label` (after the marker). */
+const row = (lines: string[], label: string) => lines.find((l) => l.replace(/^[\s▸>]+/, "").startsWith(label));
 const widest = (lines: string[]) => Math.max(...lines.map((l) => visibleWidth(l)));
 const hintLine = (lines: string[]) => [...lines].reverse().find((l) => /Esc/.test(l)) ?? "";
 
@@ -131,94 +127,65 @@ const tags = (l: string) =>
 const untag = (l: string) => l.replace(/<\/?[a-z]>/g, "");
 const styled = (v: PanelView, w: number) => renderPanel(v, w, TAGS).map(tags);
 
-describe("drawing the panel", () => {
-  it("wide: the header is the top rule, three headings on their own lines, aligned labels and values, facts tight", () => {
-    for (const w of [110, 96]) {
+/** The agreed main view, the first row selected. */
+const MOCKUP = [
+  "SPEAK (Alt+S)",
+  "  ▸ Read aloud options   Off",
+  "    Speech source        Provider",
+  "    Speech model         x-ai/grok-voice-tts-1.0 ›",
+  "    Voice                eve ›",
+  "LISTEN (Alt+Z)",
+  "    Transcription source Provider",
+  "    Transcription model  openai/whisper-large-v3-turbo ›",
+  "    Dictation language   auto",
+  "    Dictation output     Pi ›",
+  "SETTINGS",
+  "    Hotkeys ›",
+  "    Bridge connection ›",
+];
+
+const HOTKEYS_MOCKUP = [
+  "  ▸ Speak…             Alt+S",
+  "    Dictate            Alt+Z",
+  "    Replay last        r",
+  "    History…           h",
+  "    Stop               s",
+  "    Transcribe file…   t",
+];
+
+describe("drawing the main view", () => {
+  it("draws the agreed mockup: headings with their keys, one label column, only current values, › where a row opens", () => {
+    for (const w of [96, 80, 60]) {
       const lines = renderPanel(view(), w);
-      expect(widest(lines)).toBeLessThanOrEqual(96);
-      expect(lines[0]).toMatch(/^Speech ─{80,}$/);
-      expect(lines.at(-1)).toMatch(/^─{96}$/);
-      const order = ORDER.map((l) => lines.indexOf(row(lines, l) ?? ""));
-      expect(order.every((v, i) => v >= 0 && (i === 0 || v >= order[i - 1]))).toBe(true);
-      // each section is a quiet heading on its own line, above its rows
-      expect(lines.filter((l) => /^(SPEAK|LISTEN|SYSTEM)$/.test(l))).toEqual(["SPEAK", "LISTEN", "SYSTEM"]);
-      expect(lines.indexOf("SPEAK")).toBeLessThan(lines.indexOf(row(lines, "Speak…") ?? ""));
-      expect(row(lines, "Speak…")).toBe("  ▸ Speak… (Alt+S)    Replay last (r)    History… (h)    Stop (s)");
-      expect(row(lines, "Dictate")).toBe("    Dictate (Alt+Z)    Transcribe file… (t)");
-      // the labels line up in one column, and so do the values
-      expect(new Set(SETTINGS.map((l) => row(lines, l)?.indexOf(l))).size).toBe(1);
-      expect(new Set(SETTINGS.map((l, i) => row(lines, l)?.indexOf(VALUES[i]))).size).toBe(1);
-      // the facts flow tight after the value — price, then note — ending with › for a list
-      expect(row(lines, "Speech model")).toMatch(/flash-tts · ~\$0\.014\/min · tags · fast ›$/);
-      expect(row(lines, "Transcription")).toMatch(/turbo · \$0\.0002\/min · 99\+ langs · fast ›$/);
-      expect(row(lines, "Voice")).toMatch(/Kore · multilingual · documented ›$/);
-      expect(row(lines, "Play audio on")).toMatch(/auto · → this machine$/);
-      expect(hintLine(lines).trim()).toBe("Enter type messages to speak · ←→ more · Esc close");
+      expect(lines[0]).toMatch(new RegExp(`^Speech ─{${w - 7}}$`));
+      expect(lines.slice(1, 1 + MOCKUP.length)).toEqual(MOCKUP);
+      expect(lines.slice(1 + MOCKUP.length)).toEqual(["", "", "  ←→ Off · All · Esc close", "─".repeat(w)]);
     }
   });
 
-  it("rows that open a list end with › tight after their facts; toggle rows do not", () => {
-    const lines = renderPanel(view(), 96);
-    for (const l of PICKER_ROWS) expect(row(lines, l)).toMatch(/›$/);
-    for (const l of TOGGLE_ROWS) expect(row(lines, l)).not.toMatch(/›\s*$/);
-    // the › sits right after the facts, not floated off to the far edge
-    expect(row(lines, "Voice")).toMatch(/documented ›$/);
-    expect((row(lines, "Voice") ?? "").length).toBeLessThan(96);
-    expect(row(lines, "Voice")).not.toMatch(/Voice: |\(select/);
+  it("never wider than 96 columns, whatever the terminal", () => {
+    const lines = renderPanel(view(), 160);
+    expect(widest(lines)).toBe(96);
+    expect(lines.slice(1, 1 + MOCKUP.length)).toEqual(MOCKUP);
   });
 
-  it("at 80 columns each section is a heading, and a model's features give way to its price", () => {
-    const lines = renderPanel(view(), 80);
-    expect(widest(lines)).toBeLessThanOrEqual(80);
-    expect(lines).toContain("SPEAK");
-    expect(lines.some((l) => /▸ Speak… \(Alt\+S\)/.test(l))).toBe(true);
-    expect(row(lines, "Speech model")).toMatch(/flash-tts · ~\$0\.014\/min ›$/);
-    expect(row(lines, "Voice")).toMatch(/multilingual · documented ›$/);
-    expect(lines.join("\n")).not.toMatch(/tags · fast/);
-  });
-
-  it("narrower, each section is a heading, and facts give way before the value is cut", () => {
-    const lines = renderPanel(view({ selected: at("transcription") }), 60);
-    expect(widest(lines)).toBeLessThanOrEqual(60);
-    for (const l of ORDER) expect(row(lines, l), l).toBeDefined();
-    expect(lines.filter((l) => /^(SPEAK|LISTEN|SYSTEM)$/.test(l))).toEqual(["SPEAK", "LISTEN", "SYSTEM"]);
-    expect(row(lines, "Speak…")).toBe("    Speak… (Alt+S)    Replay last (r)    History… (h)");
-    expect(lines.join("\n")).not.toMatch(/tags · fast/);
-    // a long value keeps its whole name and its ›; its price gives way to make room
-    expect(row(lines, "Speech model")).toMatch(/Speech model\s+google\/gemini-3\.8-flash-tts ›$/);
-    expect(lines.some((l) => /▸ Transcription\s+openai\/whisper-large-v3-turbo ›$/.test(l))).toBe(true);
-    // a short value keeps its note
-    expect(row(lines, "Voice")).toMatch(/Kore · multilingual · documented ›$/);
-    for (const l of PICKER_ROWS) expect(row(lines, l)).toMatch(/›$/);
-  });
-
-  it("at 70 columns prices keep /min and line up on the right", () => {
-    const lines = renderPanel(view(), 70);
-    expect(row(lines, "Speech model")).toMatch(/~\$0\.014\/min ›$/);
-    expect(row(lines, "Transcription")).toMatch(/\$0\.0002\/min ›$/);
-  });
-
-  it("narrower still, notes go and values are truncated with … last", () => {
-    const lines = renderPanel(view(), 45);
+  it("narrower, a long value is cut with … and keeps its ›; the labels stay", () => {
+    const lines = renderPanel(view({ selected: at("transcription") }), 45);
     expect(widest(lines)).toBeLessThanOrEqual(45);
-    expect(row(lines, "Transcription")).toMatch(/openai\/whisper.*… ›$/);
-    expect(row(lines, "Speech model")).not.toMatch(/\$/);
-    expect(row(lines, "Play audio on")).toMatch(/auto · → this machine$/);
-    expect(hintLine(lines)).toMatch(/Esc close$/);
+    for (const l of LABELS) expect(row(lines, l), l).toBeDefined();
+    expect(row(lines, "Transcription model")).toMatch(/openai\/whisper.*… ›$/);
+    expect(row(lines, "Voice")).toMatch(/Voice\s+eve ›$/);
   });
 
-  it("an alert keeps its ✗ next to the value when its note is hidden", () => {
+  it("a note says what is wrong; when it does not fit, its short form, then only the ✗", () => {
     const alerting = rows.map((r) =>
-      r.id === "audio"
-        ? { ...r, note: "→ bridge ✗ receiver unreachable", short: "✗ receiver unreachable", alert: true }
-        : r,
+      r.id === "speechModel" ? { ...r, note: "✗ xAI: no login", short: "✗ no login", alert: true } : r,
     );
-    expect(row(renderPanel(view({ rows: alerting }), 90), "Play audio on")).toMatch(
-      /auto · → bridge ✗ receiver unreachable$/,
+    expect(row(renderPanel(view({ rows: alerting }), 80), "Speech model")).toMatch(
+      /x-ai\/grok-voice-tts-1\.0 · ✗ xAI: no login ›$/,
     );
-    // when the whole note no longer fits, the short form stands in; narrower still, only the ✗ stays
-    expect(row(renderPanel(view({ rows: alerting }), 56), "Play audio on")).toMatch(/auto · ✗ receiver unreachable$/);
-    expect(row(renderPanel(view({ rows: alerting }), 42), "Play audio on")).toMatch(/auto ✗$/);
+    expect(row(renderPanel(view({ rows: alerting }), 64), "Speech model")).toMatch(/1\.0 · ✗ no login ›$/);
+    expect(row(renderPanel(view({ rows: alerting }), 52), "Speech model")).toMatch(/1\.0 ✗ ›$/);
   });
 
   it("below 40 columns shows one line instead of a broken layout", () => {
@@ -240,33 +207,38 @@ describe("drawing the panel", () => {
       current: i === 2,
     }));
     const picker = pickerView({ items, total: 30, selected: 14, title: "Speech model", sort: "price", show: "all" });
-    for (let w = 1; w <= 130; w++) {
+    for (let w = 1; w <= 170; w++) {
       for (const v of [
         view(),
         view({ rows: longRows, state: "● REC 12:34" }),
         view({ picker, hints: VOICE_HINTS }),
-        view({ input: { label: "", value: "x".repeat(200), cursor: 100, placeholder: "", under: "speak" } }),
+        view({
+          input: { label: "Spoken language", value: "x".repeat(200), cursor: 100, placeholder: "", under: "language" },
+        }),
         view({ status: { tone: "error", text: `✗ ${"very long reason ".repeat(10)}` } }),
+        hotkeys(),
+        hotkeys({
+          rows: hotkeyRows.map((r) => (r.id === "speak" ? { ...r, note: "→ Ctrl+Alt+Shift+D after /reload" } : r)),
+        }),
+        bridge("on over SSH · plays on the Remote machine · ✗ receiver unreachable", true),
       ]) {
         expect(widest(renderPanel(v, w)), `width ${w}`).toBeLessThanOrEqual(w);
       }
     }
   });
 
-  it("on a short terminal gives up blank lines and rules first, then shows one line", () => {
+  it("on a short terminal gives up the blank lines, the rule and the headings, then shows one line", () => {
     const full = renderPanel(view(), 84);
     expect(renderPanel(view(), 84, PLAIN, 40)).toEqual(full);
     for (const h of [16, 14, 13]) {
-      const lines = renderPanel(view({ status: { tone: "success", text: "✓ Agent tools: off" } }), 84, PLAIN, h);
+      const lines = renderPanel(view({ status: { tone: "success", text: "✓ Read aloud: All" } }), 84, PLAIN, h);
       expect(lines.length, `height ${h}`).toBeLessThanOrEqual(h);
       expect(lines[0]).toMatch(/^Speech/);
       expect(hintLine(lines)).toMatch(/Esc close$/);
-      for (const l of [...ACTIONS, ...SETTINGS]) expect(row(lines, l), `${l} at ${h}`).toBeDefined();
-      expect(
-        lines.some((l) => l.includes("✓ Agent tools: off")),
-        `status at ${h}`,
-      ).toBe(true);
+      for (const l of LABELS) expect(row(lines, l), `${l} at ${h}`).toBeDefined();
+      expect(lines.some((l) => l.includes("✓ Read aloud: All"))).toBe(true);
     }
+    expect(renderPanel(view(), 84, PLAIN, 13)).not.toContain("SETTINGS");
     const tiny = renderPanel(view(), 84, PLAIN, 9);
     expect(tiny).toHaveLength(1);
     expect(tiny[0]).toMatch(/too small/);
@@ -281,43 +253,75 @@ describe("drawing the panel", () => {
     expect(rec).toContain("<e>●</e> REC 0:07");
   });
 
-  it("the status line shows errors and successes with their symbol, under the list", () => {
+  it("the status line shows errors and successes with their symbol, under the rows, after a blank line", () => {
     const lines = renderPanel(
       view({ status: { tone: "error", text: "✗ xAI: no login. Log in to xAI in Pi (/login)" } }),
       84,
     );
-    const at = lines.findIndex((l) => l.includes("✗ xAI: no login"));
-    expect(at).toBeGreaterThan(lines.indexOf(row(lines, "Agent tools") ?? ""));
+    const si = lines.findIndex((l) => l.includes("✗ xAI: no login"));
+    expect(si).toBeGreaterThan(lines.indexOf(row(lines, "Bridge connection") ?? ""));
+    expect(lines[si - 1]).toBe("");
     const ok = styled(view({ status: { tone: "success", text: "✓ Spoken" } }), 84);
     expect(ok.some((l) => l.includes("<s>✓ Spoken</s>"))).toBe(true);
-    // a blank line sets the confirmation apart from the menu above it
-    const plain = renderPanel(view({ status: { tone: "success", text: "✓ Spoken" } }), 84);
-    const si = plain.findIndex((l) => l.includes("✓ Spoken"));
-    expect(plain[si - 1].trim()).toBe("");
+  });
+});
+
+describe("drawing a submenu", () => {
+  it("Hotkeys as agreed: the title in the header, each action with its key, the hints", () => {
+    for (const w of [96, 80]) {
+      const lines = renderPanel(hotkeys(), w);
+      expect(lines[0]).toMatch(/^Speech › Hotkeys ─+$/);
+      expect(lines.slice(1, 7)).toEqual(HOTKEYS_MOCKUP);
+      expect(lines.slice(7)).toEqual(["", "", "  Enter run · k change key · Esc back", "─".repeat(w)]);
+    }
+  });
+
+  it("a changed key waits beside the bound one", () => {
+    const changed = hotkeyRows.map((r) => (r.id === "speak" ? { ...r, note: "→ Alt+D after /reload" } : r));
+    expect(row(renderPanel(hotkeys({ rows: changed }), 80), "Speak…")).toBe(
+      "  ▸ Speak…             Alt+S · → Alt+D after /reload",
+    );
+  });
+
+  it("the input of Transcribe file… is drawn under its row", () => {
+    const input = { label: "Audio file", value: "", cursor: 0, placeholder: "wav, mp3", under: "transcribe" as const };
+    const lines = renderPanel(hotkeys({ input, selected: 5 }), 80);
+    const i = lines.indexOf(row(lines, "Transcribe file…") ?? "");
+    expect(lines[i + 1]).toMatch(/^ {6}Audio file\s+wav, mp3$/);
+  });
+
+  it("Bridge connection: the mode and where audio plays; the note gives way to its short form", () => {
+    const note = "on over SSH · plays on the Remote machine · ✗ receiver unreachable";
+    let lines = renderPanel(bridge(note, true), 96);
+    expect(lines[0]).toMatch(/^Speech › Bridge connection ─+$/);
+    expect(lines[1]).toBe(`  ▸ Bridge             auto · ${note}`);
+    lines = renderPanel(bridge(note, true), 60);
+    expect(lines[1]).toBe("  ▸ Bridge             auto · ✗ receiver unreachable");
   });
 });
 
 describe("emphasis", () => {
-  it("the title is accent and bold; headings and facts dim, values normal; the selected line bold and marked ▸", () => {
+  it("the title is accent and bold; headings and labels dim, values normal; the selected line bold and marked ▸", () => {
     const lines = styled(view({ selected: at("voice") }), 96);
     expect(lines[0]).toMatch(/^<a><b>Speech<\/b><\/a> <d>─+<\/d>$/);
-    // a section is a dim heading on its own line; an action's key is dim
-    expect(lines).toContain("<d>SPEAK</d>");
-    expect(lines.find((l) => untag(l).includes("Replay last"))).toMatch(/Speak…<d> \(Alt\+S\)<\/d>/);
+    expect(lines).toContain("<d>SPEAK (Alt+S)</d>");
     const voice = lines.find((l) => untag(l).includes("Voice")) ?? "";
     expect(voice).toContain("<c>");
     expect(voice).toContain("<a>▸ </a>");
     expect(voice).toContain("<b>Voice");
-    expect(voice).toContain("<b>Kore");
-    expect(voice).not.toContain("<d>Voice");
-    expect(voice).toContain("<d> · multilingual · documented</d>");
+    expect(voice).toContain("<b>eve");
+    expect(voice).toContain("<d> ›</d>");
     const model = lines.find((l) => untag(l).includes("Speech model")) ?? "";
     expect(model).toContain("<d>Speech model");
-    expect(model).not.toMatch(/<[bd]>google/);
-    expect(model).toMatch(/<d> · ~\$0\.014\/min · tags · fast<\/d>/);
-    // a selected action is one reversed cell marked ▸
-    const speak = styled(view(), 96).find((l) => untag(l).includes("Speak…")) ?? "";
-    expect(speak).toContain("<c>▸ Speak… (Alt+S)</c>");
+    expect(model).not.toMatch(/<[bd]>x-ai/);
+    const hk = lines.find((l) => untag(l).includes("Hotkeys")) ?? "";
+    expect(hk).toBe("    <d>Hotkeys</d><d> ›</d>");
+  });
+
+  it("an alert note is in the error colour", () => {
+    const alerting = rows.map((r) => (r.id === "voice" ? { ...r, note: "✗ voices unavailable", alert: true } : r));
+    const voice = styled(view({ rows: alerting }), 96).find((l) => untag(l).includes("Voice")) ?? "";
+    expect(voice).toContain("<e> · ✗ voices unavailable</e>");
   });
 
   it("plain: no escape codes, the selection still marked ▸", () => {
@@ -328,45 +332,41 @@ describe("emphasis", () => {
 });
 
 describe("drawing an input", () => {
-  it("draws the Speak input on the line right under Speak…; the rest of the list stays", () => {
-    const input = { label: "", value: "", cursor: 0, placeholder: "type the text to speak", under: "speak" as const };
-    let lines = renderPanel(
-      view({
-        input,
-        hints: [
-          { key: "Enter", action: "speak" },
-          { key: "Esc", action: "back" },
-        ],
-      }),
-      84,
-    );
-    const at = lines.indexOf(row(lines, "Speak…") ?? "");
-    expect(lines[at + 1]).toMatch(/type the text to speak/);
-    expect(row(lines, "Stop")).toBeDefined();
-    expect(row(lines, "Agent tools")).toBeDefined();
-    expect(hintLine(lines).trim()).toBe("Enter speak · Esc back");
-    lines = renderPanel(view({ input: { ...input, value: "panel hello", cursor: 11 } }), 84);
-    expect(lines[lines.indexOf(row(lines, "Speak…") ?? "") + 1]).toMatch(/panel hello/);
-  });
-
-  it("draws the language input under the Voice row", () => {
+  it("draws the language input under its row; the rest of the rows stay", () => {
     const input = {
-      label: "Language of Kore",
+      label: "Spoken language",
       value: "",
       cursor: 0,
       placeholder: "a tag such as ja or pt-BR, or auto",
-      under: "voice" as const,
+      under: "language" as const,
     };
-    const lines = renderPanel(view({ input, selected: 5 }), 84);
-    const at = lines.indexOf(row(lines, "Voice") ?? "");
-    expect(lines[at + 1]).toMatch(/Language of Kore\s+a tag such as ja/);
+    const lines = renderPanel(view({ input, selected: at("language") }), 84);
+    const i = lines.indexOf(row(lines, "Dictation language") ?? "");
+    expect(lines[i + 1]).toMatch(/Spoken language\s+a tag such as ja/);
+    expect(row(lines, "Bridge connection")).toBeDefined();
+  });
+
+  it("an input that belongs to no row is drawn under the rows", () => {
+    const input = { label: "Audio file", value: "", cursor: 0, placeholder: "wav, mp3" };
+    const lines = renderPanel(view({ input }), 84);
+    expect(lines.findIndex((l) => /Audio file/.test(l))).toBeGreaterThan(
+      lines.indexOf(row(lines, "Bridge connection") ?? ""),
+    );
   });
 
   it("scrolls long text to keep the cursor in view", () => {
     const value = `${"x".repeat(100)}END`;
-    const lines = renderPanel(view({ input: { label: "", value, cursor: 103, placeholder: "", under: "speak" } }), 50);
+    const lines = renderPanel(view({ input: { label: "", value, cursor: 103, placeholder: "" } }), 50);
     expect(lines.some((l) => l.includes("END"))).toBe(true);
     expect(widest(lines)).toBeLessThanOrEqual(50);
+  });
+
+  it("the speak composer hides the rows", () => {
+    const input = { label: "", value: "", cursor: 0, placeholder: "type a message" };
+    const lines = renderPanel(view({ title: "Speak", composer: true, input }), 80);
+    expect(lines[0]).toMatch(/^Speak ─+$/);
+    expect(row(lines, "Voice")).toBeUndefined();
+    expect(lines.some((l) => /type a message/.test(l))).toBe(true);
   });
 });
 

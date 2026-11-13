@@ -2,29 +2,29 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Engine } from "../../src/engine/engine";
-import { matchItems, Panel, type PanelKey, type PanelView, rowLines } from "../../src/engine/panel";
+import { matchItems, Panel, type PanelKey, type PanelView } from "../../src/engine/panel";
+import type { Hotkeys } from "../../src/engine/settings";
 import { Surface } from "../../src/engine/surface";
 import { fakeOpenRouter, makeEngine, scriptedUi } from "./fixtures";
 
 afterEach(() => vi.unstubAllGlobals());
 
-/** The rows in order: each section's actions (one toolbar line), then its settings. */
+/** The rows of the main view, in order. */
 const ROWS = [
-  "Speak…",
-  "Replay last",
-  "History…",
-  "Stop",
+  "Read aloud options",
+  "Speech source",
   "Speech model",
   "Voice",
-  "Read replies aloud",
-  "Dictate",
-  "Transcribe file…",
-  "Transcription",
+  "Transcription source",
+  "Transcription model",
   "Dictation language",
   "Dictation output",
-  "Play audio on",
-  "Agent tools",
+  "Hotkeys",
+  "Bridge connection",
 ];
+
+/** The rows of Hotkeys: every action. */
+const ACTIONS = ["Speak…", "Dictate", "Replay last", "History…", "Stop", "Transcribe file…"];
 
 const XAI_TOKEN = "xai-login-token-abcdef";
 
@@ -45,7 +45,10 @@ function fakeXai() {
   return openrouter;
 }
 
-function open(env: Record<string, string> = {}, opts: { xai?: boolean; before?: (e: Engine) => void } = {}) {
+function open(
+  env: Record<string, string> = {},
+  opts: { xai?: boolean; before?: (e: Engine) => void; hotkeys?: Hotkeys } = {},
+) {
   const requests = opts.xai === undefined ? fakeOpenRouter() : fakeXai();
   const made = makeEngine(env);
   if (opts.xai !== undefined) {
@@ -56,7 +59,12 @@ function open(env: Record<string, string> = {}, opts: { xai?: boolean; before?: 
   const { ui, notes, pasted } = scriptedUi();
   const close = vi.fn();
   const changed = vi.fn();
-  const panel = new Panel(made.engine, new Surface(made.engine), { ui, close, changed });
+  const panel = new Panel(made.engine, new Surface(made.engine), {
+    ui,
+    close,
+    changed,
+    ...(opts.hotkeys ? { hotkeys: opts.hotkeys } : {}),
+  });
   panel.open();
   const press = async (...keys: Array<PanelKey | string>) => {
     for (const k of keys) panel.handle(typeof k === "string" ? { key: k as never } : k);
@@ -65,14 +73,19 @@ function open(env: Record<string, string> = {}, opts: { xai?: boolean; before?: 
   const type = async (text: string) => press({ text });
   const row = (label: string, v: PanelView = panel.view()) => v.rows.find((r) => r.label === label);
   const selectedLabel = () => panel.view().rows[panel.view().selected].label;
-  /** ↓ to the line of the row, then → along its toolbar. */
+  /**
+   * Select the row `label`: in the main view, or in Hotkeys for an action (entering it from the main view),
+   * or in Bridge connection for Bridge.
+   */
   const goTo = async (label: string) => {
-    const rows = panel.view().rows;
-    const lines = rowLines(rows);
-    const target = rows.findIndex((r) => r.label === label);
-    const line = lines.find((l) => l.includes(target)) ?? [];
-    for (let i = 0; i < lines.length && !line.includes(panel.view().selected); i++) await press("down");
-    for (let i = 0; i < line.length && panel.view().selected !== target; i++) await press("right");
+    const menu = ACTIONS.includes(label) ? "hotkeys" : label === "Bridge" ? "bridge" : "main";
+    if (panel.view().menu !== menu && panel.view().menu !== "main") await press("escape");
+    if (menu !== "main" && panel.view().menu === "main") {
+      await goTo(menu === "hotkeys" ? "Hotkeys" : "Bridge connection");
+      await press("enter");
+    }
+    for (let i = 0; i < panel.view().rows.length && selectedLabel() !== label; i++) await press("down");
+    expect(selectedLabel()).toBe(label);
   };
   const hint = () =>
     panel
@@ -105,102 +118,69 @@ function open(env: Record<string, string> = {}, opts: { xai?: boolean; before?: 
 const settingsOf = (work: string) =>
   JSON.parse(readFileSync(join(work, "agent", "pi-speech", "settings.json"), "utf8"));
 
-describe("the panel view model: rows", () => {
-  it("has the title, no state when nothing happens, and three sections of actions and settings", async () => {
+describe("the panel view model: the main view", () => {
+  it("has the title, no state when nothing happens, and SPEAK, LISTEN and SETTINGS with their keys", async () => {
     const p = open();
     await p.panel.idle();
     const v = p.panel.view();
     expect(v.title).toBe("Speech");
+    expect(v.menu).toBe("main");
+    expect(v.crumb).toBeUndefined();
     expect(v.state).toBe("");
     expect(v.rows.map((r) => r.label)).toEqual(ROWS);
-    expect(v.rows.filter((r) => r.group === "action").map((r) => r.key)).toEqual([
-      "Alt+S",
-      "r",
-      "h",
-      "s",
-      "Alt+Z",
-      "t",
-    ]);
-    expect(v.rows.filter((r) => r.section === "listen").map((r) => r.label)).toEqual(ROWS.slice(7, 12));
-    expect(v.rows.filter((r) => r.section === "system").map((r) => r.label)).toEqual(["Play audio on", "Agent tools"]);
-    // the actions of a section share a line; every setting has its own
-    expect(rowLines(v.rows).map((l) => l.length)).toEqual([4, 1, 1, 1, 2, 1, 1, 1, 1, 1]);
+    expect(v.headings).toEqual({ speak: "SPEAK (Alt+S)", listen: "LISTEN (Alt+Z)", settings: "SETTINGS" });
+    expect(v.rows.filter((r) => r.section === "speak").map((r) => r.label)).toEqual(ROWS.slice(0, 4));
+    expect(v.rows.filter((r) => r.section === "listen").map((r) => r.label)).toEqual(ROWS.slice(4, 8));
+    expect(v.rows.filter((r) => r.section === "settings").map((r) => r.label)).toEqual(ROWS.slice(8));
     expect(v.selected).toBe(0);
-    expect(p.row("Dictation language")).toMatchObject({ value: "auto", note: "the model detects it" });
-    expect(p.row("Speech model")?.value).toBe("google/gemini-3.8-flash-tts");
-    expect(p.row("Voice")?.value).toBe("Kore");
-    expect(p.row("Transcription")?.value).toBe("openai/whisper-large-v3-turbo");
-    expect(p.row("Play audio on")?.value).toBe("auto");
-    expect(p.row("Read replies aloud")?.value).toBe("off");
-    expect(p.row("Agent tools")?.value).toBe("on");
+    expect(Object.fromEntries(v.rows.map((r) => [r.label, r.value]))).toEqual({
+      "Read aloud options": "Off",
+      "Speech source": "Provider",
+      "Speech model": "google/gemini-3.8-flash-tts",
+      Voice: "Kore",
+      "Transcription source": "Provider",
+      "Transcription model": "openai/whisper-large-v3-turbo",
+      "Dictation language": "auto",
+      "Dictation output": "Pi",
+      Hotkeys: undefined,
+      "Bridge connection": undefined,
+    });
   });
 
-  it("marks the rows whose Enter opens a list, and only those", async () => {
+  it("the section headings carry the keys Pi has bound", async () => {
+    const p = open({}, { hotkeys: { speak: "ctrl+alt+s", dictate: "alt+d" } });
+    expect(p.panel.view().headings).toMatchObject({ speak: "SPEAK (Ctrl+Alt+S)", listen: "LISTEN (Alt+D)" });
+  });
+
+  it("marks the rows whose Enter opens a picker or a submenu, and only those", async () => {
     const p = open();
     const opens = p.panel
       .view()
       .rows.filter((r) => r.opens)
       .map((r) => r.label);
-    expect(opens).toEqual(["Speech model", "Voice", "Transcription", "Dictation language", "Dictation output"]);
+    expect(opens).toEqual([
+      "Speech model",
+      "Voice",
+      "Transcription model",
+      "Dictation output",
+      "Hotkeys",
+      "Bridge connection",
+    ]);
   });
 
-  it("model rows show loading… until the catalog is there, then the price and the provider", async () => {
-    const p = open();
-    expect(p.row("Speech model")?.note).toBe("loading…");
-    expect(p.row("Speech model")?.value).toBe("google/gemini-3.8-flash-tts");
-    await p.panel.idle();
-    expect(p.row("Speech model")).toMatchObject({ price: "~$0.03/min", note: "tags · fast" });
-    expect(p.row("Transcription")).toMatchObject({ price: "$0.0007/min", note: "99+ langs · fast" });
-    await p.engine.speech.set("stt-model", "openai/whisper-1");
-    expect(p.row("Transcription")?.note).toBe("translate");
-  });
-
-  it("the voice note names the language and where it comes from; an override is set by you", async () => {
+  it("shows only the name of a model or a voice: no price, features, provider or language", async () => {
     const p = open();
     await p.panel.idle();
-    expect(p.row("Voice")?.note).toBe("multilingual");
     await p.engine.speech.set("tts-model", "hexgrad/kokoro-82m");
     await p.engine.speech.set("voice", "jf_alpha");
-    expect(p.row("Voice")?.note).toBe("ja");
     await p.engine.speech.setLanguage("jf_alpha", "fr");
-    expect(p.row("Voice")?.note).toBe("fr · set by you");
-  });
-
-  it("Play audio on shows the resolved route, and an unreachable receiver", async () => {
-    const p = open();
-    await p.panel.idle();
-    expect(p.row("Play audio on")?.note).toBe("→ this machine");
-    p.engine.routes.bridge.health = async () => ({ ok: false, reason: "connection refused" });
-    await p.goTo("Play audio on");
-    await p.press("right");
-    expect(p.row("Play audio on")?.value).toBe("auto");
-    expect(p.panel.view().status).toMatchObject({
-      tone: "error",
-      text: expect.stringMatching(/^✗ .*connection refused/),
-    });
-    p.engine.routes.bridge.health = async () => ({ ok: true, version: "0.1.0" });
-    await p.press("right");
-    expect(p.row("Play audio on")).toMatchObject({ value: "bridge", note: "✓ 127.0.0.1:47613" });
-    await p.press("right");
-    expect(p.row("Play audio on")).toMatchObject({ value: "local", note: "this machine" });
-    expect(settingsOf(p.work).bridge).toBe("off");
-    await p.press("left");
-    expect(p.row("Play audio on")?.value).toBe("bridge");
-  });
-
-  it("over SSH auto goes to the bridge; an unreachable receiver is a ✗ note and the panel still opens", async () => {
-    fakeOpenRouter();
-    const made = makeEngine({ SSH_CONNECTION: "1 2 3 4" });
-    made.engine.routes.bridge.health = async () => ({ ok: false, reason: "connection refused" });
-    const panel = new Panel(made.engine, new Surface(made.engine), {
-      ui: scriptedUi().ui,
-      close: vi.fn(),
-      changed: vi.fn(),
-    });
-    panel.open();
-    await panel.idle();
-    const audio = panel.view().rows.find((r) => r.label === "Play audio on");
-    expect(audio).toMatchObject({ value: "auto", note: "→ bridge ✗ receiver unreachable", alert: true });
+    for (const label of ["Speech model", "Voice", "Transcription model"]) {
+      const r = p.row(label);
+      expect(r?.note, label).toBeUndefined();
+      expect(Object.keys(r ?? {}).sort(), label).toEqual(["id", "label", "opens", "section", "value"]);
+    }
+    expect(p.row("Speech model")?.value).toBe("hexgrad/kokoro-82m");
+    expect(p.row("Voice")?.value).toBe("jf_alpha");
   });
 
   it("shows the xai model as xAI Grok; the saved id stays xai", async () => {
@@ -209,8 +189,9 @@ describe("the panel view model: rows", () => {
     await p.press("enter", { text: "xai" }, "enter");
     expect(p.engine.speech.settings.speechModel).toBe("xai");
     expect(settingsOf(p.work).speechModel).toBe("xai");
-    expect(p.row("Speech model")).toMatchObject({ value: "xAI Grok", price: "subscription", note: "xAI" });
-    expect(p.row("Voice")).toMatchObject({ value: "eve", note: "multilingual" });
+    expect(p.row("Speech model")).toMatchObject({ value: "xAI Grok" });
+    expect(p.row("Speech model")?.note).toBeUndefined();
+    expect(p.row("Voice")).toMatchObject({ value: "eve" });
   });
 
   it("a saved xai choice without the login is shown as unavailable, with the reason", async () => {
@@ -231,57 +212,60 @@ describe("the panel view model: rows", () => {
     expect(p.panel.view().picker).toBeUndefined();
     expect(p.panel.view().status).toMatchObject({ tone: "error", text: expect.stringMatching(/^✗ No xAI login/) });
   });
+
+  it("model lists that cannot load are a ✗ note on the model rows", async () => {
+    const p = open(
+      {},
+      {
+        before: (e) => {
+          e.speech.models = async () => {
+            throw new Error("offline");
+          };
+        },
+      },
+    );
+    await p.panel.idle();
+    expect(p.row("Transcription model")).toMatchObject({ note: "✗ models unavailable", alert: true });
+    expect(p.row("Speech model")).toMatchObject({ note: "✗ models unavailable", alert: true });
+  });
 });
 
-describe("the panel view model: keys", () => {
-  it("↑↓ move line by line and wrap; ←→ move along a toolbar, and ↑↓ return to its column", async () => {
+describe("the panel view model: keys in the main view", () => {
+  it("↑↓ move row by row and wrap", async () => {
     const p = open();
     await p.press("up");
-    expect(p.selectedLabel()).toBe("Agent tools");
+    expect(p.selectedLabel()).toBe("Bridge connection");
     await p.press("down");
-    expect(p.selectedLabel()).toBe("Speak…");
-    await p.press("down");
-    expect(p.selectedLabel()).toBe("Speech model");
-    await p.press("up", "right");
-    expect(p.selectedLabel()).toBe("Replay last");
-    await p.press("left", "left");
-    expect(p.selectedLabel()).toBe("Stop");
-    await p.press("right", "right");
-    expect(p.selectedLabel()).toBe("Replay last");
-    await p.press("down", "down", "down", "down");
-    expect(p.selectedLabel()).toBe("Transcribe file…");
-    await p.press("down");
-    expect(p.selectedLabel()).toBe("Transcription");
+    expect(p.selectedLabel()).toBe("Read aloud options");
+    for (const label of ROWS.slice(1)) {
+      await p.press("down");
+      expect(p.selectedLabel()).toBe(label);
+    }
   });
 
-  it("←→ and Enter toggle Agent tools and Read replies aloud in place and save at once", async () => {
+  it("Read aloud options cycles Off and All in place with ←→ and Enter", async () => {
     const p = open();
-    const toolsChanged = vi.fn();
-    p.engine.onToolsChanged = toolsChanged;
-    await p.goTo("Agent tools");
-    p.panel.handle({ key: "right" });
-    expect(p.row("Agent tools")?.value).toBe("off");
-    await p.panel.idle();
-    expect(settingsOf(p.work).tools).toBe(false);
-    expect(toolsChanged).toHaveBeenCalled();
-    await p.press("left");
-    expect(settingsOf(p.work).tools).toBe(true);
-    await p.press("enter");
-    expect(settingsOf(p.work).tools).toBe(false);
-    await p.goTo("Read replies aloud");
     await p.press("right");
-    expect(p.row("Read replies aloud")?.value).toBe("on");
+    expect(p.row("Read aloud options")?.value).toBe("All");
+    expect(p.engine.readAloud.enabled).toBe(true);
+    expect(p.panel.view().status?.text).toBe("✓ Read aloud: All");
+    await p.press("left");
+    expect(p.row("Read aloud options")?.value).toBe("Off");
+    await p.press("enter");
     expect(p.engine.readAloud.enabled).toBe(true);
     await p.press("enter");
     expect(p.engine.readAloud.enabled).toBe(false);
     expect(p.notes).toEqual([]);
   });
 
-  it("Enter on Play audio on does the same as →", async () => {
+  it("the source rows stay Provider, the only source so far, and say so", async () => {
     const p = open();
-    await p.goTo("Play audio on");
-    await p.press("enter");
-    expect(p.row("Play audio on")?.value).toBe("bridge");
+    for (const label of ["Speech source", "Transcription source"]) {
+      await p.goTo(label);
+      await p.press("right", "enter");
+      expect(p.row(label)?.value).toBe("Provider");
+      expect(p.panel.view().status).toMatchObject({ tone: "info", text: "Provider is the only source so far" });
+    }
   });
 
   it("←→ on a picker row do nothing", async () => {
@@ -294,29 +278,28 @@ describe("the panel view model: keys", () => {
 
   it("typing on a picker row opens its picker with that character typed, l included", async () => {
     const p = open();
-    await p.goTo("Transcription");
+    await p.goTo("Transcription model");
     await p.type("1");
     const picker = p.panel.view().picker;
-    expect(picker).toMatchObject({ title: "Transcription", query: "1" });
+    expect(picker).toMatchObject({ title: "Transcription model", query: "1" });
     expect(picker?.items.map((i) => i.id)).toEqual(["openai/whisper-1"]);
     await p.press("enter");
-    expect(p.row("Transcription")?.value).toBe("openai/whisper-1");
+    expect(p.row("Transcription model")?.value).toBe("openai/whisper-1");
     await p.goTo("Voice");
     await p.type("l");
     expect(p.panel.view().picker).toMatchObject({ title: "Voice", query: "l" });
     expect(p.panel.view().input).toBeUndefined();
   });
 
-  it("typing on a toggle row does nothing", async () => {
+  it("typing on a value row does nothing but the action keys", async () => {
     const p = open();
-    await p.goTo("Agent tools");
     await p.type("x");
     expect(p.panel.view().picker).toBeUndefined();
     expect(p.panel.view().input).toBeUndefined();
-    expect(p.row("Agent tools")?.value).toBe("on");
+    expect(p.row("Read aloud options")?.value).toBe("Off");
   });
 
-  it("F2 on the Voice row asks for the voice language (a tag or auto); the note follows", async () => {
+  it("F2 on the Voice row asks for the voice language (a tag or auto); the voice picker shows it", async () => {
     const p = open();
     await p.goTo("Voice");
     await p.press("language");
@@ -334,7 +317,9 @@ describe("the panel view model: keys", () => {
     await p.type("ja");
     await p.press("enter");
     expect(p.panel.view().input).toBeUndefined();
-    expect(p.row("Voice")?.note).toBe("ja · set by you");
+    expect(p.row("Voice")?.note).toBeUndefined();
+    await p.press("enter");
+    expect(p.panel.view().picker?.items.find((i) => i.id === "Kore")?.cols?.[0]).toBe("ja · set by you");
   });
 
   it("F2 on other rows does nothing", async () => {
@@ -375,6 +360,359 @@ describe("the panel view model: keys", () => {
     await p.press("tab");
     expect(p.panel.view().status).toMatchObject({ tone: "error", text: expect.stringMatching(/^✗ .*402/) });
     expect(p.notes).toEqual([]);
+  });
+
+  it("the hints follow the row; Esc is last", async () => {
+    const p = open();
+    const hints: Record<string, string> = {
+      "Read aloud options": "←→ Off · All · Esc close",
+      "Speech source": "←→ Provider, the only source so far · Esc close",
+      "Speech model": "Enter browse, sort and filter · Esc close",
+      Voice: "Enter choose · Tab sample · F2 language · Esc close",
+      "Transcription source": "←→ Provider, the only source so far · Esc close",
+      "Transcription model": "Enter browse, sort and filter · Esc close",
+      "Dictation language": "Enter set · Esc close",
+      "Dictation output": "Enter set · Esc close",
+      Hotkeys: "Enter run actions, change keys · Esc close",
+      "Bridge connection": "Enter where audio plays · Esc close",
+    };
+    for (const label of ROWS) {
+      await p.goTo(label);
+      expect(p.hint(), label).toBe(hints[label]);
+    }
+  });
+
+  it("the picker hints follow its state: loaded, no match, loading", async () => {
+    const p = open();
+    await p.goTo("Voice");
+    await p.press("enter");
+    expect(p.hint()).toBe("Enter pick · Tab sample · F2 language · type to filter · Esc back");
+    expect(
+      p.panel
+        .view()
+        .hints.filter((h) => h.optional)
+        .map((h) => h.key),
+    ).toEqual(["Tab", "F2"]);
+    await p.type("zz");
+    expect(p.hint()).toBe("Backspace · Esc back");
+    await p.press("escape", "up");
+    await p.press("enter");
+    expect(p.hint()).toBe("Enter pick · Tab sort · Shift+Tab show · type to filter · Esc back");
+    await p.engine.speech.set("tts-model", "hexgrad/kokoro-82m");
+    let release!: () => void;
+    p.engine.speech.voicesFor = () =>
+      new Promise((r) => {
+        release = () => r(["A"]);
+      });
+    await p.press("escape", "down");
+    p.panel.handle({ key: "enter" });
+    expect(p.panel.view().picker?.loading).toBe(true);
+    expect(p.hint()).toBe("Esc back");
+    release();
+    await p.panel.idle();
+  });
+
+  it("Esc closes the panel; the header follows the live state", async () => {
+    const p = open();
+    await p.engine.speech.speak("words");
+    expect(p.panel.view().state).toBe("▶ speaking");
+    expect(p.changed).toHaveBeenCalled();
+    await p.type("s");
+    expect(p.panel.view().state).toBe("");
+    await p.press("escape");
+    expect(p.close).toHaveBeenCalled();
+  });
+
+  it("an engine notification while open becomes the status line", async () => {
+    const p = open();
+    p.panel.report("Playback failed (local): boom", "error");
+    expect(p.panel.view().status).toEqual({ tone: "error", text: "✗ Playback failed (local): boom" });
+  });
+
+  it("after dispose it no longer listens to the engine", async () => {
+    const p = open();
+    await p.panel.idle();
+    p.panel.dispose();
+    p.changed.mockClear();
+    await p.engine.speech.speak("words");
+    expect(p.changed).not.toHaveBeenCalled();
+  });
+});
+
+describe("the panel view model: Bridge connection", () => {
+  it("is a submenu holding the bridge mode, which cycles auto, on, off in place and is saved", async () => {
+    const p = open();
+    await p.panel.idle();
+    await p.goTo("Bridge connection");
+    await p.press("enter");
+    const v = p.panel.view();
+    expect(v).toMatchObject({ menu: "bridge", crumb: "Bridge connection", selected: 0 });
+    expect(v.headings).toBeUndefined();
+    expect(p.row("Bridge")).toMatchObject({ value: "auto", note: "on over SSH · plays on This machine" });
+    expect(p.hint()).toBe("←→ auto · on · off · Esc back");
+    p.engine.routes.bridge.health = async () => ({ ok: false, reason: "connection refused" });
+    await p.press("right");
+    // an unreachable receiver keeps the mode, and says why
+    expect(p.row("Bridge")?.value).toBe("auto");
+    expect(p.panel.view().status).toMatchObject({
+      tone: "error",
+      text: expect.stringMatching(/^✗ .*connection refused/),
+    });
+    p.engine.routes.bridge.health = async () => ({ ok: true, version: "0.1.0" });
+    await p.press("right");
+    expect(p.row("Bridge")).toMatchObject({ value: "on", note: "plays on the Remote machine · ✓ 127.0.0.1:47613" });
+    await p.press("enter");
+    expect(p.row("Bridge")).toMatchObject({ value: "off", note: "plays on This machine" });
+    expect(settingsOf(p.work).bridge).toBe("off");
+    await p.press("escape");
+    expect(p.panel.view().menu).toBe("main");
+    expect(p.selectedLabel()).toBe("Bridge connection");
+    expect(p.close).not.toHaveBeenCalled();
+  });
+
+  it("over SSH auto plays on the Remote machine; an unreachable receiver is a ✗ note", async () => {
+    const p = open(
+      { SSH_CONNECTION: "1 2 3 4" },
+      {
+        before: (e) => {
+          e.routes.bridge.health = async () => ({ ok: false, reason: "connection refused" });
+        },
+      },
+    );
+    await p.panel.idle();
+    await p.goTo("Bridge");
+    expect(p.row("Bridge")).toMatchObject({
+      value: "auto",
+      note: "on over SSH · plays on the Remote machine · ✗ receiver unreachable",
+      alert: true,
+    });
+  });
+});
+
+describe("the panel view model: Hotkeys", () => {
+  it("lists every action with its key; the submenu has its own title and hints", async () => {
+    const p = open();
+    await p.goTo("Hotkeys");
+    await p.press("enter");
+    const v = p.panel.view();
+    expect(v).toMatchObject({ menu: "hotkeys", crumb: "Hotkeys", selected: 0 });
+    expect(v.rows.map((r) => [r.label, r.value])).toEqual([
+      ["Speak…", "Alt+S"],
+      ["Dictate", "Alt+Z"],
+      ["Replay last", "r"],
+      ["History…", "h"],
+      ["Stop", "s"],
+      ["Transcribe file…", "t"],
+    ]);
+    expect(p.hint()).toBe("Enter run · k change key · Esc back");
+    await p.press("down");
+    expect(p.hint()).toBe("Enter run · k change key · Esc back");
+    await p.press("down");
+    expect(p.hint()).toBe("Enter run · Esc back");
+    await p.press("up", "up", "up");
+    expect(p.selectedLabel()).toBe("Transcribe file…");
+    await p.press("escape");
+    expect(p.panel.view().menu).toBe("main");
+    expect(p.selectedLabel()).toBe("Hotkeys");
+  });
+
+  it("Speak… opens a dedicated composer; Enter speaks and clears it; Esc returns to Hotkeys", async () => {
+    const p = open();
+    await p.goTo("Speak…");
+    await p.press("enter");
+    expect(p.panel.view()).toMatchObject({ title: "Speak", composer: true });
+    expect(p.panel.view().input).toMatchObject({ value: "" });
+    expect(p.hint()).toBe("Enter speak · Esc back");
+    await p.type("panel hello");
+    await p.press("up", "down");
+    p.panel.handle({ key: "enter" });
+    expect(p.panel.view().input?.value).toBe("");
+    expect(p.panel.view().status).toMatchObject({ tone: "busy", text: "♪ speaking…" });
+    await p.type("second message");
+    await p.press("enter");
+    await p.panel.idle();
+    expect(p.requests.filter((r) => r.body?.input).map((r) => r.body.input)).toEqual(["panel hello", "second message"]);
+    expect(p.close).not.toHaveBeenCalled();
+    p.local.end(1, { state: "completed" });
+    await vi.waitFor(() => expect(p.panel.view().status).toMatchObject({ tone: "success", text: "✓ Spoken" }));
+    await p.press("escape");
+    expect(p.panel.view().menu).toBe("hotkeys");
+    expect(p.panel.view().composer).toBeUndefined();
+    expect(p.selectedLabel()).toBe("Speak…");
+    expect(p.notes).toEqual([]);
+  });
+
+  it("a failed Speak is one ✗ line in the panel", async () => {
+    const p = open();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("quota", { status: 402 })),
+    );
+    await p.press("speak");
+    await p.type("hello");
+    await p.press("enter");
+    expect(p.panel.view().status).toMatchObject({ tone: "error", text: expect.stringMatching(/^✗ .*402/) });
+    expect(p.close).not.toHaveBeenCalled();
+    expect(p.notes).toEqual([]);
+  });
+
+  it("the composer says when the speech model takes inline tags", async () => {
+    const p = open();
+    await p.panel.idle();
+    await p.press("speak");
+    expect(p.panel.view().input?.placeholder).toMatch(/\[tags\] direct this model/);
+    await p.press("escape");
+    await p.engine.speech.set("tts-model", "hexgrad/kokoro-82m");
+    await p.press("speak");
+    expect(p.panel.view().input?.placeholder).not.toMatch(/tags/);
+  });
+
+  it("the Speak key opens the composer from the main view and from a picker", async () => {
+    const p = open();
+    await p.press("speak");
+    expect(p.panel.view()).toMatchObject({ title: "Speak", composer: true });
+    await p.press("escape");
+    expect(p.panel.view().menu).toBe("main");
+    await p.goTo("Voice");
+    await p.press("enter", "speak");
+    expect(p.panel.view().composer).toBe(true);
+    expect(p.panel.view().picker).toBeUndefined();
+  });
+
+  it("Replay last plays the last message from Enter and from r; the panel stays open", async () => {
+    const p = open();
+    await p.engine.speech.speak("earlier words");
+    p.local.end(0, { state: "completed" });
+    await p.type("r");
+    expect(p.close).not.toHaveBeenCalled();
+    expect(p.local.plays).toHaveLength(2);
+    expect(p.panel.view().status?.text).toBe("♪ speaking…");
+    p.local.end(1, { state: "completed" });
+    await vi.waitFor(() => expect(p.panel.view().status?.text).toBe("✓ Spoken"));
+    await p.goTo("Replay last");
+    await p.press("enter");
+    expect(p.local.plays).toHaveLength(3);
+    p.local.end(2, { state: "completed" });
+    await p.type("r");
+    expect(p.local.plays).toHaveLength(4);
+    expect(p.close).not.toHaveBeenCalled();
+    expect(p.notes).toEqual([]);
+  });
+
+  it("Stop leaves the panel open; Replay with nothing to replay is refused in the panel", async () => {
+    const p = open();
+    await p.goTo("Stop");
+    await p.press("enter");
+    expect(p.close).not.toHaveBeenCalled();
+    expect(p.panel.view().status?.text).toMatch(/nothing was playing/i);
+    await p.type("r");
+    expect(p.close).not.toHaveBeenCalled();
+    expect(p.panel.view().status).toMatchObject({ tone: "error", text: expect.stringMatching(/^✗ Nothing to replay/) });
+  });
+
+  it("Stop while speaking says Stopped, not Spoken", async () => {
+    const p = open();
+    await p.press("speak");
+    await p.type("words");
+    await p.press("enter");
+    await p.press("escape");
+    await p.type("s");
+    expect(p.panel.view().status?.text).toBe("✓ Stopped");
+    await new Promise((r) => setTimeout(r, 10));
+    expect(p.panel.view().status?.text).toBe("✓ Stopped");
+  });
+
+  it("Dictate closes the panel and starts dictation, from Hotkeys and from its key", async () => {
+    const q = open();
+    await q.goTo("Dictate");
+    await q.press("enter");
+    expect(q.close).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(q.notes.at(-1)?.message).toMatch(/no microphone here/));
+    const k = open();
+    k.panel.handle({ key: "dictate" });
+    expect(k.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("History… opens the history; Esc returns to Hotkeys", async () => {
+    const p = open();
+    await p.engine.speech.speak("first words");
+    await p.goTo("History…");
+    await p.press("enter");
+    expect(p.panel.view().picker).toMatchObject({ title: "History", total: 1 });
+    await p.press("escape");
+    expect(p.panel.view().menu).toBe("hotkeys");
+    expect(p.panel.view().picker).toBeUndefined();
+    expect(p.selectedLabel()).toBe("History…");
+  });
+
+  it("Transcribe file… asks for the path under its row in Hotkeys", async () => {
+    const p = open();
+    await p.goTo("Transcribe file…");
+    await p.press("enter");
+    expect(p.panel.view().input).toMatchObject({ label: "Audio file", under: "transcribe" });
+    await p.press("escape");
+    expect(p.panel.view().menu).toBe("hotkeys");
+  });
+
+  it("k changes the key of Speak: saved in the settings at once, bound from the next /reload", async () => {
+    const p = open();
+    await p.goTo("Speak…");
+    await p.type("k");
+    expect(p.row("Speak…")?.value).toBe("press a key…");
+    expect(p.hint()).toBe("Alt+letter new key for Speak · Esc cancel");
+    await p.press({ combo: "alt+d" });
+    expect(settingsOf(p.work).hotkeys).toEqual({ speak: "alt+d", dictate: "alt+z" });
+    expect(p.engine.speech.settings.hotkeys.speak).toBe("alt+d");
+    expect(p.panel.view().status).toMatchObject({
+      tone: "success",
+      text: "✓ Speak is Alt+D from the next /reload or start of Pi",
+    });
+    // until Pi loads the extension again, the bound key works and shows; the new one waits beside it
+    expect(p.row("Speak…")).toMatchObject({ value: "Alt+S", note: "→ Alt+D after /reload" });
+    await p.press("escape");
+    expect(p.panel.view().headings?.speak).toBe("SPEAK (Alt+S)");
+  });
+
+  it("k on Dictate takes a key with Ctrl and Shift too; setting it back to the bound key clears the note", async () => {
+    const p = open();
+    await p.goTo("Dictate");
+    await p.type("k");
+    await p.press({ combo: "ctrl+alt+shift+x" });
+    expect(settingsOf(p.work).hotkeys).toEqual({ speak: "alt+s", dictate: "ctrl+alt+shift+x" });
+    expect(p.row("Dictate")?.note).toBe("→ Ctrl+Alt+Shift+X after /reload");
+    await p.type("k");
+    await p.press({ key: "dictate", id: "alt+z" });
+    expect(p.close).not.toHaveBeenCalled();
+    expect(p.panel.view().status?.text).toBe("✓ Dictate is Alt+Z again");
+    expect(p.row("Dictate")).toMatchObject({ value: "Alt+Z" });
+    expect(p.row("Dictate")?.note).toBeUndefined();
+    expect(settingsOf(p.work).hotkeys).toBeUndefined();
+  });
+
+  it("refuses a key without Alt, and the key of the other action; Esc cancels", async () => {
+    const p = open();
+    await p.goTo("Speak…");
+    await p.type("k");
+    await p.type("d");
+    expect(p.panel.view().status).toMatchObject({
+      tone: "error",
+      text: "✗ d cannot be a hotkey: use Alt with a letter or a digit",
+    });
+    await p.type("k");
+    await p.press({ combo: "ctrl+d" });
+    expect(p.panel.view().status?.text).toBe("✗ Ctrl+D cannot be a hotkey: use Alt with a letter or a digit");
+    await p.type("k");
+    await p.press({ key: "dictate", id: "alt+z" });
+    expect(p.panel.view().status?.text).toBe("✗ Alt+Z is already the key of Dictate");
+    expect(p.close).not.toHaveBeenCalled();
+    await p.type("k");
+    await p.press("escape");
+    expect(p.panel.view().menu).toBe("hotkeys");
+    expect(p.row("Speak…")?.value).toBe("Alt+S");
+    expect(p.engine.speech.settings.hotkeys).toEqual({ speak: "alt+s", dictate: "alt+z" });
+    await p.press("down", "down");
+    await p.type("k");
+    expect(p.panel.view().status?.text).toBe("Only Speak and Dictate have keys of their own to change");
   });
 });
 
@@ -456,7 +794,7 @@ describe("the panel view model: pickers", () => {
     await p.press("up");
     expect(p.picked()?.id).toBe("xai");
     await p.press("escape");
-    await p.goTo("Transcription");
+    await p.goTo("Transcription model");
     await p.press("enter");
     expect(p.panel.view().picker?.items.map((i) => i.id)).toEqual([
       "openai/whisper-large-v3-turbo",
@@ -534,188 +872,6 @@ describe("matching in the pickers", () => {
   });
 });
 
-describe("the panel view model: hints", () => {
-  it("follow the row: actions show their own key, toggles ←→, picker rows Enter choose; Esc is last", async () => {
-    const p = open();
-    const hints: Record<string, string> = {
-      "Speak…": "Enter type messages to speak · ←→ more · Esc close",
-      "Replay last": "Enter play the last message again · ←→ more · Esc close",
-      "History…": "Enter replay an earlier message · ←→ more · Esc close",
-      Stop: "Enter stop what is playing · ←→ more · Esc close",
-      "Speech model": "Enter browse, sort and filter · Esc close",
-      Voice: "Enter choose · Tab sample · F2 language · Esc close",
-      "Read replies aloud": "←→ on/off · Esc close",
-      Dictate: "Enter record, then insert the text · ←→ more · Esc close",
-      "Transcribe file…": "Enter insert the text of an audio file · ←→ more · Esc close",
-      Transcription: "Enter browse, sort and filter · Esc close",
-      "Dictation language": "Enter set · Esc close",
-      "Dictation output": "Enter set · Esc close",
-      "Play audio on": "←→ auto · bridge · local · Esc close",
-      "Agent tools": "←→ on/off · Esc close",
-    };
-    for (const label of ROWS) {
-      await p.goTo(label);
-      expect(p.hint(), label).toBe(hints[label]);
-    }
-  });
-
-  it("follow the picker's state: loaded, no match, loading", async () => {
-    const p = open();
-    await p.goTo("Voice");
-    await p.press("enter");
-    expect(p.hint()).toBe("Enter pick · Tab sample · F2 language · type to filter · Esc back");
-    expect(
-      p.panel
-        .view()
-        .hints.filter((h) => h.optional)
-        .map((h) => h.key),
-    ).toEqual(["Tab", "F2"]);
-    await p.type("zz");
-    expect(p.hint()).toBe("Backspace · Esc back");
-    await p.press("escape", "up");
-    await p.press("enter");
-    expect(p.hint()).toBe("Enter pick · Tab sort · Shift+Tab show · type to filter · Esc back");
-    await p.engine.speech.set("tts-model", "hexgrad/kokoro-82m");
-    let release!: () => void;
-    p.engine.speech.voicesFor = () =>
-      new Promise((r) => {
-        release = () => r(["A"]);
-      });
-    await p.press("escape", "down");
-    p.panel.handle({ key: "enter" });
-    expect(p.panel.view().picker?.loading).toBe(true);
-    expect(p.hint()).toBe("Esc back");
-    release();
-    await p.panel.idle();
-  });
-});
-
-describe("the panel view model: Speak…, Replay, Stop, Dictate", () => {
-  it("Speak… opens a dedicated composer; ↑↓ do nothing; Esc returns", async () => {
-    const p = open();
-    await p.press("enter");
-    expect(p.panel.view()).toMatchObject({ title: "Speak", composer: true });
-    expect(p.panel.view().input).toMatchObject({ value: "" });
-    expect(p.panel.view().input?.under).toBeUndefined();
-    expect(p.hint()).toBe("Enter speak · Esc back");
-    await p.type("hi");
-    await p.press("up", "down");
-    expect(p.panel.view().input?.value).toBe("hi");
-    expect(p.selectedLabel()).toBe("Speak…");
-    await p.press("escape");
-    expect(p.panel.view().input).toBeUndefined();
-    expect(p.close).not.toHaveBeenCalled();
-  });
-
-  it("Enter speaks and clears the composer, ready for the next message without reselecting Speak", async () => {
-    const p = open();
-    await p.press("enter");
-    await p.type("panel hello");
-    p.panel.handle({ key: "enter" });
-    expect(p.panel.view()).toMatchObject({ title: "Speak", composer: true });
-    expect(p.panel.view().input?.value).toBe("");
-    expect(p.panel.view().status).toMatchObject({ tone: "busy", text: "♪ speaking…" });
-    await p.type("second message");
-    await p.press("enter");
-    await p.panel.idle();
-    expect(p.requests.filter((r) => r.body?.input).map((r) => r.body.input)).toEqual(["panel hello", "second message"]);
-    expect(p.panel.view().input?.value).toBe("");
-    expect(p.close).not.toHaveBeenCalled();
-    expect(p.panel.view().status?.text).toBe("♪ speaking…");
-    p.local.end(1, { state: "completed" });
-    await vi.waitFor(() => expect(p.panel.view().status).toMatchObject({ tone: "success", text: "✓ Spoken" }));
-    expect(p.notes).toEqual([]);
-  });
-
-  it("a failed Speak is one ✗ line in the panel", async () => {
-    const p = open();
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => new Response("quota", { status: 402 })),
-    );
-    await p.press("enter");
-    await p.type("hello");
-    await p.press("enter");
-    expect(p.panel.view().status).toMatchObject({ tone: "error", text: expect.stringMatching(/^✗ .*402/) });
-    expect(p.close).not.toHaveBeenCalled();
-    expect(p.notes).toEqual([]);
-  });
-
-  it("Replay last and r play the last message and the panel stays open", async () => {
-    const p = open();
-    await p.engine.speech.speak("earlier words");
-    p.local.end(0, { state: "completed" });
-    await p.type("r");
-    expect(p.close).not.toHaveBeenCalled();
-    expect(p.local.plays).toHaveLength(2);
-    expect(p.panel.view().status?.text).toBe("♪ speaking…");
-    p.local.end(1, { state: "completed" });
-    await vi.waitFor(() => expect(p.panel.view().status?.text).toBe("✓ Spoken"));
-    await p.goTo("Replay last");
-    await p.press("enter");
-    expect(p.local.plays).toHaveLength(3);
-    expect(p.close).not.toHaveBeenCalled();
-    expect(p.notes).toEqual([]);
-  });
-
-  it("Stop leaves the panel open; Replay with nothing to replay is refused in the panel", async () => {
-    const p = open();
-    await p.type("s");
-    expect(p.close).not.toHaveBeenCalled();
-    expect(p.panel.view().status?.text).toMatch(/nothing was playing/i);
-    await p.type("r");
-    expect(p.close).not.toHaveBeenCalled();
-    expect(p.panel.view().status).toMatchObject({ tone: "error", text: expect.stringMatching(/^✗ Nothing to replay/) });
-  });
-
-  it("Stop while speaking says Stopped, not Spoken", async () => {
-    const p = open();
-    await p.press("enter");
-    await p.type("words");
-    await p.press("enter");
-    await p.press("escape");
-    await p.type("s");
-    expect(p.panel.view().status?.text).toBe("✓ Stopped");
-    await new Promise((r) => setTimeout(r, 10));
-    expect(p.panel.view().status?.text).toBe("✓ Stopped");
-  });
-
-  it("Dictate closes the panel and starts dictation", async () => {
-    const q = open();
-    q.panel.handle({ key: "dictate" });
-    expect(q.close).toHaveBeenCalledTimes(1);
-    await vi.waitFor(() => expect(q.notes.at(-1)?.message).toMatch(/no microphone here/));
-  });
-
-  it("Esc closes the panel; the header follows the live state", async () => {
-    const p = open();
-    await p.engine.speech.speak("words");
-    expect(p.panel.view().state).toBe("▶ speaking");
-    expect(p.changed).toHaveBeenCalled();
-    await p.goTo("Stop");
-    await p.press("enter");
-    expect(p.panel.view().state).toBe("");
-    expect(p.panel.view().status?.text).toMatch(/stopped/i);
-    await p.press("escape");
-    expect(p.close).toHaveBeenCalled();
-  });
-
-  it("an engine notification while open becomes the status line", async () => {
-    const p = open();
-    p.panel.report("Playback failed (local): boom", "error");
-    expect(p.panel.view().status).toEqual({ tone: "error", text: "✗ Playback failed (local): boom" });
-  });
-
-  it("after dispose it no longer listens to the engine", async () => {
-    const p = open();
-    await p.panel.idle();
-    p.panel.dispose();
-    p.changed.mockClear();
-    await p.engine.speech.speak("words");
-    expect(p.changed).not.toHaveBeenCalled();
-  });
-});
-
 describe("the panel view model: browsing models", () => {
   const ids = (p: ReturnType<typeof open>) => p.panel.view().picker?.items.map((i) => i.id);
 
@@ -740,7 +896,7 @@ describe("the panel view model: browsing models", () => {
     expect(p.panel.view().picker?.sort).toBe("price");
     // the other model list follows the same order
     await p.press("tab", "escape");
-    await p.goTo("Transcription");
+    await p.goTo("Transcription model");
     await p.press("enter");
     expect(p.panel.view().picker?.sort).toBe("provider");
   });
@@ -783,17 +939,6 @@ describe("the panel view model: browsing models", () => {
     await p.press("down");
     expect(p.panel.view().picker?.detail).toMatch(/^Gemini 3.8 Flash TTS/);
   });
-
-  it("the composer says when the speech model takes inline tags", async () => {
-    const p = open();
-    await p.panel.idle();
-    await p.press("enter");
-    expect(p.panel.view().input?.placeholder).toMatch(/\[tags\] direct this model/);
-    await p.press("escape");
-    await p.engine.speech.set("tts-model", "hexgrad/kokoro-82m");
-    await p.press("enter");
-    expect(p.panel.view().input?.placeholder).not.toMatch(/tags/);
-  });
 });
 
 describe("the panel view model: history, files, and the dictation language", () => {
@@ -813,6 +958,8 @@ describe("the panel view model: history, files, and the dictation language", () 
     expect(p.panel.view().picker?.title).toBe("History");
     expect(p.panel.view().status?.text).toBe("♪ speaking…");
     expect(p.requests.filter((r) => r.body?.input)).toHaveLength(2);
+    await p.press("escape");
+    expect(p.panel.view().menu).toBe("main");
   });
 
   it("History… with nothing spoken says so", async () => {
@@ -823,12 +970,13 @@ describe("the panel view model: history, files, and the dictation language", () 
     expect(p.hint()).toBe("Esc back");
   });
 
-  it("Transcribe file… asks for a path under its row, puts the text into the editor and closes", async () => {
+  it("t in the main view asks for an audio file under the list, puts the text into the editor and closes", async () => {
     const p = open();
     const audio = join(p.work, "note.wav");
     writeFileSync(audio, "RIFFfake");
     await p.type("t");
-    expect(p.panel.view().input).toMatchObject({ label: "Audio file", under: "transcribe" });
+    expect(p.panel.view().input).toMatchObject({ label: "Audio file" });
+    expect(p.panel.view().input?.under).toBeUndefined();
     expect(p.hint()).toBe("Enter transcribe · Esc back");
     await p.type(audio);
     await p.press("enter");
@@ -866,10 +1014,7 @@ describe("the panel view model: history, files, and the dictation language", () 
     await p.type("ja");
     await p.press("enter");
     expect(p.panel.view().input).toBeUndefined();
-    expect(p.row("Dictation language")).toMatchObject({
-      value: "ja",
-      note: "sent with dictation and transcribed files",
-    });
+    expect(p.row("Dictation language")?.value).toBe("ja");
     expect(settingsOf(p.work).dictationLanguage).toBe("ja");
     const audio = join(p.work, "note.wav");
     writeFileSync(audio, "RIFFfake");
@@ -882,14 +1027,15 @@ describe("the panel view model: history, files, and the dictation language", () 
     expect(settingsOf(p.work).dictationLanguage).toBeUndefined();
   });
 
-  it("Alt+S opens the composer from the list and from a picker", async () => {
+  it("Dictation output is Pi, or User-defined with a command, set under its row", async () => {
     const p = open();
-    await p.press("speak");
-    expect(p.panel.view()).toMatchObject({ title: "Speak", composer: true });
-    await p.press("escape");
-    await p.goTo("Voice");
-    await p.press("enter", "speak");
-    expect(p.panel.view().composer).toBe(true);
-    expect(p.panel.view().picker).toBeUndefined();
+    await p.goTo("Dictation output");
+    await p.press("enter");
+    expect(p.panel.view().input).toMatchObject({ label: "Dictation output", under: "output" });
+    await p.type("wl-copy %s");
+    await p.press("enter");
+    expect(p.row("Dictation output")?.value).toBe("User-defined");
+    expect(p.row("Dictation output")?.note).toBeUndefined();
+    expect(settingsOf(p.work).dictationOutput).toBe("wl-copy %s");
   });
 });

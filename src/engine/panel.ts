@@ -1,8 +1,13 @@
 /**
- * The /speech settings panel, Pi-free: a plain view model of the panel (rows, values, notes, live state,
- * the key hints for the current focus) built from engine state, and what each key does. Every change goes
- * through the same engine operations as the `/speech --` actions. The Pi adapter draws the view model and
- * feeds the keys; nothing here knows about terminals.
+ * The /speech settings panel, Pi-free: a plain view model of the panel (rows, values, live state, the key
+ * hints for the current focus) built from engine state, and what each key does. Every change goes through the
+ * same engine operations as the `/speech --` actions. The Pi adapter draws the view model and feeds the keys;
+ * nothing here knows about terminals.
+ *
+ * The main view holds only settings, under SPEAK (with the Speak key), LISTEN (with the Dictate key) and
+ * SETTINGS; a model or a voice shows only its name there (prices, features and languages are in the pickers).
+ * Values cycle in place; rows that list things open a picker; Hotkeys and Bridge connection are submenus.
+ * Hotkeys holds every action, runnable, and changes the keys of Speak and Dictate.
  */
 
 import { basename } from "node:path";
@@ -16,48 +21,53 @@ import type { ModelOption, SpeechCatalog } from "./openrouter";
 import { REPLACED } from "./player";
 import { priceValue } from "./pricing";
 import { ReadingFailed, readingFailedMessage } from "./reading";
-import { type BridgeMode, MODEL_SORTS, type ModelSort } from "./settings";
+import { type BridgeMode, type Hotkeys, hotkeyId, keyLabel, MODEL_SORTS, type ModelSort } from "./settings";
 import { languageLabel, type SampleResult, type SettingName } from "./speech";
 import type { Surface, SurfaceUi } from "./surface";
 import { XAI_MODEL } from "./xai";
 
 export type RowId =
-  | "speak"
-  | "replay"
-  | "history"
-  | "stop"
+  // The main view
+  | "readAloud"
+  | "speechSource"
   | "speechModel"
   | "voice"
-  | "readAloud"
-  | "dictate"
-  | "transcribe"
+  | "transcriptionSource"
   | "transcription"
   | "language"
   | "output"
-  | "audio"
-  | "tools";
+  | "hotkeys"
+  | "bridge"
+  // Hotkeys: the actions
+  | "speak"
+  | "dictate"
+  | "replay"
+  | "history"
+  | "stop"
+  | "transcribe"
+  // Bridge connection
+  | "bridgeMode";
 
-/** What the rows are grouped by: turning text into speech, speech into text, and how the plugin is wired. */
-export type SectionId = "speak" | "listen" | "system";
+/** The sections of the main view: turning text into speech, speech into text, and the rest. */
+export type SectionId = "speak" | "listen" | "settings";
+
+/** What the panel shows: the main view, or one of its submenus. */
+export type MenuId = "main" | "hotkeys" | "bridge";
 
 export interface PanelRow {
   id: RowId;
-  section: SectionId;
-  group: "action" | "setting";
+  /** The section of a main-view row; a submenu's rows have none. */
+  section?: SectionId;
   label: string;
-  /** The key that runs an action. */
-  key?: string;
-  /** The value of a setting, as shown (the xai model as xAI Grok). */
+  /** The current value, as shown (the xai model as xAI Grok, a key as Alt+S); none for a submenu row. */
   value?: string;
-  /** A model row: the price per minute of audio, shown first (or what is wrong with it, starting with ✗). */
-  price?: string;
-  /** Secondary facts: the provider of a model, the voice language, the resolved audio route. */
+  /** What is wrong (starting with ✗), or in a submenu what the value means. */
   note?: string;
   /** A shorter note, for when the note does not fit. */
   short?: string;
-  /** Something is wrong or unavailable; the note (or price) says what, starting with ✗. */
+  /** Something is wrong or unavailable; the note says what, starting with ✗. */
   alert?: boolean;
-  /** Enter opens a list to choose from (drawn with ›); the other settings change in place. */
+  /** Enter opens a list or a submenu (drawn with ›); the other settings change in place. */
   opens?: boolean;
 }
 
@@ -126,6 +136,12 @@ export interface PanelView {
   title: string;
   /** What speech is doing: ▶ speaking, ● REC m:ss, … transcribing; empty when nothing happens. */
   state: string;
+  /** Which rows these are: the main view's, or a submenu's. */
+  menu: MenuId;
+  /** A submenu: its title, after the panel's (`Speech › Hotkeys`). */
+  crumb?: string;
+  /** The main view: the heading of each section, with its key as Pi has it bound (`SPEAK (Alt+S)`). */
+  headings?: Record<SectionId, string>;
   rows: PanelRow[];
   selected: number;
   picker?: PickerView;
@@ -151,15 +167,18 @@ export type NamedKey =
   | "end"
   /** Shift+Tab, the feature filter of a model list. */
   | "backtab"
-  /** Alt+S, the speak composer. */
+  /** The Speak hotkey (Alt+S unless changed): the speak composer. */
   | "speak"
   /** F2, the voice-language key. */
   | "language"
-  /** Alt+Z, the dictation key. */
+  /** The Dictate hotkey (Alt+Z unless changed). */
   | "dictate";
 
-/** A key: a named one, or typed (or pasted) text. */
-export type PanelKey = { key: NamedKey } | { text: string; paste?: boolean };
+/**
+ * A key: a named one (`id` is how Pi names it, such as `alt+s`), typed (or pasted) text, or any other key with
+ * a modifier, by Pi's name (`alt+d`), which only matters while a new hotkey is being chosen.
+ */
+export type PanelKey = { key: NamedKey; id?: string } | { text: string; paste?: boolean } | { combo: string };
 
 const isWordChar = (c: string | undefined) => c !== undefined && /[\p{L}\p{N}]/u.test(c);
 
@@ -221,6 +240,8 @@ export interface PanelDeps {
   changed(): void;
   /** How long a success line stays. */
   successMs?: number;
+  /** The keys Pi has bound to Speak and Dictate (from the settings when the extension loaded). */
+  hotkeys?: Hotkeys;
 }
 
 /** A one-line text field: the value and the cursor, in code points. */
@@ -292,45 +313,53 @@ interface PickerState {
   selected: number;
 }
 
+/** A submenu; `capture` while it waits for the new key of Speak or Dictate. */
+type MenuMode = { kind: "menu"; menu: "hotkeys" | "bridge"; selected: number; capture?: HotkeyName };
+type HotkeyName = keyof Hotkeys;
+
 type Mode =
   | { kind: "list" }
-  | { kind: "picker"; picker: PickerState }
+  | MenuMode
+  | { kind: "picker"; picker: PickerState; back: Mode }
   | { kind: "input"; purpose: "speak"; edit: LineEdit; back: Mode; standalone?: boolean }
   | { kind: "input"; purpose: "language"; voice: string; edit: LineEdit; back: Mode }
   | { kind: "input"; purpose: "transcribe" | "dictation" | "output"; edit: LineEdit; back: Mode };
 
-const ROWS: Array<Pick<PanelRow, "id" | "section" | "group" | "label" | "key" | "opens">> = [
-  { id: "speak", section: "speak", group: "action", label: "Speak…", key: "Alt+S" },
-  { id: "replay", section: "speak", group: "action", label: "Replay last", key: "r" },
-  { id: "history", section: "speak", group: "action", label: "History…", key: "h" },
-  { id: "stop", section: "speak", group: "action", label: "Stop", key: "s" },
-  { id: "speechModel", section: "speak", group: "setting", label: "Speech model", opens: true },
-  { id: "voice", section: "speak", group: "setting", label: "Voice", opens: true },
-  { id: "readAloud", section: "speak", group: "setting", label: "Read replies aloud" },
-  { id: "dictate", section: "listen", group: "action", label: "Dictate", key: "Alt+Z" },
-  { id: "transcribe", section: "listen", group: "action", label: "Transcribe file…", key: "t" },
-  { id: "transcription", section: "listen", group: "setting", label: "Transcription", opens: true },
-  { id: "language", section: "listen", group: "setting", label: "Dictation language", opens: true },
-  { id: "output", section: "listen", group: "setting", label: "Dictation output", opens: true },
-  { id: "audio", section: "system", group: "setting", label: "Play audio on" },
-  { id: "tools", section: "system", group: "setting", label: "Agent tools" },
+type RowBase = Pick<PanelRow, "id" | "section" | "label" | "opens">;
+
+const MAIN: RowBase[] = [
+  { id: "readAloud", section: "speak", label: "Read aloud options" },
+  { id: "speechSource", section: "speak", label: "Speech source" },
+  { id: "speechModel", section: "speak", label: "Speech model", opens: true },
+  { id: "voice", section: "speak", label: "Voice", opens: true },
+  { id: "transcriptionSource", section: "listen", label: "Transcription source" },
+  { id: "transcription", section: "listen", label: "Transcription model", opens: true },
+  { id: "language", section: "listen", label: "Dictation language" },
+  { id: "output", section: "listen", label: "Dictation output", opens: true },
+  { id: "hotkeys", section: "settings", label: "Hotkeys", opens: true },
+  { id: "bridge", section: "settings", label: "Bridge connection", opens: true },
 ];
 
-/**
- * The lines of the panel as indexes into `rows`: the actions of a section share one line (a toolbar), every
- * setting has its own. ↑↓ move between lines, ←→ within a toolbar.
- */
-export function rowLines(rows: Array<Pick<PanelRow, "group" | "section">>): number[][] {
-  const lines: number[][] = [];
-  rows.forEach((r, i) => {
-    const last = lines.at(-1);
-    const head = last ? rows[last[0]] : undefined;
-    if (last && head && r.group === "action" && head.group === "action" && head.section === r.section) last.push(i);
-    else lines.push([i]);
-  });
-  return lines;
-}
-const LINES = rowLines(ROWS);
+/** Every action, with its key; Enter runs it. */
+const HOTKEYS: RowBase[] = [
+  { id: "speak", label: "Speak…" },
+  { id: "dictate", label: "Dictate" },
+  { id: "replay", label: "Replay last" },
+  { id: "history", label: "History…" },
+  { id: "stop", label: "Stop" },
+  { id: "transcribe", label: "Transcribe file…" },
+];
+
+const BRIDGE: RowBase[] = [{ id: "bridgeMode", label: "Bridge" }];
+
+const MENUS: Record<MenuMode["menu"], { title: string; rows: RowBase[] }> = {
+  hotkeys: { title: "Hotkeys", rows: HOTKEYS },
+  bridge: { title: "Bridge connection", rows: BRIDGE },
+};
+
+/** The keys of the actions that only work inside the panel. */
+const LETTERS: Partial<Record<RowId, string>> = { replay: "r", history: "h", stop: "s", transcribe: "t" };
+const HOTKEY_NAMES: Record<HotkeyName, string> = { speak: "Speak", dictate: "Dictate" };
 
 const PICKER_ROWS: ListRow[] = ["speechModel", "transcription", "voice"];
 const isPickerRow = (id: RowId): id is ListRow => (PICKER_ROWS as RowId[]).includes(id);
@@ -344,22 +373,22 @@ const SETTING_OF: Record<ListRow, SettingName> = {
 };
 const LABEL_OF: Record<PickerRow, string> = {
   speechModel: "Speech model",
-  transcription: "Transcription",
+  transcription: "Transcription model",
   voice: "Voice",
   history: "History",
 };
 const LANGUAGE_HINT = "a tag such as ja or pt-BR, or auto";
 const OUTPUT_HINT = "a command; %s is the dictation text · empty uses Pi's input box";
 
-/** The bridge modes in the order ←→ step through them, with the words the panel shows. */
-const AUDIO_MODES: BridgeMode[] = ["auto", "on", "off"];
-const AUDIO_WORDS: Record<BridgeMode, string> = { auto: "auto", on: "bridge", off: "local" };
+/** The bridge modes in the order ←→ step through them. */
+const BRIDGE_MODES: BridgeMode[] = ["auto", "on", "off"];
 
 const PRICE_UNKNOWN = "price unknown";
 /** The name the panel shows for the xai model (the saved id stays xai). */
 export const XAI_LABEL = "xAI Grok";
 
-const onOff = (on: boolean) => (on ? "on" : "off");
+/** Read aloud options: Off or All for now (the whole reply is read). */
+const readAloudWord = (on: boolean) => (on ? "All" : "Off");
 const oneLine = (text: string) => text.replace(/\s+/g, " ").trim();
 /** A model as the panel shows it. */
 const modelLabel = (id: string) => (id === XAI_MODEL ? XAI_LABEL : id);
@@ -422,9 +451,10 @@ function speakError(err: unknown): string {
 
 export class Panel {
   private mode: Mode = { kind: "list" };
+  /** The selected row of the main view. */
   private selected = 0;
-  /** The column ↑↓ return to in a toolbar. */
-  private col = 0;
+  /** The keys Pi has bound; a changed key shows beside them until Pi loads the extension again. */
+  private readonly bound: Hotkeys;
   private transcribing = false;
   private status?: Status;
   private statusTimer?: ReturnType<typeof setTimeout>;
@@ -450,7 +480,9 @@ export class Panel {
     private readonly engine: Engine,
     private readonly surface: Surface,
     private readonly deps: PanelDeps,
-  ) {}
+  ) {
+    this.bound = { ...(deps.hotkeys ?? engine.speech.settings.hotkeys) };
+  }
 
   private get speech() {
     return this.engine.speech;
@@ -475,8 +507,13 @@ export class Panel {
 
   /** Open the repeated-speaking composer. Standalone mode closes on Esc instead of returning to settings. */
   openSpeaker(standalone = false): void {
-    this.mode = { kind: "input", purpose: "speak", edit: new LineEdit(), back: { kind: "list" }, standalone };
+    this.mode = { kind: "input", purpose: "speak", edit: new LineEdit(), back: this.home(), standalone };
     this.changed();
+  }
+
+  /** The main view or the submenu under the current focus (a picker or an input goes back to it). */
+  private home(mode: Mode = this.mode): { kind: "list" } | MenuMode {
+    return mode.kind === "list" || mode.kind === "menu" ? mode : this.home(mode.back);
   }
 
   /** Settles when every operation started so far has finished. */
@@ -494,28 +531,41 @@ export class Panel {
   // ── The view ────────────────────────────────────────────────────────────
 
   view(): PanelView {
+    const home = this.home();
+    const rows = (home.kind === "list" ? MAIN : MENUS[home.menu].rows).map((r) => this.row(r, home));
     const view: PanelView = {
       title: "Speech",
       state: this.engine.indicator.live(),
-      rows: ROWS.map((r) => this.row(r)),
-      selected: this.selected,
+      menu: home.kind === "list" ? "main" : home.menu,
+      rows,
+      selected: home.kind === "list" ? this.selected : home.selected,
       hints: this.hints(),
     };
+    if (home.kind === "list") {
+      view.headings = {
+        speak: `SPEAK (${keyLabel(this.bound.speak)})`,
+        listen: `LISTEN (${keyLabel(this.bound.dictate)})`,
+        settings: "SETTINGS",
+      };
+    } else view.crumb = MENUS[home.menu].title;
     if (this.status) view.status = this.status;
     if (this.mode.kind === "picker") view.picker = this.pickerView(this.mode.picker);
     if (this.mode.kind === "input") {
       const m = this.mode;
+      // Under its row when the row is shown, else under the list.
       const input = (label: string, placeholder: string, under?: RowId): InputView => ({
         label,
         value: m.edit.value,
         cursor: m.edit.cursor,
         placeholder,
-        ...(under ? { under } : {}),
+        ...(under && rows.some((r) => r.id === under) ? { under } : {}),
       });
       switch (m.purpose) {
         case "speak":
           view.title = "Speak";
           view.composer = true;
+          delete view.crumb;
+          delete view.headings;
           view.input = input(
             "",
             this.takesTags()
@@ -545,90 +595,91 @@ export class Panel {
     return view;
   }
 
-  private row(base: (typeof ROWS)[number]): PanelRow {
+  private row(base: RowBase, home: { kind: "list" } | MenuMode = this.home()): PanelRow {
     const s = this.speech.settings;
     const value = (actual: string) => this.pending.get(base.id) ?? actual;
     switch (base.id) {
+      // Only the name of a model or a voice: what it costs and offers is in its picker.
       case "speechModel": {
         const v = value(s.speechModel);
-        return { ...base, value: modelLabel(v), ...this.modelNote("tts", v) };
+        return { ...base, value: modelLabel(v), ...this.modelAlert("tts", v) };
       }
       case "transcription": {
         const v = value(s.transcriptionModel);
-        return { ...base, value: modelLabel(v), ...this.modelNote("stt", v) };
+        return { ...base, value: modelLabel(v), ...this.modelAlert("stt", v) };
       }
       case "voice": {
         const v = value(s.voice);
-        return { ...base, value: v, ...this.voiceRowNote(v) };
-      }
-      case "audio": {
-        const v = value(AUDIO_WORDS[this.engine.routes.mode]);
-        const mode = AUDIO_MODES.find((m) => AUDIO_WORDS[m] === v) ?? "auto";
-        return { ...base, value: v, ...this.audioNote(mode) };
+        return { ...base, value: v, ...this.voiceAlert() };
       }
       case "readAloud":
-        return { ...base, value: onOff(this.engine.readAloud.enabled) };
+        return { ...base, value: readAloudWord(this.engine.readAloud.enabled) };
+      case "speechSource":
+      case "transcriptionSource":
+        return { ...base, value: "Provider" };
       case "language":
-        return {
-          ...base,
-          value: value(s.dictationLanguage ?? "auto"),
-          note: s.dictationLanguage ? "sent with dictation and transcribed files" : "the model detects it",
-        };
-      case "tools":
-        return { ...base, value: value(onOff(s.tools)), note: "lets the agent speak and transcribe" };
+        return { ...base, value: value(s.dictationLanguage ?? "auto") };
       case "output":
-        return s.dictationOutput
-          ? { ...base, value: "User-defined", note: s.dictationOutput }
-          : { ...base, value: "Pi", note: "into Pi's input box" };
-      default:
-        return { ...base };
+        return { ...base, value: s.dictationOutput ? "User-defined" : "Pi" };
+      case "speak":
+      case "dictate":
+        return { ...base, ...this.hotkeyValue(base.id, home) };
+      case "bridgeMode": {
+        const v = value(this.engine.routes.mode);
+        const mode = BRIDGE_MODES.find((m) => m === v) ?? "auto";
+        return { ...base, value: v, ...this.bridgeNote(mode) };
+      }
+      default: {
+        const letter = LETTERS[base.id];
+        return letter ? { ...base, value: letter } : { ...base };
+      }
     }
+  }
+
+  /** The key of Speak or Dictate: the bound one, then a changed one that waits for Pi to load it. */
+  private hotkeyValue(name: HotkeyName, home: { kind: "list" } | MenuMode): Pick<PanelRow, "value" | "note"> {
+    if (home.kind === "menu" && home.capture === name) return { value: "press a key…" };
+    const saved = this.speech.settings.hotkeys[name];
+    const value = keyLabel(this.bound[name]);
+    return saved === this.bound[name] ? { value } : { value, note: `→ ${keyLabel(saved)} after /reload` };
   }
 
   /** The value a row shows now, a pending one included. */
   private shown(id: RowId): string | undefined {
-    const base = ROWS.find((r) => r.id === id);
+    const base = [...MAIN, ...HOTKEYS, ...BRIDGE].find((r) => r.id === id);
     return base ? this.row(base).value : undefined;
   }
 
-  /** Price and provider of a model, or why it is not offered. */
-  private modelNote(kind: "tts" | "stt", id: string): Pick<PanelRow, "price" | "note" | "alert"> {
-    if (!this.models) return this.modelsError ? { note: "✗ models unavailable", alert: true } : { note: "loading…" };
+  /** Why a model is not usable; nothing when it is (its price and features are in the picker). */
+  private modelAlert(kind: "tts" | "stt", id: string): Pick<PanelRow, "note" | "alert"> {
+    if (!this.models) return this.modelsError ? { note: "✗ models unavailable", alert: true } : {};
     const m = this.models[kind].find((x) => x.id === id);
     if (!m) {
       return id === XAI_MODEL ? { note: "✗ xAI: no login", alert: true } : { note: "✗ not offered", alert: true };
     }
-    const provider = this.speech.providerName(id);
-    if (this.speech.catalogOffline(id)) {
-      return { price: "✗ catalog offline", note: provider, alert: true };
-    }
-    // What the model offers, as far as the catalog says; where it says nothing, who serves it.
-    // `free` is already the price.
-    const features = m.features?.filter((f) => f !== "free");
-    return { price: priceOf(m), note: featureLine({ features, languages: m.languages }) || provider };
+    if (this.speech.catalogOffline(id)) return { note: "✗ catalog offline", alert: true };
+    return {};
   }
 
-  private voiceRowNote(voice: string): Pick<PanelRow, "note" | "alert"> {
+  /** Why the voices are not usable; nothing when they are (a voice's language is in the picker). */
+  private voiceAlert(): Pick<PanelRow, "note" | "alert"> {
     const model = this.speech.settings.speechModel;
     const v = this.voices?.model === model ? this.voices : undefined;
     if (v?.error) return { note: "✗ voices unavailable", alert: true };
-    if (model === XAI_MODEL && !v?.ids) return { note: "loading…" };
     if (v?.ids && v.ids.length === 0) return { note: "✗ xAI lists no voices", alert: true };
-    return { note: voiceNote(this.speech.languageOf(model, voice)) };
+    return {};
   }
 
-  /** Where audio goes in a mode: this machine, or the bridge with the receiver's state. */
-  private audioNote(mode: BridgeMode): Pick<PanelRow, "note" | "short" | "alert"> {
+  /** Where audio plays in a mode: This machine, or the Remote machine with the receiver's state. */
+  private bridgeNote(mode: BridgeMode): Pick<PanelRow, "note" | "short" | "alert"> {
     const routes = this.engine.routes;
-    if (routes.routeFor(mode) === "local") {
-      const where = routes.ssh ? "Pi host" : "this machine";
-      return { note: mode === "auto" ? `→ ${where}` : where };
-    }
+    const when = mode === "auto" ? "on over SSH · " : "";
+    if (routes.routeFor(mode) === "local") return { note: `${when}plays on This machine`, short: "This machine" };
     const r = this.receiver;
     const host = routes.url.replace(/^[a-z]+:\/\//, "");
     const state = !r || r === "checking" ? "… checking" : r.ok ? `✓ ${host}` : "✗ receiver unreachable";
     const alert = typeof r === "object" && !r.ok;
-    return { note: mode === "auto" ? `→ bridge ${state}` : state, short: state, ...(alert ? { alert } : {}) };
+    return { note: `${when}plays on the Remote machine · ${state}`, short: state, ...(alert ? { alert } : {}) };
   }
 
   /** The models of a model list as the catalog has them (a model it does not list keeps its id). */
@@ -740,21 +791,15 @@ export class Panel {
         esc("back"),
       ];
     }
+    const home = this.home();
+    if (home.kind === "menu") return this.menuHints(home);
     const close = esc("close");
-    const others: Hint = { key: "←→", action: "more", optional: true };
-    switch (ROWS[this.selected].id) {
-      case "speak":
-        return [{ key: "Enter", action: "type messages to speak" }, others, close];
-      case "replay":
-        return [{ key: "Enter", action: "play the last message again" }, others, close];
-      case "history":
-        return [{ key: "Enter", action: "replay an earlier message" }, others, close];
-      case "stop":
-        return [{ key: "Enter", action: "stop what is playing" }, others, close];
-      case "dictate":
-        return [{ key: "Enter", action: "record, then insert the text" }, others, close];
-      case "transcribe":
-        return [{ key: "Enter", action: "insert the text of an audio file" }, others, close];
+    switch (MAIN[this.selected].id) {
+      case "readAloud":
+        return [{ key: "←→", action: "Off · All" }, close];
+      case "speechSource":
+      case "transcriptionSource":
+        return [{ key: "←→", action: "Provider, the only source so far" }, close];
       case "voice":
         return [{ key: "Enter", action: "choose" }, ...this.voiceKeys(), close];
       case "speechModel":
@@ -763,11 +808,25 @@ export class Panel {
       case "language":
       case "output":
         return [{ key: "Enter", action: "set" }, close];
-      case "audio":
-        return [{ key: "←→", action: AUDIO_MODES.map((mode) => AUDIO_WORDS[mode]).join(" · ") }, close];
+      case "hotkeys":
+        return [{ key: "Enter", action: "run actions, change keys" }, close];
       default:
-        return [{ key: "←→", action: "on/off" }, close];
+        return [{ key: "Enter", action: "where audio plays" }, close];
     }
+  }
+
+  private menuHints(m: MenuMode): Hint[] {
+    const back: Hint = { key: "Esc", action: "back" };
+    if (m.capture) {
+      return [
+        { key: "Alt+letter", action: `new key for ${HOTKEY_NAMES[m.capture]}` },
+        { key: "Esc", action: "cancel" },
+      ];
+    }
+    if (m.menu === "bridge") return [{ key: "←→", action: BRIDGE_MODES.join(" · ") }, back];
+    const id = HOTKEYS[m.selected].id;
+    const change: Hint[] = id === "speak" || id === "dictate" ? [{ key: "k", action: "change key" }] : [];
+    return [{ key: "Enter", action: "run" }, ...change, back];
   }
 
   private voiceKeys(): Hint[] {
@@ -782,7 +841,10 @@ export class Panel {
   /** One key. Never throws: a failure becomes the status line. */
   handle(k: PanelKey): void {
     try {
-      if ("text" in k) this.text(k.text, k.paste === true);
+      const m = this.mode;
+      if (m.kind === "menu" && m.capture) this.capture(m, m.capture, k);
+      else if ("combo" in k) return;
+      else if ("text" in k) this.text(k.text, k.paste === true);
       else this.named(k.key);
     } catch (err) {
       this.setStatus("error", `✗ ${errorMessage(err)}`);
@@ -796,7 +858,7 @@ export class Panel {
       return;
     }
     if (key === "speak") {
-      // Alt+S: the composer from anywhere; in the composer it changes nothing.
+      // The Speak key: the composer from anywhere; in the composer it changes nothing.
       if (this.mode.kind !== "input" || this.mode.purpose !== "speak") this.openSpeaker();
       return;
     }
@@ -816,8 +878,8 @@ export class Panel {
       const highlighted = items[Math.min(p.selected, n - 1)];
       if (key === "up" || key === "down") {
         if (n) p.selected = (Math.min(p.selected, n - 1) + (key === "up" ? n - 1 : 1)) % n;
-      } else if (key === "enter") this.pick(p);
-      else if (key === "escape") this.mode = { kind: "list" };
+      } else if (key === "enter") this.pick(m);
+      else if (key === "escape") this.mode = m.back;
       else if (key === "tab") {
         if (p.row === "voice" && highlighted) this.sample(highlighted.id);
         else if (isModelRow(p.row)) this.nextSort(p);
@@ -832,27 +894,26 @@ export class Panel {
       }
       return;
     }
-    const id = ROWS[this.selected].id;
+    if (m.kind === "menu") {
+      const rows = MENUS[m.menu].rows;
+      const id = rows[m.selected].id;
+      if (key === "up" || key === "down")
+        m.selected = (m.selected + (key === "up" ? rows.length - 1 : 1)) % rows.length;
+      else if (key === "enter") this.activate(id);
+      else if (key === "left" || key === "right") this.step(id, key === "left" ? -1 : 1);
+      else if (key === "escape") this.mode = { kind: "list" };
+      return;
+    }
+    const id = MAIN[this.selected].id;
     switch (key) {
       case "up":
-      case "down": {
-        // Line by line; a toolbar is entered at the column it was left at.
-        const at = LINES.findIndex((line) => line.includes(this.selected));
-        const line = LINES[(at + (key === "up" ? LINES.length - 1 : 1)) % LINES.length];
-        this.selected = line[Math.min(this.col, line.length - 1)];
+      case "down":
+        this.selected = (this.selected + (key === "up" ? MAIN.length - 1 : 1)) % MAIN.length;
         return;
-      }
       case "left":
-      case "right": {
-        const line = LINES.find((l) => l.includes(this.selected)) ?? [this.selected];
-        if (line.length === 1) {
-          this.step(id, key === "left" ? -1 : 1);
-          return;
-        }
-        this.col = (line.indexOf(this.selected) + (key === "left" ? line.length - 1 : 1)) % line.length;
-        this.selected = line[this.col];
+      case "right":
+        this.step(id, key === "left" ? -1 : 1);
         return;
-      }
       case "enter":
         this.activate(id);
         return;
@@ -880,23 +941,65 @@ export class Panel {
       m.picker.selected = 0;
       return;
     }
-    const id = ROWS[this.selected].id;
-    if (isPickerRow(id)) {
-      this.openPicker(id, text);
+    if (m.kind === "list" && isPickerRow(MAIN[this.selected].id)) {
+      this.openPicker(MAIN[this.selected].id as ListRow, text);
       return;
     }
     if (paste) return;
-    // The keys of the actions; on the other rows typing does nothing.
     const ch = [...text][0];
-    if (ch === "s") this.stop();
-    else if (ch === "r") this.replay();
-    else if (ch === "h") this.openPicker("history");
-    else if (ch === "t") this.ask("transcribe");
+    if (m.kind === "menu" && m.menu === "hotkeys" && ch === "k") {
+      const id = HOTKEYS[m.selected].id;
+      if (id === "speak" || id === "dictate") m.capture = id;
+      else this.setStatus("info", "Only Speak and Dictate have keys of their own to change");
+      return;
+    }
+    if (m.kind === "menu" && m.menu !== "hotkeys") return;
+    // The keys of the actions, in the main view and in Hotkeys.
+    const action = (Object.keys(LETTERS) as RowId[]).find((id) => LETTERS[id] === ch);
+    if (action) this.activate(action);
+  }
+
+  /**
+   * The new key of Speak or Dictate, saved in the settings. Pi binds an extension's shortcuts when it loads the
+   * extension, so the key works from the next /reload or start of Pi; until then the bound key keeps working.
+   */
+  private capture(m: MenuMode, name: HotkeyName, k: PanelKey): void {
+    if ("key" in k && k.key === "escape") {
+      m.capture = undefined;
+      return;
+    }
+    const pressed = "combo" in k ? k.combo : "key" in k ? k.id : k.text;
+    if (!pressed) return;
+    m.capture = undefined;
+    const key = hotkeyId(pressed);
+    if (!key) {
+      const shown = pressed.length === 1 ? pressed : keyLabel(pressed);
+      this.setStatus("error", `✗ ${shown} cannot be a hotkey: use Alt with a letter or a digit`);
+      return;
+    }
+    const saved = this.speech.settings.hotkeys;
+    const other: HotkeyName = name === "speak" ? "dictate" : "speak";
+    if (key === saved[other]) {
+      this.setStatus("error", `✗ ${keyLabel(key)} is already the key of ${HOTKEY_NAMES[other]}`);
+      return;
+    }
+    if (key === saved[name]) {
+      this.setStatus("info", `${HOTKEY_NAMES[name]} is already ${keyLabel(key)}`);
+      return;
+    }
+    this.speech.settings.hotkeys = { ...saved, [name]: key };
+    this.speech.save();
+    this.setStatus(
+      "success",
+      key === this.bound[name]
+        ? `✓ ${HOTKEY_NAMES[name]} is ${keyLabel(key)} again`
+        : `✓ ${HOTKEY_NAMES[name]} is ${keyLabel(key)} from the next /reload or start of Pi`,
+    );
   }
 
   /** Ask for the file to transcribe, or the dictation language, on the line under its row. */
   private ask(purpose: "transcribe" | "dictation"): void {
-    this.mode = { kind: "input", purpose, edit: new LineEdit(), back: { kind: "list" } };
+    this.mode = { kind: "input", purpose, edit: new LineEdit(), back: this.home() };
   }
 
   private activate(id: RowId): void {
@@ -928,6 +1031,13 @@ export class Panel {
       case "voice":
         this.openPicker(id);
         return;
+      case "hotkeys":
+        this.mode = { kind: "menu", menu: "hotkeys", selected: 0 };
+        return;
+      case "bridge":
+        this.mode = { kind: "menu", menu: "bridge", selected: 0 };
+        this.probe();
+        return;
       default:
         this.step(id, 1);
         return;
@@ -936,19 +1046,18 @@ export class Panel {
 
   // ── Changes, through the engine's operations ────────────────────────────
 
-  /** ←→ on a setting: toggle, or step through the audio modes. Picker rows have long lists: nothing. */
+  /** Enter or ←→ on a value: cycle it in place. Picker rows have long lists: nothing. */
   private step(id: RowId, dir: 1 | -1): void {
     if (id === "readAloud") {
       const on = !this.engine.readAloud.enabled;
       this.engine.readAloud.enabled = on;
-      this.setStatus("success", `✓ Read replies aloud: ${onOff(on)}`);
-    } else if (id === "tools") {
-      const on = this.shown("tools") !== "on";
-      this.change("tools", onOff(on), async () => `✓ ${await this.engine.setTools(on)}`);
-    } else if (id === "audio") {
-      const i = AUDIO_MODES.findIndex((m) => AUDIO_WORDS[m] === this.shown("audio"));
-      const next = AUDIO_MODES[(i + dir + AUDIO_MODES.length) % AUDIO_MODES.length];
-      this.change("audio", AUDIO_WORDS[next], async () => {
+      this.setStatus("success", `✓ Read aloud: ${readAloudWord(on)}`);
+    } else if (id === "speechSource" || id === "transcriptionSource") {
+      this.setStatus("info", "Provider is the only source so far");
+    } else if (id === "bridgeMode") {
+      const i = BRIDGE_MODES.indexOf(this.shown("bridgeMode") as BridgeMode);
+      const next = BRIDGE_MODES[(i + dir + BRIDGE_MODES.length) % BRIDGE_MODES.length];
+      this.change("bridgeMode", next, async () => {
         const notice = await this.engine.setBridge(next);
         await this.probe();
         return notice.level === "info" ? `✓ ${notice.message}` : { tone: "error", text: `✗ ${notice.message}` };
@@ -974,7 +1083,8 @@ export class Panel {
     this.track(run);
   }
 
-  private pick(p: PickerState): void {
+  private pick(m: Extract<Mode, { kind: "picker" }>): void {
+    const p = m.picker;
     const item = this.pickerItems(p)[p.selected];
     if (!item) return;
     const row = p.row;
@@ -983,7 +1093,7 @@ export class Panel {
       this.replayFile(item.id);
       return;
     }
-    this.mode = { kind: "list" };
+    this.mode = m.back;
     this.change(row, item.id, async () => {
       const summary = await this.speech.set(SETTING_OF[row], item.id);
       if (row === "speechModel") this.track(this.loadVoices());
@@ -1009,7 +1119,8 @@ export class Panel {
   /** Open a picker, with `typed` already in its filter; the selection starts at the top. */
   private openPicker(row: PickerRow, typed = ""): void {
     const p: PickerState = { row, edit: new LineEdit(typed), selected: 0, show: "all" };
-    this.mode = { kind: "picker", picker: p };
+    const back = this.home();
+    this.mode = { kind: "picker", picker: p, back };
     if (row === "history") {
       p.messages = this.speech.messages();
       p.ids = p.messages.map((m) => m.file);
@@ -1028,7 +1139,7 @@ export class Panel {
           p.ids = loaded;
         },
         (err) => {
-          if (this.mode.kind === "picker" && this.mode.picker === p) this.mode = { kind: "list" };
+          if (this.mode.kind === "picker" && this.mode.picker === p) this.mode = back;
           this.setStatus("error", `✗ ${errorMessage(err)}`);
         },
       ),
@@ -1044,7 +1155,7 @@ export class Panel {
       kind: "input",
       purpose: "output",
       edit: new LineEdit(this.speech.settings.dictationOutput ?? ""),
-      back: { kind: "list" },
+      back: this.home(),
     };
   }
 

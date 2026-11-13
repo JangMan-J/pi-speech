@@ -6,10 +6,11 @@
  */
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { decodeKittyPrintable, Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import { decodeKittyPrintable, Key, matchesKey, parseKey, truncateToWidth } from "@earendil-works/pi-tui";
 import type { Engine } from "../engine/engine";
 import type { Env } from "../engine/env";
 import { type NamedKey, Panel, type PanelKey } from "../engine/panel";
+import { DEFAULT_HOTKEYS, type Hotkeys } from "../engine/settings";
 import type { Surface, SurfaceUi } from "../engine/surface";
 import { MAX_WIDTH, type PanelStyle, renderPanel } from "./panel-render";
 
@@ -69,16 +70,27 @@ const NAMED: Array<[Parameters<typeof matchesKey>[1], NamedKey]> = [
   [Key.home, "home"],
   [Key.end, "end"],
   [Key.f2, "language"],
-  ["alt+z", "dictate"],
-  ["alt+s", "speak"],
 ];
 
 const PASTE_START = "\x1b[200~";
 const PASTE_END = "\x1b[201~";
 
-/** Turns terminal input into panel keys; bracketed paste may arrive in pieces, so it is collected first. */
+/**
+ * Turns terminal input into panel keys; bracketed paste may arrive in pieces, so it is collected first. The
+ * Speak and Dictate hotkeys are the keys Pi has bound to them; any other key with a modifier comes through by
+ * its name (`alt+d`), for choosing a new hotkey.
+ */
 export class KeyDecoder {
   private paste?: string;
+  private readonly named: Array<[Parameters<typeof matchesKey>[1], NamedKey]>;
+
+  constructor(hotkeys: Hotkeys = DEFAULT_HOTKEYS) {
+    this.named = [
+      ...NAMED,
+      [hotkeys.dictate as Parameters<typeof matchesKey>[1], "dictate"],
+      [hotkeys.speak as Parameters<typeof matchesKey>[1], "speak"],
+    ];
+  }
 
   decode(data: string): PanelKey[] {
     if (this.paste === undefined && data.includes(PASTE_START)) {
@@ -95,10 +107,14 @@ export class KeyDecoder {
       this.paste = undefined;
       return [...(text ? [{ text, paste: true }] : []), ...(rest ? this.decode(rest) : [])];
     }
-    for (const [id, key] of NAMED) if (matchesKey(data, id)) return [{ key }];
+    const id = parseKey(data);
+    for (const [match, key] of this.named) {
+      if (matchesKey(data, match)) return [id?.includes("+") ? { key, id } : { key }];
+    }
     const plain = data.length > 0 && [...data].every((c) => c >= " " && c !== "\x7f");
     const printable = decodeKittyPrintable(data) ?? (plain ? data : undefined);
-    return printable ? [{ text: printable }] : [];
+    if (printable) return [{ text: printable }];
+    return id?.includes("+") ? [{ combo: id }] : [];
   }
 }
 
@@ -120,6 +136,7 @@ export function openPanel(
   env: Env,
   track: (panel: Panel | undefined) => void,
   speak = false,
+  hotkeys: Hotkeys = DEFAULT_HOTKEYS,
 ): Promise<void> {
   return ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
     let closed = false;
@@ -136,9 +153,10 @@ export function openPanel(
       changed: () => {
         if (!closed) tui.requestRender();
       },
+      hotkeys,
     });
     const style = panelStyle(theme as unknown as Theme, env);
-    const keys = new KeyDecoder();
+    const keys = new KeyDecoder(hotkeys);
     track(panel);
     panel.open();
     if (speak) panel.openSpeaker(true);
