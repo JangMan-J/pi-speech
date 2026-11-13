@@ -10,6 +10,7 @@ import type { Engine } from "../engine/engine";
 import { errorMessage } from "../engine/env";
 import { STATUS_KEY } from "../engine/indicator";
 import type { Panel } from "../engine/panel";
+import { type Hotkeys, keyLabel } from "../engine/settings";
 import type { SpeechResult } from "../engine/speech";
 import { parse, Surface, type SurfaceUi } from "../engine/surface";
 import { openPanel } from "./panel";
@@ -116,10 +117,71 @@ export async function summarizeWith(
     .join("\n");
 }
 
+/**
+ * What Option with a letter or a digit types on a US Mac layout when the terminal does not send Option as Alt
+ * (macOS Terminal.app unless "Use Option as Meta key" is on). Dead keys (e, i, n, u) type nothing at once.
+ */
+const MAC_OPTION: Record<string, string> = {
+  a: "å",
+  b: "∫",
+  c: "ç",
+  d: "∂",
+  f: "ƒ",
+  g: "©",
+  h: "˙",
+  j: "∆",
+  k: "˚",
+  l: "¬",
+  m: "µ",
+  o: "ø",
+  p: "π",
+  q: "œ",
+  r: "®",
+  s: "ß",
+  t: "†",
+  v: "√",
+  w: "∑",
+  x: "≈",
+  y: "¥",
+  z: "Ω",
+  "1": "¡",
+  "2": "™",
+  "3": "£",
+  "4": "¢",
+  "5": "∞",
+  "6": "§",
+  "7": "¶",
+  "8": "•",
+  "9": "ª",
+  "0": "º",
+};
+
+/** The character the hotkey `key` (`alt+z`) types on a US Mac layout without Option as Alt; none for other keys. */
+export function macOptionCharacter(key: string): string | undefined {
+  const m = /^alt\+([a-z0-9])$/.exec(key);
+  return m ? MAC_OPTION[m[1]] : undefined;
+}
+
+/** The one-time notice: the Speak or Dictate key reached Pi as a character, and what to do about it. */
+export function optionKeyNotice(name: keyof Hotkeys, key: string, char: string): string {
+  const action = name === "speak" ? "Speak" : "Dictate";
+  const instead = name === "speak" ? "/speech <text>" : "/speech --dictate";
+  return (
+    `${keyLabel(key)} (${action}) reached Pi as the character ${char}: macOS sends characters for Option+letter. ` +
+    `Turn on "Use Option as Meta key" in Terminal > Settings > Profiles > Keyboard (iTerm2 and Ghostty: Option as Alt), ` +
+    `which gives up Option for accented letters; or choose another key in /speech > Hotkeys; or use ${instead}.`
+  );
+}
+
 /** Pi has a terminal UI here (not RPC or print mode). */
 const hasTerminal = (ctx: ExtensionContext) => ctx.mode === "tui" && ctx.hasUI;
 
-export function registerPi(pi: ExtensionAPI, engine: Engine, env: NodeJS.ProcessEnv = process.env): void {
+export function registerPi(
+  pi: ExtensionAPI,
+  engine: Engine,
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): void {
   const surface = new Surface(engine);
   let ui: ExtensionContext["ui"] | undefined;
   /** The settings panel while it is open: engine notifications go to its status line instead of toasts. */
@@ -160,6 +222,7 @@ export function registerPi(pi: ExtensionAPI, engine: Engine, env: NodeJS.Process
     attach(ctx);
     engine.start();
     applyTools();
+    watchOptionKey(ctx);
     void engine.announce().then((n) => {
       if (n) engine.notify(n.message, n.level);
     });
@@ -218,6 +281,48 @@ export function registerPi(pi: ExtensionAPI, engine: Engine, env: NodeJS.Process
       speak,
       hotkeys,
     );
+
+  /**
+   * macOS: a terminal that does not send Option as Alt types Ω for Option+Z, so the hotkey never reaches Pi.
+   * When the character the Speak or Dictate key types there arrives in an empty editor, say once per install
+   * what happened. The character is only looked at: it always goes on to the editor unchanged.
+   */
+  let stopWatching: (() => void) | undefined;
+  const watchOptionKey = (ctx: ExtensionContext) => {
+    stopWatching?.();
+    stopWatching = undefined;
+    if (platform !== "darwin" || !hasTerminal(ctx) || engine.speech.settings.optionKeyHintShown) return;
+    const chars = new Map<string, keyof Hotkeys>();
+    for (const name of ["speak", "dictate"] as const) {
+      const char = macOptionCharacter(hotkeys[name]);
+      if (char) chars.set(char, name);
+    }
+    if (!chars.size) return;
+    const current = ctx.ui;
+    stopWatching = current.onTerminalInput((data) => {
+      try {
+        const name = chars.get(data);
+        if (!name || panel || engine.speech.settings.optionKeyHintShown) return undefined;
+        if (current.getEditorText() !== "") return undefined;
+        engine.speech.settings.optionKeyHintShown = true;
+        try {
+          engine.speech.save();
+        } catch {
+          // Unwritable settings: shown once in this session all the same.
+        }
+        const stop = stopWatching;
+        stopWatching = undefined;
+        // After this input has gone on to the editor.
+        setTimeout(() => {
+          stop?.();
+          current.notify(optionKeyNotice(name, hotkeys[name], data), "info");
+        }, 0);
+      } catch {
+        // Never in the way of typing.
+      }
+      return undefined;
+    });
+  };
 
   pi.registerShortcut(hotkeys.dictate as KeyId, {
     description: "Dictate: record, then press again to insert the transcript at the cursor (never sends)",

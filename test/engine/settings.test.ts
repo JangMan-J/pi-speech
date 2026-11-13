@@ -160,6 +160,19 @@ describe("the settings file", () => {
   });
 });
 
+describe("the macOS Option-key notice", () => {
+  it("is remembered once shown, and left out of the file until then", () => {
+    const f = new SettingsFile(dir);
+    const s = f.load();
+    expect(s.optionKeyHintShown).toBeUndefined();
+    f.save(s);
+    expect(JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"))).not.toHaveProperty("optionKeyHintShown");
+    f.save({ ...s, optionKeyHintShown: true });
+    expect(JSON.parse(readFileSync(join(dir, "settings.json"), "utf8")).optionKeyHintShown).toBe(true);
+    expect(new SettingsFile(dir).load().optionKeyHintShown).toBe(true);
+  });
+});
+
 describe("the hotkeys", () => {
   it("are saved only when changed, and read back", () => {
     const f = new SettingsFile(dir);

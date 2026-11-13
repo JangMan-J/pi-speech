@@ -1,8 +1,8 @@
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { GUIDELINE_PREFIX } from "../../src/engine/read-aloud";
-import { piModels, registerPi, summarizeWith } from "../../src/pi/adapter";
+import { macOptionCharacter, optionKeyNotice, piModels, registerPi, summarizeWith } from "../../src/pi/adapter";
 import { fakeOpenRouter, makeEngine } from "../engine/fixtures";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -171,6 +171,79 @@ describe("the Pi adapter", () => {
     await expect(summarizeWith(ctx, "anthropic/claude-haiku", "x")).rejects.toThrow("rate limited");
     expect(piModels(ctx)).toEqual(["anthropic/claude-haiku", "openai/gpt-mini"]);
     expect(piModels({ ...ctx, scopedModels: [{ model }] })).toEqual(["anthropic/claude-haiku"]);
+  });
+
+  describe("on macOS, the Speak or Dictate key typed as a character", () => {
+    /** A terminal UI whose raw input the extension may watch; `editor` is the editor's text. */
+    function macPi(platform: NodeJS.Platform = "darwin", hotkeys?: { speak: string; dictate: string }) {
+      const f = fakePi();
+      const listeners: Array<(data: string) => unknown> = [];
+      let editor = "";
+      f.ctx.mode = "tui";
+      f.ctx.ui.getEditorText = () => editor;
+      f.ctx.ui.onTerminalInput = (h: (data: string) => unknown) => {
+        listeners.push(h);
+        return () => listeners.splice(listeners.indexOf(h), 1);
+      };
+      const made = makeEngine();
+      if (hotkeys) made.engine.speech.settings.hotkeys = hotkeys;
+      registerPi(f.pi, made.engine, {}, platform);
+      /** Type `data`: what each listener returns (undefined lets it through). */
+      const type = (data: string) => listeners.map((h) => h(data));
+      const setEditor = (t: string) => {
+        editor = t;
+      };
+      return { ...made, ...f, listeners, type, setEditor };
+    }
+    const settle = () => new Promise((r) => setTimeout(r, 5));
+    const settingsFile = (work: string) =>
+      JSON.parse(readFileSync(join(work, "agent", "pi-speech", "settings.json"), "utf8"));
+
+    it("maps Alt with a letter to what a US Mac layout types; nothing for dead keys or other keys", () => {
+      expect(macOptionCharacter("alt+z")).toBe("Ω");
+      expect(macOptionCharacter("alt+s")).toBe("ß");
+      expect(macOptionCharacter("alt+e")).toBeUndefined();
+      expect(macOptionCharacter("ctrl+alt+z")).toBeUndefined();
+      expect(optionKeyNotice("dictate", "alt+z", "Ω")).toMatch(
+        /^Alt\+Z \(Dictate\) reached Pi as the character Ω.*Use Option as Meta key.*Terminal > Settings > Profiles > Keyboard.*iTerm2 and Ghostty: Option as Alt.*accented letters.*\/speech > Hotkeys.*\/speech --dictate/,
+      );
+    });
+
+    it("in an empty editor, says once per install what happened, and lets the character through", async () => {
+      const f = macPi();
+      await f.emit("session_start");
+      f.setEditor("hello ");
+      expect(f.type("Ω")).toEqual([undefined]);
+      await settle();
+      expect(f.notes).toEqual([]);
+      f.setEditor("");
+      expect(f.type("x")).toEqual([undefined]);
+      expect(f.type("Ω")).toEqual([undefined]);
+      await settle();
+      expect(f.notes.map((n) => n.message)).toEqual([optionKeyNotice("dictate", "alt+z", "Ω")]);
+      expect(settingsFile(f.work).optionKeyHintShown).toBe(true);
+      expect(f.listeners).toHaveLength(0);
+      // A new session of the same install: not again.
+      await f.emit("session_start");
+      expect(f.listeners).toHaveLength(0);
+    });
+
+    it("follows the bound keys: ß for Speak on Alt+S, nothing for a key not in the table", async () => {
+      const f = macPi("darwin", { speak: "alt+s", dictate: "alt+e" });
+      await f.emit("session_start");
+      f.type("ß");
+      await settle();
+      expect(f.notes.map((n) => n.message)).toEqual([optionKeyNotice("speak", "alt+s", "ß")]);
+      const g = macPi("darwin", { speak: "ctrl+alt+s", dictate: "alt+e" });
+      await g.emit("session_start");
+      expect(g.listeners).toHaveLength(0);
+    });
+
+    it("does nothing on other platforms", async () => {
+      const f = macPi("linux");
+      await f.emit("session_start");
+      expect(f.listeners).toHaveLength(0);
+    });
   });
 
   it("the synthesize tool names the saved files and whether it plays", async () => {

@@ -94,6 +94,8 @@ export interface Settings {
   localSpeechModel?: string;
   /** The on-device transcription model. */
   localTranscriptionModel?: string;
+  /** macOS: the notice that Option+letter reached Pi as a character has been shown (once per install). */
+  optionKeyHintShown?: boolean;
 }
 
 export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
@@ -237,6 +239,7 @@ export class SettingsFile {
       if (localSpeech) s.localSpeechModel = localSpeech;
       const localTranscription = str(raw.localTranscriptionModel);
       if (localTranscription) s.localTranscriptionModel = localTranscription;
+      if (raw.optionKeyHintShown === true) s.optionKeyHintShown = true;
     } else if (raw) {
       // settings.json without a version
       legacy = true;
@@ -289,6 +292,7 @@ export class SettingsFile {
       ...(s.transcriptionSource !== "provider" ? { transcriptionSource: s.transcriptionSource } : {}),
       ...(s.localSpeechModel ? { localSpeechModel: s.localSpeechModel } : {}),
       ...(s.localTranscriptionModel ? { localTranscriptionModel: s.localTranscriptionModel } : {}),
+      ...(s.optionKeyHintShown ? { optionKeyHintShown: true } : {}),
     };
     const tmp = `${this.file}.${process.pid}.tmp`;
     writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`);
