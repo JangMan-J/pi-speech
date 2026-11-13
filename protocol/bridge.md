@@ -12,9 +12,12 @@ This file is the contract between the two sides. Both sides implement it exactly
 
 - The receiver listens on loopback only. It refuses to start on any address that is
   not `127.0.0.1` or `::1`.
-- When Pi runs on a remote host, the user forwards the receiver's port with SSH, for
-  example `ssh -R 127.0.0.1:47613:127.0.0.1:47613 decent-spider`. Pi then reaches the
-  receiver at `http://127.0.0.1:47613` on the remote host.
+- When Pi runs on a remote host, the receiver's port is forwarded there with SSH. The
+  usual way is `pi-speech-receiver ssh <host>` on the user's computer (see "SSH
+  sessions" below), which runs a receiver for that session and adds the forward. By
+  hand: `ssh -R 127.0.0.1:47613:127.0.0.1:47613 decent-spider` with a receiver already
+  running. Either way Pi reaches the receiver at `http://127.0.0.1:47613` on the remote
+  host.
 - HTTP/1.1, one request per connection is enough. JSON bodies are UTF-8.
 - The whole request head (request line and headers) must arrive within 10 s of the
   connection opening; otherwise the receiver answers `408` if it can and closes the
@@ -163,6 +166,65 @@ pi-speech-receiver [--listen 127.0.0.1:47613] [--token-file PATH]
   port actually bound (so `--listen 127.0.0.1:0` works in tests).
 - It stops cleanly on SIGINT and SIGTERM: playback and recording stop, temporary
   files are deleted.
+
+## SSH sessions
+
+```
+pi-speech-receiver ssh [ssh-args...] <host> [command...]
+pi-speech-receiver pair [ssh-args...] <host>
+```
+
+`ssh` runs the user's own `ssh` (found on `PATH`) with the bridge for that session only:
+
+1. **Pairing**, on the first connection to a host: the local token file (made if missing,
+   as above) is uploaded to the remote host as `.config/pi-speech/bridge.token` under the
+   directory `sftp` starts in (the user's home, on Windows OpenSSH too), where the
+   extension reads it. The upload is `sftp -b -` with this batch, so it needs no
+   particular remote shell:
+
+   ```
+   -mkdir .config
+   -mkdir .config/pi-speech
+   -chmod 700 .config/pi-speech
+   -chmod 600 .config/pi-speech/bridge.token
+   put '<local token file>' .config/pi-speech/bridge.token
+   -chmod 600 .config/pi-speech/bridge.token
+   ```
+
+   A pairing is remembered in `paired-hosts` next to the local token file, one line
+   `<token fingerprint><TAB><host key>` per host. The host key is the destination as
+   given, with ` -l <user>` and ` -p <port>` when those options were given; the
+   fingerprint is the first 8 bytes of the token's SHA-256 in hex, so a new token pairs
+   every host again. A failed pairing is reported (with the end of `sftp`'s error
+   output) and the session goes on without it; the next session tries again. `pair`
+   uploads the token whether or not the host was paired and exits non-zero when it fails.
+2. **Receiver**: a receiver starts on `127.0.0.1:0` with the local token.
+3. **Session**: `ssh -R 127.0.0.1:47613:127.0.0.1:<port> <ssh-args...> <host> [command...]`,
+   the user's arguments unchanged after the added forward, with the terminal as it is.
+4. **End**: when `ssh` exits, the receiver stops and its files are deleted, and
+   `pi-speech-receiver` exits with `ssh`'s status (128 + the signal when a signal ended
+   it). Ctrl+C is left to `ssh`; a SIGTERM is passed on to it.
+
+The ssh arguments are read as OpenSSH's `ssh` reads them: options until the destination
+(flags may be clustered, `-p22` and `-p 22` alike), options again after it, and from the
+first word that is not an option (or after `--`) the remote command. The options that
+take a value are `-B -b -c -D -E -e -F -I -i -J -L -l -m -O -o -P -p -Q -R -S -W -w`; any
+letter that is neither one of these nor an `ssh` flag is an error.
+
+`sftp` reaches the host the same way as `ssh`, with the options that shape the
+connection: `-4 -6 -C -q -v -c -F -i -J` as they are; `-p` as `-P`; `-l` as `-o User=`;
+`-b`, `-B`, `-I`, `-m`, `-S`, `-P` as `-o BindAddress=`, `BindInterface=`, `PKCS11Provider=`,
+`MACs=`, `ControlPath=`, `Tag=`; `-K`/`-k` as the GSSAPI options; and `-o` options except
+those of the session (forwardings, `RemoteCommand`, `RequestTTY`, `LocalCommand`,
+`ForkAfterAuthentication`, `SessionType`, `StdinNull`, tunnels, X11 and agent
+forwarding, `EscapeChar`). `-o RemoteCommand=none -o RequestTTY=no` come first, because
+either from the user's configuration breaks `sftp`. An `ssh://` destination becomes
+`sftp://`, and an IPv6 address is put in brackets. Because `sftp -b` runs in batch mode,
+pairing needs key or agent authentication and a host key already known.
+
+Arguments that open no session (no destination, `-V`, `-G`, `-Q`, `-O`, `-W`) run `ssh`
+unchanged, without pairing or a receiver. `-f` (and `-o ForkAfterAuthentication=yes`) is
+refused: `ssh` would exit at once and take the receiver with it.
 
 ## Player and recorder programs
 
