@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { BinaryChoice } from "../../src/engine/binary";
 import { findBinary } from "../../src/engine/binary";
 import { chooseStreamPlayer, LocalOutput } from "../../src/engine/local-output";
+import { Player } from "../../src/engine/player";
 import type { AudioStream, PcmFormat } from "../../src/engine/provider";
 import { wrapPcmAsWav } from "../../src/engine/wav";
 import { pcmBytes, until } from "./fixtures";
@@ -296,5 +297,23 @@ describe.skipIf(!built.ok)("local playback through the bundled binary (null audi
     await new Promise((res) => setTimeout(res, 200));
     await r.stop();
     expect(await r.done).toEqual({ state: "cancelled" });
+  });
+
+  it("replays saved messages (a WAV and an MP3) through the player, each fed as a Stream", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-speech-replay-"));
+    try {
+      const wavFile = join(dir, "m.wav");
+      writeFileSync(wavFile, wrapPcmAsWav(new Uint8Array(4800), 24000, 1));
+      const mp3File = join(__dirname, "..", "..", "receiver", "tests", "fixtures", "tone-0.5s-24k.mp3");
+      const player = new Player(() => new LocalOutput(env));
+      for (const file of [wavFile, mp3File]) {
+        const r = await player.play(file, "message");
+        if (!r.ok) throw new Error(r.reason);
+        expect(r.player).toBe("pi-speech-receiver");
+        expect(await r.done).toEqual({ state: "completed" });
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
