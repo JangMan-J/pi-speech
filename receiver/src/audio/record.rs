@@ -270,17 +270,22 @@ mod tests {
         dir
     }
 
-    /// Record from the null input for `run`, with a ring of `backlog`.
+    /// Record from the null input for `run`, with a ring of `backlog`: (seconds recorded,
+    /// seconds until the stop was sent). The latter, not `run`, is what the recording
+    /// should match: a busy machine can sleep longer than asked, and finishing the file
+    /// (an fsync) can take a while after the stop.
     fn record_null(path: &Path, run: Duration, backlog: Duration) -> (f64, f64) {
         let (tx, rx) = mpsc::channel();
         let stop = tx.clone();
         let t = Instant::now();
-        std::thread::spawn(move || {
+        let stopper = std::thread::spawn(move || {
             std::thread::sleep(run);
+            let at = t.elapsed().as_secs_f64();
             stop.send(Event::Stop).unwrap();
+            at
         });
         let secs = record_with(path, Input::null(), tx, rx, backlog).unwrap();
-        (secs, t.elapsed().as_secs_f64())
+        (secs, stopper.join().unwrap())
     }
 
     fn samples(bytes: &[u8]) -> Vec<i16> {

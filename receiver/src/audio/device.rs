@@ -736,10 +736,12 @@ mod tests {
         }
     }
 
-    /// What a null output was asked for in `run`: (samples, last latency).
-    fn null_output_takes(stalls_after: Option<Duration>, run: Duration) -> (usize, Duration) {
+    /// What a null output was asked for in about `run`: (samples, last latency, the
+    /// seconds it actually ran, which a busy machine can make longer than `run`).
+    fn null_output_takes(stalls_after: Option<Duration>, run: Duration) -> (usize, Duration, f64) {
         let taken = Arc::new(Mutex::new((0usize, Duration::ZERO)));
         let t = Arc::clone(&taken);
+        let started = Instant::now();
         let s = NullStream::output(NULL_OUTPUT, stalls_after, move |buf, lat| {
             let mut g = t.lock().unwrap();
             g.0 += buf.len();
@@ -748,22 +750,23 @@ mod tests {
         .unwrap();
         std::thread::sleep(run);
         drop(s);
-        let got = *taken.lock().unwrap();
-        got
+        let ran = started.elapsed().as_secs_f64();
+        let (n, lat) = *taken.lock().unwrap();
+        (n, lat, ran)
     }
 
     #[test]
     fn the_null_output_takes_audio_at_real_time_pace() {
-        let (n, lat) = null_output_takes(None, Duration::from_millis(500));
+        let (n, lat, ran) = null_output_takes(None, Duration::from_millis(500));
         let secs = NULL_OUTPUT.duration_of(n).as_secs_f64();
-        assert!((0.4..=0.6).contains(&secs), "{secs}");
+        assert!((secs - ran).abs() < 0.1, "{secs} s taken in {ran} s");
         assert_eq!(lat, NULL_LATENCY);
     }
 
     #[test]
     fn a_stuck_null_output_stops_calling_back_and_still_closes() {
         let t = Instant::now();
-        let (n, _) =
+        let (n, _, _) =
             null_output_takes(Some(Duration::from_millis(200)), Duration::from_millis(600));
         let secs = NULL_OUTPUT.duration_of(n).as_secs_f64();
         assert!((0.15..=0.25).contains(&secs), "{secs}");
@@ -774,15 +777,18 @@ mod tests {
     fn the_null_input_gives_a_quiet_tone_at_real_time_pace() {
         let got = Arc::new(Mutex::new(Vec::new()));
         let g = Arc::clone(&got);
+        let started = Instant::now();
         let s = NullStream::input(NULL_INPUT, None, move |buf| {
             g.lock().unwrap().extend_from_slice(buf)
         })
         .unwrap();
         std::thread::sleep(Duration::from_millis(500));
         drop(s);
+        // A busy machine can sleep longer than asked: the pace is against the time it ran.
+        let ran = started.elapsed().as_secs_f64();
         let got = got.lock().unwrap();
         let secs = NULL_INPUT.duration_of(got.len()).as_secs_f64();
-        assert!((0.4..=0.6).contains(&secs), "{secs}");
+        assert!((secs - ran).abs() < 0.1, "{secs} s captured in {ran} s");
         let peak = got.iter().fold(0.0f32, |m, s| m.max(s.abs()));
         assert!(peak > 0.05 && peak <= NULL_TONE_LEVEL, "{peak}");
     }
