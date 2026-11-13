@@ -58,8 +58,33 @@ SETTINGS
 ```
 
 Values change in place with Enter or ←→ and are saved at once; a row ending in `›` opens a picker (models,
-voices), a field (Dictation output) or a submenu. **Speech source** and **Transcription source** are Provider, the
-only source so far. Something unavailable shows `✗` and the reason beside the value (`✗ xAI: no login`,
+voices), a field (Dictation output) or a submenu.
+
+**Speech source** and **Transcription source** each switch between Provider (a speech service over the
+network) and Local (a model on This machine), on their own, so provider speech can go with local transcription
+or the other way round. With Local, the model row of that direction holds the on-device model, and its picker
+lists the models of the bundled `pi-speech-receiver` with their size and whether they are downloaded:
+
+```
+Speech › Transcription model ─────────────────────────────────────────────────────
+Find:                                                                     3 models
+▸ ✓ parakeet-tdt-0.6b-v3-int8  487 MB  downloaded      25 langs
+    whisper-small              639 MB  not downloaded  99 langs
+    sense-voice-int8           163 MB  not downloaded  5 langs
+Runs on This machine, with no network request once downloaded.
+
+  Enter pick · d download · x delete · Esc back
+```
+
+Enter picks a downloaded model. On one that is not downloaded, Enter says its size and Enter again downloads it,
+with its progress on the status line, and then picks it. `d` downloads the highlighted model, `x` twice
+deletes it. A stopped download goes on from where it stopped the next time. Models are kept in the per-user
+model cache (`~/.cache/pi-speech/models` on Linux, or `PI_SPEECH_MODELS_DIR`).
+
+Local transcription (dictation, Transcribe file…, `--transcribe`, `speech_transcribe`) runs
+`pi-speech-receiver transcribe <model> <audio>` on This machine, with no network request; it reads WAV and MP3.
+Local speech is not available yet: with Speech source Local, the speech models are listed, but speaking says so
+and plays nothing. Choose Provider to speak. Something unavailable shows `✗` and the reason beside the value (`✗ xAI: no login`,
 `✗ models unavailable`).
 
 **Read aloud options ›** says what is read aloud once a run ends, and how; one line under the rows says what
@@ -209,25 +234,25 @@ starts a turn. Text is always spoken, never interpreted: `/speech stop the press
 
 **`/speech --<action>`** runs one action:
 
-| Action                                             | Effect                                                                                                                   |
-| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `--stop`                                           | Stop what is playing                                                                                                     |
-| `--replay`                                         | Play the last message again (from the history, no new request)                                                           |
-| `--dictate [language\|auto]`                       | Start/stop dictation and insert the transcript; optional one-off language (like Alt+Z)                                   |
-| `--type <text>`                                    | Insert literal text into the editor, preserving spaces; never speak or submit it                                         |
-| `--transcribe <audio-file> [language\|auto]`       | Insert an audio file's transcript into the editor; never submit it                                                       |
-| `--sample [voice]`                                 | Play a short sample of a voice of the current model, in its language                                                     |
-| `--status`                                         | Settings and what speech is doing                                                                                        |
-| `--models`                                         | Speech and transcription models with their prices and features                                                           |
-| `--voices`                                         | Voices of the current speech model                                                                                       |
-| `--languages`                                      | The voice language of each voice, with its evidence                                                                      |
-| `--read-aloud on\|off\|summary\|thinking\|all`     | Speak the final reply of each run (`on` is All), or a spoken summary of it (see [Read aloud options](#speech))           |
-| `--bridge auto\|on\|off\|status`                   | Where audio plays and records (see [The bridge](#the-bridge))                                                            |
-| `--language <voice> <tag\|auto>`                   | Set the language of a voice (`ja`, `pt-BR`, …), or remove it                                                             |
-| `--set <setting> <value>`                          | Change a setting: `tts-model`, `voice`, `stt-model`, `stt-language`, `tools`, `dictation-output`                         |
-| `--endpoints`                                      | List the OpenAI-compatible endpoints and what each offers (see [Other providers](#other-providers-the-openai-audio-api)) |
-| `--endpoint <name> <base-url\|off> [key\|KEY_ENV]` | Add or remove such an endpoint                                                                                           |
-| `--help`                                           | The usage                                                                                                                |
+| Action                                             | Effect                                                                                                                                                  |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--stop`                                           | Stop what is playing                                                                                                                                    |
+| `--replay`                                         | Play the last message again (from the history, no new request)                                                                                          |
+| `--dictate [language\|auto]`                       | Start/stop dictation and insert the transcript; optional one-off language (like Alt+Z)                                                                  |
+| `--type <text>`                                    | Insert literal text into the editor, preserving spaces; never speak or submit it                                                                        |
+| `--transcribe <audio-file> [language\|auto]`       | Insert an audio file's transcript into the editor; never submit it                                                                                      |
+| `--sample [voice]`                                 | Play a short sample of a voice of the current model, in its language                                                                                    |
+| `--status`                                         | Settings and what speech is doing                                                                                                                       |
+| `--models`                                         | Speech and transcription models with their prices and features                                                                                          |
+| `--voices`                                         | Voices of the current speech model                                                                                                                      |
+| `--languages`                                      | The voice language of each voice, with its evidence                                                                                                     |
+| `--read-aloud on\|off\|summary\|thinking\|all`     | Speak the final reply of each run (`on` is All), or a spoken summary of it (see [Read aloud options](#speech))                                          |
+| `--bridge auto\|on\|off\|status`                   | Where audio plays and records (see [The bridge](#the-bridge))                                                                                           |
+| `--language <voice> <tag\|auto>`                   | Set the language of a voice (`ja`, `pt-BR`, …), or remove it                                                                                            |
+| `--set <setting> <value>`                          | Change a setting: `tts-model`, `voice`, `stt-model`, `stt-language`, `tools`, `dictation-output`, `tts-source` and `stt-source` (`provider` or `local`) |
+| `--endpoints`                                      | List the OpenAI-compatible endpoints and what each offers (see [Other providers](#other-providers-the-openai-audio-api))                                |
+| `--endpoint <name> <base-url\|off> [key\|KEY_ENV]` | Add or remove such an endpoint                                                                                                                          |
+| `--help`                                           | The usage                                                                                                                                               |
 
 An unknown action, or an action with the wrong arguments, is an error that shows the usage.
 
@@ -465,7 +490,7 @@ receiver, in the `Authorization` header.
 Every choice lives in one versioned file, `pi-speech/settings.json` in Pi's agent directory (`~/.pi/agent`,
 or `$PI_CODING_AGENT_DIR`): speech model, voice, transcription model, dictation language, the dictation output
 command, tools, bridge mode, the order of the model lists, voice-language overrides, the endpoints you added, and
-the keys of Speak and Dictate (only when changed, as `"hotkeys": { "speak": "alt+d", "dictate": "alt+z" }`; read
+the Speech and Transcription sources with their local models, the keys of Speak and Dictate (only when changed, as `"hotkeys": { "speak": "alt+d", "dictate": "alt+z" }`; read
 when Pi loads the extension), and the read-aloud options Summarized by, Length and Truncate at. Settings persist
 across restarts, also with `--no-session`. What read-aloud reads (Read) is not saved: it starts Off.
 

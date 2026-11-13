@@ -1,6 +1,8 @@
 // Visible acceptance: the /speech panel, redesign 01 layout. The main view holds only settings, under
 // SPEAK (Alt+S), LISTEN (Alt+Z) and SETTINGS; models and voices show only their names (details in the pickers);
 // Hotkeys runs every action and changes the keys of Speak and Dictate (leaving Hotkeys reloads Pi to bind them).
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
 import path from 'node:path';
 import { check, finish, ROOT, setup } from '../lib/lib.mjs';
 import { openPanelPi, readSettings, sleep } from '../lib/panel.mjs';
@@ -68,7 +70,14 @@ try {
     await t.key('Escape');
     t.close();
   }
-  t = await openPanelPi(ctx, { cols: 100, rows: 40 });
+  // The built receiver lists the on-device models; its model cache is private to this run, with whisper-small
+  // looking downloaded (its directory exists). Nothing is ever downloaded here.
+  const modelsDir = path.join(ctx.work, 'models');
+  const receiverEnv = { PI_SPEECH_BINARY: process.env.RECEIVER_BIN, PI_SPEECH_MODELS_DIR: modelsDir };
+  const catalogue = execFileSync(process.env.RECEIVER_BIN, ['models', 'list'], { encoding: 'utf8', env: { ...process.env, ...receiverEnv } })
+    .trim().split('\n').map((l) => JSON.parse(l));
+  fs.mkdirSync(catalogue.find((m) => m.id === 'whisper-small').path, { recursive: true });
+  t = await openPanelPi(ctx, { cols: 100, rows: 40, env: receiverEnv });
   await t.open();
   let d = dock(t.lines());
 
@@ -118,15 +127,49 @@ try {
   check(/Read aloud options\s+Summary ›$/.test(rowOf(dock(t.lines()), 'Read aloud options') ?? ''), 'Esc goes back; the row shows Summary');
   await t.key('Enter'); await t.key('Left'); await t.key('Escape');
   check(/Read aloud options\s+Off ›$/.test(rowOf(dock(t.lines()), 'Read aloud options') ?? ''), 'Read set back to Off');
+  // Speech source Local: the local speech models are listed, and the panel says plainly that it cannot speak yet
   await goTo(t, 'Speech source');
-  await t.key('Right');
+  check(/←→ Provider · Local/.test(hintOf(dock(t.lines()))), 'on Speech source the hint names Provider and Local', hintOf(dock(t.lines())));
+  await t.key('Right'); await sleep(300);
   d = dock(t.lines());
-  check(/Speech source\s+Provider$/.test(rowOf(d, 'Speech source') ?? '') && d.some((l) => /Provider is the only source so far/.test(l)), 'Speech source stays Provider and says it is the only one so far', d.slice(-6));
+  check(/Speech source\s+Local$/.test(rowOf(d, 'Speech source') ?? '') && d.some((l) => /! Speech source: Local · local speech is not available yet/.test(l)), 'Right sets Speech source to Local and says local speech is not available yet', d.slice(-6));
+  check(/Speech model\s+none · ✗ local speech not available yet ›$/.test(rowOf(d, 'Speech model') ?? ''), 'the Speech model row says local speech is not available yet', rowOf(d, 'Speech model'));
+  check(/Transcription source\s+Provider$/.test(rowOf(d, 'Transcription source') ?? '') && readSettings(ctx).speechSource === 'local' && readSettings(ctx).transcriptionSource === undefined, 'Speech source is saved; Transcription source stays Provider', readSettings(ctx));
+  await goTo(t, 'Speech model');
+  await t.key('Enter');
+  await t.until((s) => /kokoro-multi-lang/.test(s), 5000);
+  let lines = t.lines();
+  check(lines.some((l) => /kokoro-multi-lang-v1\.1-int8\s+\d+(\.\d)? MB\s+not downloaded/.test(l)) && !lines.some((l) => /whisper-small/.test(l)), 'the Local speech model list shows the speech models with size and state', lines.slice(-14));
+  await t.key('Escape');
+  await goTo(t, 'Speech source');
+  await t.key('Left');
+  check(/Speech model\s+google\/gemini-3\.8-flash-tts ›$/.test(rowOf(dock(t.lines()), 'Speech model') ?? ''), 'back to Provider, the provider model shows again');
+
+  // Transcription source Local: on-device models with size and state; one not downloaded is offered, not fetched
+  await goTo(t, 'Transcription source');
+  await t.key('Right'); await sleep(300);
+  check(readSettings(ctx).transcriptionSource === 'local' && readSettings(ctx).speechSource === undefined, 'Transcription source Local is saved on its own', readSettings(ctx));
+  await goTo(t, 'Transcription model');
+  await t.key('Enter');
+  await t.until((s) => /whisper-small/.test(s), 5000);
+  lines = t.lines();
+  check(lines.some((l) => /whisper-small\s+\d+ MB\s+downloaded/.test(l)) && lines.some((l) => /parakeet-tdt-0\.6b-v3-int8\s+\d+ MB\s+not downloaded/.test(l)), 'the Local transcription list shows each model with its size and whether it is downloaded', lines.slice(-14));
+  check(/Enter pick · d download · x delete · Esc back/.test(hintOf(dock(lines))), 'its hint names d and x', hintOf(dock(lines)));
+  await t.key('Enter'); await sleep(300);
+  check(t.lines().some((l) => /! parakeet-tdt-0\.6b-v3-int8 is not downloaded \(\d+ MB\) · Enter downloads it/.test(l)), 'choosing a model not downloaded offers the download with its size', t.lines().slice(-6));
+  await t.key('Down');
+  await t.key('Enter'); await sleep(300);
+  d = dock(t.lines());
+  check(/Transcription model\s+whisper-small ›$/.test(rowOf(d, 'Transcription model') ?? '') && readSettings(ctx).localTranscriptionModel === 'whisper-small', 'a downloaded model is chosen at once and saved', [rowOf(d, 'Transcription model'), readSettings(ctx)]);
+  check(!fs.readdirSync(modelsDir).some((f) => /parakeet/.test(f)), 'nothing was downloaded');
+  await goTo(t, 'Transcription source');
+  await t.key('Left');
+  check(/Transcription model\s+openai\/whisper-large-v3-turbo ›$/.test(rowOf(dock(t.lines()), 'Transcription model') ?? ''), 'back to Provider, the provider model shows again');
 
   // 4. the voice picker: the details live here, not in the main view
   check(await goTo(t, 'Voice'), 'the selection reaches Voice');
   await t.key('Enter'); await sleep(300);
-  let lines = t.lines();
+  lines = t.lines();
   check(lines.some((l) => /Speech › Voice/.test(l)) && lines.some((l) => /Find:.*\b\d+ voices/.test(l)), 'Enter on Voice opens the voice picker', lines.slice(-12));
   t.type('kore'); await sleep(400);
   check(t.lines().some((l) => /✓ Kore\b/.test(l)), 'the picker marks the current voice', t.lines().slice(-12));

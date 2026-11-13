@@ -39,6 +39,14 @@ or leaves out words. Told by comparing the model's own transcript with the text.
 _Example_: asked to say "Turn left at the bridge", the model says "Sure! Turn left at the bridge."
 _Confirmed_: 2026-11-12, Jang (a Stray stops playback by default).
 
+**Source**:
+Where one direction, speech or transcription, comes from: Provider (a speech service over the network) or Local
+(an on-device model run by the bundled `pi-speech-receiver` on This machine). Each direction has its own.
+_Example_: Speech source Provider with x-ai/grok-voice-tts-1.0, Transcription source Local with whisper-small.
+_Not_: the route (where audio plays or records, This machine or the Remote machine through the bridge).
+_Avoid_: backend, engine (for the source)
+_Confirmed_: 2026-11-13, slice 05 of the redesign (Speech source, Transcription source: Provider | Local).
+
 **Spoken summary**:
 What read-aloud reads in its Summary and Thinking modes instead of the whole reply: a short version of the reply
 (Thinking: of the reasoning, then of the reply), written to be heard and aimed at a length (Minimum ~15 s,

@@ -300,6 +300,7 @@ function pickerTable(
   selected: number,
   w: number,
   s: PanelStyle,
+  keepColumns = false,
 ): string[] {
   const check = "✓ ";
   const prefix = MARKER.length + check.length;
@@ -312,6 +313,7 @@ function pickerTable(
   const colCount = useCols ? Math.max(0, ...items.map((it) => it.cols?.length ?? 0)) : 0;
   // A column every row fills the same way (or leaves empty) carries nothing, so it is dropped (width 0).
   const sameEverywhere = (c: number) => {
+    if (keepColumns) return false;
     const first = items[0]?.cols?.[c] ?? "";
     return items.length > 1 && items.every((it) => (it.cols?.[c] ?? "") === first);
   };
@@ -385,7 +387,7 @@ function pickerLines(p: PickerView, w: number, s: PanelStyle, rows: number): Lin
     const n = p.items.length;
     const start = Math.max(0, Math.min(p.selected - Math.floor(height / 2), n - height));
     const end = Math.min(n, start + height);
-    for (const line of pickerTable(p.items, start, end, p.selected, w, s)) out.push(keep(line));
+    for (const line of pickerTable(p.items, start, end, p.selected, w, s, p.keepColumns)) out.push(keep(line));
     if (n > height) where = `${start > 0 ? "↑" : " "} ${start + 1}–${end} of ${n} ${end < n ? "↓" : " "}`;
   }
   // A steady height: the panel does not jump while the list is filtered.

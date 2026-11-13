@@ -118,6 +118,8 @@ export interface PickerView {
   detail?: string;
   /** What the items are, for the count: `models`, `voices`, `messages`. */
   noun: string;
+  /** Draw every column even when all rows share its value (a local model's state must always show). */
+  keepColumns?: boolean;
   query: string;
   cursor: number;
   /** The matches of the query, best first. */
@@ -915,6 +917,7 @@ export class Panel {
       empty: p.ids?.length === 0 ? none : "No matches",
     };
     if (p.local) {
+      view.keepColumns = true;
       view.detail = "Runs on This machine, with no network request once downloaded.";
       if (p.ids?.length === 0) view.empty = "No local models of this kind";
     } else if (isModelRow(p.row)) {

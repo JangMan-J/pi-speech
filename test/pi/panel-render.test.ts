@@ -578,6 +578,20 @@ describe("drawing the picker", () => {
     expect(widest(lines)).toBeLessThanOrEqual(60);
   });
 
+  it("a list of on-device models keeps its state column even when every row shares it", () => {
+    const items: PickerItem[] = [
+      { id: "kokoro", label: "kokoro", price: "147 MB", cols: ["not downloaded", "en zh"], current: false },
+      { id: "piper", label: "piper", price: "67 MB", cols: ["not downloaded", "en"], current: false },
+    ];
+    const p = pickerView({ title: "Speech model", noun: "models", items, total: 2, keepColumns: true });
+    const lines = renderPanel(view({ picker: p }), 80);
+    const one = lines.find((l) => l.includes("kokoro")) ?? "";
+    const two = lines.find((l) => l.includes("piper")) ?? "";
+    expect(one).toMatch(/kokoro +147 MB {2}not downloaded {2}en zh$/);
+    expect(two).toMatch(/piper +67 MB {2}not downloaded {2}en$/);
+    expect(one.indexOf("MB")).toBe(two.indexOf("MB"));
+  });
+
   it("structured columns: name, price, then the language and voices line up in their own columns", () => {
     const items: PickerItem[] = [
       { id: "a/one", label: "a/one", price: "~$0.03/min", note: "", cols: ["", "30 voices"], current: false },
