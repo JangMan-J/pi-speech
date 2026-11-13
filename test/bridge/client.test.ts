@@ -587,3 +587,73 @@ describe("a Stream", () => {
     await rx.close();
   });
 });
+
+describe("local models on the Remote machine", () => {
+  const MODELS_HEALTH = { ...HEALTH, capabilities: [...HEALTH.capabilities, "models"] };
+  const models = () => createBridgeAudio({ url, token: TOKEN }).models!;
+
+  it("speak sends the text and voice and streams the PCM as it is generated, at the rate the receiver names", async () => {
+    let finish!: () => void;
+    handler = (r, res) => {
+      if (r.url === "/v1/health") return send(res, 200, MODELS_HEALTH);
+      res.writeHead(200, { "Content-Type": "application/octet-stream", "X-Pi-Speech-Rate": "22050" });
+      res.write(Buffer.from("AAAA"));
+      finish = () => res.end(Buffer.from("BB"));
+    };
+    const stream = await models().speak("piper", "Hello.", { voice: "af_sol" });
+    expect(stream.format).toEqual({ codec: "pcm", rate: 22050, channels: 1 });
+    const it = stream.chunks[Symbol.asyncIterator]();
+    expect(Buffer.from((await it.next()).value).toString()).toBe("AAAA");
+    finish();
+    expect(Buffer.from((await it.next()).value).toString()).toBe("BB");
+    expect((await it.next()).done).toBe(true);
+    expect(JSON.parse(seen.at(-1)!.body.toString())).toEqual({ model: "piper", text: "Hello.", voice: "af_sol" });
+    expect(seen.at(-1)!.headers.authorization).toBe(`Bearer ${TOKEN}`);
+  });
+
+  it("speech that breaks off before its end is an error, not a short clip", async () => {
+    handler = (r, res) => {
+      if (r.url === "/v1/health") return send(res, 200, MODELS_HEALTH);
+      res.writeHead(200, { "X-Pi-Speech-Rate": "24000" });
+      res.write(Buffer.from("AAAA"), () => res.socket?.destroy());
+    };
+    const stream = await models().speak("kokoro", "Hello.");
+    await expect(
+      (async () => {
+        for await (const _ of stream.chunks);
+      })(),
+    ).rejects.toThrow("the speech broke off on the Remote machine before its end");
+  });
+
+  it("transcribe sends the audio with its type and the model, and returns the text", async () => {
+    handler = (r, res) => {
+      if (r.url === "/v1/health") return send(res, 200, MODELS_HEALTH);
+      send(res, 200, { text: " words there " });
+    };
+    expect(await models().transcribe("parakeet-v3", Buffer.from("RIFF...."), "mp3")).toBe("words there");
+    const req = seen.at(-1)!;
+    expect(req.url).toBe("/v1/transcribe?model=parakeet-v3");
+    expect(req.headers["content-type"]).toBe("audio/mpeg");
+    expect(req.body.toString()).toBe("RIFF....");
+  });
+
+  it("says plainly what failed: the model's words there, a run already going, a receiver too old", async () => {
+    let answer: [number, unknown] = [422, { error: "the model whisper is not downloaded" }];
+    handler = (r, res) => {
+      if (r.url === "/v1/health") return send(res, 200, MODELS_HEALTH);
+      send(res, ...answer);
+    };
+    await expect(models().transcribe("whisper", Buffer.from("x"), "wav")).rejects.toThrow(
+      "on the Remote machine: the model whisper is not downloaded",
+    );
+    await expect(models().speak("whisper", "Hi.")).rejects.toThrow(
+      "on the Remote machine: the model whisper is not downloaded",
+    );
+    answer = [409, { error: "busy" }];
+    await expect(models().speak("kokoro", "Hi.")).rejects.toThrow(
+      /already running a model for another client \(one at a time\)/,
+    );
+    handler = (_r, res) => send(res, 200, HEALTH);
+    await expect(models().list()).rejects.toThrow(/too old to run models: update pi-speech-receiver there/);
+  });
+});

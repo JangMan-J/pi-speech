@@ -606,11 +606,12 @@ describe("the panel view model: Bridge connection's DIRECTION", () => {
   it("over SSH each row cycles This machine | Remote machine and is saved; a choice that needs this host's microphone warns", async () => {
     const p = open({ SSH_CONNECTION: "1 2 3 4" });
     await p.goTo("Record audio on");
-    expect(p.panel.view().rows.filter((r) => r.section === "direction").map((r) => r.value)).toEqual([
-      "Remote machine",
-      "Remote machine",
-      "Remote machine",
-    ]);
+    expect(
+      p.panel
+        .view()
+        .rows.filter((r) => r.section === "direction")
+        .map((r) => r.value),
+    ).toEqual(["Remote machine", "Remote machine", "Remote machine"]);
     expect(p.hint()).toBe("←→ This machine · Remote machine · Esc back");
     await p.press("right");
     expect(p.row("Record audio on")?.value).toBe("This machine");
