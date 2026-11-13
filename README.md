@@ -83,8 +83,15 @@ model cache (`~/.cache/pi-speech/models` on Linux, or `PI_SPEECH_MODELS_DIR`).
 
 Local transcription (dictation, Transcribe file…, `--transcribe`, `speech_transcribe`) runs
 `pi-speech-receiver transcribe <model> <audio>` on This machine, with no network request; it reads WAV and MP3.
-Local speech is not available yet: with Speech source Local, the speech models are listed, but speaking says so
-and plays nothing. Choose Provider to speak. Something unavailable shows `✗` and the reason beside the value (`✗ xAI: no login`,
+With Speech source Local, speech is made on This machine by the chosen on-device model (Kokoro, or an English
+Piper voice) through the bundled pi-speech-receiver: it plays as it is generated, sentence by sentence, and is
+saved in the history like provider speech; nothing goes over the network. The Voice row then opens the local
+model's voices (Kokoro v1.1 has 103, a Piper voice one; `Tab` samples the highlighted one), and
+`/speech --set voice <name>` sets it; `default` is the model's first voice, and choosing another local model
+goes back to it. A Piper voice speaks through sherpa-onnx's English lexicon (`lexicon-en-us.txt`, 6.3 MB),
+which its download fetches into the model cache with it; deleting the voice leaves the lexicon for the others.
+Until a model is chosen, the Speech model row shows `✗ choose a model` and speaking says
+`Choose a local speech model first: /speech, Speech model`. Something unavailable shows `✗` and the reason beside the value (`✗ xAI: no login`,
 `✗ models unavailable`).
 
 **Read aloud options ›** says what is read aloud once a run ends, and how; one line under the rows says what
