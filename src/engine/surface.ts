@@ -13,7 +13,10 @@ import { REPLACED } from "./player";
 import { READ_MODES, type ReadMode } from "./read-aloud";
 import { ReadingFailed, readingFailedMessage } from "./reading";
 import type { BridgeMode } from "./settings";
-import { languageLabel, type SampleResult, SETTING_NAMES, type SpeechResult } from "./speech";
+import { LOCAL_SPEECH_UNAVAILABLE, languageLabel, type SampleResult, SETTING_NAMES, type SpeechResult } from "./speech";
+
+/** Why Voice language… has nothing to set with Speech source Local. */
+export const LOCAL_VOICE_LANGUAGES = "Voice languages are set per provider voice and do not apply to local voices.";
 
 export interface SurfaceUi extends DictationUi {
   /** Base for a relative audio path passed to --transcribe. */
@@ -374,6 +377,7 @@ export class Surface {
       {
         label: `Voice language: ${s.voice} is ${languageLabel(vl)}…`,
         run: async (ui) => {
+          if (s.speechSource === "local") return done(ui.notify(LOCAL_VOICE_LANGUAGES, "info"));
           const voice = await this.pickVoice(ui, "Voice language of", true);
           if (!voice) return "back";
           const tag = (await ui.input(`Language of ${voice}: a tag such as ja or pt-BR, or auto`, "auto"))?.trim();
@@ -417,6 +421,14 @@ export class Surface {
   }
 
   private async pickVoice(ui: SurfaceUi, title: string, withLanguage = false): Promise<string | undefined> {
+    const s = this.speech.settings;
+    if (s.speechSource === "local") {
+      const local = s.localSpeechModel;
+      if (!local) throw new Error(LOCAL_SPEECH_UNAVAILABLE);
+      const voices = await this.speech.localVoices(local);
+      const chosen = await ui.pick(`${title} (${local}, local)`, voices, s.localSpeechVoice ?? voices[0]);
+      return chosen === undefined || !voices.includes(chosen) ? undefined : chosen;
+    }
     const model = this.speech.settings.speechModel;
     const voices = await this.speech.voicesFor(model);
     const labels = voices.map((v) => (withLanguage ? `${v}  ${languageLabel(this.speech.languageOf(model, v))}` : v));

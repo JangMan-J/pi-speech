@@ -1,8 +1,9 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { parse, Surface, usage } from "../../src/engine/surface";
-import { fakeOpenRouter, makeEngine, scriptedUi } from "./fixtures";
+import { fakeOpenRouter, fakeReceiver, makeEngine, scriptedUi } from "./fixtures";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -321,6 +322,34 @@ describe("the menu", () => {
     ]);
     await new Surface(engine).run("", ui);
     expect(engine.speech.settings.transcriptionModel).toBe("openai/whisper-1");
+  });
+
+  it("with Speech source Local, Sample a voice lists the local voices, or asks for a local model first", async () => {
+    const requests = fakeOpenRouter();
+    const bin = fakeReceiver(mkdtempSync(join(tmpdir(), "pi-speech-receiver-")));
+    const { engine } = makeEngine({ PI_SPEECH_BINARY: bin.path, PI_SPEECH_AUDIO_NULL: "1" });
+    engine.speech.setSource("speech", "local");
+    const sample = (o?: string[]) => o?.find((x) => x.startsWith("Sample"));
+    await expect(new Surface(engine).run("", scriptedUi([(_t, o) => sample(o)]).ui)).rejects.toThrow(
+      "Choose a local speech model first: /speech, Speech model",
+    );
+    await engine.speech.local.download("kokoro").result;
+    engine.speech.setLocalModel("speech", "kokoro");
+    const { ui, dialogs, notes } = scriptedUi([(_t, o) => sample(o), () => "af_sol"]);
+    await new Surface(engine).run("", ui);
+    expect(dialogs[1]).toMatchObject({ kind: "pick", options: ["af_alloy", "af_sol", "bm_lewis"] });
+    expect(notes.at(-1)?.message).toMatch(/Sample of af_sol \(kokoro\)/);
+    expect(requests.filter((r) => r.url.endsWith("/audio/speech"))).toHaveLength(0);
+  });
+
+  it("with Speech source Local, Voice language offers no provider voices and says why", async () => {
+    fakeOpenRouter();
+    const { engine } = makeEngine();
+    engine.speech.setSource("speech", "local");
+    const { ui, dialogs, notes } = scriptedUi([(_t, o) => o?.find((x) => x.startsWith("Voice language"))]);
+    await new Surface(engine).run("", ui);
+    expect(dialogs.map((d) => d.kind)).toEqual(["select"]);
+    expect(notes).toEqual([{ message: expect.stringMatching(/do not apply to local voices/), level: "info" }]);
   });
 
   it("toggles read-aloud and tools in one step", async () => {
