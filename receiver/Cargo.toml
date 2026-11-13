@@ -2,7 +2,7 @@
 name = "pi-speech-receiver"
 version = "0.3.0"
 edition = "2021"
-description = "Playback-machine receiver for the pi-speech playback bridge (play and record)"
+description = "Receiver for the pi-speech playback bridge: play, record, and transcribe with local speech models"
 license = "MIT"
 
 [lib]
