@@ -2,8 +2,9 @@
 //!
 //! `ssh [ssh-args...] <host> [cmd...]` runs the user's own `ssh` with a receiver behind it:
 //! on the first connection to a host it uploads the bridge token there with `sftp -b`
-//! (pairing), then starts a receiver on `127.0.0.1:0`, runs `ssh -R 127.0.0.1:47613:
-//! 127.0.0.1:<port> <ssh-args...>`, and when `ssh` exits stops the receiver and exits with
+//! (pairing), then joins the user's shared receiver (starting it if none runs, see
+//! `shared.rs`), runs `ssh -R 127.0.0.1:47613:127.0.0.1:<port> -R 127.0.0.1:<spare>:
+//! 127.0.0.1:<port> <ssh-args...>`, and when `ssh` exits gives up its lease and exits with
 //! `ssh`'s status. `pair [ssh-args...] <host>` uploads the token again.
 //!
 //! The ssh arguments are read the way OpenSSH's `ssh` reads them (getopt, then the
@@ -11,11 +12,10 @@
 //! that only shape the connection can be handed to `sftp` and the rest left out.
 
 use crate::proc::start_thread;
-use crate::server::{self, Config, Server, DEFAULT_PORT};
-use crate::{private, signals, token};
+use crate::server::DEFAULT_PORT;
+use crate::{private, shared, signals, token};
 use sha2::{Digest, Sha256};
 use std::io::{self, Read, Write};
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -320,15 +320,23 @@ fn is_paired(path: &Path, key: &str, fp: &str) -> bool {
 }
 
 fn record_paired(path: &Path, key: &str, fp: &str) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        private::dir().recursive(true).create(dir)?;
+    }
+    // Sessions that pair at once each keep the others' lines.
+    let lock = private::file()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("lock"))?;
+    lock.lock()?;
     let mut entries: Vec<_> = read_paired(path)
         .into_iter()
         .filter(|(_, k)| k != key)
         .collect();
     entries.push((fp.to_string(), key.to_string()));
     let text: String = entries.iter().map(|(f, k)| format!("{f}\t{k}\n")).collect();
-    if let Some(dir) = path.parent() {
-        private::dir().recursive(true).create(dir)?;
-    }
     let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     let written = private::file()
@@ -498,7 +506,17 @@ pub fn ssh_main(args: &[String]) -> ExitCode {
     }
 }
 
-/// Pair if needed, then run `ssh` with a receiver behind its forward for as long as it runs.
+/// The `-R` forwards of a session to the receiver at `port`: 47613, and `spare` when it has
+/// one (a Pi whose 47613 belongs to another session finds this one there).
+pub fn forwards(port: u16, spare: Option<u16>) -> Vec<String> {
+    std::iter::once(DEFAULT_PORT)
+        .chain(spare)
+        .flat_map(|p| ["-R".to_string(), format!("127.0.0.1:{p}:127.0.0.1:{port}")])
+        .collect()
+}
+
+/// Pair if needed, then run `ssh` with the shared receiver behind its forwards, holding a
+/// lease on it for as long as `ssh` runs.
 fn session(a: &SshArgs, args: &[String]) -> Result<ExitStatus, String> {
     let token = token::load_token(None).map_err(|e| e.to_string())?;
     let key = pair_key(a);
@@ -518,23 +536,18 @@ fn session(a: &SshArgs, args: &[String]) -> Result<ExitStatus, String> {
     // From here SIGINT and SIGTERM come to the pipe: Ctrl+C is for ssh, and a SIGTERM is
     // passed on to it, so the receiver is always stopped after ssh has exited.
     let mut signals = signals::pipe().map_err(|e| format!("cannot handle signals: {e}"))?;
-    let tmp = server::private_tmp_dir()
-        .map_err(|e| format!("cannot create the temporary directory: {e}"))?;
-    let listen = SocketAddr::from(([127, 0, 0, 1], 0));
-    let srv = match Server::start(Config::new(listen, token, tmp.clone())) {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&tmp);
-            return Err(format!("cannot start the receiver: {e}"));
-        }
-    };
-    let forward = format!(
-        "127.0.0.1:{DEFAULT_PORT}:127.0.0.1:{}",
-        srv.local_addr().port()
-    );
+    let dir = token::default_token_path()
+        .map_err(|e| e.to_string())?
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let program = std::env::current_exe().map_err(|e| format!("cannot find this program: {e}"))?;
+    let lease = shared::join(&dir, &program)?;
+    if lease.spare.is_none() {
+        say("every spare port is taken by another session: this one forwards 47613 only");
+    }
     let result = Command::new("ssh")
-        .arg("-R")
-        .arg(&forward)
+        .args(forwards(lease.port, lease.spare))
         .args(args)
         .spawn();
     let status = match result {
@@ -556,8 +569,7 @@ fn session(a: &SshArgs, args: &[String]) -> Result<ExitStatus, String> {
         }
         Err(e) => Err(format!("cannot run ssh: {e}")),
     };
-    srv.shutdown();
-    let _ = std::fs::remove_dir_all(&tmp);
+    drop(lease);
     status
 }
 

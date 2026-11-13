@@ -1,8 +1,9 @@
 //! `pi-speech-receiver ssh` and `pair` with stand-in `ssh` and `sftp` scripts on PATH.
 //!
-//! The stand-in `ssh` writes its arguments to `ssh.args` and waits for a `release` file;
-//! the stand-in `sftp` writes its arguments and its batch (standard input). Unix only:
-//! the stand-ins are shell scripts.
+//! The stand-in `ssh` writes its arguments to `ssh.args<id>` and waits for a
+//! `release<id>` file (`<id>` from `STUB_ID`, empty by default); the stand-in `sftp` writes
+//! its arguments and its batch (standard input). Unix only: the stand-ins are shell scripts.
+//! Every session of a test shares one receiver, which stops once the last session ends.
 #![cfg(unix)]
 
 mod support;
@@ -16,10 +17,10 @@ use support::*;
 const BIN: &str = env!("CARGO_BIN_EXE_pi-speech-receiver");
 
 const SSH: &str = r#"#!/bin/sh
-printf '%s\n' "$@" > "$STUB/ssh.args.tmp"
-mv "$STUB/ssh.args.tmp" "$STUB/ssh.args"
+printf '%s\n' "$@" > "$STUB/ssh.args.tmp$STUB_ID"
+mv "$STUB/ssh.args.tmp$STUB_ID" "$STUB/ssh.args$STUB_ID"
 echo x >> "$STUB/ssh.calls"
-while [ ! -e "$STUB/release" ]; do sleep 0.05; done
+while [ ! -e "$STUB/release$STUB_ID" ]; do sleep 0.05; done
 exit "${STUB_SSH_EXIT:-0}"
 "#;
 
@@ -60,6 +61,7 @@ impl Rig {
             .env("XDG_CONFIG_HOME", self.dir.join("xdg"))
             .env("XDG_RUNTIME_DIR", self.dir.join("run"))
             .env_remove("STUB_SSH_EXIT")
+            .env_remove("STUB_ID")
             .env_remove("STUB_SFTP_EXIT")
             .env_remove("PI_SPEECH_RECEIVER_STREAM_PLAYER")
             .env_remove("PI_SPEECH_RECEIVER_RECORDER")
@@ -117,26 +119,45 @@ impl Rig {
         child
     }
 
-    /// The receiver's address from the `-R` the stand-in ssh was given.
-    fn forwarded(&self) -> SocketAddr {
-        let args = self.lines("ssh.args");
-        assert_eq!(args[0], "-R");
+    /// The receiver's address from the `-R` forwards the stand-in ssh `id` was given (47613,
+    /// then a spare port, to the same receiver); the spare port.
+    fn forwarded_as(&self, id: &str) -> (SocketAddr, u16) {
+        let args = self.lines(&format!("ssh.args{id}"));
+        assert_eq!(
+            (args[0].as_str(), args[2].as_str()),
+            ("-R", "-R"),
+            "{args:?}"
+        );
         let port = args[1]
             .strip_prefix("127.0.0.1:47613:127.0.0.1:")
             .unwrap_or_else(|| panic!("unexpected forward {:?}", args[1]));
-        format!("127.0.0.1:{port}").parse().unwrap()
+        let (spare, to) = args[3]
+            .strip_prefix("127.0.0.1:")
+            .and_then(|s| s.split_once(":127.0.0.1:"))
+            .unwrap_or_else(|| panic!("unexpected forward {:?}", args[3]));
+        assert_eq!(to, port, "both forwards lead to the one receiver");
+        let spare: u16 = spare.parse().unwrap();
+        assert!((47614..=47633).contains(&spare), "{spare}");
+        (format!("127.0.0.1:{port}").parse().unwrap(), spare)
     }
 
-    /// Whether the receiver's private directory is gone.
+    fn forwarded(&self) -> SocketAddr {
+        self.forwarded_as("").0
+    }
+
+    /// Whether the receiver's private directory is gone (it may take a moment after the
+    /// last session).
     fn tmp_cleaned(&self) -> bool {
-        std::fs::read_dir(self.dir.join("run"))
-            .unwrap()
-            .flatten()
-            .all(|e| {
-                !e.file_name()
-                    .to_string_lossy()
-                    .starts_with("pi-speech-receiver")
-            })
+        wait_until(Duration::from_secs(5), || {
+            std::fs::read_dir(self.dir.join("run"))
+                .unwrap()
+                .flatten()
+                .all(|e| {
+                    !e.file_name()
+                        .to_string_lossy()
+                        .starts_with("pi-speech-receiver")
+                })
+        })
     }
 }
 
@@ -150,8 +171,12 @@ fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
+/// Whether nothing answers at `addr` (within a few seconds: the receiver stops a moment
+/// after the last session).
 fn unreachable(addr: SocketAddr) -> bool {
-    TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_err()
+    wait_until(Duration::from_secs(5), || {
+        TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_err()
+    })
 }
 
 fn health(addr: SocketAddr, token: &str) -> u16 {
@@ -178,7 +203,7 @@ fn first_session_pairs_then_serves_for_the_life_of_ssh_only() {
 
     // ssh got the forward first, then the user's arguments unchanged.
     let got = rig.lines("ssh.args");
-    assert_eq!(got[2..], args.map(String::from)[..]);
+    assert_eq!(got[4..], args.map(String::from)[..]);
     let addr = rig.forwarded();
     assert_eq!(health(addr, &rig.token()), 200);
 
@@ -337,5 +362,86 @@ fn sigterm_reaches_ssh_and_the_receiver_stops_after_it() {
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(128 + SIGTERM));
     assert!(unreachable(addr));
+    assert!(rig.tmp_cleaned());
+}
+
+#[test]
+fn sessions_share_one_receiver_and_closing_the_first_keeps_the_second_s_audio() {
+    let rig = Rig::new("ssh-two");
+    let player = rig.file("player");
+    script(&player, "#!/bin/sh\ncat > /dev/null\n");
+    let session = |id: &str| {
+        let mut c = rig.command(&["ssh", "box"]);
+        c.env("STUB_ID", id)
+            .env("PI_SPEECH_RECEIVER_STREAM_PLAYER", &player);
+        let child = c.spawn().unwrap();
+        let args = format!("ssh.args{id}");
+        assert!(
+            wait_until(Duration::from_secs(20), || rig.file(&args).exists()),
+            "the stand-in ssh {id} did not start"
+        );
+        child
+    };
+    let first = session("1");
+    let second = session("2");
+    let (addr, spare1) = rig.forwarded_as("1");
+    let (addr2, spare2) = rig.forwarded_as("2");
+    assert_eq!(
+        addr, addr2,
+        "the second session reuses the first one's receiver"
+    );
+    assert_ne!(
+        spare1, spare2,
+        "each session forwards a spare port of its own"
+    );
+    let token = rig.token();
+
+    // The second session's Pi plays a Stream; the first session ends meanwhile.
+    let r = request(
+        addr,
+        "POST",
+        "/v1/play/stream",
+        Some(&token),
+        &[("X-Pi-Speech-Client", "pi-2")],
+        br#"{"format": "pcm", "rate": 24000, "channels": 1}"#,
+        None,
+    );
+    assert_eq!(r.status, 202, "{}", r.text());
+    let id = json_field(&r.text(), "id").unwrap();
+    let mut upload = Upload::chunked(addr, &id, &token);
+    upload.chunk(&[0u8; 4800]);
+    std::fs::write(rig.file("release1"), "").unwrap();
+    let out = first.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(
+        health(addr, &token),
+        200,
+        "the receiver stays for the second session"
+    );
+    upload.chunk(&[0u8; 4800]);
+    assert_eq!(upload.end().status, 200);
+    let state = request(
+        addr,
+        "GET",
+        &format!("/v1/play/{id}?wait=10"),
+        Some(&token),
+        &[],
+        b"",
+        None,
+    );
+    assert_eq!(
+        json_field(&state.text(), "state").as_deref(),
+        Some("completed")
+    );
+
+    // The last session's end stops it.
+    std::fs::write(rig.file("release2"), "").unwrap();
+    let out = second.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        unreachable(addr),
+        "the receiver stops after the last session"
+    );
     assert!(rig.tmp_cleaned());
 }

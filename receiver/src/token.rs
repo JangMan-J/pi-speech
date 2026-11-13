@@ -90,14 +90,28 @@ pub fn read_token(path: &Path) -> io::Result<String> {
 }
 
 /// Create `path` (mode 0600) holding a new random token. Parent directories are made 0700.
-/// (On Windows both get the default ACLs of the user's profile.)
+/// (On Windows both get the default ACLs of the user's profile.) Atomic: the token is
+/// written whole to a file of its own, then linked to `path` only if `path` does not
+/// exist, so a receiver started at the same moment reads either no file or the whole
+/// token, and two that create it at once agree on one token (`AlreadyExists` for the
+/// later).
 fn create_token(path: &Path) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
-        private::dir().recursive(true).create(dir)?;
-    }
-    let mut f = private::file().write(true).create_new(true).open(path)?;
-    f.write_all(random_hex(32)?.as_bytes())?;
-    f.write_all(b"\n")
+    let dir = path.parent().unwrap_or(Path::new("."));
+    private::dir().recursive(true).create(dir)?;
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = dir.join(format!(".{name}.{}-{}", std::process::id(), random_hex(4)?));
+    let written = private::file()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| {
+            f.write_all(random_hex(32)?.as_bytes())?;
+            f.write_all(b"\n")?;
+            f.sync_all()
+        });
+    let linked = written.and_then(|()| std::fs::hard_link(&tmp, path));
+    let _ = std::fs::remove_file(&tmp);
+    linked
 }
 
 /// The token to serve with. An explicit `--token-file` must exist. The default file is
@@ -187,6 +201,33 @@ mod tests {
         assert!(
             create_token(&p).is_err(),
             "never overwrites an existing token"
+        );
+        std::fs::remove_dir_all(d).ok();
+    }
+
+    #[test]
+    fn receivers_creating_the_token_at_once_all_read_the_same_whole_token() {
+        let d = scratch("race");
+        let p = d.join("receiver.token");
+        let tokens: Vec<String> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..8)
+                .map(|_| {
+                    s.spawn(|| {
+                        match create_token(&p) {
+                            Ok(()) => {}
+                            Err(e) => assert_eq!(e.kind(), io::ErrorKind::AlreadyExists),
+                        }
+                        read_token(&p).unwrap()
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(tokens.iter().all(|t| t == &tokens[0]));
+        assert_eq!(
+            std::fs::read_dir(&d).unwrap().count(),
+            1,
+            "no file left over"
         );
         std::fs::remove_dir_all(d).ok();
     }
