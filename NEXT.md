@@ -90,8 +90,7 @@ not answer whether Minimum ~15 s should be the default).
 
 Mac testing ended 2026-11-13 (user: the primitives are confirmed; no more Mac tests). Never checked on a real Mac:
 the Option+Z hint by a real keypress (the one try suspended Pi, probably Ctrl+Z; a pty test sending Ω shows the
-notice and keeps Ω), local speech (Kokoro, Piper) by ear, local transcription inside Pi. The Mac still holds the
-copied logins (`~/.pi/agent/auth.json`) and the test setup; remove them if the user asks.
+notice and keeps Ω), local speech (Kokoro, Piper) by ear, local transcription inside Pi. The logins copied to the Mac are in a separate account the user made for this work; nothing to remove.
 
 Learned there: macOS gives a process started over ssh no microphone (TCC); a Terminal.app first started by `open`
 over ssh inherits `SSH_CONNECTION` (start it with `env -i ... open`); quitting Terminal with a busy window stalls
