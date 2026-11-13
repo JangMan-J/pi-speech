@@ -1,5 +1,5 @@
 """Held-out acceptance for pi-speech-receiver."""
-import os, signal, socket, stat, subprocess, tempfile, time, shutil
+import json, os, signal, socket, stat, subprocess, tempfile, time, shutil
 from common import Receiver, check, finish, wait_until, wav_bytes, wav_seconds, started_paths, BIN
 
 r = Receiver()
@@ -37,10 +37,12 @@ try:
     time.sleep(1.0)
     check(not r.log("player"), "truncated upload never plays", r.log("player"))
 
-    # oversize body is 413
+    # oversize Stream audio is 413
+    s, j = r.json("POST", "/v1/play/stream", body=json.dumps({"format": "wav"}), headers={"Content-Type": "application/json"})
+    big = j.get("id") if isinstance(j, dict) else None
     sock = socket.create_connection((r.host, r.port))
     size = 70 * 1024 * 1024
-    sock.sendall((f"POST /v1/play HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {r.token}\r\nContent-Type: audio/wav\r\n"
+    sock.sendall((f"POST /v1/play/{big}/audio HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {r.token}\r\nContent-Type: application/octet-stream\r\n"
                   f"Content-Length: {size}\r\n\r\n").encode())
     chunk = wav_bytes(0.1) + b"\0" * (1024 * 1024)
     sent = 0
@@ -63,7 +65,8 @@ try:
         pass
     sock.close()
     check(resp.startswith(b"HTTP/1.1 413") or resp.startswith(b"HTTP/1.0 413"), "oversize body is 413", resp[:40])
-    check(not r.log("player"), "oversize body never plays")
+    st = r.wait_state(big, 5)
+    check(st == "failed", "an oversize Stream fails and does not complete", st)
 
     # MP3 forms
     mp3_id3 = b"ID3\x04\x00\x00\x00\x00\x00\x00" + bytes([0xFF, 0xFB, 0x90, 0x64]) + b"\x00" * 600
