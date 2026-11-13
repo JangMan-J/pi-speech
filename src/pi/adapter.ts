@@ -299,6 +299,8 @@ export function registerPi(
     }
     if (!chars.size) return;
     const current = ctx.ui;
+    // Pi before onTerminalInput existed (and test doubles without it): no hint.
+    if (typeof current.onTerminalInput !== "function") return;
     stopWatching = current.onTerminalInput((data) => {
       try {
         const name = chars.get(data);

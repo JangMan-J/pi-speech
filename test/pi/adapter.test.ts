@@ -209,6 +209,15 @@ describe("the Pi adapter", () => {
       );
     });
 
+    it("with a Pi (or a test double) that has no onTerminalInput, starts without the hint", async () => {
+      const f = fakePi();
+      f.ctx.mode = "tui";
+      f.ctx.ui.getEditorText = () => "";
+      registerPi(f.pi, makeEngine().engine, {}, "darwin");
+      await expect(f.emit("session_start")).resolves.toBeDefined();
+      expect(f.notes).toEqual([]);
+    });
+
     it("in an empty editor, says once per install what happened, and lets the character through", async () => {
       const f = macPi();
       await f.emit("session_start");
