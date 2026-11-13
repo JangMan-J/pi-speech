@@ -197,7 +197,7 @@ try {
   d = dock(t.lines());
   check(/^Speech › Bridge connection ─+$/.test(d[0] ?? ''), 'Enter opens Bridge connection', d[0]);
   check(/▸ Bridge\s+auto · on over SSH · plays on This machine$/.test(d[1] ?? ''), 'it shows the bridge mode and where audio plays', d[1]);
-  check(/^ {4}Remote machine\s+127\.0\.0\.1:47613 · from PI_SPEECH_BRIDGE_URL$/.test(d[2] ?? ''), 'Remote machine shows the bridge address, read-only, from PI_SPEECH_BRIDGE_URL', d[2]);
+  check(/^ {4}Remote machine\s+127\.0\.0\.1:47613 · ssh forward$/.test(d[2] ?? ''), 'Remote machine shows the bridge address, read-only: the ssh forward when nothing else is set', d[2]);
   await sleep(1200);
   d = dock(t.lines());
   check(/^ {4}Pairing\s+✗ Re-pair · .+ ›$/.test(d[3] ?? ''), 'without a receiver, Pairing is ✗ Re-pair ›', d[3]);
