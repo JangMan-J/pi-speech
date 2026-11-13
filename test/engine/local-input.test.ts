@@ -1,10 +1,24 @@
 import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { type BinaryChoice, findBinary } from "../../src/engine/binary";
 import { chooseRecorder, LocalInput } from "../../src/engine/local-input";
 import { wavSeconds } from "../../src/engine/wav";
+
+// A private temporary directory for this file: LocalInput puts its recordings in os.tmpdir(), and the
+// leftover counts below must not see the recordings of other test runs on the same machine.
+const savedTmp = process.env.TMPDIR;
+let privateTmp: string;
+beforeAll(() => {
+  privateTmp = mkdtempSync(join(tmpdir(), "pi-speech-local-input-"));
+  process.env.TMPDIR = privateTmp;
+});
+afterAll(() => {
+  if (savedTmp === undefined) delete process.env.TMPDIR;
+  else process.env.TMPDIR = savedTmp;
+  rmSync(privateTmp, { recursive: true, force: true });
+});
 
 let dir: string;
 beforeEach(() => {
