@@ -4,7 +4,7 @@
  */
 
 import { join } from "node:path";
-import type { BridgeAudio } from "../bridge/index";
+import { type BridgeAudio, type BridgeProbe, bridgeConfig, probeBridge } from "../bridge/index";
 import type { AudioInput, AudioOutput } from "./audio";
 import { Dictation } from "./dictation";
 import { runDictationOutput } from "./dictation-output";
@@ -43,8 +43,11 @@ export class Engine {
   /** Called after the tools setting changed. */
   onToolsChanged: () => void = () => {};
   private announced = false;
+  /** Probe the receiver once, as the configuration stands now (the Pairing row of Bridge connection). */
+  probeBridge: () => Promise<BridgeProbe>;
 
   constructor(opts: EngineOptions) {
+    this.probeBridge = () => probeBridge(() => bridgeConfig(opts.env));
     const settingsFile = new SettingsFile(join(opts.agentDir, "pi-speech"));
     const mode = settingsFile.load().bridge;
     this.routes = new Routes({

@@ -197,6 +197,15 @@ try {
   d = dock(t.lines());
   check(/^Speech › Bridge connection ─+$/.test(d[0] ?? ''), 'Enter opens Bridge connection', d[0]);
   check(/▸ Bridge\s+auto · on over SSH · plays on This machine$/.test(d[1] ?? ''), 'it shows the bridge mode and where audio plays', d[1]);
+  check(/^ {4}Remote machine\s+127\.0\.0\.1:47613 · from PI_SPEECH_BRIDGE_URL$/.test(d[2] ?? ''), 'Remote machine shows the bridge address, read-only, from PI_SPEECH_BRIDGE_URL', d[2]);
+  await sleep(1200);
+  d = dock(t.lines());
+  check(/^ {4}Pairing\s+✗ Re-pair · .+ ›$/.test(d[3] ?? ''), 'without a receiver, Pairing is ✗ Re-pair ›', d[3]);
+  await t.key('Down', 2); await sleep(200);
+  check(/Enter how to pair · Esc back/.test(hintOf(dock(t.lines()))), 'its hint offers how to pair', hintOf(dock(t.lines())));
+  await t.key('Enter'); await sleep(300);
+  check(/pi-speech-receiver pair/.test(dock(t.lines()).join('\n')), 'Enter on Re-pair says how to pair', dock(t.lines()));
+  await t.key('Up', 2); await sleep(200);
   await t.key('Right'); await sleep(1200);
   check(readSettings(ctx).bridge === 'on' || /unreachable|✗/.test(dock(t.lines()).join('\n')), 'Right cycles the mode (or says why it cannot)', dock(t.lines()).slice(0, 6));
   await t.key('Left'); await sleep(600);

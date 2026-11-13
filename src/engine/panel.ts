@@ -11,7 +11,7 @@
  */
 
 import { basename } from "node:path";
-import type { BridgeHealth } from "../bridge/index";
+import type { BridgeHealth, BridgeProbe } from "../bridge/index";
 import type { VoiceLanguage } from "../voice-language/index";
 import type { Engine } from "./engine";
 import { errorMessage } from "./env";
@@ -65,6 +65,8 @@ export type RowId =
   | "transcribe"
   // Bridge connection
   | "bridgeMode"
+  | "remoteMachine"
+  | "pairing"
   // Read aloud options
   | "readMode"
   | "summarizer"
@@ -267,6 +269,8 @@ export interface PanelDeps {
   successMs?: number;
   /** The keys Pi has bound to Speak and Dictate (from the settings when the extension loaded). */
   hotkeys?: Hotkeys;
+  /** How often Bridge connection probes the receiver again while it is open. */
+  pairingMs?: number;
 }
 
 /** A one-line text field: the value and the cursor, in code points. */
@@ -377,7 +381,37 @@ const HOTKEYS: RowBase[] = [
   { id: "transcribe", label: "Transcribe file…" },
 ];
 
-const BRIDGE: RowBase[] = [{ id: "bridgeMode", label: "Bridge" }];
+/** The bridge mode, the Remote machine's address (PI_SPEECH_BRIDGE_URL), and whether its receiver answers. */
+const BRIDGE: RowBase[] = [
+  { id: "bridgeMode", label: "Bridge" },
+  { id: "remoteMachine", label: "Remote machine" },
+  { id: "pairing", label: "Pairing" },
+];
+/** How to pair: it runs on the user's own computer, not from Pi. */
+const PAIR_HOW =
+  "Pair on your own computer: run pi-speech-receiver pair <pi-host>, or connect with pi-speech-receiver ssh <pi-host>";
+const URL_FROM =
+  "The Remote machine's address comes from PI_SPEECH_BRIDGE_URL (loopback only, default http://127.0.0.1:47613); set it before starting Pi";
+
+/** The host:port of a bridge URL, or undefined when it is not one. */
+function hostPort(url: string): string | undefined {
+  try {
+    const u = new URL(url);
+    return u.hostname ? `${u.hostname}:${u.port || (u.protocol === "https:" ? 443 : 80)}` : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Why a probe failed, in a word or two. */
+function pairingFault(reason: string): string {
+  if (/^no bridge token/.test(reason)) return "no token on This machine";
+  if (/\b401\b|check the bridge token/.test(reason)) return "token rejected";
+  if (/not reachable/.test(reason)) return "receiver unreachable";
+  if (/too old/.test(reason)) return "receiver too old";
+  if (/loopback|valid URL|plain http|user name/.test(reason)) return "bridge URL not usable";
+  return "receiver not usable";
+}
 
 /** What read-aloud reads, who summarizes, how long a summary is, and where reading stops. */
 const READ_ALOUD: RowBase[] = [
@@ -540,6 +574,10 @@ export class Panel {
   private voices?: { model: string; ids?: string[]; error?: string; load: Promise<string[]> };
   private receiver?: BridgeHealth | "checking";
   private probeSeq = 0;
+  /** Bridge connection's Pairing: the latest probe of the receiver, and the timer that repeats it. */
+  private pairing?: BridgeProbe | "checking";
+  private pairSeq = 0;
+  private pairTimer?: ReturnType<typeof setInterval>;
   private sampleSeq = 0;
   /** Speak… and Replay: a newer one, or Stop, replaces the line of an older one. */
   private playSeq = 0;
@@ -589,6 +627,7 @@ export class Panel {
     this.disposed = true;
     this.unlisten?.();
     if (this.statusTimer) clearTimeout(this.statusTimer);
+    this.stopPairing();
   }
 
   /** Open the repeated-speaking composer. Standalone mode closes on Esc instead of returning to settings. */
@@ -731,6 +770,15 @@ export class Panel {
         const mode = BRIDGE_MODES.find((m) => m === v) ?? "auto";
         return { ...base, value: v, ...this.bridgeNote(mode) };
       }
+      case "remoteMachine": {
+        // Settings hold no bridge URL: the address is shown, and changed only through the environment.
+        const at = hostPort(this.engine.routes.url);
+        return at
+          ? { ...base, value: at, note: "from PI_SPEECH_BRIDGE_URL" }
+          : { ...base, value: "not set", note: "✗ PI_SPEECH_BRIDGE_URL is not a URL", alert: true };
+      }
+      case "pairing":
+        return { ...base, ...this.pairingValue() };
       default: {
         const letter = LETTERS[base.id];
         return letter ? { ...base, value: letter } : { ...base };
@@ -814,6 +862,14 @@ export class Panel {
     const state = !r || r === "checking" ? "… checking" : r.ok ? `✓ ${host}` : "✗ receiver unreachable";
     const alert = typeof r === "object" && !r.ok;
     return { note: `${when}plays on the Remote machine · ${state}`, short: state, ...(alert ? { alert } : {}) };
+  }
+
+  /** Whether the receiver answers: ✓ with where and how fast, or ✗ Re-pair, whose Enter says how to pair. */
+  private pairingValue(): Pick<PanelRow, "value" | "note" | "opens"> {
+    const p = this.pairing;
+    if (!p || p === "checking") return { value: "… checking" };
+    if (p.ok) return { value: `✓ Connected to ${p.address}:${p.port} · ${p.ms} ms` };
+    return { value: "✗ Re-pair", note: pairingFault(p.reason), opens: true };
   }
 
   /** The models of a model list as the catalog has them (a model it does not list keeps its id). */
@@ -1004,7 +1060,13 @@ export class Panel {
         { key: "Esc", action: "cancel" },
       ];
     }
-    if (m.menu === "bridge") return [{ key: "←→", action: BRIDGE_MODES.join(" · ") }, back];
+    if (m.menu === "bridge") {
+      const id = BRIDGE[m.selected].id;
+      if (id === "bridgeMode") return [{ key: "←→", action: BRIDGE_MODES.join(" · ") }, back];
+      if (id === "remoteMachine") return [{ key: "Enter", action: "where it comes from" }, back];
+      const p = this.pairing;
+      return typeof p === "object" && !p.ok ? [{ key: "Enter", action: "how to pair" }, back] : [back];
+    }
     if (m.menu === "readAloud") {
       const id = READ_ALOUD[m.selected].id;
       if (id === "summarizer") return [{ key: "Enter", action: "choose a model" }, back];
@@ -1255,7 +1317,18 @@ export class Panel {
       case "bridge":
         this.mode = { kind: "menu", menu: "bridge", selected: 0 };
         this.probe();
+        this.startPairing();
         return;
+      case "remoteMachine":
+        this.setStatus("info", URL_FROM);
+        return;
+      case "pairing": {
+        const p = this.pairing;
+        if (typeof p === "object" && !p.ok) this.setStatus("info", PAIR_HOW);
+        else if (typeof p === "object")
+          this.setStatus("info", `The receiver ${p.version} answers at ${p.address}:${p.port}`);
+        return;
+      }
       default:
         this.step(id, 1);
         return;
@@ -1813,6 +1886,36 @@ export class Panel {
     );
     this.track(done);
     return done;
+  }
+
+  /** Probe the receiver for Pairing now, and again every ~2 s while Bridge connection is open. */
+  private startPairing(): void {
+    this.stopPairing();
+    this.pairing = "checking";
+    this.track(this.pair());
+    this.pairTimer = setInterval(() => {
+      const home = this.home();
+      if (this.disposed || home.kind !== "menu" || home.menu !== "bridge") this.stopPairing();
+      else this.track(this.pair());
+    }, this.deps.pairingMs ?? 2000);
+    this.pairTimer.unref?.();
+  }
+
+  private stopPairing(): void {
+    if (this.pairTimer) clearInterval(this.pairTimer);
+    this.pairTimer = undefined;
+  }
+
+  /** One probe; a newer one wins. The row keeps its last result while the next probe runs. */
+  private async pair(): Promise<void> {
+    const seq = ++this.pairSeq;
+    let r: BridgeProbe;
+    try {
+      r = await this.engine.probeBridge();
+    } catch (err) {
+      r = { ok: false, reason: errorMessage(err) };
+    }
+    if (seq === this.pairSeq) this.pairing = r;
   }
 
   // ── Plumbing ────────────────────────────────────────────────────────────

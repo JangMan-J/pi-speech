@@ -27,6 +27,9 @@ const ROWS = [
 /** The rows of Hotkeys: every action. */
 const ACTIONS = ["Speak…", "Dictate", "Replay last", "History…", "Stop", "Transcribe file…"];
 
+/** The rows of Bridge connection. */
+const BRIDGE_ROWS = ["Bridge", "Remote machine", "Pairing"];
+
 const XAI_TOKEN = "xai-login-token-abcdef";
 
 /** xAI answers voices and speech; OpenRouter as in the fixtures. */
@@ -48,7 +51,7 @@ function fakeXai() {
 
 function open(
   env: Record<string, string> = {},
-  opts: { xai?: boolean; before?: (e: Engine) => void; hotkeys?: Hotkeys } = {},
+  opts: { xai?: boolean; before?: (e: Engine) => void; hotkeys?: Hotkeys; pairingMs?: number } = {},
 ) {
   const requests = opts.xai === undefined ? fakeOpenRouter() : fakeXai();
   const made = makeEngine(env);
@@ -65,6 +68,7 @@ function open(
     close,
     changed,
     ...(opts.hotkeys ? { hotkeys: opts.hotkeys } : {}),
+    ...(opts.pairingMs ? { pairingMs: opts.pairingMs } : {}),
   });
   panel.open();
   const press = async (...keys: Array<PanelKey | string>) => {
@@ -79,7 +83,7 @@ function open(
    * or in Bridge connection for Bridge.
    */
   const goTo = async (label: string) => {
-    const menu = ACTIONS.includes(label) ? "hotkeys" : label === "Bridge" ? "bridge" : "main";
+    const menu = ACTIONS.includes(label) ? "hotkeys" : BRIDGE_ROWS.includes(label) ? "bridge" : "main";
     if (panel.view().menu !== menu && panel.view().menu !== "main") await press("escape");
     if (menu !== "main" && panel.view().menu === "main") {
       await goTo(menu === "hotkeys" ? "Hotkeys" : "Bridge connection");
@@ -591,6 +595,77 @@ describe("the panel view model: Bridge connection", () => {
       note: "on over SSH · plays on the Remote machine · ✗ receiver unreachable",
       alert: true,
     });
+  });
+});
+
+describe("the panel view model: Bridge connection's Remote machine and Pairing", () => {
+  const connected = async () => ({ ok: true, address: "127.0.0.1", port: 47613, ms: 52, version: "0.3.0" }) as const;
+  const refused = async () =>
+    ({
+      ok: false,
+      address: "127.0.0.1",
+      port: 47613,
+      reason: "the playback receiver is not reachable at http://127.0.0.1:47613: fetch failed",
+    }) as const;
+
+  it("shows the bridge, the Remote machine's address from the environment, and a connected receiver", async () => {
+    const p = open({}, { before: (e) => (e.probeBridge = connected) });
+    await p.goTo("Bridge connection");
+    await p.press("enter");
+    expect(p.panel.view().rows.map((r) => r.label)).toEqual(BRIDGE_ROWS);
+    expect(p.row("Remote machine")).toMatchObject({ value: "127.0.0.1:47613", note: "from PI_SPEECH_BRIDGE_URL" });
+    expect(p.row("Remote machine")?.opens).toBeFalsy();
+    expect(p.row("Pairing")).toMatchObject({ value: "✓ Connected to 127.0.0.1:47613 · 52 ms" });
+    expect(p.row("Pairing")?.opens).toBeFalsy();
+    await p.goTo("Remote machine");
+    expect(p.hint()).toBe("Enter where it comes from · Esc back");
+    await p.press("enter");
+    expect(p.panel.view().status).toMatchObject({ tone: "info", text: expect.stringMatching(/PI_SPEECH_BRIDGE_URL/) });
+    await p.goTo("Pairing");
+    expect(p.hint()).toBe("Esc back");
+  });
+
+  it("names the address PI_SPEECH_BRIDGE_URL gives", async () => {
+    const p = open({ PI_SPEECH_BRIDGE_URL: "http://localhost:5000" }, { before: (e) => (e.probeBridge = connected) });
+    await p.goTo("Remote machine");
+    expect(p.row("Remote machine")?.value).toBe("localhost:5000");
+  });
+
+  it("an unreachable receiver is ✗ Re-pair, whose Enter says how to pair on your own computer", async () => {
+    const p = open({}, { before: (e) => (e.probeBridge = refused) });
+    await p.goTo("Pairing");
+    expect(p.row("Pairing")).toMatchObject({ value: "✗ Re-pair", note: "receiver unreachable", opens: true });
+    expect(p.hint()).toBe("Enter how to pair · Esc back");
+    await p.press("enter");
+    expect(p.panel.view().status?.text).toMatch(/pi-speech-receiver pair <pi-host>.*pi-speech-receiver ssh <pi-host>/);
+  });
+
+  it("probes when it opens and again while it is open, and stops when it is left", async () => {
+    let n = 0;
+    let ok = false;
+    const p = open(
+      {},
+      {
+        pairingMs: 20,
+        before: (e) =>
+          (e.probeBridge = async () => {
+            n++;
+            return ok ? connected() : refused();
+          }),
+      },
+    );
+    await p.goTo("Bridge connection");
+    await p.press("enter");
+    expect(n).toBe(1);
+    expect(p.row("Pairing")?.value).toBe("✗ Re-pair");
+    ok = true;
+    await vi.waitFor(() => expect(p.row("Pairing")?.value).toMatch(/^✓ Connected/));
+    expect(n).toBeGreaterThan(1);
+    await p.press("escape");
+    await new Promise((r) => setTimeout(r, 60));
+    const after = n;
+    await new Promise((r) => setTimeout(r, 80));
+    expect(n).toBe(after);
   });
 });
 

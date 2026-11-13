@@ -137,7 +137,11 @@ model or voice row, where typing searches).
 
 **Bridge connection ›** holds the bridge mode, `auto` (the bridge when Pi runs over SSH), `on` or `off`,
 changed with ←→ or Enter, and says where audio plays: on This machine, or on the Remote machine with the
-receiver's state (`✓ 127.0.0.1:47613`, `✗ receiver unreachable`).
+receiver's state (`✓ 127.0.0.1:47613`, `✗ receiver unreachable`). **Remote machine** is the bridge address
+(`127.0.0.1:47613`), from `PI_SPEECH_BRIDGE_URL`; it is set there, not in the dock. **Pairing** checks the
+receiver when the submenu opens and every 2 s while it is open: `✓ Connected to 127.0.0.1:47613 · 52 ms`, or
+`✗ Re-pair ›`, whose Enter says how to pair. Pairing runs on your own computer, not from Pi (see
+[The bridge](#the-bridge)).
 
 | Key             | In the dock                                                                                                     |
 | --------------- | --------------------------------------------------------------------------------------------------------------- |
