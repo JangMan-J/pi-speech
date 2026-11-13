@@ -628,7 +628,7 @@ fn pair_over(master: &Master, a: &SshArgs, token: &str, key: &str, ended: &Atomi
         if Instant::now() >= end {
             return fail(&format!(
                 "its connection was not up within {} s",
-                wait.as_secs_f64().round()
+                wait.as_secs_f64()
             ));
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -1121,6 +1121,42 @@ mod tests {
         assert!(is_paired(&f, "other -p 2", "aa"));
         assert_eq!(read_paired(&f).len(), 2);
         std::fs::remove_dir_all(d).ok();
+    }
+
+    #[test]
+    fn multiplexing_set_by_the_user_is_seen() {
+        for xs in [
+            &["-M", "box"][..],
+            &["-S", "/c", "box"],
+            &["box", "-oControlPath=/c"],
+            &["-o", "controlmaster auto", "box"],
+            &["-o", "ControlPersist=10m", "box"],
+        ] {
+            assert!(sets_multiplexing(&p(xs)), "{xs:?}");
+        }
+        for xs in [
+            &["box"][..],
+            &["-J", "jump", "-o", "ProxyCommand=nc %h %p", "box"],
+            &["box", "ssh", "-M", "x"],
+        ] {
+            assert!(!sets_multiplexing(&p(xs)), "{xs:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_control_socket_path_is_short_private_and_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let m = Master::new().unwrap();
+        assert!(m.socket.as_os_str().len() <= SOCKET_PATH_MAX);
+        let mode = std::fs::metadata(&m.dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        assert!(m
+            .options()
+            .contains(&format!("ControlPath={}", m.socket.display())));
+        let dir = m.dir.clone();
+        drop(m);
+        assert!(!dir.exists());
     }
 
     #[test]

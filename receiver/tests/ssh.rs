@@ -1,14 +1,19 @@
 //! `pi-speech-receiver ssh` and `pair` with stand-in `ssh` and `sftp` scripts on PATH.
 //!
 //! The stand-in `ssh` writes its arguments to `ssh.args<id>` and waits for a
-//! `release<id>` file (`<id>` from `STUB_ID`, empty by default); the stand-in `sftp` writes
-//! its arguments and its batch (standard input). Unix only: the stand-ins are shell scripts.
+//! `release<id>` file (`<id>` from `STUB_ID`, empty by default). Given `-o ControlPath=<p>`
+//! it plays a multiplexing master: it makes `<p>` once started (unless `STUB_MASTER` is
+//! `never`), and `-O check` answers whether `<p>` exists (logged to `ssh.checks`). The
+//! stand-in `sftp` writes its arguments and its batch (standard input), fails when its
+//! `ControlPath` does not exist (it may not connect on its own), and otherwise copies the
+//! uploaded file under `remote/`. Unix only: the stand-ins are shell scripts.
 //! Every session of a test shares one receiver, which stops once the last session ends.
 #![cfg(unix)]
 
 mod support;
 
 use std::net::{SocketAddr, TcpStream};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
@@ -17,9 +22,24 @@ use support::*;
 const BIN: &str = env!("CARGO_BIN_EXE_pi-speech-receiver");
 
 const SSH: &str = r#"#!/bin/sh
+cp=""; op=""; prev=""
+for a in "$@"; do
+  case "$prev" in
+    -o) case "$a" in ControlPath=*) [ -z "$cp" ] && cp="${a#ControlPath=}";; esac;;
+    -O) op="$a";;
+  esac
+  prev="$a"
+done
+if [ -n "$op" ] && [ -n "$cp" ]; then
+  echo "$op $cp" >> "$STUB/ssh.checks"
+  if [ -e "$cp" ]; then echo "Master running (pid=$$)" >&2; exit 0; fi
+  echo "Control socket connect($cp): No such file or directory" >&2
+  exit 255
+fi
 printf '%s\n' "$@" > "$STUB/ssh.args.tmp$STUB_ID"
 mv "$STUB/ssh.args.tmp$STUB_ID" "$STUB/ssh.args$STUB_ID"
 echo x >> "$STUB/ssh.calls"
+if [ -n "$cp" ] && [ "${STUB_MASTER:-up}" = up ]; then : > "$cp"; fi
 while [ ! -e "$STUB/release$STUB_ID" ]; do sleep 0.05; done
 exit "${STUB_SSH_EXIT:-0}"
 "#;
@@ -28,8 +48,20 @@ const SFTP: &str = r#"#!/bin/sh
 printf '%s\n' "$@" > "$STUB/sftp.args"
 cat > "$STUB/sftp.batch"
 echo x >> "$STUB/sftp.calls"
-if [ "${STUB_SFTP_EXIT:-0}" != 0 ]; then echo "Permission denied (publickey)." >&2; fi
-exit "${STUB_SFTP_EXIT:-0}"
+cp=""; prev=""
+for a in "$@"; do
+  if [ "$prev" = -o ]; then case "$a" in ControlPath=*) cp="${a#ControlPath=}";; esac; fi
+  prev="$a"
+done
+if [ -n "$cp" ] && [ ! -e "$cp" ]; then
+  echo "Control socket connect($cp): No such file or directory" >&2
+  echo "Connection closed by UNKNOWN port 65535" >&2
+  exit 255
+fi
+if [ "${STUB_SFTP_EXIT:-0}" != 0 ]; then echo "Permission denied (publickey)." >&2; exit "$STUB_SFTP_EXIT"; fi
+src=$(sed -n "s/^put '\(.*\)' .*/\1/p" "$STUB/sftp.batch")
+mkdir -p "$STUB/remote/.config/pi-speech"
+cp "$src" "$STUB/remote/.config/pi-speech/bridge.token"
 "#;
 
 struct Rig {
@@ -145,6 +177,46 @@ impl Rig {
         self.forwarded_as("").0
     }
 
+    /// The control socket the stand-in ssh was told to be the master on, if any.
+    fn master_socket(&self) -> Option<PathBuf> {
+        self.lines("ssh.args")
+            .windows(2)
+            .find(|w| w[0] == "-o" && w[1].starts_with("ControlPath="))
+            .map(|w| PathBuf::from(&w[1]["ControlPath=".len()..]))
+    }
+
+    /// Run a session to its end; when it `pairs`, ssh exits only once sftp has run.
+    fn session(&self, c: &mut Command, pairs: bool) -> Output {
+        let before = self.calls("sftp");
+        let child = self.start(c);
+        if pairs {
+            assert!(
+                wait_until(Duration::from_secs(20), || self.calls("sftp") > before),
+                "the session did not pair"
+            );
+        }
+        self.release();
+        let out = child.wait_with_output().unwrap();
+        std::fs::remove_file(self.file("release")).unwrap();
+        out
+    }
+
+    /// The token the stand-in sftp uploaded.
+    fn remote_token(&self) -> String {
+        std::fs::read_to_string(self.file("remote/.config/pi-speech/bridge.token"))
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    }
+
+    /// Whether no control socket directory is left in the runtime directory.
+    fn sockets_gone(&self) -> bool {
+        std::fs::read_dir(self.dir.join("run"))
+            .unwrap()
+            .flatten()
+            .all(|e| !e.file_name().to_string_lossy().starts_with("pisr-"))
+    }
+
     /// Whether the receiver's private directory is gone (it may take a moment after the
     /// last session).
     fn tmp_cleaned(&self) -> bool {
@@ -192,7 +264,7 @@ fn batch_put(batch: &str) -> String {
 }
 
 #[test]
-fn first_session_pairs_then_serves_for_the_life_of_ssh_only() {
+fn first_session_pairs_over_its_own_connection_then_serves_for_the_life_of_ssh_only() {
     let rig = Rig::new("ssh-first");
     let args = [
         "-p", "2222", "-i", "/k/id", "-o", "User=bob", "-t", "-L", "1:h:2", "box", "tmux", "-a",
@@ -201,31 +273,62 @@ fn first_session_pairs_then_serves_for_the_life_of_ssh_only() {
     c.args(args).env("STUB_SSH_EXIT", "7");
     let child = rig.start(&mut c);
 
-    // ssh got the forward first, then the user's arguments unchanged.
+    // ssh got the forwards first, then the master options on a private socket, then the
+    // user's arguments unchanged.
     let got = rig.lines("ssh.args");
-    assert_eq!(got[4..], args.map(String::from)[..]);
+    let socket = rig.master_socket().expect("no ControlPath");
+    assert_eq!(
+        got[4..10],
+        [
+            "-o".to_string(),
+            "ControlMaster=yes".into(),
+            "-o".into(),
+            format!("ControlPath={}", socket.display()),
+            "-o".into(),
+            "ControlPersist=no".into(),
+        ]
+    );
+    assert_eq!(got[10..], args.map(String::from)[..]);
+    assert!(socket.starts_with(rig.dir.join("run")), "{socket:?}");
+    assert!(socket.as_os_str().len() <= 86, "{socket:?}");
+    let dir = socket.parent().unwrap();
+    let mode = std::fs::metadata(dir).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o700, "{dir:?}");
     let addr = rig.forwarded();
     assert_eq!(health(addr, &rig.token()), 200);
 
-    // Pairing ran before ssh, with the connection options only.
+    // Pairing ran over the session's master, once it was up: no connection of its own.
+    assert!(
+        wait_until(Duration::from_secs(20), || rig
+            .paired()
+            .contains("\tbox -p 2222\n")),
+        "not paired: {}",
+        rig.paired()
+    );
     assert_eq!(rig.calls("sftp"), 1);
     assert_eq!(
         rig.lines("sftp.args"),
         [
-            "-o",
-            "RemoteCommand=none",
-            "-o",
-            "RequestTTY=no",
-            "-P",
-            "2222",
-            "-i",
-            "/k/id",
-            "-o",
-            "User=bob",
-            "-b",
-            "-",
-            "box"
+            "-o".to_string(),
+            format!("ControlPath={}", socket.display()),
+            "-o".into(),
+            "ControlMaster=no".into(),
+            "-o".into(),
+            "ProxyCommand=false".into(),
+            "-o".into(),
+            "RemoteCommand=none".into(),
+            "-o".into(),
+            "RequestTTY=no".into(),
+            "-b".into(),
+            "-".into(),
+            "box".into(),
         ]
+    );
+    assert!(
+        rig.lines("ssh.checks")
+            .contains(&format!("check {}", socket.display())),
+        "{:?}",
+        rig.lines("ssh.checks")
     );
     let batch = std::fs::read_to_string(rig.file("sftp.batch")).unwrap();
     assert_eq!(
@@ -235,63 +338,156 @@ fn first_session_pairs_then_serves_for_the_life_of_ssh_only() {
             rig.token_path().display()
         )
     );
+    assert_eq!(rig.remote_token(), rig.token(), "the token landed");
 
     rig.release();
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(7), "ssh's status passes through");
-    assert!(
-        stderr(&out).contains("paired with box -p 2222"),
-        "{}",
-        stderr(&out)
-    );
+    let err = stderr(&out);
+    assert!(err.contains("paired with box -p 2222"), "{err}");
+    assert!(!err.contains("cannot pair"), "{err}");
     assert!(unreachable(addr), "the receiver stops when ssh exits");
     assert!(rig.tmp_cleaned());
-    assert!(rig.paired().contains("\tbox -p 2222\n"), "{}", rig.paired());
+    assert!(!dir.exists(), "the socket's directory is gone");
+    assert!(rig.sockets_gone());
+}
+
+#[test]
+fn a_master_that_never_comes_up_gives_one_warning_and_the_session_goes_on() {
+    let rig = Rig::new("ssh-nomaster");
+    let mut c = rig.command(&["ssh", "box"]);
+    c.env("STUB_MASTER", "never")
+        .env("STUB_SSH_EXIT", "5")
+        .env("PI_SPEECH_RECEIVER_PAIR_WAIT", "0.5");
+    let child = rig.start(&mut c);
+    let addr = rig.forwarded();
+    let socket = rig.master_socket().expect("no ControlPath");
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(health(addr, &rig.token()), 200, "the session still serves");
+    rig.release();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(5), "ssh's status passes through");
+    let err = stderr(&out);
+    assert_eq!(err.matches("cannot pair").count(), 1, "{err:?}");
+    assert!(
+        err.contains(
+            "\r\npi-speech-receiver: cannot pair with box: its connection was not up within"
+        ),
+        "{err:?}"
+    );
+    assert!(err.contains("pi-speech-receiver pair box"), "{err:?}");
+    assert!(err.ends_with("\r\n"), "{err:?}");
+    assert_eq!(rig.calls("sftp"), 0, "no upload without the master");
+    assert_eq!(rig.paired(), "");
+    assert!(unreachable(addr));
+    assert!(!socket.parent().unwrap().exists());
+    assert!(rig.sockets_gone());
+}
+
+#[test]
+fn a_session_that_ends_before_its_master_is_seen_is_tried_again_next_time() {
+    let rig = Rig::new("ssh-short");
+    rig.release();
+    let out = rig
+        .command(&["ssh", "box", "true"])
+        .env("STUB_MASTER", "never")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let err = stderr(&out);
+    assert!(err.contains("not paired with box"), "{err}");
+    assert_eq!(rig.calls("sftp"), 0);
+    assert_eq!(rig.paired(), "");
+    assert!(rig.sockets_gone());
+    std::fs::remove_file(rig.file("release")).unwrap();
+
+    let out = rig.session(&mut rig.command(&["ssh", "box"]), true);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(rig.paired().contains("\tbox\n"));
 }
 
 #[test]
 fn a_paired_host_is_not_paired_again() {
     let rig = Rig::new("ssh-second");
-    rig.release();
-    for _ in 0..2 {
-        let out = rig.command(&["ssh", "box", "true"]).output().unwrap();
-        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
-    }
+    let out = rig.session(&mut rig.command(&["ssh", "box", "true"]), true);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(rig.master_socket().is_some());
+
+    // Paired: no master, no checks, no upload, nothing said.
+    let checks = rig.lines("ssh.checks").len();
+    let out = rig.session(&mut rig.command(&["ssh", "box", "true"]), false);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stderr(&out), "");
+    assert_eq!(rig.master_socket(), None, "{:?}", rig.lines("ssh.args"));
+    assert_eq!(rig.lines("ssh.args")[4..], ["box", "true"]);
+    assert_eq!(rig.lines("ssh.checks").len(), checks);
     assert_eq!(rig.calls("ssh"), 2);
     assert_eq!(rig.calls("sftp"), 1);
 
     // Another host, or the same one on another port, is paired on its own.
-    let out = rig.command(&["ssh", "-p", "2", "box"]).output().unwrap();
+    let out = rig.session(&mut rig.command(&["ssh", "-p", "2", "box"]), true);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(rig.calls("sftp"), 2);
 
     // A new token is paired again.
     std::fs::remove_file(rig.token_path()).unwrap();
-    let out = rig.command(&["ssh", "box"]).output().unwrap();
+    let out = rig.session(&mut rig.command(&["ssh", "box"]), true);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(rig.calls("sftp"), 3);
+    assert_eq!(rig.remote_token(), rig.token());
+    assert!(rig.sockets_gone());
 }
 
 #[test]
 fn a_failed_pairing_lets_the_session_go_on_and_is_tried_again() {
     let rig = Rig::new("ssh-fail");
-    rig.release();
-    let out = rig
-        .command(&["ssh", "box"])
-        .env("STUB_SFTP_EXIT", "1")
-        .output()
-        .unwrap();
+    let mut c = rig.command(&["ssh", "box"]);
+    c.env("STUB_SFTP_EXIT", "1");
+    let out = rig.session(&mut c, true);
     assert_eq!(out.status.code(), Some(0));
     let err = stderr(&out);
     assert!(err.contains("cannot pair with box"), "{err}");
     assert!(err.contains("Permission denied"), "{err}");
     assert!(err.contains("pi-speech-receiver pair box"), "{err}");
+    assert_eq!(err.matches("cannot pair").count(), 1, "{err:?}");
     assert_eq!(rig.calls("ssh"), 1);
     assert_eq!(rig.paired(), "");
 
-    let out = rig.command(&["ssh", "box"]).output().unwrap();
+    let out = rig.session(&mut rig.command(&["ssh", "box"]), true);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(rig.calls("sftp"), 2);
+    assert!(rig.paired().contains("\tbox\n"));
+}
+
+#[test]
+fn a_session_that_sets_its_own_multiplexing_pairs_before_it() {
+    let rig = Rig::new("ssh-own-mux");
+    // Their own master's socket, already up.
+    let theirs = rig.dir.join("their-cm");
+    std::fs::write(&theirs, "").unwrap();
+    let theirs = theirs.to_string_lossy().into_owned();
+    let mut c = rig.command(&["ssh", "-S", &theirs, "box"]);
+    let child = rig.start(&mut c);
+    // Paired before ssh started, the way it always was: their -S as ControlPath.
+    assert_eq!(rig.calls("sftp"), 1);
+    assert!(rig.lines("sftp.args").ends_with(&[
+        "-o".into(),
+        format!("ControlPath={theirs}"),
+        "-b".into(),
+        "-".into(),
+        "box".into()
+    ]));
+    assert_eq!(
+        rig.lines("ssh.args")[4..],
+        ["-S".to_string(), theirs.clone(), "box".into()]
+    );
+    assert!(rig.sockets_gone(), "no socket of ours");
+    rig.release();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(stderr(&out).contains("paired with box"));
+    assert!(rig.paired().contains("\tbox\n"));
+    assert_eq!(rig.remote_token(), rig.token());
 }
 
 #[test]
@@ -372,6 +568,9 @@ fn the_shared_receiver_stops_when_its_state_directory_is_removed() {
     let child = rig.start(&mut c);
     let addr = rig.forwarded();
     assert_eq!(health(addr, &rig.token()), 200);
+    assert!(wait_until(Duration::from_secs(20), || !rig
+        .paired()
+        .is_empty()));
     // As when a test's scratch directory is removed: its leases go with it.
     std::fs::remove_dir_all(rig.dir.join("xdg/pi-speech")).unwrap();
     rig.release();
