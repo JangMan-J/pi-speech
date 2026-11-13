@@ -1,5 +1,7 @@
 //! The built-in audio engine end to end: the `play` and `record` subcommands of the
 //! binary, on the null audio device (never the real speakers or microphone).
+//!
+//! On Windows, SIGINT is Ctrl+Break (see `support::signal`); SIGTERM is Unix only.
 
 mod support;
 
@@ -26,6 +28,7 @@ fn engine(args: &[&str]) -> Command {
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    signalable(&mut c);
     c
 }
 
@@ -34,10 +37,6 @@ fn pcm(seconds: f64) -> Vec<u8> {
     (0..(seconds * 24000.0) as usize)
         .flat_map(|i| (((i % 100) as i16 - 50) * 40).to_le_bytes())
         .collect()
-}
-
-fn signal(child: &Child, sig: i32) {
-    unsafe { libc::kill(child.id() as i32, sig) };
 }
 
 fn wait_within(child: &mut Child, limit: Duration) -> Option<ExitStatus> {
@@ -93,9 +92,14 @@ fn a_stall_in_the_input_does_not_end_the_playback() {
     assert!(took >= Duration::from_millis(1300) + TAIL, "{took:?}");
 }
 
+#[cfg(unix)]
+const STOP_SIGNALS: [i32; 2] = [SIGINT, SIGTERM];
+#[cfg(windows)]
+const STOP_SIGNALS: [i32; 1] = [SIGINT];
+
 #[test]
 fn sigint_or_sigterm_stops_a_playback_at_once() {
-    for sig in [libc::SIGINT, libc::SIGTERM] {
+    for sig in STOP_SIGNALS {
         let mut child = engine(&["play", "s16le", "24000", "1"]).spawn().unwrap();
         let writer = feed(child.stdin.take().unwrap(), pcm(10.0));
         std::thread::sleep(Duration::from_millis(500));
@@ -246,11 +250,11 @@ fn a_signal_while_the_output_is_being_opened_stops_the_playback() {
     let mut child = c.spawn().unwrap();
     let writer = feed(child.stdin.take().unwrap(), pcm(5.0));
     std::thread::sleep(Duration::from_millis(400));
-    signal(&child, libc::SIGINT);
+    signal(&child, SIGINT);
     let status = wait_within(&mut child, Duration::from_secs(5)).expect("did not stop");
     assert_eq!(
         status.code(),
-        Some(128 + libc::SIGINT),
+        Some(128 + SIGINT),
         "{status:?}: {}",
         stderr_of(&mut child)
     );
@@ -291,7 +295,7 @@ fn record_finishes_a_valid_wav_on_sigint_and_on_the_end_of_its_input() {
         let input = child.stdin.take().unwrap();
         std::thread::sleep(Duration::from_millis(1200));
         match how {
-            "SIGINT" => signal(&child, libc::SIGINT),
+            "SIGINT" => signal(&child, SIGINT),
             _ => drop(input),
         }
         let status = wait_within(&mut child, Duration::from_secs(5)).expect("did not stop");

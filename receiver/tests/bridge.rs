@@ -1,4 +1,9 @@
 //! The bridge, end to end over HTTP, with fake player and recorder programs.
+//!
+//! The fake programs are Unix shell scripts that log the SIGINT they get, so the tests
+//! that run them are Unix only. The rest (authentication, request checks, the front
+//! door's deadlines and fairness, shutdown) run everywhere; on Windows the players and
+//! recorders are covered with the built-in engine in `cli.rs`.
 
 mod support;
 
@@ -18,6 +23,8 @@ struct Rig {
     tmp: PathBuf,
 }
 
+// Some helpers serve only the tests that run the fake programs, which are Unix only.
+#[cfg_attr(windows, allow(dead_code))]
 impl Rig {
     fn new() -> Rig {
         Rig::with(|_| {})
@@ -187,6 +194,7 @@ exit 0
             .collect()
     }
 
+    #[cfg(unix)]
     fn no_stream_player_left(&self) -> bool {
         wait_until(Duration::from_secs(5), || {
             self.stream_pids().into_iter().all(gone)
@@ -261,6 +269,7 @@ fn unknown_endpoint_is_404_with_error_body() {
 }
 
 #[test]
+#[cfg(unix)]
 fn completed_only_when_the_player_exits_zero_and_the_file_is_deleted() {
     let r = Rig::new();
     let audio = wav(0.2);
@@ -277,6 +286,7 @@ fn completed_only_when_the_player_exits_zero_and_the_file_is_deleted() {
 }
 
 #[test]
+#[cfg(unix)]
 fn mp3_is_accepted_and_kind_header_is_checked() {
     let r = Rig::new();
     let mp3 = [b"ID3\x04\0\0\0\0\0\0".as_slice(), &[0u8; 64]].concat();
@@ -365,6 +375,7 @@ fn missing_content_length_is_400() {
 }
 
 #[test]
+#[cfg(unix)]
 fn oversized_body_is_413_and_never_plays() {
     let r = Rig::with(|c| c.max_body = 1000);
     let big = [wav(0.2), vec![0u8; 5000]].concat();
@@ -374,6 +385,7 @@ fn oversized_body_is_413_and_never_plays() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_new_play_cancels_the_one_in_progress() {
     let r = Rig::new();
     r.mode("player", "long");
@@ -390,6 +402,7 @@ fn a_new_play_cancels_the_one_in_progress() {
 }
 
 #[test]
+#[cfg(unix)]
 fn player_failure_is_failed_with_its_error_text() {
     let r = Rig::new();
     r.mode("player", "fail");
@@ -412,6 +425,7 @@ fn missing_player_is_503() {
 }
 
 #[test]
+#[cfg(unix)]
 fn cancel_and_stop_mark_playback_cancelled() {
     let r = Rig::new();
     r.mode("player", "long");
@@ -439,6 +453,7 @@ fn cancel_and_stop_mark_playback_cancelled() {
 }
 
 #[test]
+#[cfg(unix)]
 fn wait_returns_at_the_deadline_while_still_playing() {
     let r = Rig::new();
     r.mode("player", "long");
@@ -453,6 +468,7 @@ fn wait_returns_at_the_deadline_while_still_playing() {
 }
 
 #[test]
+#[cfg(unix)]
 fn record_start_stop_returns_wav_and_deletes_it() {
     let r = Rig::new();
     let rep = r.record_start();
@@ -476,6 +492,7 @@ fn record_start_stop_returns_wav_and_deletes_it() {
 }
 
 #[test]
+#[cfg(unix)]
 fn record_cancel_deletes_the_recording() {
     let r = Rig::new();
     let id = json_field(&r.record_start().text(), "id").unwrap();
@@ -488,6 +505,7 @@ fn record_cancel_deletes_the_recording() {
 }
 
 #[test]
+#[cfg(unix)]
 fn recorder_that_cannot_start_is_503_with_its_message() {
     let r = Rig::new();
     r.mode("recorder", "fail");
@@ -510,6 +528,7 @@ fn recorder_that_cannot_start_is_503_with_its_message() {
 }
 
 #[test]
+#[cfg(unix)]
 fn empty_recording_is_422_and_deleted() {
     let r = Rig::new();
     r.mode("recorder", "empty");
@@ -521,6 +540,7 @@ fn empty_recording_is_422_and_deleted() {
 }
 
 #[test]
+#[cfg(unix)]
 fn recorder_crash_while_recording_is_503_with_its_message() {
     let r = Rig::new();
     r.mode("recorder", "die");
@@ -535,6 +555,7 @@ fn recorder_crash_while_recording_is_503_with_its_message() {
 }
 
 #[test]
+#[cfg(unix)]
 fn recording_stops_itself_at_the_time_limit_and_is_dropped_if_uncollected() {
     let r = Rig::with(|c| {
         c.max_record_seconds = 1;
@@ -564,6 +585,7 @@ fn recording_stops_itself_at_the_time_limit_and_is_dropped_if_uncollected() {
 }
 
 #[test]
+#[cfg(unix)]
 fn shutdown_stops_players_and_recorders_and_removes_the_directory() {
     let r = Rig::new();
     r.mode("player", "long");
@@ -685,6 +707,7 @@ fn a_slow_request_does_not_hold_up_another_and_still_completes() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_body_that_arrives_with_the_head_is_not_lost() {
     let r = Rig::new();
     let audio = wav(0.2);
@@ -706,7 +729,9 @@ fn a_body_that_arrives_with_the_head_is_not_lost() {
     assert_eq!(fs::read(r.dir.join("last-played")).unwrap(), audio);
 }
 
+// Unix only: it times uploads against the deletion of 50,000 files, far slower on NTFS.
 #[test]
+#[cfg(unix)]
 fn no_audio_is_stored_once_shutdown_is_deleting_the_directory() {
     const FILLER: usize = 50_000;
     let r = Rig::new();
@@ -786,6 +811,7 @@ fn a_play_after_shutdown_is_503_and_stores_nothing() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_recorder_that_finishes_just_inside_the_grace_period_is_a_clean_stop() {
     let r = Rig::new();
     r.mode("recorder", "slowstop");
@@ -800,6 +826,7 @@ fn a_recorder_that_finishes_just_inside_the_grace_period_is_a_clean_stop() {
 // ---- Streams ----
 
 #[test]
+#[cfg(unix)]
 fn a_stream_player_gets_each_piece_before_the_client_has_sent_the_rest() {
     let r = Rig::new();
     let id = r.stream();
@@ -825,6 +852,7 @@ fn a_stream_player_gets_each_piece_before_the_client_has_sent_the_rest() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_stream_player_gets_the_format_as_its_arguments() {
     let r = Rig::new();
     for (body, args) in [
@@ -858,6 +886,7 @@ fn a_stream_player_gets_the_format_as_its_arguments() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_content_length_audio_body_also_plays_as_it_arrives() {
     let r = Rig::new();
     let id = r.stream();
@@ -878,6 +907,7 @@ fn a_content_length_audio_body_also_plays_as_it_arrives() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_stop_cancel_or_newer_play_during_the_upload_ends_the_stream_cancelled() {
     for how in ["stop", "cancel", "file play", "stream"] {
         let r = Rig::new();
@@ -923,6 +953,7 @@ fn a_stop_cancel_or_newer_play_during_the_upload_ends_the_stream_cancelled() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_stop_frees_an_upload_held_up_by_a_player_that_does_not_read() {
     let r = Rig::new();
     r.mode("streamer", "deaf");
@@ -946,6 +977,7 @@ fn a_stop_frees_an_upload_held_up_by_a_player_that_does_not_read() {
 }
 
 #[test]
+#[cfg(unix)]
 fn an_upload_that_breaks_off_fails_the_stream_and_leaves_no_player() {
     for how in ["closed mid-chunk", "malformed chunk", "no byte in time"] {
         let r = Rig::with(|c| c.stream_idle = Duration::from_millis(700));
@@ -981,6 +1013,7 @@ fn an_upload_that_breaks_off_fails_the_stream_and_leaves_no_player() {
 }
 
 #[test]
+#[cfg(unix)]
 fn audio_past_the_body_limit_is_413_and_fails_the_stream() {
     let r = Rig::with(|c| c.max_body = 1000);
     let id = r.stream();
@@ -1000,6 +1033,7 @@ fn audio_past_the_body_limit_is_413_and_fails_the_stream() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_stream_whose_audio_never_begins_fails() {
     let r = Rig::with(|c| c.stream_start = Duration::from_millis(600));
     let id = r.stream();
@@ -1021,6 +1055,7 @@ fn a_stream_whose_audio_never_begins_fails() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_player_that_ends_early_does_not_upset_the_upload() {
     let r = Rig::new();
     r.mode("streamer", "early");
@@ -1038,6 +1073,7 @@ fn a_player_that_ends_early_does_not_upset_the_upload() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_stream_player_failure_is_failed_with_its_error_text() {
     let r = Rig::new();
     r.mode("streamer", "fail");
@@ -1054,6 +1090,7 @@ fn a_stream_player_failure_is_failed_with_its_error_text() {
 }
 
 #[test]
+#[cfg(unix)]
 fn stream_requests_are_checked() {
     let r = Rig::new();
     // Without the right token: 401 and no effect.
@@ -1140,6 +1177,7 @@ fn stream_requests_are_checked() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_chunked_stream_request_body_is_accepted() {
     let r = Rig::new();
     let mut s = TcpStream::connect(r.addr).unwrap();
@@ -1157,6 +1195,7 @@ fn a_chunked_stream_request_body_is_accepted() {
 }
 
 #[test]
+#[cfg(unix)]
 fn no_stream_player_when_only_the_file_player_is_configured() {
     let r = Rig::with(|c| c.stream_player = None);
     let rep = r.stream_with(PCM);
@@ -1179,6 +1218,7 @@ fn no_stream_player_when_only_the_file_player_is_configured() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_stream_stops_the_file_playback_in_progress() {
     let r = Rig::new();
     r.mode("player", "long");
@@ -1194,6 +1234,7 @@ fn a_stream_stops_the_file_playback_in_progress() {
 }
 
 #[test]
+#[cfg(unix)]
 fn shutdown_stops_stream_players_and_leaves_no_files() {
     for uploading in [false, true] {
         let r = Rig::new();

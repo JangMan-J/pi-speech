@@ -3,6 +3,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
@@ -120,14 +121,14 @@ fn header_sizes(data_bytes: u64) -> (u32, u32) {
 }
 
 impl Writer {
-    /// Create (or replace) `path`, readable by its owner only.
+    /// Create (or replace) `path`, readable by its owner only (mode 0600 on Unix; on
+    /// Windows the default ACLs of its directory, in the user's profile, do that).
     pub fn create(path: &Path, rate: u32, channels: u16) -> io::Result<Writer> {
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options.open(path)?;
         let mut out = BufWriter::new(file);
         let block = 2 * channels;
         let mut h = Vec::with_capacity(HEADER_BYTES as usize);
@@ -201,9 +202,12 @@ mod tests {
         assert_eq!(wav_seconds(&b), Some(12002.0 / 24000.0));
         assert_eq!(&b[4..8], &(36u32 + 2 * 12002).to_le_bytes());
         assert_eq!(&b[b.len() - 4..], &[0xFF, 0x7F, 0x00, 0x80]);
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         std::fs::remove_dir_all(dir).ok();
     }
 

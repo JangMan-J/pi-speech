@@ -4,8 +4,10 @@
 use pi_speech_receiver::token::random_hex;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 pub fn scratch(name: &str) -> PathBuf {
@@ -112,8 +114,10 @@ pub fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
     }
 }
 
+/// An executable script. (On Windows only the file: these scripts are for Unix shells.)
 pub fn script(path: &Path, text: &str) {
     std::fs::write(path, text).unwrap();
+    #[cfg(unix)]
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
@@ -136,12 +140,65 @@ pub fn chunk_frame(data: &[u8]) -> Vec<u8> {
 }
 
 /// Whether process `pid` is gone (no such process, or only a zombie left).
+#[cfg(target_os = "linux")]
 pub fn gone(pid: u32) -> bool {
     match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         Err(_) => true,
         Ok(stat) => stat
             .rsplit_once(')')
             .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+    }
+}
+
+/// Whether process `pid` is gone. Without /proc a zombie still counts as running, but
+/// the receiver reaps its children at once, and orphans are reaped by the system.
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn gone(pid: u32) -> bool {
+    let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    r != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// SIGINT; on Windows, which has none, Ctrl+Break, which the receiver takes for it.
+pub const SIGINT: i32 = 2;
+/// SIGTERM (Unix only).
+pub const SIGTERM: i32 = 15;
+
+/// Prepare `c` so that [`signal`] can reach the process: on Windows, a console process
+/// group of its own, on a console this test process shares. Nothing to do on Unix.
+pub fn signalable(c: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Console::AllocConsole;
+        use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+        static CONSOLE: std::sync::Once = std::sync::Once::new();
+        // Control events only reach processes on the sender's console. This fails,
+        // harmlessly, when the test process already has one.
+        CONSOLE.call_once(|| unsafe {
+            AllocConsole();
+        });
+        c.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+    c
+}
+
+/// Send `sig` to `child`. On Windows every signal is Ctrl+Break (the child must have
+/// been started [`signalable`]), which the receiver takes for SIGINT.
+pub fn signal(child: &Child, sig: i32) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(child.id() as i32, sig)
+    };
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
+        let _ = sig;
+        let ok = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, child.id()) };
+        assert!(
+            ok != 0,
+            "cannot send Ctrl+Break: {}",
+            std::io::Error::last_os_error()
+        );
     }
 }
 

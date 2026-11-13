@@ -11,6 +11,7 @@ use crate::wav::{self, Kind};
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command};
@@ -107,7 +108,9 @@ pub fn check_loopback(addr: &SocketAddr) -> Result<(), String> {
     }
 }
 
-/// Create the receiver's private (0700) temporary directory under a generated name.
+/// Create the receiver's private (0700) temporary directory under a generated name. On
+/// Windows it is made in the user's own temporary directory (`%TEMP%`, in the profile),
+/// whose default ACLs keep it private; there are no modes to set.
 pub fn private_tmp_dir() -> io::Result<PathBuf> {
     let base = match std::env::var_os("XDG_RUNTIME_DIR") {
         Some(v) if !v.is_empty() && Path::new(&v).is_dir() => PathBuf::from(v),
@@ -118,7 +121,10 @@ pub fn private_tmp_dir() -> io::Result<PathBuf> {
         std::process::id(),
         random_hex(8)?
     ));
+    #[cfg(unix)]
     DirBuilder::new().mode(0o700).create(&dir)?;
+    #[cfg(windows)]
+    DirBuilder::new().create(&dir)?;
     Ok(dir)
 }
 
@@ -185,7 +191,8 @@ struct Rec {
     path: PathBuf,
     ctl: Arc<ProcCtl>,
     /// The built-in recorder's input, open while it records; it stops when this closes,
-    /// should the receiver go away without stopping it.
+    /// should the receiver go away without stopping it. (On Windows the recorder's
+    /// `ProcCtl` keeps it instead, and this is `None`.)
     input: Option<ChildStdin>,
     phase: RecPhase,
     /// Set when the recorder failed while it ran; the audio is then already deleted.
@@ -363,6 +370,7 @@ fn with_note(what: &str, note: &str) -> String {
     }
 }
 
+#[cfg(unix)]
 fn find_in_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
@@ -371,6 +379,16 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
             p.metadata()
                 .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         })
+}
+
+/// Windows has no execute bit: the first file of that name on PATH. A name found nowhere
+/// is left to the system's own search, which also tries it with `.exe`.
+#[cfg(windows)]
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|d| d.join(name))
+        .find(|p| p.metadata().is_ok_and(|m| m.is_file()))
 }
 
 /// A configured program: a bare name is looked up on PATH.
@@ -540,11 +558,12 @@ impl Shared {
             .cfg
             .tmp_dir
             .join(format!("{prefix}-{}.{ext}", random_hex(8)?));
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)?;
+        // On Windows the directory's default ACLs (it is in the user's profile) keep it private.
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut f = options.open(&path)?;
         if let Err(e) = f.write_all(bytes).and_then(|_| f.flush()) {
             let _ = fs::remove_file(&path);
             return Err(e);
@@ -935,12 +954,8 @@ impl Shared {
         let mut g = lock(&self.inner);
         let on_exit = move |exit: Exit| sh.recorder_ended(&done_id, &exit);
         // The built-in recorder also ends when its input closes; a configured one keeps
-        // the closed input it always had.
-        let spawned = if program.builtin {
-            proc::spawn_with_input(cmd, on_exit).map(|(c, input)| (c, Some(input)))
-        } else {
-            proc::spawn(cmd, on_exit).map(|c| (c, None))
-        };
+        // the closed input it always had (on Unix; see `proc::spawn_recorder`).
+        let spawned = proc::spawn_recorder(cmd, program.builtin, on_exit);
         let (ctl, input) = match spawned {
             Ok(x) => x,
             Err(e) => {

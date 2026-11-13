@@ -14,10 +14,27 @@ name = "pi-speech-receiver"
 path = "src/main.rs"
 
 [dependencies]
-libc = "0.2"
-# The built-in audio engine: devices (PulseAudio when it runs, else ALSA on Linux) and decoding.
+# The built-in audio engine: devices (PulseAudio when it runs, else ALSA on Linux; CoreAudio
+# on macOS; WASAPI on Windows) and decoding.
 cpal = { version = "0.18.2", features = ["pulseaudio"] }
 symphonia = { version = "0.6.1", default-features = false, features = ["pcm", "wav", "mp3", "id3v1", "id3v2"] }
+# Random bytes (tokens, ids, file names) from the operating system, on every system.
+getrandom = "0.3"
+
+[target.'cfg(unix)'.dependencies]
+# Signals, process groups, poll.
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Console control handlers, process control (job objects), and WSAPoll.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
 
 [profile.release]
 panic = "unwind"

@@ -631,8 +631,17 @@ mod tests {
                 Err(format!("unknown PI_SPEECH_AUDIO_NULL value: {unknown:?}")),
             );
         }
-        use std::os::unix::ffi::OsStrExt;
-        assert!(mode_of(Some(OsStr::from_bytes(b"\xff"))).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(mode_of(Some(OsStr::from_bytes(b"\xff"))).is_err());
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            let lone_surrogate = std::ffi::OsString::from_wide(&[0xD800]);
+            assert!(mode_of(Some(&lone_surrogate)).is_err());
+        }
     }
 
     #[test]
