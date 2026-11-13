@@ -38,16 +38,16 @@ This file is the contract between the two sides. Both sides implement it exactly
 
 Every non-2xx response has the body `{"error": "<readable message>"}`.
 
-| Status | Meaning                                                                                |
-| ------ | -------------------------------------------------------------------------------------- |
-| 400    | Malformed request, or a body that breaks off (interrupted transfer).                   |
-| 401    | Missing or wrong token.                                                                |
-| 408    | The request head did not arrive within 10 s.                                           |
-| 404    | Unknown endpoint, or unknown playback or recording id.                                 |
-| 409    | A recording is already active, or a Stream's playback cannot take audio (see below).   |
-| 413    | Body larger than the receiver's limit (default 64 MiB).                                |
-| 422    | The recording holds less than 0.1 s of audio.                                          |
-| 503    | The player or the microphone is not available; the message says why.                   |
+| Status | Meaning                                                                              |
+| ------ | ------------------------------------------------------------------------------------ |
+| 400    | Malformed request, or a body that breaks off (interrupted transfer).                 |
+| 401    | Missing or wrong token.                                                              |
+| 408    | The request head did not arrive within 10 s.                                         |
+| 404    | Unknown endpoint, or unknown playback or recording id.                               |
+| 409    | A recording is already active, or a Stream's playback cannot take audio (see below). |
+| 413    | Body larger than the receiver's limit (default 64 MiB).                              |
+| 422    | The recording holds less than 0.1 s of audio.                                        |
+| 503    | The player or the microphone is not available; the message says why.                 |
 
 ## Endpoints
 

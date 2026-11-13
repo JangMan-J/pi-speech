@@ -260,18 +260,20 @@ describe.skipIf(onWindows)("LocalInput", () => {
 const built = findBinary({});
 describe.skipIf(!built.ok || onWindows)("dictation through the bundled binary (null audio device)", () => {
   it("records until stopped and returns a WAV of the null device's silence", async () => {
+    const before = leftovers();
     const input = new LocalInput({ PATH: "", PI_SPEECH_AUDIO_NULL: "1" });
     const rec = await input.start();
     await sleep(400);
     const { audio, format } = await rec.stop();
     expect(format).toBe("wav");
     expect(wavSeconds(audio)).toBeGreaterThan(0.3);
-    expect(leftovers()).toEqual([]);
+    expect(leftovers().filter((d) => !before.includes(d))).toEqual([]);
   });
 
   it("cancel stops it and leaves nothing behind", async () => {
+    const before = leftovers();
     const rec = await new LocalInput({ PATH: "", PI_SPEECH_AUDIO_NULL: "1" }).start();
     await rec.cancel();
-    expect(leftovers()).toEqual([]);
+    expect(leftovers().filter((d) => !before.includes(d))).toEqual([]);
   });
 });
