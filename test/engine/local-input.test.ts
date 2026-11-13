@@ -141,7 +141,11 @@ describe.skipIf(onWindows)("LocalInput", () => {
 
   it("a recorder that exits within the start window fails with the end of its error output", async () => {
     const before = leftovers().length;
-    const r = recorder("dead", `console.error("no such audio device"); process.exit(1);`);
+    // A shell stand-in, not node: it must exit well inside the 500 ms start window even on a
+    // cold machine, where launching node alone can take longer than that.
+    const r = join(dir, "dead");
+    writeFileSync(r, '#!/bin/sh\necho "opening the default input" >&2\necho "no such audio device" >&2\nexit 1\n');
+    chmodSync(r, 0o755);
     await expect(new LocalInput({ ...base, PI_SPEECH_RECORDER: r }).start()).rejects.toThrow(/no such audio device/);
     expect(leftovers().length).toBe(before);
   });
