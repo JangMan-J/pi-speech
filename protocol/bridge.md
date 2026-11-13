@@ -297,7 +297,10 @@ The local models of the catalogue and the per-user model cache. stdout: one JSON
     and its lexicon are both there.
 - `download <id>`: `{"event":"progress","id","done","total"}` (bytes of the archive) as they
   arrive, then `{"event":"verifying","id"}` and `{"event":"unpacking","id"}`. A model already
-  downloaded gives one `progress` line with `done` = `total`.
+  downloaded gives one `progress` line with `done` = `total`. While another download of the
+  same model is running (another Pi session sharing the receiver), this one waits for it and
+  its `progress` lines report the other's bytes; then it ends with `done` if the other put the
+  model in place, else resumes the part the other left.
   - `file`: for a voice whose lexicon is not yet in the cache, the archive is followed by
     `{"event":"progress","id","file":"<lexicon name>","done","total"}` lines, where `file` is
     the lexicon's `name` (as in `list`) and `done` and `total` count the lexicon's bytes, not the
@@ -311,7 +314,10 @@ The local models of the catalogue and the per-user model cache. stdout: one JSON
     lexicon, and then `done` and `total` are the lexicon's bytes). A download stops on SIGINT,
     SIGTERM, or the end of its standard input, and leaves its part (`<dir>.part`, or
     `<lexicon name>.part` in the cache root) for the next download to resume.
-- `delete <id>`: `{"event":"deleted","id","freed":<bytes>}`. A shared lexicon stays.
+- `delete <id>`: `{"event":"deleted","id","freed":<bytes>}`. A shared lexicon stays, and so
+  does a lock file (`<dir>.lock`, `<lexicon name>.lock`): the empty file a running download
+  holds locked so that downloads of the same file take turns. A download removes it as it
+  ends; one is left only by a download that was killed outright.
 
 ## SSH sessions
 

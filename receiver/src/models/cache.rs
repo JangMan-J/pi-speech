@@ -17,10 +17,11 @@
 //! lexicon, so that two downloads of voices that share it never write the same `<name>.part` at
 //! once.
 //!
-//! The lock files stay in the cache, also after `delete` (deleting one could let two locks
-//! coexist: one on the deleted file, one on a new file of the same name). Nothing scans the
-//! cache directory for models (a model is found by its catalogue `dir`), so they are never
-//! taken for one.
+//! A download removes its lock file as it ends, while it still holds it, so a lock file is in
+//! the cache only while a download runs (or after a hard kill, until the next download of the
+//! same file). `delete` leaves it: removing one that another download holds could let two
+//! locks coexist. Nothing scans the cache directory for models (a model is found by its
+//! catalogue `dir`), so a lock file is never taken for one.
 
 use super::catalog::{Entry, Lexicon};
 use std::ffi::OsString;
@@ -231,7 +232,7 @@ mod tests {
         fs::write(lexicon_path(&root, &lexicon), "x").unwrap();
         assert!(is_ready(&root, &entry, Some(&lexicon)));
         fs::write(model_lock_path(&root, &entry), "").unwrap();
-        // Deleting the voice leaves the shared lexicon, and its lock file.
+        // Deleting the voice leaves the shared lexicon, and the lock file (of a download).
         delete(&root, &entry).unwrap();
         assert!(lexicon_path(&root, &lexicon).is_file());
         assert!(model_lock_path(&root, &entry).is_file());

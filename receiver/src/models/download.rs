@@ -14,7 +14,8 @@
 //! one receiver), so from before step 1 until the model is in place or the download ends, a
 //! download holds `<dir>.lock` locked (the system's file lock, released when the process ends
 //! however it ends); another waits for it, then finds the model in place or resumes the part
-//! the first one left.
+//! the first one left. A download removes the lock file as it ends (see [`Lock`]), so that it
+//! stays in the cache only after a hard kill, until the next download of the model.
 //!
 //! A shared lexicon (see [`lexicon`]) is fetched the same way into `<name>.part` in the cache
 //! root, checked, and renamed to `<name>`. Downloads of different voices may need the same
@@ -222,34 +223,108 @@ pub fn lexicon(
 /// How often a download waiting for another's fetch of the same file looks again.
 const LOCK_POLL: Duration = Duration::from_millis(50);
 
+/// A lock file locked by this download. Dropping it removes the file while it is still locked
+/// (so that the cache holds no lock file once no download runs), then unlocks it.
+struct Lock {
+    file: Option<File>,
+    path: PathBuf,
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        // A waiter that then gets the lock on the removed file sees that the path no longer
+        // names it (`names`), and opens the path again.
+        #[cfg(unix)]
+        let _ = fs::remove_file(&self.path);
+        drop(self.file.take());
+        // Nobody can remove a file someone has open here (see `open_lock`), so it is removed
+        // once closed, and only if no other download has it open, waiting for it.
+        #[cfg(not(unix))]
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Open (creating) the lock file at `path`. On Windows, others may not delete it while it is
+/// open.
+fn open_lock(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+        const FILE_SHARE_WRITE: u32 = 2;
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    }
+    options.open(path)
+}
+
+/// Whether `path` still names `file` (it was not removed, nor replaced by a new file).
+fn names(path: &Path, file: &File) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (fs::metadata(path), file.metadata()) {
+            (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // It cannot be removed while open (see `open_lock`).
+        let _ = (path, file);
+        true
+    }
+}
+
 /// Lock the lock file at `path` (a model's or a lexicon's), waiting while another download holds
 /// it. While it waits it reports the other's progress: the bytes in `part`, of `total`. A stop
-/// while waiting leaves everything as it is. Returns the locked file, and whether it waited.
+/// while waiting leaves everything as it is. Returns the lock, and whether it waited.
 fn lock(
     path: &Path,
     part: &Path,
     total: u64,
     stop: &AtomicBool,
     progress: &mut dyn FnMut(u64),
-) -> Result<(File, bool), Failure> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+) -> Result<(Lock, bool), Failure> {
     let mut waited = false;
     let mut last: Option<Instant> = None;
+    let mut file: Option<File> = None;
     loop {
-        match file.try_lock() {
-            Ok(()) => break,
-            Err(fs::TryLockError::WouldBlock) => {}
-            Err(fs::TryLockError::Error(e)) => {
-                return Err(Failure::Failed(format!(
-                    "cannot lock {}: {e}",
-                    path.display()
-                )))
+        if file.is_none() {
+            match open_lock(path) {
+                Ok(f) => file = Some(f),
+                // Being removed by the download that held it (Windows): open it again.
+                Err(e) if cfg!(windows) && e.kind() == io::ErrorKind::PermissionDenied => {}
+                Err(e) => {
+                    return Err(Failure::Failed(format!(
+                        "cannot open {}: {e}",
+                        path.display()
+                    )))
+                }
+            }
+        }
+        if let Some(f) = &file {
+            match f.try_lock() {
+                Ok(()) if names(path, f) => {
+                    let lock = Lock {
+                        file,
+                        path: path.to_path_buf(),
+                    };
+                    return Ok((lock, waited));
+                }
+                // The download that held it removed it: lock the path's file instead.
+                Ok(()) => {
+                    file = None;
+                    continue;
+                }
+                Err(fs::TryLockError::WouldBlock) => {}
+                Err(fs::TryLockError::Error(e)) => {
+                    return Err(Failure::Failed(format!(
+                        "cannot lock {}: {e}",
+                        path.display()
+                    )))
+                }
             }
         }
         let done = fs::metadata(part).map_or(0, |m| m.len().min(total));
@@ -263,7 +338,6 @@ fn lock(
         waited = true;
         std::thread::sleep(LOCK_POLL);
     }
-    Ok((file, waited))
 }
 
 /// A file to fetch: an archive or a lexicon.
@@ -713,6 +787,7 @@ mod tests {
             );
         }
         assert!(!part.exists());
+        assert!(!cache::lexicon_lock_path(&root, &lexicon).exists());
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -848,6 +923,7 @@ mod tests {
         }
         assert!(!part.exists());
         assert!(cache::unpack_leftovers(&root, &entry).is_empty());
+        assert!(!cache::model_lock_path(&root, &entry).exists());
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -877,6 +953,30 @@ mod tests {
         // The other's part is left as it was.
         assert_eq!(fs::read(cache::part_path(&root, &entry)).unwrap(), b"abcd");
         drop(held);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_file_is_removed_when_unlocked_and_a_waiter_on_it_locks_the_new_one() {
+        let root = scratch("lock");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("m.lock");
+        let part = root.join("m.part");
+        let stop = AtomicBool::new(false);
+        let (held, waited) = lock(&path, &part, 1, &stop, &mut |_| {}).unwrap();
+        assert!(!waited);
+        // A waiter opened it before it was removed.
+        let old = open_lock(&path).unwrap();
+        drop(held);
+        assert!(!path.exists());
+        old.try_lock().unwrap();
+        assert!(!names(&path, &old));
+        // Another download locks the path's new file.
+        let (again, _) = lock(&path, &part, 1, &stop, &mut |_| {}).unwrap();
+        assert!(names(&path, again.file.as_ref().unwrap()));
+        drop(again);
+        drop(old);
         fs::remove_dir_all(&root).unwrap();
     }
 
