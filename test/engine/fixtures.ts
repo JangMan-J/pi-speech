@@ -1,6 +1,6 @@
 /** Test fixtures: an engine with a fixed catalog, a recording fake output, and a fake OpenRouter fetch. */
 
-import { mkdtempSync } from "node:fs";
+import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { vi } from "vitest";
@@ -180,6 +180,65 @@ export function makeEngine(
   engine.notify = (message, level) => notes.push({ message, level });
   engine.start();
   return { engine, work, local, bridgeOut, notes };
+}
+
+/** A stand-in binary is a script started as a program (shebang), which Windows cannot do. */
+export const STAND_IN_BINARY = process.platform !== "win32";
+
+/**
+ * A stand-in for the receiver binary's `models` and `transcribe` commands, in `dir`: two transcription models
+ * (parakeet-v3 downloaded, whisper-small not) and one speech model (kokoro, not downloaded). Downloads and deletes
+ * change what `models list` says; `transcribe` answers `local words from <id>` for a downloaded model. Every
+ * call is appended to `calls.log` in `dir`.
+ */
+export function fakeReceiver(dir: string): { path: string; log: string } {
+  const path = join(dir, "fake-receiver");
+  const log = join(dir, "calls.log");
+  const state = join(dir, "downloaded.json");
+  writeFileSync(state, JSON.stringify(["parakeet-v3"]));
+  writeFileSync(
+    path,
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const [, , cmd, sub, id] = process.argv;
+fs.appendFileSync(${JSON.stringify(log)}, process.argv.slice(2).join(" ") + "\\n");
+const out = (v) => process.stdout.write(JSON.stringify(v) + "\\n");
+const state = ${JSON.stringify(state)};
+const have = JSON.parse(fs.readFileSync(state, "utf8"));
+const CATALOG = [
+  { id: "parakeet-v3", kind: "transcription", name: "Parakeet v3", languages: ["en", "de"], size: 640000000 },
+  { id: "whisper-small", kind: "transcription", name: "Whisper small", languages: ["en"], size: 639387718 },
+  { id: "kokoro", kind: "speech", name: "Kokoro", languages: ["en"], size: 100000000 },
+];
+if (cmd === "transcribe") {
+  if (!have.includes(sub)) { process.stderr.write("pi-speech-receiver: " + sub + " is not downloaded\\n"); process.exit(1); }
+  fs.readFileSync(id);
+  process.stdout.write("local words from " + sub + "\\n");
+  process.exit(0);
+}
+if (cmd === "models" && sub === "list") {
+  for (const m of CATALOG) out({ ...m, downloaded: have.includes(m.id), partial: 0, path: "/cache/" + m.id });
+  process.exit(0);
+}
+if (cmd === "models" && sub === "download") {
+  const m = CATALOG.find((x) => x.id === id);
+  for (const done of [0, m.size / 2, m.size]) out({ event: "progress", id, done, total: m.size });
+  out({ event: "verifying", id });
+  out({ event: "unpacking", id });
+  fs.writeFileSync(state, JSON.stringify([...have, id]));
+  out({ event: "done", id, path: "/cache/" + id });
+  process.exit(0);
+}
+if (cmd === "models" && sub === "delete") {
+  fs.writeFileSync(state, JSON.stringify(have.filter((x) => x !== id)));
+  out({ event: "deleted", id, freed: 1234 });
+  process.exit(0);
+}
+process.exit(2);
+`,
+  );
+  chmodSync(path, 0o755);
+  return { path, log };
 }
 
 /** A UI that answers dialogs from a script and records what it was shown. */

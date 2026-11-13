@@ -6,8 +6,11 @@ import {
   type DownloadProgress,
   deleteModel,
   downloadModel,
+  formatSize,
+  LocalModels,
   LocalModelsError,
   listModels,
+  transcribeLocal,
 } from "../../src/engine/local-models";
 
 // The stand-in binary is a script with a shebang line, which Windows cannot start.
@@ -30,6 +33,12 @@ function fakeBinary(): string {
     `#!/usr/bin/env node
 const [, , cmd, sub, id] = process.argv;
 const out = (v) => process.stdout.write(JSON.stringify(v) + "\\n");
+if (cmd === "transcribe") {
+  if (sub === "missing") { process.stderr.write("pi-speech-receiver: model missing is not downloaded\\n"); process.exit(1); }
+  const bytes = require("node:fs").readFileSync(id).length;
+  process.stdout.write("heard " + sub + " " + require("node:path").extname(id) + " " + bytes + "\\n");
+  process.exit(0);
+}
 if (cmd !== "models") process.exit(2);
 if (sub === "list") {
   out({ id: "whisper-small", kind: "transcription", name: "Whisper small", languages: ["en", "de"], size: 639387718,
@@ -171,5 +180,46 @@ describe.skipIf(WINDOWS)("deleteModel", () => {
   it("resolves to the bytes freed, and rejects on an unknown id", async () => {
     await expect(deleteModel(fakeBinary(), "kokoro")).resolves.toBe(1234);
     await expect(deleteModel(fakeBinary(), "nope")).rejects.toThrow('unknown model "nope"');
+  });
+});
+
+describe("formatSize", () => {
+  it("shows sizes as the pickers do", () => {
+    expect([639387718, 1_234_000_000, 80_000, 5_500_000, 12].map(formatSize)).toEqual([
+      "639 MB",
+      "1.2 GB",
+      "80 KB",
+      "5.5 MB",
+      "12 B",
+    ]);
+  });
+});
+
+describe.skipIf(WINDOWS)("transcription with a local model", () => {
+  it("runs transcribe <id> <file> and gives its text", async () => {
+    const file = join(dir, "a.wav");
+    writeFileSync(file, "RIFF1234");
+    await expect(transcribeLocal(fakeBinary(), "whisper-small", file)).resolves.toBe("heard whisper-small .wav 8");
+    await expect(transcribeLocal(fakeBinary(), "missing", file)).rejects.toThrow(/^model missing is not downloaded$/);
+  });
+
+  it("LocalModels finds the binary, lists by kind, and transcribes audio in memory through a temporary file", async () => {
+    const local = new LocalModels({ PI_SPEECH_BINARY: fakeBinary(), PATH: process.env.PATH });
+    expect((await local.list("speech")).map((m) => m.id)).toEqual(["kokoro"]);
+    expect((await local.list("transcription")).map((m) => m.id)).toEqual(["whisper-small"]);
+    await expect(local.transcribe("whisper-small", Buffer.from("RIFFabcdef"), "wav")).resolves.toBe(
+      "heard whisper-small .wav 10",
+    );
+    await expect(local.transcribe("whisper-small", Buffer.from("x"), "ogg")).rejects.toThrow(
+      /wav and mp3 audio, not ogg/,
+    );
+    await expect(local.transcribeFile("whisper-small", join(dir, "a.flac"))).rejects.toThrow(/not flac/);
+  });
+});
+
+describe("LocalModels without a binary", () => {
+  it("says why there is none", async () => {
+    const local = new LocalModels({}, () => ({ ok: false, reason: "the bundled pi-speech-receiver is not installed" }));
+    await expect(local.list()).rejects.toThrow("the bundled pi-speech-receiver is not installed");
   });
 });

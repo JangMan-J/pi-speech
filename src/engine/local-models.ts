@@ -5,7 +5,12 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { extname, join } from "node:path";
 import { createInterface } from "node:readline";
+import { type BinaryChoice, findBinary } from "./binary";
+import { childEnv, type Env } from "./env";
 
 export type ModelKind = "transcription" | "speech";
 
@@ -223,4 +228,133 @@ export function downloadModel(binary: string, id: string, options: DownloadOptio
     }
   })();
   return { result, cancel };
+}
+
+/** The audio a local model transcribes, by file extension. */
+export const LOCAL_AUDIO = ["wav", "mp3"];
+
+/** A size as the pickers show it: `640 MB`, `1.2 GB`, `80 KB`. */
+export function formatSize(bytes: number): string {
+  const units: Array<[number, string]> = [
+    [1e9, "GB"],
+    [1e6, "MB"],
+    [1e3, "KB"],
+  ];
+  for (const [n, unit] of units) {
+    if (bytes >= n) {
+      const v = bytes / n;
+      return `${v >= 10 ? Math.round(v) : Math.round(v * 10) / 10} ${unit}`;
+    }
+  }
+  return `${bytes} B`;
+}
+
+/**
+ * Transcribe a WAV or MP3 file with a downloaded model, on this machine: `transcribe <id> <file>` prints the
+ * text. Nothing goes over the network. Aborting kills the binary.
+ */
+export async function transcribeLocal(
+  binary: string,
+  id: string,
+  file: string,
+  options: { signal?: AbortSignal; env?: NodeJS.ProcessEnv } = {},
+): Promise<string> {
+  options.signal?.throwIfAborted();
+  const child = spawn(binary, ["transcribe", id, file], {
+    env: options.env ?? process.env,
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout?.setEncoding("utf8");
+  child.stderr?.setEncoding("utf8");
+  child.stdout?.on("data", (s: string) => {
+    stdout += s;
+  });
+  child.stderr?.on("data", (s: string) => {
+    stderr += s;
+  });
+  const onAbort = () => child.kill();
+  options.signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    const code = await new Promise<number | null>((resolve, reject) => {
+      child.once("error", (e) => reject(new LocalModelsError(`cannot run ${binary}: ${e.message}`)));
+      child.once("close", (c) => resolve(c));
+    });
+    options.signal?.throwIfAborted();
+    if (code !== 0) {
+      const why = stderr
+        .trim()
+        .split("\n")
+        .at(-1)
+        ?.replace(/^pi-speech-receiver: /, "");
+      throw new LocalModelsError(why || `the transcribe command exited with ${code}`);
+    }
+    return stdout.trim();
+  } finally {
+    options.signal?.removeEventListener("abort", onAbort);
+  }
+}
+
+/**
+ * The on-device models of this machine through the bundled binary (found as src/engine/binary.ts says): the
+ * catalogue, downloads, deletes, and transcription with a downloaded model.
+ */
+export class LocalModels {
+  constructor(
+    private readonly env: Env,
+    private readonly locate: () => BinaryChoice = () => findBinary(env),
+  ) {}
+
+  /** The binary's path; throws why there is none. */
+  binary(): string {
+    const b = this.locate();
+    if (!b.ok) throw new LocalModelsError(b.reason);
+    return b.path;
+  }
+
+  private get childEnv(): NodeJS.ProcessEnv {
+    return childEnv(this.env);
+  }
+
+  /** The catalogue, of one kind when given, with each model's state. */
+  async list(kind?: ModelKind): Promise<LocalModel[]> {
+    const all = await listModels(this.binary(), this.childEnv);
+    return kind ? all.filter((m) => m.kind === kind) : all;
+  }
+
+  download(id: string, options: Omit<DownloadOptions, "env"> = {}): Download {
+    return downloadModel(this.binary(), id, { ...options, env: this.childEnv });
+  }
+
+  delete(id: string): Promise<number> {
+    return deleteModel(this.binary(), id, this.childEnv);
+  }
+
+  /** Transcribe an audio file (WAV or MP3) with the downloaded model `id`. */
+  async transcribeFile(id: string, file: string, signal?: AbortSignal): Promise<string> {
+    const ext = extname(file).slice(1).toLowerCase();
+    if (!LOCAL_AUDIO.includes(ext)) {
+      throw new LocalModelsError(
+        `local models transcribe ${LOCAL_AUDIO.join(" and ")} files, not ${ext || "this file"}`,
+      );
+    }
+    return transcribeLocal(this.binary(), id, file, { signal, env: this.childEnv });
+  }
+
+  /** Transcribe audio held in memory (a dictation recording), through a private temporary file. */
+  async transcribe(id: string, audio: Buffer, format: string, signal?: AbortSignal): Promise<string> {
+    if (!LOCAL_AUDIO.includes(format)) {
+      throw new LocalModelsError(`local models transcribe ${LOCAL_AUDIO.join(" and ")} audio, not ${format}`);
+    }
+    const dir = mkdtempSync(join(tmpdir(), "pi-speech-local-"));
+    try {
+      const file = join(dir, `audio.${format}`);
+      writeFileSync(file, audio, { mode: 0o600 });
+      return await transcribeLocal(this.binary(), id, file, { signal, env: this.childEnv });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
 }
