@@ -85,7 +85,11 @@ jobs:
       - run: npm run typecheck
       - run: npm test
 
-  # The receiver and audio engine (Rust), on every desktop system it ships for.
+  # The receiver, its audio engine and its speech engines (Rust), on every desktop system it ships
+  # for. sherpa-onnx-sys's build script downloads sherpa-onnx's static libraries (ONNX Runtime
+  # included) into target/sherpa-onnx-prebuilt/; the archive is cached, keyed by the lock file that
+  # pins its version. On Windows it is the static-MT archive, matching .cargo/config.toml's
+  # +crt-static.
   receiver:
     name: Receiver on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -96,6 +100,8 @@ jobs:
     env:
       # Tests never reach a real audio device; an unknown value would fail, not fall back.
       PI_SPEECH_AUDIO_NULL: "1"
+      # A real recording through a real model (Parakeet v3 int8, about 465 MB, cached).
+      TEST_MODEL: sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8
     defaults:
       run:
         working-directory: receiver
@@ -105,12 +111,60 @@ jobs:
       - name: Install the ALSA development library (the audio engine links it)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Cache the crates and sherpa-onnx's prebuilt archive
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            receiver/target/sherpa-onnx-prebuilt/*.tar.bz2
+          key: receiver-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('receiver/Cargo.lock') }}
+          restore-keys: receiver-${{ runner.os }}-${{ runner.arch }}-
+      - name: Cache the test model
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: test-models
+          key: test-model-${{ env.TEST_MODEL }}
+      - name: Download the test model
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        working-directory: .
+        run: |
+          mkdir -p test-models
+          curl -fsSL --retry 3 "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/$TEST_MODEL.tar.bz2" | tar -xjf - -C test-models
+          ls -l "test-models/$TEST_MODEL"
       - run: cargo fmt --check
         if: runner.os == 'Linux'
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       - name: Build the release binary
         run: cargo build --release
+      - name: Report the release binary's size
+        run: |
+          bin=target/release/pi-speech-receiver
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          bytes=$(wc -c < "$bin")
+          echo "release binary: $bin, $bytes bytes ($((bytes / 1048576)) MiB)"
+          echo "Receiver release binary on ${{ runner.os }}: $bytes bytes ($((bytes / 1048576)) MiB)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Check the Windows binary needs no Visual C++ runtime DLL
+        if: runner.os == 'Windows'
+        run: |
+          exe=target/release/pi-speech-receiver.exe
+          if command -v objdump >/dev/null; then
+            objdump -p "$exe" | grep 'DLL Name' > imports.txt
+          else
+            # No objdump: the DLL names in the import table are plain strings in the file.
+            grep -aoi '[a-z0-9_-]*\.dll' "$exe" | sort -u > imports.txt
+          fi
+          cat imports.txt
+          if grep -qi 'vcruntime140' imports.txt; then
+            echo "pi-speech-receiver.exe imports VCRUNTIME140.dll: a fresh Windows cannot start it" >&2
+            exit 1
+          fi
+      - name: Transcribe a real recording with the release build
+        env:
+          PI_SPEECH_TEST_MODELS: ${{ github.workspace }}/test-models
+        run: cargo test --release --test transcribe -- --nocapture
       - name: Keep the release binary for testing on real machines
         uses: actions/upload-artifact@v4
         with:
