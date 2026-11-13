@@ -1,7 +1,8 @@
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { buildPlatformPackage, optionalDependencies, stamp, stampProblem, TARGETS } from "../../npm/platforms.mjs";
 import { findBinary, platformPackage } from "../../src/engine/binary";
 
 const onWindows = process.platform === "win32";
@@ -75,6 +76,84 @@ describe.skipIf(onWindows)("finding the bundled binary", () => {
   it("looks for pi-speech-receiver.exe on Windows", () => {
     const r = findBinary({}, { ...opts(), platform: "win32" });
     expect(r.ok).toBe(false);
+  });
+});
+
+describe("the platform packages", () => {
+  const manifest = JSON.parse(readFileSync(join(__dirname, "..", "..", "package.json"), "utf8"));
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "pi-speech-platform-"));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("are the five shipped targets, named as findBinary looks them up", () => {
+    expect(TARGETS.map((t) => t.target)).toEqual([
+      "linux-x64",
+      "linux-arm64",
+      "darwin-arm64",
+      "darwin-x64",
+      "win32-x64",
+    ]);
+    expect(Object.keys(optionalDependencies(manifest.name, manifest.version))).toEqual(
+      TARGETS.map((t) => platformPackage(t.os as NodeJS.Platform, t.cpu)),
+    );
+  });
+
+  it("are stamped into the main manifest at its version, not committed there", () => {
+    expect(manifest.optionalDependencies).toBeUndefined();
+    expect(stampProblem(manifest)).toMatch(/pi-speech-linux-x64 must be .*, is missing/);
+    const stamped = stamp(manifest);
+    expect(stampProblem(stamped)).toBeUndefined();
+    expect(Object.values(stamped.optionalDependencies)).toEqual(TARGETS.map(() => manifest.version));
+    expect(stampProblem({ ...stamped, version: "9.9.9" })).toMatch(/must be 9\.9\.9, is /);
+    const extra = {
+      ...stamped,
+      optionalDependencies: { ...stamped.optionalDependencies, [`${manifest.name}-sunos-x64`]: manifest.version },
+    };
+    expect(stampProblem(extra)).toMatch(/sunos-x64 is not a platform package/);
+  });
+
+  it("are generated with os, cpu, the main package's identity, and the binary in bin/", () => {
+    const binary = join(dir, "pi-speech-receiver.exe");
+    writeFileSync(binary, "MZ");
+    const built = buildPlatformPackage({ target: "win32-x64", binary, out: join(dir, "out"), manifest });
+    const pkg = JSON.parse(readFileSync(join(built.dir, "package.json"), "utf8"));
+    expect(pkg).toMatchObject({
+      name: "@jangmanj/pi-speech-win32-x64",
+      version: manifest.version,
+      os: ["win32"],
+      cpu: ["x64"],
+      license: manifest.license,
+      repository: manifest.repository,
+    });
+    expect(pkg.libc).toBeUndefined();
+    expect(readFileSync(built.binary, "utf8")).toBe("MZ");
+    expect(() => buildPlatformPackage({ target: "linux-x64", binary, out: join(dir, "x"), manifest })).toThrow(
+      /must be named pi-speech-receiver/,
+    );
+    expect(() => buildPlatformPackage({ target: "sunos-x64", binary, out: join(dir, "x"), manifest })).toThrow(
+      /unknown target/,
+    );
+  });
+
+  it.skipIf(onWindows)("carry an executable binary that findBinary takes", () => {
+    const binary = join(dir, "pi-speech-receiver");
+    writeFileSync(binary, "#!/bin/sh\n");
+    const built = buildPlatformPackage({ target: "linux-arm64", binary, out: join(dir, "pkg"), manifest });
+    const pkg = JSON.parse(readFileSync(join(built.dir, "package.json"), "utf8"));
+    expect(pkg).toMatchObject({ os: ["linux"], cpu: ["arm64"], libc: ["glibc"] });
+    expect(statSync(built.binary).mode & 0o111).toBe(0o111);
+    const found = findBinary(
+      {},
+      {
+        root: join(dir, "root"),
+        platform: "linux",
+        arch: "arm64",
+        packageDir: (name) => (name === built.name ? built.dir : undefined),
+      },
+    );
+    expect(found).toEqual({ ok: true, path: built.binary, from: "package" });
   });
 });
 
