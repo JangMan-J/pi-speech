@@ -73,7 +73,8 @@ the newest first; Enter replays one from its file, without a new request, and th
 transcribed file until you change it. **Dictation output** chooses where a finished transcript lands: _Pi_
 (the default) inserts it into Pi's input box, or _User-defined_ hands it to a command you supply — `%s` stands
 for the text (also on the command's stdin and in `$DICTATION_TEXT`), e.g. `zellij action write-chars %s` or
-`wl-copy`. If the command fails, the text falls back into Pi's input box so it is never lost.
+`wl-copy`. The command runs in `sh`, or in PowerShell on Windows (`Set-Clipboard %s`). If the command fails, the
+text falls back into Pi's input box so it is never lost.
 
 ### Choosing a model
 

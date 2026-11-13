@@ -114,7 +114,9 @@ export function chooseStreamPlayer(env: Env, format: StreamFormat): StreamPlayer
 function kill(c: ChildProcess): void {
   if (!c.pid || c.exitCode !== null || c.signalCode !== null) return;
   try {
-    process.kill(-c.pid, "SIGTERM"); // the player's whole process group
+    // The player's whole process group on Unix; Windows has none, and kill() ends the process there.
+    if (process.platform === "win32") c.kill();
+    else process.kill(-c.pid, "SIGTERM");
   } catch {
     try {
       c.kill("SIGTERM");
@@ -168,7 +170,10 @@ export class LocalOutput implements AudioOutput {
     let child: ChildProcess;
     try {
       child = spawn(bin, args, {
-        detached: true,
+        // Its own process group on Unix, so stop() ends whatever the player starts; on Windows that would
+        // open a console window instead.
+        detached: process.platform !== "win32",
+        windowsHide: true,
         stdio: [input ? "pipe" : "ignore", "ignore", "ignore"],
         env: childEnv(this.env),
       });

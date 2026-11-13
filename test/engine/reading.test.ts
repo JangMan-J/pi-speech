@@ -1,6 +1,6 @@
 import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { AudioOutput, PlayOutcome, PlayStart } from "../../src/engine/audio";
 import type { SavedMessage } from "../../src/engine/history";
@@ -235,7 +235,7 @@ describe("speaking a text in pieces", () => {
     await h.answer(0);
     const [file] = h.plays;
     expect(file.startsWith(h.dir)).toBe(true);
-    const sub = file.slice(h.dir.length + 1).split("/");
+    const sub = file.slice(h.dir.length + 1).split(sep);
     expect(sub.length).toBe(2);
     expect(sub[0]).toMatch(/^pi-speech-.+/);
     await h.answer(1);

@@ -1,6 +1,6 @@
 import { readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { READING_MIN_CHARS } from "../../src/engine/pieces";
 import { Surface } from "../../src/engine/surface";
@@ -94,7 +94,7 @@ describe("playback-only speech of a long text", () => {
     const r = await engine.speech.say(LONG);
     expect(inputs.length).toBeGreaterThanOrEqual(2);
     expect(r.files[0].endsWith(".mp3")).toBe(true);
-    expect(readdirSync(join(work, "history"))).toEqual([r.files[0].split("/").at(-1)]);
+    expect(readdirSync(join(work, "history"))).toEqual([basename(r.files[0])]);
     expect(local.plays.map((p) => p.stream?.format)).toEqual([{ codec: "mp3" }]);
   });
 
@@ -114,7 +114,7 @@ describe("playback-only speech of a long text", () => {
     expect(norm(inputs.join(" "))).toBe(norm(LONG));
     expect(r.files).toHaveLength(1);
     expect(r.files[0].endsWith(".mp3")).toBe(true);
-    expect(readdirSync(join(work, "history"))).toEqual([r.files[0].split("/").at(-1)]);
+    expect(readdirSync(join(work, "history"))).toEqual([basename(r.files[0])]);
     expect(bridgeOut.plays[0].file?.endsWith(".mp3")).toBe(true);
   });
 

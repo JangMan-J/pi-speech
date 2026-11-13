@@ -1,6 +1,6 @@
 import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { HISTORY_KEEP, History, historyDir } from "../../src/engine/history";
 
@@ -49,7 +49,7 @@ describe("History", () => {
     const b = await h.save("An MP3 message", mp3, "mp3");
     expect(a.file.endsWith(".wav")).toBe(true);
     expect(b.file.endsWith(".mp3")).toBe(true);
-    expect(readdirSync(dir).sort()).toEqual([a.file, b.file].map((f) => f.split("/").at(-1)).sort());
+    expect(readdirSync(dir).sort()).toEqual([a.file, b.file].map((f) => basename(f)).sort());
   });
 
   it("runs onWritten once the file exists", async () => {
