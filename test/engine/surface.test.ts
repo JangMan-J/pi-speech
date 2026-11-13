@@ -324,23 +324,27 @@ describe("the menu", () => {
     expect(engine.speech.settings.transcriptionModel).toBe("openai/whisper-1");
   });
 
-  it("with Speech source Local, Sample a voice lists the local voices, or asks for a local model first", async () => {
-    const requests = fakeOpenRouter();
-    const bin = fakeReceiver(mkdtempSync(join(tmpdir(), "pi-speech-receiver-")));
-    const { engine } = makeEngine({ PI_SPEECH_BINARY: bin.path, PI_SPEECH_AUDIO_NULL: "1" });
-    engine.speech.setSource("speech", "local");
-    const sample = (o?: string[]) => o?.find((x) => x.startsWith("Sample"));
-    await expect(new Surface(engine).run("", scriptedUi([(_t, o) => sample(o)]).ui)).rejects.toThrow(
-      "Choose a local speech model first: /speech, Speech model",
-    );
-    await engine.speech.local.download("kokoro").result;
-    engine.speech.setLocalModel("speech", "kokoro");
-    const { ui, dialogs, notes } = scriptedUi([(_t, o) => sample(o), () => "af_sol"]);
-    await new Surface(engine).run("", ui);
-    expect(dialogs[1]).toMatchObject({ kind: "pick", options: ["af_alloy", "af_sol", "bm_lewis"] });
-    expect(notes.at(-1)?.message).toMatch(/Sample of af_sol \(kokoro\)/);
-    expect(requests.filter((r) => r.url.endsWith("/audio/speech"))).toHaveLength(0);
-  });
+  // The stand-in receiver is a script started as a program (shebang): Unix only.
+  it.skipIf(process.platform === "win32")(
+    "with Speech source Local, Sample a voice lists the local voices, or asks for a local model first",
+    async () => {
+      const requests = fakeOpenRouter();
+      const bin = fakeReceiver(mkdtempSync(join(tmpdir(), "pi-speech-receiver-")));
+      const { engine } = makeEngine({ PI_SPEECH_BINARY: bin.path, PI_SPEECH_AUDIO_NULL: "1" });
+      engine.speech.setSource("speech", "local");
+      const sample = (o?: string[]) => o?.find((x) => x.startsWith("Sample"));
+      await expect(new Surface(engine).run("", scriptedUi([(_t, o) => sample(o)]).ui)).rejects.toThrow(
+        "Choose a local speech model first: /speech, Speech model",
+      );
+      await engine.speech.local.download("kokoro").result;
+      engine.speech.setLocalModel("speech", "kokoro");
+      const { ui, dialogs, notes } = scriptedUi([(_t, o) => sample(o), () => "af_sol"]);
+      await new Surface(engine).run("", ui);
+      expect(dialogs[1]).toMatchObject({ kind: "pick", options: ["af_alloy", "af_sol", "bm_lewis"] });
+      expect(notes.at(-1)?.message).toMatch(/Sample of af_sol \(kokoro\)/);
+      expect(requests.filter((r) => r.url.endsWith("/audio/speech"))).toHaveLength(0);
+    },
+  );
 
   it("with Speech source Local, Voice language offers no provider voices and says why", async () => {
     fakeOpenRouter();

@@ -46,7 +46,7 @@ case "$1" in
   transcribe)
     [ "$2" = parakeet ] || {{ echo "pi-speech-receiver: $2 is not downloaded" >&2; exit 1; }}
     echo "$3" > {d}/audio-path
-    echo "heard $(wc -c < "$3") bytes";;
+    echo "heard $(wc -c < "$3" | tr -d ' ') bytes";;
   speak)
     if [ "$3" = --list-voices ]; then echo '{{"name":"af_sol","number":0}}'; exit 0; fi
     [ "$2" = kokoro ] || {{ echo '{{"event":"error","message":"the model '"$2"' is not downloaded"}}' >&2; exit 1; }}
