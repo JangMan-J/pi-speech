@@ -1,15 +1,15 @@
 //! Child programs (players and recorders): spawn, observe, and stop.
 //!
 //! On Unix, stopping sends SIGINT, waits up to [`STOP_GRACE`], then SIGKILL. Each child
-//! leads its own process group so strays can be removed with it.
+//! leads its own process group so its descendants can be removed with it.
 //!
 //! Windows has no SIGINT for a child. A player is stopped with a hard kill: that is what
 //! stopping playback means. A recorder is stopped by closing its standard input (the
 //! built-in recorder finishes its WAV and exits when its input ends), then the same
 //! grace, then a kill. Each child runs in a job object of its own, the counterpart of the
-//! process group: a kill ends the job, so strays go with it. Each also gets a console
-//! process group of its own, so the console's Ctrl+C reaches only the receiver, which
-//! then stops its children itself.
+//! process group: a kill ends the job, so its descendants go with it. Each also gets a
+//! console process group of its own, so the console's Ctrl+C reaches only the receiver,
+//! which then stops its children itself.
 
 use std::io::{self, Read};
 #[cfg(unix)]

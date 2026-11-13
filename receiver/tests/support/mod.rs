@@ -163,6 +163,13 @@ pub const SIGINT: i32 = 2;
 /// SIGTERM (Unix only).
 pub const SIGTERM: i32 = 15;
 
+/// The signals the receiver and the engine stop on, the first the one a user or the system
+/// would send; on Windows, Ctrl+Break.
+#[cfg(unix)]
+pub const STOP_SIGNALS: [i32; 2] = [SIGTERM, SIGINT];
+#[cfg(windows)]
+pub const STOP_SIGNALS: [i32; 1] = [SIGINT];
+
 /// Prepare `c` so that [`signal`] can reach the process: on Windows, a console process
 /// group of its own, on a console this test process shares. Nothing to do on Unix.
 pub fn signalable(c: &mut Command) -> &mut Command {

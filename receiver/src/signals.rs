@@ -86,7 +86,7 @@ mod unix {
 mod windows {
     use crate::proc::lock;
     use std::io::{self, PipeReader, PipeWriter, Write};
-    use std::sync::{Mutex, Once};
+    use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
     use windows_sys::core::BOOL;
     use windows_sys::Win32::Foundation::{FALSE, TRUE};
@@ -101,7 +101,8 @@ mod windows {
     /// Where control events are written; the latest [`pipe`] replaces the one before, as
     /// on Unix.
     static SIGNAL_PIPE: Mutex<Option<PipeWriter>> = Mutex::new(None);
-    static HANDLER: Once = Once::new();
+    /// Whether installing the handler (done once) worked: else the system's error code.
+    static HANDLER: OnceLock<Result<(), i32>> = OnceLock::new();
 
     /// Runs on a thread the system starts for each event, so it may lock and write.
     unsafe extern "system" fn on_event(event: u32) -> BOOL {
@@ -123,17 +124,19 @@ mod windows {
     }
 
     /// Route the console's control events into a pipe; returns its read end. Each byte
-    /// read is the number of the signal the event stands for (2 or 15).
+    /// read is the number of the signal the event stands for (2 or 15). The handler is
+    /// installed by the first call; when that failed, every call returns its error.
     pub fn pipe() -> io::Result<PipeReader> {
         let (r, w) = io::pipe()?;
         *lock(&SIGNAL_PIPE) = Some(w);
-        let mut result = Ok(());
-        HANDLER.call_once(|| {
+        let installed = *HANDLER.get_or_init(|| {
             if unsafe { SetConsoleCtrlHandler(Some(on_event), TRUE) } == 0 {
-                result = Err(io::Error::last_os_error());
+                Err(io::Error::last_os_error().raw_os_error().unwrap_or(0))
+            } else {
+                Ok(())
             }
         });
-        result.map(|()| r)
+        installed.map(|()| r).map_err(io::Error::from_raw_os_error)
     }
 }
 

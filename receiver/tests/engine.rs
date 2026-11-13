@@ -92,11 +92,6 @@ fn a_stall_in_the_input_does_not_end_the_playback() {
     assert!(took >= Duration::from_millis(1300) + TAIL, "{took:?}");
 }
 
-#[cfg(unix)]
-const STOP_SIGNALS: [i32; 2] = [SIGINT, SIGTERM];
-#[cfg(windows)]
-const STOP_SIGNALS: [i32; 1] = [SIGINT];
-
 #[test]
 fn sigint_or_sigterm_stops_a_playback_at_once() {
     for sig in STOP_SIGNALS {

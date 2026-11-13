@@ -4,15 +4,16 @@ use crate::front::{self, Ready};
 use crate::http::{
     answer_nonblocking, json_str, BodyError, BodyFault, Conn, Framing, Request, Response,
 };
+use crate::private;
 use crate::proc::{self, lock, start_thread, Exit, ProcCtl};
 use crate::stream::{self, Format};
 use crate::token::{ct_eq, random_hex};
 use crate::wav::{self, Kind};
-use std::fs::{self, DirBuilder, OpenOptions};
+use std::fs;
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -121,10 +122,7 @@ pub fn private_tmp_dir() -> io::Result<PathBuf> {
         std::process::id(),
         random_hex(8)?
     ));
-    #[cfg(unix)]
-    DirBuilder::new().mode(0o700).create(&dir)?;
-    #[cfg(windows)]
-    DirBuilder::new().create(&dir)?;
+    private::dir().create(&dir)?;
     Ok(dir)
 }
 
@@ -381,23 +379,165 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
         })
 }
 
-/// Windows has no execute bit: the first file of that name on PATH. A name found nowhere
-/// is left to the system's own search, which also tries it with `.exe`.
+/// Windows has no execute bit: see [`windows_program::find`]. A name found nowhere is left
+/// to the system's own search, which also tries it with `.exe`.
 #[cfg(windows)]
 fn find_in_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|d| d.join(name))
-        .find(|p| p.metadata().is_ok_and(|m| m.is_file()))
+    let pathext = std::env::var_os("PATHEXT");
+    windows_program::find(
+        name,
+        &path.to_string_lossy(),
+        pathext.as_ref().map(|e| e.to_string_lossy()).as_deref(),
+        |p| p.metadata().is_ok_and(|m| m.is_file()),
+    )
 }
 
-/// A configured program: a bare name is looked up on PATH.
-fn configured_program(p: &Path) -> PathBuf {
-    if p.components().count() == 1 {
+/// How Windows programs are found, as the extension finds them (`findExecutable` in
+/// `src/engine/env.ts`): a program is a file with an extension from PATHEXT that is `.exe`
+/// or `.com` (by default `.COM;.EXE`), named with or without it; a `.cmd` or `.bat`
+/// script never is. Pure, so that it is tested on every system.
+#[cfg(any(windows, test))]
+mod windows_program {
+    use std::path::{Path, PathBuf};
+
+    /// The extension of `name` (from its last dot, with no path separator after it), in
+    /// lowercase.
+    fn extension(name: &str) -> Option<String> {
+        let ext = &name[name.rfind('.')?..];
+        (ext.len() > 1 && !ext.contains(['\\', '/'])).then(|| ext.to_ascii_lowercase())
+    }
+
+    /// A `.cmd` or `.bat` script, which is never run as a program.
+    pub fn is_script(name: &str) -> bool {
+        matches!(extension(name).as_deref(), Some(".cmd" | ".bat"))
+    }
+
+    /// The directories of a Windows PATH: split at semicolons outside double quotes, the
+    /// quotes removed, empty entries skipped (as `std::env::split_paths` does on Windows).
+    fn dirs(path: &str) -> Vec<String> {
+        let mut dirs = vec![String::new()];
+        let mut quoted = false;
+        for c in path.chars() {
+            match c {
+                '"' => quoted = !quoted,
+                ';' if !quoted => dirs.push(String::new()),
+                c => dirs.last_mut().unwrap().push(c),
+            }
+        }
+        dirs.retain(|d| !d.is_empty());
+        dirs
+    }
+
+    /// The program a bare `name` names on `path` (a PATH value), with `pathext` (a PATHEXT
+    /// value, if set); `is_file` tells whether a file exists at a path.
+    pub fn find(
+        name: &str,
+        path: &str,
+        pathext: Option<&str>,
+        is_file: impl Fn(&Path) -> bool,
+    ) -> Option<PathBuf> {
+        if is_script(name) {
+            return None;
+        }
+        let exts: Vec<String> = pathext
+            .unwrap_or(".COM;.EXE")
+            .split(';')
+            .map(|e| e.trim().to_ascii_lowercase())
+            .filter(|e| e == ".exe" || e == ".com")
+            .collect();
+        // The name itself when it already has a program extension, else the name with each.
+        let names: Vec<String> = match extension(name) {
+            Some(ext) if exts.contains(&ext) => vec![name.to_string()],
+            _ => exts
+                .iter()
+                .flat_map(|e| [format!("{name}{e}"), format!("{name}{}", e.to_uppercase())])
+                .collect(),
+        };
+        dirs(path).iter().find_map(|d| {
+            names
+                .iter()
+                .map(|n| Path::new(d).join(n))
+                .find(|p| is_file(p))
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// `is_file` for a directory holding exactly `names`.
+        fn files<'a>(dir: &'a str, names: &'a [&str]) -> impl Fn(&Path) -> bool + 'a {
+            move |p| names.iter().any(|n| p == Path::new(dir).join(n))
+        }
+
+        const DIR: &str = r"C:\tools";
+
+        #[test]
+        fn finds_a_bare_name_with_the_program_extensions_of_pathext() {
+            let is_file = files(DIR, &["player.EXE", "rec.com"]);
+            let path = format!(r"C:\nowhere;;{DIR}");
+            let pathext = Some(".COM;.EXE;.BAT;.CMD");
+            let found = |name| find(name, &path, pathext, &is_file);
+            let player = Some(Path::new(DIR).join("player.EXE"));
+            assert_eq!(found("player"), player);
+            assert_eq!(found("player.EXE"), player);
+            assert_eq!(found("rec"), Some(Path::new(DIR).join("rec.com")));
+            assert_eq!(found("missing"), None);
+            // Only .exe and .com of PATHEXT count.
+            assert_eq!(find("player", &path, Some(".BAT;.COM"), &is_file), None);
+        }
+
+        #[test]
+        fn never_takes_a_cmd_or_bat_script() {
+            let is_file = files(DIR, &["script.cmd", "other.bat", "other.BAT.exe"]);
+            let pathext = Some(".COM;.EXE;.BAT;.CMD");
+            assert_eq!(find("script", DIR, pathext, &is_file), None);
+            assert_eq!(find("script.cmd", DIR, pathext, &is_file), None);
+            assert_eq!(find("other.BAT", DIR, pathext, &is_file), None);
+            assert!(is_script("script.cmd") && is_script(r"C:\x\OTHER.Bat"));
+            assert!(!is_script("player.exe") && !is_script(r"C:\x.cmd\player"));
+        }
+
+        #[test]
+        fn uses_com_and_exe_when_pathext_is_not_set() {
+            let is_file = files(DIR, &["tool.exe"]);
+            assert_eq!(
+                find("tool", DIR, None, &is_file),
+                Some(Path::new(DIR).join("tool.exe"))
+            );
+        }
+
+        #[test]
+        fn splits_path_at_semicolons_outside_quotes() {
+            assert_eq!(
+                dirs(r#"C:\a;;"C:\b;c";C:\d"#),
+                [r"C:\a", r"C:\b;c", r"C:\d"]
+            );
+            let is_file = files(r"C:\b;c", &["tool.exe"]);
+            assert_eq!(
+                find("tool", r#""C:\b;c""#, None, &is_file),
+                Some(Path::new(r"C:\b;c").join("tool.exe"))
+            );
+        }
+    }
+}
+
+/// A configured program: a bare name is looked up on PATH. On Windows a `.cmd` or `.bat`
+/// script is refused, as the extension refuses it, rather than run through `cmd.exe`.
+fn configured_program(p: &Path) -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    if windows_program::is_script(&p.to_string_lossy()) {
+        return Err(format!(
+            "cannot start {}: a program is an .exe or .com file, not a .cmd or .bat script",
+            p.display()
+        ));
+    }
+    Ok(if p.components().count() == 1 {
         find_in_path(&p.to_string_lossy()).unwrap_or_else(|| p.to_path_buf())
     } else {
         p.to_path_buf()
-    }
+    })
 }
 
 /// A player or recorder to run, and the arguments it takes before its own.
@@ -441,7 +581,7 @@ impl Shared {
     fn program(&self, configured: &Option<PathBuf>, subcommand: &str) -> Result<Program, String> {
         if let Some(p) = configured {
             return Ok(Program {
-                path: configured_program(p),
+                path: configured_program(p)?,
                 args: Vec::new(),
                 builtin: false,
             });
@@ -559,11 +699,7 @@ impl Shared {
             .tmp_dir
             .join(format!("{prefix}-{}.{ext}", random_hex(8)?));
         // On Windows the directory's default ACLs (it is in the user's profile) keep it private.
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut f = options.open(&path)?;
+        let mut f = private::file().write(true).create_new(true).open(&path)?;
         if let Err(e) = f.write_all(bytes).and_then(|_| f.flush()) {
             let _ = fs::remove_file(&path);
             return Err(e);

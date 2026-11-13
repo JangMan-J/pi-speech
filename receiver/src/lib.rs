@@ -4,6 +4,7 @@
 pub mod audio;
 pub mod front;
 pub mod http;
+mod private;
 pub mod proc;
 pub mod server;
 pub mod signals;

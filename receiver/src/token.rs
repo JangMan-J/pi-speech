@@ -5,10 +5,11 @@
 //! (under the user's profile) get the default ACLs of where they are made, which give
 //! access to the user, administrators and the system only; no permission check is made.
 
-use std::fs::{DirBuilder, File, OpenOptions};
+use crate::private;
+use std::fs::File;
 use std::io::{self, Read, Write};
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 pub const MIN_TOKEN_LEN: usize = 32;
@@ -92,17 +93,9 @@ pub fn read_token(path: &Path) -> io::Result<String> {
 /// (On Windows both get the default ACLs of the user's profile.)
 fn create_token(path: &Path) -> io::Result<()> {
     if let Some(dir) = path.parent() {
-        let mut builder = DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        builder.mode(0o700);
-        builder.create(dir)?;
+        private::dir().recursive(true).create(dir)?;
     }
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut f = options.open(path)?;
+    let mut f = private::file().write(true).create_new(true).open(path)?;
     f.write_all(random_hex(32)?.as_bytes())?;
     f.write_all(b"\n")
 }

@@ -1,10 +1,9 @@
 //! Inspection of audio bytes (upload sniffing and recording duration), and writing
 //! recordings.
 
-use std::fs::{File, OpenOptions};
+use crate::private;
+use std::fs::File;
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,11 +123,11 @@ impl Writer {
     /// Create (or replace) `path`, readable by its owner only (mode 0600 on Unix; on
     /// Windows the default ACLs of its directory, in the user's profile, do that).
     pub fn create(path: &Path, rate: u32, channels: u16) -> io::Result<Writer> {
-        let mut options = OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let file = options.open(path)?;
+        let file = private::file()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
         let mut out = BufWriter::new(file);
         let block = 2 * channels;
         let mut h = Vec::with_capacity(HEADER_BYTES as usize);

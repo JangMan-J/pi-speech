@@ -87,12 +87,6 @@ fn temp_entries(dir: &Path) -> Vec<String> {
         .collect()
 }
 
-/// The signals the receiver stops on; on Windows, Ctrl+Break.
-#[cfg(unix)]
-const STOP_SIGNALS: [i32; 2] = [SIGTERM, SIGINT];
-#[cfg(windows)]
-const STOP_SIGNALS: [i32; 1] = [SIGINT];
-
 /// Ask the receiver to stop as a user or the system would.
 fn terminate(child: &Child) {
     signal(child, STOP_SIGNALS[0]);
