@@ -22,9 +22,22 @@ run 3 times, e2e all). Fixed while gating: the shared receiver lingered forever 
 file busy"), e2e panel expects `127.0.0.1:47613 · ssh forward` when nothing is set. Still for the user: by ear,
 two Pi sessions speaking at once overlap.
 
-Obligations moved to Director node-6dc34e1c71181838 (the old node's can no longer be updated). Leaves running:
-`local-speech-loose-ends` (protocol/bridge.md lexicon/file fields; concurrent lexicon `.part`) and
-`slice10-followups` (local-input test with a built binary; ubuntu-22.04 release runners; README release notes).
+Obligations moved to Director node-6dc34e1c71181838 (the old node's can no longer be updated).
+
+Landed after it (2026-11-13 afternoon), CI green on Linux/macOS/Windows at `7cacec6`:
+- protocol/bridge.md "Subcommand notes: models" (`lexicon` field, progress `file`); downloads of the same lexicon
+  or model archive take turns under `<name>.lock` / `<dir>.lock` (removed at the end; dev/ino check on Unix).
+- Release Linux binaries build on ubuntu-22.04 / 22.04-arm (glibc 2.35; unchecked until a release run). README
+  release steps. local-input with a built binary: not reproduced (22/22, 671/671).
+- CI fixes: surface local-voices test Unix only; transcribe stand-in strips macOS `wc -c` padding.
+- Pairing over the session's own ssh connection (user's decision): on Linux/macOS a first session runs ssh as a
+  ControlMaster on a private socket and uploads the token over it, so a new host key or password auth pairs.
+  Windows and user-set multiplexing fall back to the pre-session `sftp -b`. See protocol/bridge.md "SSH sessions".
+  Checked for real against a scratch user sshd on localhost: an unknown host key answered in the session, the token
+  arrived mid-session, paired-hosts written, socket and receiver dirs removed, the second session did not pair.
+  Password auth not checkable here (non-root sshd has no PAM).
+- User decisions: by-ear overlap check skipped (tests cover it); Windows VM checks wanted (agent-jail was offline
+  at 13:05; still to do, including the ControlMaster fallback on Windows).
 
 ### Earlier (2026-11-13 ~11:35)
 

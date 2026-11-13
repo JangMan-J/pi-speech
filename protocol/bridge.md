@@ -332,8 +332,20 @@ by all of the user's sessions:
 1. **Pairing**, on the first connection to a host: the local token file (made if missing,
    as above) is uploaded to the remote host as `.config/pi-speech/bridge.token` under the
    directory `sftp` starts in (the user's home, on Windows OpenSSH too), where the
-   extension reads it. The upload is `sftp -b -` with this batch, so it needs no
-   particular remote shell:
+   extension reads it. On Linux and macOS the upload goes over the session's own
+   connection: the session's `ssh` gets `-o ControlMaster=yes -o ControlPath=<dir>/cm
+   -o ControlPersist=no` (after the forwards, before the user's arguments), `<dir>` being a
+   new 0700 directory `pisr-<8 hex>` in `$XDG_RUNTIME_DIR`, the temporary directory or
+   `/tmp` (the first giving a socket path of at most 86 bytes), removed after `ssh` exits.
+   While the session runs, the master is awaited (the socket, then `ssh -o
+   ControlPath=<socket> -O check <host>`) for at most `PI_SPEECH_RECEIVER_PAIR_WAIT`
+   seconds (default 300), and the token is uploaded with `sftp -o ControlPath=<socket> -o
+   ControlMaster=no -o ProxyCommand=false -o RemoteCommand=none -o RequestTTY=no -b -
+   <host>`, so host-key and password prompts are answered in the session as usual and the
+   upload needs no authentication of its own. On Windows, and when the user's arguments
+   set multiplexing (`-M`, `-S`, `-o ControlMaster`, `ControlPath`, `ControlPersist`), the
+   upload runs before the session as `sftp -b -` with the connection options described
+   below. Either way the batch is this, so it needs no particular remote shell:
 
    ```
    -mkdir .config
@@ -349,7 +361,9 @@ by all of the user's sessions:
    given, with ` -l <user>` and ` -p <port>` when those options were given; the
    fingerprint is the first 8 bytes of the token's SHA-256 in hex, so a new token pairs
    every host again. A failed pairing is reported (with the end of `sftp`'s error
-   output) and the session goes on without it; the next session tries again. `pair`
+   output; during the session as one line ended by CR LF) and the session goes on without
+   it; a session that ends before its master was up is reported after it. The next session
+   tries again. Success is reported (`paired with <host>`) after the session. `pair`
    uploads the token whether or not the host was paired and exits non-zero when it fails.
    Sessions that pair at once lock `paired-hosts.lock` around the update.
 2. **Receiver**: the session takes a lease on the shared receiver, and starts it when none
@@ -361,8 +375,9 @@ by all of the user's sessions:
    holding its terminal, where pairing codes are shown. The locks are the system's file
    locks, which a process gives up when it dies.
 3. **Session**: `ssh -R 127.0.0.1:47613:127.0.0.1:<port> -R 127.0.0.1:<spare>:127.0.0.1:<port>
-   <ssh-args...> <host> [command...]`, the user's arguments unchanged after the added
-   forwards, with the terminal as it is. `<spare>` is the first of 47614 to 47633 no other
+   [-o ControlMaster=yes -o ControlPath=<socket> -o ControlPersist=no] <ssh-args...> <host>
+   [command...]` (the master options only when pairing over the session), the user's
+   arguments unchanged after the added forwards, with the terminal as it is. `<spare>` is the first of 47614 to 47633 no other
    session holds (none when all are held). When another session to the same host already
    forwards 47613 there, `ssh` warns that that forward failed, and Pi finds this session
    at its spare port.
@@ -385,8 +400,9 @@ those of the session (forwardings, `RemoteCommand`, `RequestTTY`, `LocalCommand`
 `ForkAfterAuthentication`, `SessionType`, `StdinNull`, tunnels, X11 and agent
 forwarding, `EscapeChar`). `-o RemoteCommand=none -o RequestTTY=no` come first, because
 either from the user's configuration breaks `sftp`. An `ssh://` destination becomes
-`sftp://`, and an IPv6 address is put in brackets. Because `sftp -b` runs in batch mode,
-pairing needs key or agent authentication and a host key already known.
+`sftp://`, and an IPv6 address is put in brackets. When the upload runs before the session
+(`sftp -b`, batch mode), pairing needs key or agent authentication and a host key already
+known.
 
 Arguments that open no session (no destination, `-V`, `-G`, `-Q`, `-O`, `-W`) run `ssh`
 unchanged, without pairing or a receiver. `-f` (and `-o ForkAfterAuthentication=yes`) is
