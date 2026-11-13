@@ -7,6 +7,11 @@
 //! recording keeps its timeline. A writer thread takes from the ring, converts to 24 kHz
 //! mono and writes. On a stop the device closes first, so everything it captured is
 //! written before the file is finished.
+//!
+//! A real device that captured only exact zeros for the whole recording gave no signal
+//! at all: on macOS that is what a microphone denied by the privacy settings delivers.
+//! The file is still finished, but the recording ends in an error that says so. A real
+//! microphone, however quiet, always has some noise; the null device is exempt.
 
 use super::convert::Converter;
 use super::device::{Format, Input};
@@ -49,17 +54,59 @@ struct Lost {
     owed: AtomicU64,
 }
 
+/// Whether the device has captured anything, and anything but exact zeros.
+#[derive(Default)]
+struct Signal {
+    /// Some samples were captured.
+    captured: AtomicBool,
+    /// Some captured sample was not exactly zero.
+    heard: AtomicBool,
+}
+
+impl Signal {
+    /// Note one captured buffer; called from the device's callback.
+    fn see(&self, buf: &[f32]) {
+        if buf.is_empty() {
+            return;
+        }
+        self.captured.store(true, Ordering::Relaxed);
+        if !self.heard.load(Ordering::Relaxed) && buf.iter().any(|&s| s != 0.0) {
+            self.heard.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Samples were captured and every one of them was exactly zero.
+    fn exactly_silent(&self) -> bool {
+        self.captured.load(Ordering::Relaxed) && !self.heard.load(Ordering::Relaxed)
+    }
+}
+
+/// The error for a real device that gave exact zeros for the whole recording.
+fn no_signal_error() -> String {
+    if cfg!(target_os = "macos") {
+        "the microphone gave no signal at all (every sample was exactly zero); on macOS, allow \
+         microphone access for this terminal in System Settings > Privacy & Security > Microphone"
+            .into()
+    } else {
+        "the input device delivered no signal at all (every sample was exactly zero); check \
+         that it is not muted and that this process may use it"
+            .into()
+    }
+}
+
 /// The device's side of the ring.
 struct Capture {
     ring: Producer,
     /// Silence still to be put in the ring for audio lost, in samples.
     owed: usize,
     lost: Arc<Lost>,
+    signal: Arc<Signal>,
 }
 
 impl Capture {
     /// The device's callback.
     fn take(&mut self, buf: &[f32]) {
+        self.signal.see(buf);
         // The silence for audio lost earlier goes first, so what follows keeps its place.
         self.owed -= self.ring.push_silence(self.owed);
         let n = if self.owed == 0 {
@@ -96,6 +143,7 @@ fn record_with(
     backlog: Duration,
 ) -> Result<f64, String> {
     let format = input.format();
+    let real_device = !input.is_null();
     let file = wav::Writer::create(path, RATE, 1)
         .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
     let frames = (format.samples_in(backlog) / format.channels).max(1);
@@ -117,10 +165,12 @@ fn record_with(
         writer.thread().unpark();
     };
 
+    let signal = Arc::new(Signal::default());
     let mut capture = Capture {
         ring: producer,
         owed: 0,
         lost: Arc::clone(&lost),
+        signal: Arc::clone(&signal),
     };
     let fatal_tx = tx;
     let started = input.start(
@@ -154,6 +204,7 @@ fn record_with(
         );
     }
     match event {
+        Event::Stop if real_device && signal.exactly_silent() => Err(no_signal_error()),
         Event::Stop => Ok(frames as f64 / RATE as f64),
         Event::Failed(why) => Err(why),
     }
@@ -324,6 +375,7 @@ mod tests {
             ring: p,
             owed: 0,
             lost: Arc::clone(&lost),
+            signal: Arc::default(),
         };
         cap.take(&[1.0, 2.0, 3.0]);
         cap.take(&[4.0, 5.0, 6.0]); // room for one
@@ -361,6 +413,33 @@ mod tests {
         let peak = pcm.iter().map(|s| s.unsigned_abs()).max().unwrap();
         assert!(peak > 2000, "and the rest is the tone: {peak}");
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn silent(buffers: &[&[f32]]) -> bool {
+        let s = Signal::default();
+        for b in buffers {
+            s.see(b);
+        }
+        s.exactly_silent()
+    }
+
+    #[test]
+    fn only_exact_zeros_throughout_is_no_signal() {
+        assert!(silent(&[&[0.0; 64], &[0.0, -0.0], &[0.0; 8]]));
+        assert!(
+            !silent(&[&[0.0; 64], &[0.0, 1e-9], &[0.0; 8]]),
+            "faint noise"
+        );
+        assert!(!silent(&[&[-3e-5, 2e-5], &[0.0; 64]]), "noise, then zeros");
+        assert!(!silent(&[&[0.0; 64], &[0.5]]), "zeros, then sound");
+        assert!(!silent(&[]), "nothing captured is not silence");
+        assert!(!silent(&[&[], &[]]));
+        assert!(no_signal_error().contains("no signal"));
+    }
+
+    #[test]
+    fn the_null_input_is_exempt_from_the_silence_check() {
+        assert!(Input::null().is_null());
     }
 
     #[test]

@@ -293,6 +293,11 @@ impl Input {
         self.0.format
     }
 
+    /// Whether this is a null input, which may legitimately capture exact silence.
+    pub fn is_null(&self) -> bool {
+        matches!(self.0.backend, Backend::Null { .. })
+    }
+
     /// Start capturing. `take` is called from the device's thread with each buffer
     /// captured; `fatal` when the device stops working.
     pub fn start<T, E>(self, take: T, fatal: E) -> Result<DeviceStream, String>
