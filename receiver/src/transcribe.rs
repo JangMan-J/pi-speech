@@ -1,5 +1,6 @@
-//! `transcribe <model-dir> <audio>`: the text spoken in a WAV or MP3 file, by a local speech
-//! model run in-process, on standard output.
+//! `transcribe <model-dir|model-id> <audio>`: the text spoken in a WAV or MP3 file, by a local
+//! speech model run in-process, on standard output. A catalogue id (`models list`) names a
+//! model downloaded into the model cache.
 
 use crate::audio::convert::Converter;
 use crate::audio::decode::{Decode, WavOrMp3};
@@ -10,7 +11,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-pub const USAGE: &str = "pi-speech-receiver transcribe <model-dir> <audio.wav|audio.mp3>";
+pub const USAGE: &str =
+    "pi-speech-receiver transcribe <model-dir>|<model-id> <audio.wav|audio.mp3>";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -75,10 +77,15 @@ pub fn load_audio(path: &Path) -> Result<Vec<f32>, String> {
     Ok(out)
 }
 
-/// The text spoken in `audio`, by the model in `model_dir`.
+/// The text spoken in `audio`, by the model in `model_dir` (or the downloaded model of
+/// that catalogue id).
 pub fn transcribe(model_dir: &Path, audio: &Path) -> Result<String, String> {
     // The cheap checks first: a wrong path fails before a large model is loaded.
-    let model = model::detect(model_dir)?;
+    let model_dir = match model_dir.to_str() {
+        Some(arg) => crate::models::resolve_model_dir(arg)?,
+        None => model_dir.to_path_buf(),
+    };
+    let model = model::detect(&model_dir)?;
     let samples = load_audio(audio)?;
     Recognizer::load(&model)?.transcribe(&samples)
 }

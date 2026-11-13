@@ -246,3 +246,71 @@ fn real_models_transcribe_more_than_30_seconds() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// `transcribe <model-id> <audio>`: an id from the catalogue names a model in the model cache.
+#[test]
+fn a_catalogue_id_names_a_model_in_the_cache() {
+    let dir = scratch("tr-id");
+    let cache = dir.join("cache");
+    let catalog = dir.join("catalog.json");
+    std::fs::write(
+        &catalog,
+        r#"[{"id":"test-model","kind":"transcription","name":"T","languages":["en"],"size":1,
+            "url":"http://127.0.0.1:1/t.tar.bz2","sha256":"00","dir":"test-model-v1"},
+           {"id":"test-voice","kind":"speech","name":"V","languages":["en"],"size":1,
+            "url":"http://127.0.0.1:1/v.tar.bz2","sha256":"00","dir":"test-voice"}]"#,
+    )
+    .unwrap();
+    let run_id = |id: &str, with_catalog: bool| {
+        let mut c = Command::new(BIN);
+        c.args(["transcribe", id])
+            .arg(fox())
+            .env("PI_SPEECH_AUDIO_NULL", "1")
+            .env("PI_SPEECH_MODELS_DIR", &cache);
+        if with_catalog {
+            c.env("PI_SPEECH_MODELS_CATALOG", &catalog);
+        } else {
+            c.env_remove("PI_SPEECH_MODELS_CATALOG");
+        }
+        c.output().unwrap()
+    };
+    // Not downloaded: the error says how to download it.
+    let o = run_id("test-model", true);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        stderr(&o).contains("`pi-speech-receiver models download test-model`"),
+        "{}",
+        stderr(&o)
+    );
+    let o = run_id("whisper-small", false);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        stderr(&o).contains("models download whisper-small"),
+        "{}",
+        stderr(&o)
+    );
+    // A speech model does not transcribe.
+    let o = run_id("test-voice", true);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        stderr(&o).contains("test-voice is a speech model"),
+        "{}",
+        stderr(&o)
+    );
+    // Downloaded: the cache's directory is used (here not a real model).
+    std::fs::create_dir_all(cache.join("test-model-v1")).unwrap();
+    std::fs::write(cache.join("test-model-v1").join("README.md"), "x").unwrap();
+    let o = run_id("test-model", true);
+    assert_eq!(o.status.code(), Some(1));
+    let e = stderr(&o);
+    assert!(e.contains("unrecognised model directory"), "{e}");
+    assert!(e.contains("test-model-v1"), "{e}");
+    // An unknown name is still taken as a directory.
+    let o = run_id("no-such-thing", true);
+    assert!(
+        stderr(&o).contains("no model directory at no-such-thing"),
+        "{}",
+        stderr(&o)
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
