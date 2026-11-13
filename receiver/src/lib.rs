@@ -10,6 +10,7 @@ mod private;
 pub mod proc;
 pub mod server;
 pub mod signals;
+pub mod ssh;
 pub mod stream;
 pub mod token;
 pub mod transcribe;
