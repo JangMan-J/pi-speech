@@ -510,9 +510,13 @@ On your machine, connect to the Pi host with `pi-speech-receiver ssh <pi-host>` 
 Any ssh options work, for example `pi-speech-receiver ssh -p 2222 -i ~/.ssh/key user@pi-host`.
 
 - On the first connection to a host it creates your token (`~/.config/pi-speech/receiver.token`, mode 0600)
-  if needed and copies it to the Pi host as `~/.config/pi-speech/bridge.token` with `sftp`. That needs key
-  or agent authentication and a host key you have already accepted: for a new host, connect once with plain
-  `ssh` first. A failed copy is reported and the session goes on; the next session tries again.
+  if needed and copies it to the Pi host as `~/.config/pi-speech/bridge.token` with `sftp`. On Linux and
+  macOS the copy goes over the session's own connection once you are logged in, so passwords and a new host
+  key work: you answer ssh's prompts in the session as usual. On Windows the copy runs before the session
+  and needs key or agent authentication and a host key you have already accepted (for a new host, connect
+  once with plain `ssh` first); so does it anywhere when your own options set ssh's connection sharing
+  (`-M`, `-S`, `-o ControlMaster`/`ControlPath`/`ControlPersist`). A failed copy is reported in one line and
+  the session goes on; the next session tries again.
 - All your sessions share one receiver: the first starts it, the others reuse it, and it stops a moment after
   the last session ends, so closing one session leaves the audio of the others alone. Each session forwards it
   to `127.0.0.1:47613` on the Pi host and to a spare port of its own (47614-47633). A second session to the
