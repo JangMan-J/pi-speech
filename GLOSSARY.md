@@ -39,6 +39,19 @@ or leaves out words. Told by comparing the model's own transcript with the text.
 _Example_: asked to say "Turn left at the bridge", the model says "Sure! Turn left at the bridge."
 _Confirmed_: 2026-11-12, Jang (a Stray stops playback by default).
 
+**Spoken summary**:
+What read-aloud reads in its Summary and Thinking modes instead of the whole reply: a short version of the reply
+(Thinking: of the reasoning, then of the reply), written to be heard and aimed at a length (Minimum ~15 s,
+Abridged ~30 s, Full ~60 s). The same model writes it at the end of its reply between `<spoken_summary>`
+markers, and the block is taken out of the reply before it is shown or kept; or another Pi model writes it in
+one extra request per reply.
+_Example_: a 600-word answer about a failing build, read aloud as "The build failed because a test timed out;
+I raised the timeout and it passes now."
+_Not_: a cut reply (Truncate at, or the 2000-character cut, keeps the start of the text; a Spoken summary is new
+text).
+_Avoid_: TL;DR, abstract
+_Confirmed_: 2026-11-13, slice 02 of the redesign (Read: Off | Summary | Thinking | All).
+
 **This machine**:
 The machine Pi runs on, as the /speech panel and messages name it.
 _Example_: decent-spider when Pi runs there over SSH; the laptop when Pi runs on the laptop.

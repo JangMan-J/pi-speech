@@ -40,7 +40,7 @@ picker). The header is also the top rule, and shows what speech is doing (`▶ s
 ```
 Speech ──────────────────────────────────────────────────────────────── ▶ speaking
 SPEAK (Alt+S)
-  ▸ Read aloud options   Off
+  ▸ Read aloud options   Off ›
     Speech source        Provider
     Speech model         x-ai/grok-voice-tts-1.0 ›
     Voice                eve ›
@@ -53,15 +53,41 @@ SETTINGS
     Hotkeys ›
     Bridge connection ›
 
-  ✓ Read aloud: All
-  ←→ Off · All · Esc close
+  ✓ Voice: eve
+  Enter what is read and how · Esc close
 ```
 
 Values change in place with Enter or ←→ and are saved at once; a row ending in `›` opens a picker (models,
-voices), a field (Dictation output) or a submenu. **Read aloud options** is Off or All (every reply is read
-aloud; it starts Off in each session). **Speech source** and **Transcription source** are Provider, the only
-source so far. Something unavailable shows `✗` and the reason beside the value (`✗ xAI: no login`,
+voices), a field (Dictation output) or a submenu. **Speech source** and **Transcription source** are Provider, the
+only source so far. Something unavailable shows `✗` and the reason beside the value (`✗ xAI: no login`,
 `✗ models unavailable`).
+
+**Read aloud options ›** says what is read aloud once a run ends, and how; one line under the rows says what
+the highlighted one does:
+
+```
+Speech › Read aloud options ──────────────────────────────────────────────────────
+  ▸ Read               Summary
+    Summarized by      Same model ›
+    Length             Abridged ~30 s
+    Truncate at        Off
+
+  Reads the model's spoken summary of its reply.
+  ←→ Off · Summary · Thinking · All · Esc back
+```
+
+- **Read**: Off; Summary (a spoken summary of the reply); Thinking (a spoken summary of the reasoning, then of
+  the reply); All (the whole reply). It starts Off in every session.
+- **Summarized by**: Same model (no extra request: the model ends its reply with the summary, which is read and
+  then taken out of the reply, so you never see it and it is not kept in the session), or one of your Pi models
+  from a picker (one extra request to it per reply, with the reply, and the reasoning for Thinking when the model
+  shows it).
+- **Length**: Minimum ~15 s, Abridged ~30 s or Full ~60 s; the model is shown a placeholder of that many words
+  (about 2.5 words a second), so the length is a best effort.
+- **Truncate at**: Off, 15, 30, 60 or 120 s; reading stops at the last sentence end before the limit, in every
+  Read mode.
+
+Read, Length and Truncate at change in place with Enter or ←→; Summarized by opens its picker.
 
 **Hotkeys ›** lists every action with its key; Enter runs the highlighted one:
 
@@ -91,7 +117,7 @@ receiver's state (`✓ 127.0.0.1:47613`, `✗ receiver unreachable`).
 | Key             | In the dock                                                                                                     |
 | --------------- | --------------------------------------------------------------------------------------------------------------- |
 | `↑` `↓`         | Move row by row (they wrap)                                                                                     |
-| `←` `→`         | Change the value in place (Read aloud options, the bridge mode); saved at once                                  |
+| `←` `→`         | Change the value in place (the read-aloud options, the bridge mode); saved at once                              |
 | `Enter`         | Change the value in place; open the picker, field or submenu of a row ending in `›`; in Hotkeys, run the action |
 | `k`             | In Hotkeys, on Speak… or Dictate: set a new key (bound when you leave Hotkeys, which reloads Pi)                |
 | `r` `h` `s` `t` | Replay last, History…, Stop, Transcribe file…: in Hotkeys, and on the main view's other rows                    |
@@ -195,7 +221,7 @@ starts a turn. Text is always spoken, never interpreted: `/speech stop the press
 | `--models`                                         | Speech and transcription models with their prices and features                                                           |
 | `--voices`                                         | Voices of the current speech model                                                                                       |
 | `--languages`                                      | The voice language of each voice, with its evidence                                                                      |
-| `--read-aloud on\|off`                             | Speak the final reply of each run                                                                                        |
+| `--read-aloud on\|off\|summary\|thinking\|all`      | Speak the final reply of each run (`on` is All), or a spoken summary of it (see [Read aloud options](#speech))           |
 | `--bridge auto\|on\|off\|status`                   | Where audio plays and records (see [The bridge](#the-bridge))                                                            |
 | `--language <voice> <tag\|auto>`                   | Set the language of a voice (`ja`, `pt-BR`, …), or remove it                                                             |
 | `--set <setting> <value>`                          | Change a setting: `tts-model`, `voice`, `stt-model`, `stt-language`, `tools`, `dictation-output`                         |
@@ -261,7 +287,8 @@ Orpheus, Kokoro, MAI Voice, Speechify) send it all at the end, and play then (me
 stopped or replaced before its audio has fully arrived cancels the request and is not saved; once it has
 arrived it is saved, whether or not it is still playing.
 
-Read-aloud (off at the start of every session) speaks the final reply of each run as readable text: markdown
+Read-aloud (off at the start of every session) speaks the final reply of each run, or a spoken summary of it
+(see Read aloud options under [`/speech`](#speech)), as readable text: markdown
 formatting is removed, fenced code blocks are skipped, links are read as their text and bare URLs as their
 host. Replies longer than 2000 characters are cut at a sentence boundary, and a notification says so. A reply
 (or `/speech <text>`) longer than 280 characters is spoken in pieces split at sentence ends, requested in order
@@ -439,7 +466,8 @@ Every choice lives in one versioned file, `pi-speech/settings.json` in Pi's agen
 or `$PI_CODING_AGENT_DIR`): speech model, voice, transcription model, dictation language, the dictation output
 command, tools, bridge mode, the order of the model lists, voice-language overrides, the endpoints you added, and
 the keys of Speak and Dictate (only when changed, as `"hotkeys": { "speak": "alt+d", "dictate": "alt+z" }`; read
-when Pi loads the extension). Settings persist across restarts, also with `--no-session`. Read-aloud is not saved.
+when Pi loads the extension), and the read-aloud options Summarized by, Length and Truncate at. Settings persist
+across restarts, also with `--no-session`. What read-aloud reads (Read) is not saved: it starts Off.
 
 Files from earlier versions (`settings.json` without a version, `bridge.json`, `language-overrides.json`)
 are read on load, and replaced by the versioned file the first time a setting is saved.

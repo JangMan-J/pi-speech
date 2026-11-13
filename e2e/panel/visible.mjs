@@ -8,7 +8,7 @@ import { openPanelPi, readSettings, sleep } from '../lib/panel.mjs';
 /** The main view as agreed, with this suite's defaults, the first row selected. */
 const MAIN = [
   'SPEAK (Alt+S)',
-  '  ▸ Read aloud options   Off',
+  '  ▸ Read aloud options   Off ›',
   '    Speech source        Provider',
   '    Speech model         google/gemini-3.8-flash-tts ›',
   '    Voice                Kore ›',
@@ -90,11 +90,34 @@ try {
   await t.key('Up');
   check(isSelected(dock(t.lines()), 'Bridge connection'), 'Up from the first row wraps to the last');
   await t.key('Down');
-  check(/←→ Off · All/.test(hintOf(dock(t.lines()))), 'on Read aloud options the hint names Off and All', hintOf(dock(t.lines())));
+  check(/Enter what is read and how/.test(hintOf(dock(t.lines()))), 'on Read aloud options the hint says Enter opens it', hintOf(dock(t.lines())));
+  await t.key('Enter'); await sleep(200);
+  d = dock(t.lines());
+  check(/^Speech › Read aloud options ─+$/.test(d[0] ?? ''), 'Enter opens Read aloud options', d[0]);
+  check(JSON.stringify(d.slice(1, 5)) === JSON.stringify([
+    '  ▸ Read               Off',
+    '    Summarized by      Same model ›',
+    '    Length             Abridged ~30 s',
+    '    Truncate at        Off',
+  ]), 'it has Read, Summarized by, Length and Truncate at', d.slice(1, 5));
+  check(d.some((l) => /Off: nothing is read aloud\./.test(l)), 'one line says what the highlighted row does', d.slice(-5));
   await t.key('Right');
-  check(/Read aloud options\s+All$/.test(rowOf(dock(t.lines()), 'Read aloud options') ?? ''), 'Right cycles Read aloud options to All in place');
-  await t.key('Enter');
-  check(/Read aloud options\s+Off$/.test(rowOf(dock(t.lines()), 'Read aloud options') ?? ''), 'Enter cycles it back to Off');
+  d = dock(t.lines());
+  check(/Read\s+Summary$/.test(rowOf(d, 'Read') ?? '') && d.some((l) => /Reads the model's spoken summary of its reply\./.test(l)), 'Right cycles Read to Summary in place, and the line follows', d.slice(1, 8));
+  await t.key('Down');
+  check(dock(t.lines()).some((l) => /Same model, same reply\. No extra request\./.test(l)), 'on Summarized by the line says there is no extra request');
+  await t.key('Down'); await t.key('Enter');
+  d = dock(t.lines());
+  check(/Length\s+Full ~60 s$/.test(rowOf(d, 'Length') ?? '') && d.some((l) => /Best effort: about 60 s\./.test(l)), 'Enter cycles Length; best effort, it says', d.slice(1, 8));
+  await t.key('Down'); await t.key('Right', 2);
+  d = dock(t.lines());
+  check(/Truncate at\s+30 s$/.test(rowOf(d, 'Truncate at') ?? '') && d.some((l) => /Stops at 30 s, at a sentence end\./.test(l)), 'Truncate at cycles to 30 s and says where reading stops', d.slice(1, 8));
+  check(readSettings(ctx).readAloud?.length === 'full' && readSettings(ctx).readAloud?.truncate === 30, 'Length and Truncate at are saved', readSettings(ctx).readAloud);
+  await t.key('Left', 2); await t.key('Up'); await t.key('Left');
+  await t.key('Escape');
+  check(/Read aloud options\s+Summary ›$/.test(rowOf(dock(t.lines()), 'Read aloud options') ?? ''), 'Esc goes back; the row shows Summary');
+  await t.key('Enter'); await t.key('Left'); await t.key('Escape');
+  check(/Read aloud options\s+Off ›$/.test(rowOf(dock(t.lines()), 'Read aloud options') ?? ''), 'Read set back to Off');
   await goTo(t, 'Speech source');
   await t.key('Right');
   d = dock(t.lines());
