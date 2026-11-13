@@ -1,62 +1,52 @@
 # NEXT
 
-Written 2026-11-12 on `agent-jail` (the laptop) at the end of the session that built streaming playback.
-Live state is in `git log`, `package.json` and the registry; this file holds what those do not say. The
-plan and its slices are in `.pad/streaming-playback/` (not committed); the terms are in `GLOSSARY.md`.
+Handoff written 2026-11-13 on `agent-jail` (the laptop), at the end of a long session. Read this, then the latest
+vector of the thread you take up (`VECTORS/<thread>/`, newest file), then its pad (`.pad/<thread>/`, gitignored,
+on this machine only). Terms: `GLOSSARY.md`.
 
-## Hosts
+## Where the code is
 
-`agent-jail` is the laptop: speakers, PulseAudio, `pacat`/`pw-cat`/`ffplay`/`mpv`/`mpg123` installed. All
-audio plays there. `decent-spider` is a VPS in a datacenter (no GPU, no sound); Pi there reaches the laptop
-through the playback bridge (`pi-speech-receiver` on the laptop, over an SSH port forward). Audio, not text,
-crosses the bridge; the Rust receiver stays (the user turned down a headless-Pi server as less robust).
+- Branch `portable-3` (checked out), draft PR #5 against `main`; CI green on Linux, macOS, Windows at `57aa205`
+  (later commits are vectors and notes). GitHub `main` is still `7b04463`; nothing is released (npm has 0.1.0).
+  Merging PR #5 is the user's call. Tags: only `v0.1.0`. **A pushed `v*` tag publishes to npm**: push only with
+  `git push origin HEAD:refs/heads/portable-3`, never tags.
+- Done and confirmed by ear: streaming playback (every provider, Readings as one Stream, the bridge), the
+  receiver's own audio engine (no outside audio programs), one history file per message (no ffmpeg), Linux/macOS/
+  Windows builds (Windows checked for real in a VM, which found and fixed a missing-C-runtime bug).
 
-## The goal, and where it stands
+## Threads
 
-**Streaming audio playback** (a Stream, `GLOSSARY.md`): speech starts playing while the rest of it is still
-arriving, from every provider whose audio can arrive in pieces, on the laptop and through the bridge.
+- `redesign` (active, nothing built): `.pad/redesign/plan.md`, slices 01-10. The user designed the new /speech panel
+  in this session; the slice files hold every agreed detail (mockups, wording, Read aloud options, Source switch,
+  Bridge connection and Direction, lorem-ipsum length anchor). Start 01 (panel layout), 03 (sherpa-onnx engines;
+  full brief in its slice file) and 07 (every playback a Stream) in parallel.
+- `portable-package`: slices 01a-03 done; 04-06 moved into `redesign` (07, 08, 10).
+- `streaming-playback`: built; open items below.
 
-Built and committed (`bdb4955`..`5f21dce`), `npm run check` and the receiver's fmt/clippy/test green, and
-`e2e/run all` passes every suite but `panel`, which fails the same 22 checks it failed before this work:
+## Waiting on the user
 
-1. xAI plays as a Stream on the Pi host. **Confirmed by ear** by the user (start and stop).
-2. OpenRouter `/audio/speech`: every maker the same way (over time or one late burst); MP3 from models that
-   refuse PCM streams through an MP3 player. Checked live on the free `fish-audio/s2.1-pro-free:free`.
-3. OpenAI-compatible endpoints: WAV (sizes left open), raw PCM, MP3. Checked against a local server only.
-4. Chat audio (`openai/gpt-audio*`): audio plays only once the transcript said after it is still the start
-   of the text; a Stray stops playback, saves nothing, no second request. Measured live (one paid
-   `gpt-audio-mini` reading, approved): the transcript leads the audio by 0.3 to 1.6 s of speech, so the
-   check delays the first audio by 47 ms (first audio at about 1.0 s) and catches a Stray before it is heard.
-5. A Reading (texts over 280 characters) plays as one Stream on one player, pieces requested two at a time.
-   Checked live with xAI through a logging player (22 s of audio over 1 s, one player). **Confirmed by ear**
-   by the user: "played perfectly", no gap between pieces.
-6. The bridge: protocol capability `stream` (`protocol/bridge.md`, "Playing a Stream"), the client, and
-   receiver 0.2.0. Checked live on the laptop: real receiver, real Pi with `--bridge on`, xAI.
+- MacBook Air being set up with Tailscale: needs its address and username, then copy the macOS CI artifact
+  (`gh run download` from the latest `portable-3` run) and run the speed/pitch bracket there.
+- Whether a message stopped after its audio fully arrived is still saved (it is now).
+- Listening check with Pi on `decent-spider` through the bridge (never done; receiver on the laptop must be 0.3.0).
 
-Where a Stream cannot play (no player for it, only `PI_SPEECH_PLAYER` set, a receiver older than 0.2.0),
-the clip plays as a file once it has arrived, with one warning; a long text then plays piece by piece as
-files, and no piece is asked for twice.
+## Test rigs (on this machine)
 
-## Open, for the user
+- `.proto/portable-probe/`: `bracket.py <binary>` (same clip at 1.00/0.75/1.25/1.00x, announced; by ear and
+  measured), `capture.sh`, `rectest.py`, `measure.py` (speed and pitch from a speaker capture).
+- `~/vms/win11/`: Windows 11 LTSC eval VM. `run.sh install|wav|listen|none`, SSH `-i vm_key -p 22622 pi@127.0.0.1`,
+  `kit/` (vm-bracket.ps1, vm-record.ps1), `analyze.py audio.wav [skip_s]`.
 
-- **By ear**: Pi on `decent-spider` through the bridge. The bridge was only run with Pi and the receiver both
-  on the laptop; the SSH forward was not in the path.
-- **Decide**: a message stopped after its audio has fully arrived (about 1 s for xAI, while it plays for
-  ten) is still saved in the history. Kept that way for now, as a Reading already did.
-- `GLOSSARY.md` lists unresolved terms (piece/part/chunk, lowercase reading, Stream player, a burst as a
-  Stream, vouch).
-- The receiver on the laptop must be rebuilt and restarted (0.2.0) for the bridge to stream.
+## Rules learned the hard way
 
-## Other open items (not blocking)
-
-- Dependabot opened four pull requests; the dev-tools group one fails CI.
-- `e2e/panel/visible.mjs` still asserts the panel layout from before the redesign and fails.
-- The direct endpoints were only tested against a local server; the Fireworks key in Pi is refused by
-  Fireworks' audio hosts.
+- Never let a test reach a real audio device: export `PI_SPEECH_AUDIO_NULL=1` for receiver tests (an unknown value
+  now fails instead of falling back; a test once played a loud tone and scared the user).
+- Never put a write and something that depends on it in one parallel tool batch: they race (happened four times).
+- `pgrep -f <pattern>` matches its own shell; check processes with `ps -eo comm`.
+- Quote the cost before any paid live check; the user approves. xAI is included in the user's plan.
+- On Windows: PowerShell 5.1 pipes text (binary stdin via `cmd /c ... <`); .NET uses its own current directory.
 
 ## Checks
 
-- `npm run check` (typecheck, lint, tests), `npm run smoke:pack`, and in `receiver/`: `cargo fmt --check`,
-  `cargo clippy --all-targets -- -D warnings`, `cargo test`. CI runs all of them.
-- `e2e/run all` drives a real `pi --mode rpc` against fake servers and the real receiver; no cost.
-- `e2e/chat-models/live.test.ts` costs about 15 US cents a run; `e2e/README.md` has the command.
+`npm run check`; in `receiver/` with `PI_SPEECH_AUDIO_NULL=1`: `cargo fmt --check`, `cargo clippy --all-targets
+-- -D warnings`, `cargo test`; `e2e/run all` (the `panel` suite fails as before: stale, replaced by redesign 01).
