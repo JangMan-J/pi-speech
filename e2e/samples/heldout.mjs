@@ -40,7 +40,7 @@ try {
   // rapid samples: a new sample stops the previous one
   const slow = path.join(ctx.work, 'slow-player');
   fs.writeFileSync(slow, `#!/usr/bin/env bash\necho "start $$" >> "${ctx.work}/slow.log"\ntrap 'echo "term $$" >> "${ctx.work}/slow.log"; exit 143' TERM INT\nsleep 5 & wait $!\necho "end $$" >> "${ctx.work}/slow.log"\n`, { mode: 0o755 });
-  const s2 = await ctx.pi({ env: { PI_SPEECH_PLAYER: slow, TMPDIR: tmp } });
+  const s2 = await ctx.pi({ env: { PI_SPEECH_STREAM_PLAYER: slow, TMPDIR: tmp } });
   await command(s2, '/speech --sample ara', 200);
   await command(s2, '/speech --sample rex', 600);
   const log = fs.existsSync(path.join(ctx.work, 'slow.log')) ? fs.readFileSync(path.join(ctx.work, 'slow.log'), 'utf8') : '';

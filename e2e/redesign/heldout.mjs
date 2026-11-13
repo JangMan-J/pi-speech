@@ -64,7 +64,7 @@ try {
   const slow = path.join(ctx.work, 'slow-player');
   const log = path.join(ctx.work, 'slow.log');
   fs.writeFileSync(slow, `#!/usr/bin/env bash\necho "start $$" >> "${log}"\ntrap 'echo "term $$" >> "${log}"; exit 143' TERM INT\nsleep 6 & wait $!\n`, { mode: 0o755 });
-  s = await ctx.pi({ env: { PI_SPEECH_PLAYER: slow } });
+  s = await ctx.pi({ env: { PI_SPEECH_STREAM_PLAYER: slow } });
   await command(s, '/speech a message to stop from the menu', 700);
   s.onUi = (req) => (req.method === 'select' ? { value: req.options.find((o) => /^Stop/.test(o)) } : { cancelled: true });
   await command(s, '/speech', 1200);

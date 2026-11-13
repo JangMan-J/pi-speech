@@ -168,7 +168,7 @@ try {
   check(lines.some((l) => /Speech › History/.test(l)) && lines.some((l) => /2 messages/.test(l)), 'History… opens the history with both messages', lines.slice(-10));
   played = ctx.playerLog().length;
   await t.key('Down'); await t.key('Enter'); await sleep(1500);
-  check(ctx.playerLog().length === played + 1 && /panel-hello/.test(ctx.playerLog().at(-1)), 'Enter replays an earlier message', ctx.playerLog().slice(-2));
+  check(ctx.playerLog().length === played + 1 && ctx.played(-1)?.equals(ctx.savedAudio(ctx.history().find((f) => /panel-hello/.test(f)))), 'Enter replays an earlier message from its file', ctx.playerLog().slice(-2));
   await t.key('Escape');
   check(/^Speech › Hotkeys/.test(dock(t.lines())[0] ?? ''), 'Esc from the history returns to Hotkeys');
   // Stop

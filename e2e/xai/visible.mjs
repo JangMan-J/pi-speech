@@ -56,7 +56,7 @@ const lines = (t) => t.split('\n');
     if (wavs[0]) check(isWav(fs.readFileSync(path.join(ctx.speechDir, wavs[0]))), 'the saved WAV is a valid WAV file');
     await new Promise((r) => setTimeout(r, 500));
     const played = ctx.playerLog();
-    check(played.length === 1 && played[0].startsWith(ctx.speechDir), 'the saved message is played', played);
+    check(played.length === 1 && ctx.played(0)?.equals(ctx.savedAudio(ctx.history().find((f) => f.endsWith('.wav')))), 'the saved message is played', played);
 
     const { content } = await callTool(ctx, s, 'speech_synthesize', { text: 'tool call through xai' });
     check(ctx.xai.tts().at(-1)?.body?.text === 'tool call through xai' && /\.wav/.test(content), 'speech_synthesize uses xai and names the saved WAV', content.slice(0, 200));
