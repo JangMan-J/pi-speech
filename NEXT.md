@@ -13,14 +13,28 @@ gitignored, on this machine and on agent-jail). `VECTORS/` is retired: write no 
 - Done before the redesign and confirmed by ear: streaming playback, the receiver's own audio engine, one history
   file per message, Linux/macOS/Windows builds.
 
-## Resume point (2026-11-13 ~12:55)
+## Resume point (2026-11-13 ~13:30)
 
-`portable-3` at `e837ecd` is pushed; local `main` equals it. Landed: several Pi clients per receiver plus
+`portable-3` is pushed at the commit that wrote this; local `main` equals it. Its CI run is the check for the
+macOS ssh-test fix (the socket falls back outside a long `XDG_RUNTIME_DIR`); `93ea0b2` was green except that test.
+
+**The one open item** (obligation obl-a733abf1f2491519): the Windows VM checks on agent-jail `~/vms/win11`
+(see Test rigs): `transcribe`, `models` (list/download/delete, including the new `.lock` files), `speak`, and
+`ssh` with its pre-session `sftp -b` pairing fallback, plus whether a SIGTERM reaches `ssh`. Use the Windows
+CI artifact `pi-speech-receiver-Windows-X64` of the latest green `portable-3` run. Blocked on 2026-11-13: the laptop slept
+(offline on Tailscale). The user wants this run.
+
+Optional, the user's call: a listening check with Pi on `decent-spider` through `pi-speech-receiver ssh` from the
+laptop. The by-ear overlap check of two sessions was skipped by the user (tests cover it). The macOS Option-key
+hint stays pty-checked only (Mac testing ended).
+
+### Earlier (2026-11-13 ~12:55)
+
+`portable-3` at `e837ecd`. Landed: several Pi clients per receiver plus
 address pairing (`2036f9e`..`e837ecd`, rebased onto `1c46544`), full gate passed (npm check, cargo fmt/clippy/test
 run 3 times, e2e all). Fixed while gating: the shared receiver lingered forever when its state directory was removed
 (every ssh test leaked one; it now stops), test scripts are written by `cp` (a sibling test's fork made them "Text
-file busy"), e2e panel expects `127.0.0.1:47613 · ssh forward` when nothing is set. Still for the user: by ear,
-two Pi sessions speaking at once overlap.
+file busy"), e2e panel expects `127.0.0.1:47613 · ssh forward` when nothing is set.
 
 Obligations moved to Director node-6dc34e1c71181838 (the old node's can no longer be updated).
 
@@ -36,8 +50,7 @@ Landed after it (2026-11-13 afternoon), CI green on Linux/macOS/Windows at `7cac
   Checked for real against a scratch user sshd on localhost: an unknown host key answered in the session, the token
   arrived mid-session, paired-hosts written, socket and receiver dirs removed, the second session did not pair.
   Password auth not checkable here (non-root sshd has no PAM).
-- User decisions: by-ear overlap check skipped (tests cover it); Windows VM checks wanted (agent-jail was offline
-  at 13:05; still to do, including the ControlMaster fallback on Windows).
+- User decisions: by-ear overlap check skipped (tests cover it); Windows VM checks wanted (the open item above).
 
 ### Earlier (2026-11-13 ~11:35)
 
@@ -116,18 +129,8 @@ Landed and pushed on `portable-3` (CI green on Linux, macOS, Windows at `575b27b
   Option as Meta key" and its cost to accented letters; the character is never swallowed. Skipped when Pi has no
   `ctx.ui.onTerminalInput`.
 
-Not done (open obligations in Jing, also here):
-
-- Local speech loose ends: protocol/bridge.md should document `models list`'s `lexicon` field and progress `file`;
-  `src/engine/surface.ts` RPC menus "Sample a voice…"/"Voice language…" still list provider voices under Local.
-- 08 pairing limits (for the user): `sftp -b` forces BatchMode, so a new host or password-only auth cannot pair
-  (warning; connect once with plain ssh first, or pair over the session's ControlMaster). A second concurrent
-  session's `-R 47613` fails with only an ssh warning: report it? Windows: SIGTERM not forwarded to ssh, untested.
-- Slice 10: local-input.test.ts reportedly fails 3 tests when receiver/target/release holds a built binary
-  (unreproduced since the stand-in fixes; check); Linux release binaries built on ubuntu-latest (glibc 2.39), consider
-  ubuntu-22.04 for reach.
-- Windows VM (agent-jail `~/vms/win11`): `transcribe`, `models`, `speak`, `ssh` never checked there.
-- Listening check with Pi on `decent-spider` through the bridge with `pi-speech-receiver ssh` from the laptop.
+Not done: only the Windows VM checks (see the resume point). The earlier loose ends (local speech docs, 08 pairing
+limits, slice 10 follow-ups) landed on 2026-11-13.
 
 ## The Mac (`moms-macbook`, macOS 26.6 arm64; the user's mother's; user sits at it for sound tests)
 

@@ -211,10 +211,16 @@ impl Rig {
 
     /// Whether no control socket directory is left in the runtime directory.
     fn sockets_gone(&self) -> bool {
-        std::fs::read_dir(self.dir.join("run"))
-            .unwrap()
-            .flatten()
-            .all(|e| !e.file_name().to_string_lossy().starts_with("pisr-"))
+        // The last session's socket directory, wherever it was made (not in run/ when that
+        // path is too long, as on macOS), and none left in run/.
+        let last_gone = self
+            .master_socket()
+            .is_none_or(|s| !s.parent().unwrap().exists());
+        last_gone
+            && std::fs::read_dir(self.dir.join("run"))
+                .unwrap()
+                .flatten()
+                .all(|e| !e.file_name().to_string_lossy().starts_with("pisr-"))
     }
 
     /// Whether the receiver's private directory is gone (it may take a moment after the
@@ -289,7 +295,12 @@ fn first_session_pairs_over_its_own_connection_then_serves_for_the_life_of_ssh_o
         ]
     );
     assert_eq!(got[10..], args.map(String::from)[..]);
-    assert!(socket.starts_with(rig.dir.join("run")), "{socket:?}");
+    // In XDG_RUNTIME_DIR when the path fits (`/pisr-<8 hex>/cm` is 17 bytes); on macOS the
+    // scratch directory is long and another place is used.
+    let run = rig.dir.join("run");
+    if run.as_os_str().len() + 17 <= 86 {
+        assert!(socket.starts_with(&run), "{socket:?}");
+    }
     assert!(socket.as_os_str().len() <= 86, "{socket:?}");
     let dir = socket.parent().unwrap();
     let mode = std::fs::metadata(dir).unwrap().permissions().mode();
