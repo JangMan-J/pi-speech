@@ -172,6 +172,8 @@ mod tests {
         }
     }
 
+    // "/x/cache" is an absolute path only where the Linux rule can apply.
+    #[cfg(unix)]
     #[test]
     fn linux_uses_xdg_cache_home_else_dot_cache() {
         let e = env(&[("HOME", "/home/u"), ("XDG_CACHE_HOME", "/x/cache")]);

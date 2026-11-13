@@ -10,6 +10,9 @@ import {
   listModels,
 } from "../../src/engine/local-models";
 
+// The stand-in binary is a script with a shebang line, which Windows cannot start.
+const WINDOWS = process.platform === "win32";
+
 let dir: string;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "pi-speech-models-"));
@@ -71,7 +74,7 @@ process.exit(2);
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-describe("listModels", () => {
+describe.skipIf(WINDOWS)("listModels", () => {
   it("gives typed entries with their state in the cache", async () => {
     const models = await listModels(fakeBinary());
     expect(models).toEqual([
@@ -103,7 +106,7 @@ describe("listModels", () => {
   });
 });
 
-describe("downloadModel", () => {
+describe.skipIf(WINDOWS)("downloadModel", () => {
   it("reports each step to an async callback, in order, before the result", async () => {
     const seen: DownloadProgress[] = [];
     const d = downloadModel(fakeBinary(), "kokoro", {
@@ -164,7 +167,7 @@ describe("downloadModel", () => {
   });
 });
 
-describe("deleteModel", () => {
+describe.skipIf(WINDOWS)("deleteModel", () => {
   it("resolves to the bytes freed, and rejects on an unknown id", async () => {
     await expect(deleteModel(fakeBinary(), "kokoro")).resolves.toBe(1234);
     await expect(deleteModel(fakeBinary(), "nope")).rejects.toThrow('unknown model "nope"');
