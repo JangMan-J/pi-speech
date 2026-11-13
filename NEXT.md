@@ -13,16 +13,29 @@ gitignored, on this machine and on agent-jail). `VECTORS/` is retired: write no 
 - Done before the redesign and confirmed by ear: streaming playback, the receiver's own audio engine, one history
   file per message, Linux/macOS/Windows builds.
 
-## Resume point (2026-11-13 ~11:35)
+## Resume point (2026-11-13 ~12:55)
 
-`portable-3` at `1de6eea` is pushed; local `main` equals it. Landed since the last resume point:
+`portable-3` at `e837ecd` is pushed; local `main` equals it. Landed: several Pi clients per receiver plus
+address pairing (`2036f9e`..`e837ecd`, rebased onto `1c46544`), full gate passed (npm check, cargo fmt/clippy/test
+run 3 times, e2e all). Fixed while gating: the shared receiver lingered forever when its state directory was removed
+(every ssh test leaked one; it now stops), test scripts are written by `cp` (a sibling test's fork made them "Text
+file busy"), e2e panel expects `127.0.0.1:47613 · ssh forward` when nothing is set. Still for the user: by ear,
+two Pi sessions speaking at once overlap.
+
+Obligations moved to Director node-6dc34e1c71181838 (the old node's can no longer be updated). Leaves running:
+`local-speech-loose-ends` (protocol/bridge.md lexicon/file fields; concurrent lexicon `.part`) and
+`slice10-followups` (local-input test with a built binary; ubuntu-22.04 release runners; README release notes).
+
+### Earlier (2026-11-13 ~11:35)
+
+`portable-3` at `1de6eea`. Landed then:
 
 - 09 Direction (`dbb9df6`): DIRECTION rows Play audio on, Record audio on, Run models on; receiver model endpoints
   GET /v1/models, GET /v1/voices, POST /v1/transcribe, POST /v1/speak (one model run at a time, 409 otherwise).
   Full gate passed (npm run check, cargo fmt/clippy/test, every e2e suite).
 - Read-aloud Length default Minimum ~15 s (`526d229`, `1de6eea`).
 
-**2026-11-13 resume: the leaf was lost; the Director rebased its 4 commits onto `0650c15` as branch `mc-rebase`
+**(Landed at `e837ecd`; history follows.) 2026-11-13 resume: the leaf was lost; the Director rebased its 4 commits onto `0650c15` as branch `mc-rebase`
 (worktree `/var/tmp/ps-mc/wt`) and is gating them.** Was: leaf node-c1c58883f416e441 "multi-client-pairing" (branch `jing/ra8608ded0857`, worktree
 `/tmp/jing-stage/51bf5b3b33e9/ra8608ded0857`, based on `526d229`). Spec: obligation obl-00ea6c5704619d1b and below.
 Its panel e2e may fail "Enter cycles Length" until it is rebased onto `1de6eea`. If it is lost to "lost contact",
