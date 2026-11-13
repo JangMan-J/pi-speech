@@ -19,45 +19,53 @@ The user's own words on the design are in `.pad/redesign/design-conversation.txt
 end of slice 01's file.
 
 Done, on `portable-3`:
+
 - 03 engines (`c830099`..`2e433b0`): `pi-speech-receiver transcribe <model-dir|id> <audio>` with sherpa-onnx 2.0.1
   linked statically. CI green on all three systems at `2e433b0`, transcribing a real recording with Parakeet v3
   int8. Release binary then: Linux 37 MiB, macOS 26 MiB, Windows 20 MiB; no VCRUNTIME140 import on Windows.
 - 01 panel layout (`7059efe`..`376f9c7`): SPEAK (Alt+S), LISTEN (Alt+Z), SETTINGS with Hotkeys and Bridge
   connection; names only in the main view. CI green at `376f9c7`; `e2e/run panel` passes (82 checks).
-- 04 model downloads (`212ba29`..`9ca0b29`, then a test fix): `models list|download|delete` with JSON lines,
-  resumable, SHA-256 checked, atomic unpack; `src/engine/local-models.ts` wraps it. Linux and macOS green in CI at
-  `9ca0b29`; Windows failed there on two tests only (a Unix path in a Linux-rule test, a shebang stand-in binary),
-  fixed in the commit that carries this file. **First action: check that commit's CI run is green on Windows**
-  (`gh run list --branch portable-3 --limit 1`).
+- 04 model downloads (`212ba29`..`9ca0b29`): `models list|download|delete` with JSON lines, resumable, SHA-256
+  checked, atomic unpack; `src/engine/local-models.ts` wraps it.
+- Hotkey reload (`7af6308`..`599fbb7`): leaving Hotkeys after a changed key closes the panel and reloads Pi
+  silently (after `agent_settled` if the agent runs). Pi prints its own "Reloaded ..." line; pi-speech adds none.
+- 07 every playback a Stream (`0a6d17a`..`b52ac75`): bundled-binary resolver, adaptive start buffer, replay and
+  Reading as Streams; `POST /v1/play`, `PI_SPEECH_PLAYER` and `PI_SPEECH_RECEIVER_PLAYER` gone. `e2e/run all`
+  passed; CI green on all three systems at `b52ac75`.
+- Mac fixes (`db4b7f3`..`aa5e864`): a real input giving only exact zeros (macOS microphone denied) is an error;
+  `models download` documents that it stops when stdin closes; the start-window recorder test uses a sh stand-in.
+- 10 platform packages (`71e0da7`..`8b36ac9`): `npm/platforms.mjs` generates `@jangmanj/pi-speech-<os>-<cpu>`
+  for linux-x64, linux-arm64, darwin-arm64, darwin-x64, win32-x64; publish.yml builds them on native runners and
+  publishes them before the main package. The optionalDependencies are NOT committed in package.json (npm ci
+  fails while a version is not on npm); publish stamps them in and checks them. First release needs a version
+  bump (0.1.0 is on npm) and `npm run bootstrap:npm` once (5 more trusted publishers, user's 2FA).
 
-In flight:
-- 07 every playback a Stream: branch `jing/r92335acc521c`, worktree `/tmp/jing-stage/51bf5b3b33e9/r92335acc521c`
-  (in /tmp: gone after a reboot, the branch stays). Tip `45a05fd` at the time of writing, 7 commits: binary
-  resolver (`src/engine/binary.ts`), adaptive start buffer, replay and Reading as Streams, `POST /v1/play` and
-  `PI_SPEECH_PLAYER` removed. The agent was still updating e2e suites, with uncommitted edits in the worktree,
-  some in files it does not own (`e2e/panel`, `e2e/redesign`, `e2e/samples`, `e2e/xai`): review those against
-  slice 01's panel suite. Its uncommitted edits at wrap-up are kept as branch `wip/07-stream-only-snapshot` (a stash commit on the tip). It had not reported. To finish: rebase the branch on `portable-3` (01 and 04 landed
-  since; expect conflicts in `test/engine/chat-models.test.ts` and `endpoints.test.ts`, each a one-line change
-  here), run every check below and `e2e/run all`, read the diff, then land and push.
+Checked on the Mac (`moms-macbook`, macOS 26.6 arm64, 2026-11-13, CI artifact of `b52ac75`), by ear with the user:
+speed/pitch bracket right (clips that say their own setting); `models list`, download with interrupt and resume,
+`transcribe` word-for-word in 1-2 s; recording from Terminal; inside Pi (xAI): speak, replay, a Reading, stop
+mid-sentence (cut at once). Dictation with `/speech --dictate` works (by ear and text); the Alt+Z hotkey does not reach Pi in stock Terminal (below). Mac setup, no sudo: Node in `~/.local/node`, Pi
+fork release `next-cda143063b13` in `~/.local/share/pi-fork`, source in `~/Projects/pi-speech` (copied, not a
+clone), `~/.pi/agent/settings.json` package `../../Projects/pi-speech`, logins copied from here. Learned there:
 
-Next, once 07 is in: 02 (read aloud options) and 05 (source switch) both touch `src/engine/panel.ts`, so give
-them to one agent in order or split the files first; 08 (bridge connection) and 10 (platform packages) are
-unblocked by 07; 06 needs 05; 09 needs 06 and 08. Add a CI smoke step `pi-speech-receiver models list` (suggested
-by the 04 agent).
+- macOS gives a process started over ssh no microphone (TCC, no prompt): record from a Terminal window.
+- A Terminal.app first started by `open` over ssh inherits `SSH_CONNECTION`, so Pi in it thinks it runs over SSH:
+  start it with `env -i HOME=$HOME USER=$USER PATH=/usr/bin:/bin open -a Terminal x.command`.
+- Option+Z in stock Terminal types `Ω`: Alt hotkeys need "Use Option as Meta key" (Settings > Profiles >
+  Keyboard). README must say so; maybe detect `Ω`/`ß` in the editor and hint.
+- Run one sound test at a time and announce it; never open test windows that overlap (the user was confused once).
+- Still to check there: the exact-zero microphone error, with a binary from CI at or after `aa5e864`, over ssh.
 
-Not yet checked on real machines: `transcribe` and `models` in the Windows VM (agent-jail, `~/vms/win11`) and on
-the Mac.
+In flight (Jing leaves, started 2026-11-13 ~07:15):
+
+- 02 then 05 (read aloud options, source switch), one agent, branch `jing/r30c4fb135bf7`.
+- 08 non-panel part: `pi-speech-receiver ssh|pair` and the connection probe in `src/bridge/client.ts`, branch
+  `jing/rf1d59dee0297`. The Bridge connection panel rows come after 05 (they share `panel.ts`).
+
+Next: 08's panel rows; 06 needs 05; 09 needs 06 and 08. `transcribe` and `models` in the Windows VM (agent-jail,
+`~/vms/win11`) not yet checked.
 
 ## Waiting on the user
 
-- Changing the Speak or Dictate key, user's answer (2026-11-13): acceptable, but better: when the user leaves the
-  Hotkeys screen after changing a key, the /speech command handler calls `await ctx.reload(); return;` (Pi's
-  extension API, docs/extensions.md "ctx.reload()"), silently, with no message. Drop the `→ Alt+D after /reload`
-  hint. Pi can't reload while the agent is running: in that case record the request and run it from
-  `agent_settled`. Not built yet.
-- The Mac is `moms-macbook` on Tailscale (`ssh moms-macbook`, user and key in `~/.ssh/config`). It was offline
-  each time it was tried (04:20-05:30); when it is up, download the macOS artifact of the latest `portable-3` run
-  (`gh run download`), copy it over and run the speed/pitch bracket there.
 - Whether a message stopped after its audio fully arrived is still saved (it is now).
 - Listening check with Pi on `decent-spider` through the bridge (never done; receiver on the laptop must be 0.3.0).
 
