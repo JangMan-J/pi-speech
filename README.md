@@ -23,10 +23,10 @@ pi install ./
 Or load it for one run: `pi -e ./index.ts`. pi-speech registers only the `/speech` command and the
 `speech_synthesize` and `speech_transcribe` tools, so it can be installed next to pi-openrouter-multimodal.
 
-You need an OpenRouter API key or an xAI login in Pi (see [Credentials](#credentials)), and for playback on the Pi host one of
-`mpv`, `ffplay`, `paplay`, `pw-play`, `mpg123` (or `PI_SPEECH_PLAYER`). Speech plays as it arrives (a Stream) through one of `pacat`, `pw-cat`, `ffplay`, `mpv`, `aplay`
-(MP3 through `ffplay`, `mpv`, `mpg123`), or `PI_SPEECH_STREAM_PLAYER`; without one, or with only
-`PI_SPEECH_PLAYER` set, it plays once it has fully arrived.
+You need an OpenRouter API key or an xAI login in Pi (see [Credentials](#credentials)). Every playback, a replay
+included, is a Stream: it plays as it arrives, through the bundled `pi-speech-receiver` binary (its own audio
+engine; `PI_SPEECH_BINARY` names another). Without the binary it uses one of `pacat`, `pw-cat`, `ffplay`, `mpv`,
+`aplay` (MP3 through `ffplay`, `mpv`, `mpg123`), or `PI_SPEECH_STREAM_PLAYER`.
 
 ## `/speech`
 
@@ -468,7 +468,7 @@ of any error text. An endpoint you added with no key is sent none.
 | ----------------------------- | --------------------------------------------------------------------------------------- |
 | `OPENROUTER_API_KEY`          | OpenRouter API key                                                                      |
 | `PI_SPEECH_DIR`               | History directory (default `~/Music/pi-speech`)                                         |
-| `PI_SPEECH_PLAYER`            | Player on the Pi host, run as `<player> <audio file>`                                   |
+| `PI_SPEECH_BINARY`            | The bundled `pi-speech-receiver` binary, when it is not in its packaged place           |
 | `PI_SPEECH_STREAM_PLAYER`     | Player of speech as it arrives, run as `<player> s16le <rate> <channels>`, PCM on stdin |
 | `PI_SPEECH_RECORDER`          | Recorder on the Pi host, run as `<recorder> <output.wav>`, stops on SIGINT              |
 | `PI_SPEECH_LOCAL_MIC`         | `1`: the Pi host's microphone is yours, even over SSH                                   |

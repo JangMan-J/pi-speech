@@ -19,11 +19,11 @@ export async function liveSession({ key, env = {}, player } = {}) {
   const home = path.join(work, 'home');
   fs.mkdirSync(home);
   const playerPath = path.join(work, 'fake-player');
-  fs.writeFileSync(playerPath, `#!/usr/bin/env bash\n${player ?? 'echo "$1" >> "$(dirname "$0")/player.log"'}\nexit 0\n`, { mode: 0o755 });
+  fs.writeFileSync(playerPath, `#!/usr/bin/env bash\n${player ?? 'echo "$*" >> "$(dirname "$0")/player.log"; cat > /dev/null'}\nexit 0\n`, { mode: 0o755 });
   const baseEnv = {
     OPENROUTER_API_KEY: key, PI_SPEECH_DIR: speechDir, HOME: home, SSH_CONNECTION: null, SSH_TTY: null,
     PI_SPEECH_BRIDGE_URL: null, PI_SPEECH_BRIDGE_TOKEN: null, PI_SPEECH_BRIDGE_TOKEN_FILE: null,
-    PI_SPEECH_PLAYER: playerPath, FAKE_OPENROUTER_URL: null, FAKE_FETCH_LOG: null, ...env,
+    PI_SPEECH_STREAM_PLAYER: playerPath, FAKE_OPENROUTER_URL: null, FAKE_FETCH_LOG: null, ...env,
   };
   const sessions = [];
   const ctx = {

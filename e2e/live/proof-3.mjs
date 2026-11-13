@@ -14,13 +14,25 @@ const PAIRS = [
 ];
 
 const key = needKey();
-// The player copies the file it is given, so the sample can be transcribed after the player has finished.
-const ctx = await liveSession({ key, player: 'cp "$1" "$(dirname "$0")/played-$(date +%s%N).audio"' });
+// The Stream player keeps what it is fed (and its arguments), so the sample can be transcribed after it has finished.
+const ctx = await liveSession({ key, player: 'f="$(dirname "$0")/played-$(date +%s%N)"; cat > "$f.part"; echo "$*" > "$f.args"; mv "$f.part" "$f.audio"' });
+/** A Stream as played: raw 16-bit PCM is given a WAV header from the player's arguments. */
+function playedAudio(file) {
+  const audio = fs.readFileSync(file);
+  const [codec, rate, channels] = fs.readFileSync(file.replace(/\.audio$/, '.args'), 'utf8').trim().split(/\s+/);
+  if (codec !== 's16le') return { audio, format: codec };
+  const h = Buffer.alloc(44);
+  const ch = Number(channels), r = Number(rate);
+  h.write('RIFF', 0); h.writeUInt32LE(36 + audio.length, 4); h.write('WAVE', 8); h.write('fmt ', 12);
+  h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); h.writeUInt16LE(ch, 22); h.writeUInt32LE(r, 24);
+  h.writeUInt32LE(r * ch * 2, 28); h.writeUInt16LE(ch * 2, 32); h.writeUInt16LE(16, 34); h.write('data', 36); h.writeUInt32LE(audio.length, 40);
+  return { audio: Buffer.concat([h, audio]), format: 'wav' };
+}
 try {
   const s = await ctx.pi();
   const set = await command(s, '/speech --set tts-model hexgrad/kokoro-82m');
   check(errors(set).length === 0, 'the speech model is Kokoro', notes(set));
-  const played = () => fs.readdirSync(ctx.work).filter((f) => f.startsWith('played-')).sort();
+  const played = () => fs.readdirSync(ctx.work).filter((f) => f.startsWith('played-') && f.endsWith('.audio')).sort();
 
   for (const { voice, label, ok } of PAIRS) {
     const before = played().length;
@@ -31,8 +43,7 @@ try {
     check(files.length === before + 1, `the ${voice} sample reaches the player`, files);
     const file = files[files.length - 1];
     if (files.length === before || !file) continue;
-    const audio = fs.readFileSync(path.join(ctx.work, file));
-    const format = audio.subarray(0, 4).toString() === 'RIFF' ? 'wav' : 'mp3';
+    const { audio, format } = playedAudio(path.join(ctx.work, file));
     let text = '';
     try {
       text = await transcribe(key, audio, format, TRANSCRIBE_MODEL);
