@@ -28,7 +28,8 @@ try {
   if (wavs[0]) check(content.includes(path.join(ctx.speechDir, wavs[0])), 'tool result names the saved WAV', content.slice(0, 300));
   await new Promise((r) => setTimeout(r, 500));
   const played = ctx.playerLog();
-  check(played.length === 1 && fs.existsSync(played[0]) && played[0].startsWith(ctx.speechDir), 'the saved message is played with PI_SPEECH_PLAYER', played);
+  const saved = wavs[0] ? fs.readFileSync(path.join(ctx.speechDir, wavs[0])) : Buffer.alloc(0);
+  check(played.length === 1 && ctx.played(0)?.equals(saved.subarray(44)), 'the message is played as a Stream with PI_SPEECH_STREAM_PLAYER, the same audio as saved', [played, ctx.playerArgs()]);
 
   // transcribe through the tool
   const clip = path.join(ctx.work, 'clip.wav');

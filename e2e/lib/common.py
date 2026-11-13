@@ -52,7 +52,7 @@ class Receiver:
         with open(self.token_file, "w") as f:
             f.write(self.token + "\n")
         os.chmod(self.token_file, token_mode)
-        e = dict(os.environ, PI_SPEECH_RECEIVER_PLAYER=os.path.join(HERE, "fake-player"),
+        e = dict(os.environ, PI_SPEECH_RECEIVER_STREAM_PLAYER=os.path.join(HERE, "fake-player"), PI_SPEECH_AUDIO_NULL="1",
                  PI_SPEECH_RECEIVER_RECORDER=os.path.join(HERE, "fake-recorder"), FAKE_DIR=self.fake,
                  XDG_CONFIG_HOME=os.path.join(self.dir, "xdg"))
         e.update(env or {})
@@ -135,10 +135,18 @@ class Receiver:
         return open(p).read().splitlines() if os.path.exists(p) else []
 
     def play(self, audio=None, ctype="audio/wav", kind=None):
-        h = {"Content-Type": ctype}
+        """Play audio that is already whole the one way there is: as a Stream (POST /v1/play/stream, then its
+        audio). Returns the start's status and body; the audio request answers once it has all been sent."""
+        h = {"Content-Type": "application/json"}
         if kind:
             h["X-Pi-Speech-Kind"] = kind
-        return self.json("POST", "/v1/play", body=audio if audio is not None else wav_bytes(), headers=h)
+        fmt = "mp3" if ctype == "audio/mpeg" else "wav"
+        s, j = self.json("POST", "/v1/play/stream", body=json.dumps({"format": fmt}), headers=h)
+        if s != 202 or not isinstance(j, dict) or "id" not in j:
+            return s, j
+        body = audio if audio is not None else wav_bytes()
+        self.req("POST", f"/v1/play/{j['id']}/audio", body=body, headers={"Content-Type": "application/octet-stream"})
+        return s, j
 
     def wait_state(self, pid, seconds=10):
         s, j = self.json("GET", f"/v1/play/{pid}?wait={seconds}", timeout=seconds + 10)

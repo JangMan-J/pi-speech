@@ -1,12 +1,21 @@
 #!/usr/bin/env bash
-# Fake player for tests: logs its argument, copies the file, then behaves per $FAKE_DIR/player-mode.
-f="$1"
-echo "start $$ $f" >> "$FAKE_DIR/player.log"
-cp "$f" "$FAKE_DIR/last-played" 2>/dev/null
+# Fake Stream player for tests: run as `fake-player s16le <rate> <channels>`, `fake-player mp3` or
+# `fake-player wav`, it keeps what it is fed on stdin in $FAKE_DIR/last-played (and its arguments in
+# last-args), then behaves per $FAKE_DIR/player-mode. Run with one file argument, it copies that file instead.
+echo "start $$ $*" >> "$FAKE_DIR/player.log"
 mode=$(cat "$FAKE_DIR/player-mode" 2>/dev/null || echo ok)
 child=""
 trap 'echo "signal $$ INT" >> "$FAKE_DIR/player.log"; [ -n "$child" ] && kill "$child" 2>/dev/null; exit 130' INT
 trap 'echo "signal $$ TERM" >> "$FAKE_DIR/player.log"; [ -n "$child" ] && kill "$child" 2>/dev/null; exit 143' TERM
+case "$1" in
+  s16le|mp3|wav)
+    echo "$*" > "$FAKE_DIR/last-args"
+    if [ "$mode" = fail ]; then cat > /dev/null; echo "fake player: cannot open audio device" >&2; exit 3; fi
+    cat <&0 > "$FAKE_DIR/playing-$$" & child=$!; wait "$child"; child=""
+    mv "$FAKE_DIR/playing-$$" "$FAKE_DIR/last-played"
+    ;;
+  *) cp "$1" "$FAKE_DIR/last-played" 2>/dev/null ;;
+esac
 case "$mode" in
   ok) sleep 0.3 & child=$!; wait "$child"; echo "done $$" >> "$FAKE_DIR/player.log"; exit 0 ;;
   long) sleep 30 & child=$!; wait "$child"; exit 0 ;;

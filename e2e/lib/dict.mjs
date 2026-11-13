@@ -35,7 +35,7 @@ export async function until(fn, ms = 8000) {
 export function tui(ctx, rec, extraEnv = {}) {
   const session = 'pi-speech-accept-' + crypto.randomBytes(4).toString('hex');
   const env = { PI_CODING_AGENT_DIR: ctx.agentDir, PI_OFFLINE: '1', NODE_OPTIONS: `--import ${path.join(HERE, 'preload.mjs')}`,
-    FAKE_OPENROUTER_URL: ctx.or.url, OPENROUTER_API_KEY: ctx.key, PI_SPEECH_DIR: ctx.speechDir, PI_SPEECH_PLAYER: ctx.player,
+    FAKE_OPENROUTER_URL: ctx.or.url, OPENROUTER_API_KEY: ctx.key, PI_SPEECH_DIR: ctx.speechDir, PI_SPEECH_STREAM_PLAYER: ctx.player, PI_SPEECH_AUDIO_NULL: '1',
     PI_SPEECH_RECORDER: rec.env.PI_SPEECH_RECORDER, FAKE_DIR: rec.fake, ...extraEnv };
   const cwd = fs.mkdtempSync(path.join(ctx.work, 'tui-cwd-'));
   const tt = (...args) => execFileSync('tui-test', args, { encoding: 'utf8', timeout: 30000, env: { ...process.env, TUI_TEST_SESSION: session } });

@@ -1,4 +1,4 @@
-// Build and run pi-speech-receiver for acceptance checks, with fake player and recorder programs.
+// Build and run pi-speech-receiver for acceptance checks, with fake Stream player and recorder programs.
 import { execFileSync, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -28,7 +28,7 @@ export async function startReceiver({ bin = process.env.RECEIVER_BIN, fakes = pr
   const tokenFile = path.join(dir, 'token');
   fs.writeFileSync(tokenFile, token + '\n', { mode: 0o600 });
   const child = spawn(bin, ['--listen', '127.0.0.1:0', '--token-file', tokenFile], {
-    env: { ...process.env, PI_SPEECH_RECEIVER_PLAYER: path.join(fakes, 'fake-player'),
+    env: { ...process.env, PI_SPEECH_RECEIVER_STREAM_PLAYER: path.join(fakes, 'fake-player'), PI_SPEECH_AUDIO_NULL: '1',
       PI_SPEECH_RECEIVER_RECORDER: path.join(fakes, 'fake-recorder'), FAKE_DIR: fake, XDG_CONFIG_HOME: path.join(dir, 'xdg') },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -52,6 +52,8 @@ export async function startReceiver({ bin = process.env.RECEIVER_BIN, fakes = pr
     log: read,
     starts(who) { return read(who).filter((l) => l.startsWith('start ')); },
     lastPlayed() { const p = path.join(fake, 'last-played'); return fs.existsSync(p) ? fs.readFileSync(p) : undefined; },
+    /** The arguments of the last Stream played: `s16le <rate> <channels>`, `mp3` or `wav`. */
+    lastArgs() { const p = path.join(fake, 'last-args'); return fs.existsSync(p) ? fs.readFileSync(p, 'utf8').trim() : undefined; },
     output: () => output,
     async stop() { if (child.exitCode === null) { child.kill('SIGTERM'); await exited; } },
     cleanup() { fs.rmSync(dir, { recursive: true, force: true }); },

@@ -1,4 +1,4 @@
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -35,11 +35,14 @@ describe("createBridgeAudio", () => {
     expect(b.input.name).toBe("bridge");
   });
 
-  it("plays a file on the receiver and follows it to completion", async () => {
+  it("plays a saved file on the receiver as a Stream and follows it to completion", async () => {
     const file = join(tmpdir(), `bridge-accept-${process.pid}.wav`);
     writeFileSync(file, wav());
     const b = createBridgeAudio({ url: rcv.url, token: rcv.token });
-    const p = await b.output.play(file, "message");
+    const chunks = (async function* () {
+      yield readFileSync(file);
+    })();
+    const p = await b.output.playStream({ format: { codec: "wav" }, chunks }, "message");
     expect(p.ok).toBe(true);
     if (p.ok) expect(await p.done).toEqual({ state: "completed" });
   });

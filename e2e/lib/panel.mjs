@@ -13,7 +13,7 @@ export async function openPanelPi(ctx, { cols = 110, rows = 34, env: extra = {},
   const env = {
     PI_CODING_AGENT_DIR: ctx.agentDir, PI_OFFLINE: '1', NODE_OPTIONS: `--import ${path.join(HERE, 'preload.mjs')}`,
     FAKE_OPENROUTER_URL: ctx.or.url, FAKE_XAI_URL: ctx.xai.url, OPENROUTER_API_KEY: ctx.key, PI_SPEECH_DIR: ctx.speechDir,
-    PI_SPEECH_PLAYER: ctx.player, HOME: ctx.home, ...extra,
+    PI_SPEECH_STREAM_PLAYER: ctx.player, PI_SPEECH_AUDIO_NULL: '1', HOME: ctx.home, ...extra,
   };
   const cwd = fs.mkdtempSync(path.join(ctx.work, 'tui-cwd-'));
   const tt = (...args) => execFileSync('tui-test', args, { encoding: 'utf8', timeout: 30000, env: { ...process.env, TUI_TEST_SESSION: session } });

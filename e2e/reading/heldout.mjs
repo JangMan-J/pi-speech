@@ -86,7 +86,7 @@ const MS = 8;
   } finally { await ctx.close(); ctx.cleanup(); }
 }
 
-// 4. over the bridge the pieces play one after another on the receiver
+// 4. over the bridge the Reading plays as one Stream on the receiver
 const rcv = await startReceiver();
 {
   const ctx = await setup({ msPerChar: MS, env: { PI_SPEECH_BRIDGE_URL: rcv.url, PI_SPEECH_BRIDGE_TOKEN: rcv.token } });
@@ -102,7 +102,8 @@ const rcv = await startReceiver();
     const inputs = ctx.speechRequests().slice(reqFrom).map((r) => r.body?.input ?? '');
     const plays = rcv.starts('player');
     check(inputs.length >= 3 && norm(inputs.join(' ')) === norm(text), 'the whole reply is requested over the bridge route', inputs.length);
-    check(plays.length === inputs.length, 'the receiver played one file per piece', [plays.length, inputs.length]);
+    check(plays.length === 1 && rcv.lastArgs() === 's16le 24000 1', 'the receiver played the whole Reading as one Stream', [plays, rcv.lastArgs()]);
+    check(rcv.lastPlayed()?.equals(ctx.savedAudio(ctx.history().find((f) => f.endsWith('.wav')) ?? '')), 'with the audio that was saved', rcv.lastPlayed()?.length);
     check(ctx.playerLog().length === 0, 'nothing played on the Pi host');
     const wavs = ctx.history().filter((f) => f.endsWith('.wav'));
     check(wavs.length === 1, 'one message in the history', ctx.history());

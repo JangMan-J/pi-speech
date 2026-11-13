@@ -34,7 +34,8 @@ try {
   n = await command(s, '/speech --replay', 800);
   check(errors(n).length === 0 && ctx.playerLog().length === plays + 1, 'replay plays the last message again', notes(n));
   check(ctx.speechRequests().length === requests, 'replay sends nothing to OpenRouter');
-  check(ctx.playerLog().at(-1)?.startsWith(ctx.speechDir) && fs.existsSync(ctx.playerLog().at(-1)), 'replay plays the saved file', ctx.playerLog().at(-1));
+  const last = ctx.history().filter((f) => f.endsWith('.wav')).at(-1);
+  check(last !== undefined && ctx.played(-1)?.equals(ctx.savedAudio(last)), 'replay feeds the saved file to the player as a Stream', [ctx.playerLog().at(-1), ctx.playerArgs().at(-1)]);
 
   await command(s, '/speech --read-aloud off');
   ctx.llm.script([{ text: 'Not spoken.' }]);
@@ -46,7 +47,7 @@ try {
   // stop
   const slow = path.join(ctx.work, 'slow-player');
   fs.writeFileSync(slow, `#!/usr/bin/env bash\necho "start $1" >> "${ctx.work}/slow.log"\ntrap 'echo "term" >> "${ctx.work}/slow.log"; exit 143' TERM INT\nsleep 8 & wait $!\n`, { mode: 0o755 });
-  s = await ctx.pi({ env: { PI_SPEECH_PLAYER: slow } });
+  s = await ctx.pi({ env: { PI_SPEECH_STREAM_PLAYER: slow } });
   check(/Read-aloud: off/.test(notes(await command(s, '/speech --status'))), 'read-aloud is off again after a restart');
   await command(s, '/speech a long message', 500);
   n = await command(s, '/speech --stop', 800);

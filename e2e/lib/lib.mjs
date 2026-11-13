@@ -1,4 +1,4 @@
-// Shared setup for the pi-speech acceptance checks: fake services, isolated dirs, a fake player.
+// Shared setup for the pi-speech acceptance checks: fake services, isolated dirs, a fake Stream player.
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -38,8 +38,11 @@ export function isWav(buf) {
 export async function setup({ catalog, mp3OnlyModels, env = {}, xai = false, msPerChar = 0, mismatchAt = 0 } = {}) {
   const work = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-speech-accept-'));
   const key = 'sk-or-v1-accept-' + crypto.randomBytes(12).toString('hex');
+  // Every playback is a Stream: the fake player (PI_SPEECH_STREAM_PLAYER) logs where it keeps what it was fed,
+  // and its arguments (`s16le <rate> <channels>`, `mp3` or `wav`), then keeps the Stream's bytes there.
   const player = path.join(work, 'fake-player');
-  fs.writeFileSync(player, `#!/usr/bin/env bash\necho "$1" >> "${work}/player.log"\necho "$(date +%s%3N) $1" >> "${work}/player.times"\nexit 0\n`, { mode: 0o755 });
+  fs.mkdirSync(path.join(work, 'played'));
+  fs.writeFileSync(player, `#!/usr/bin/env bash\nf="${work}/played/$(date +%s%N)-$$"\necho "$f" >> "${work}/player.log"\necho "$(date +%s%3N) $f" >> "${work}/player.times"\necho "$*" >> "${work}/player.args"\ncat > "$f"\nexit 0\n`, { mode: 0o755 });
   const or = await startFakeOpenRouter({ catalog, mp3OnlyModels, msPerChar, mismatchAt });
   const llm = await startFakeLlm();
   const agentDir = path.join(work, 'agent');
@@ -51,7 +54,7 @@ export async function setup({ catalog, mp3OnlyModels, env = {}, xai = false, msP
   const home = path.join(work, 'home');
   fs.mkdirSync(home);
   const fetchLog = path.join(work, 'fetch.log');
-  const baseEnv = { FAKE_XAI_URL: fakeXai.url, OPENROUTER_API_KEY: key, PI_SPEECH_DIR: speechDir, PI_SPEECH_PLAYER: player, HOME: home, SSH_CONNECTION: null, SSH_TTY: null, PI_SPEECH_LOCAL_MIC: null, ...env };
+  const baseEnv = { FAKE_XAI_URL: fakeXai.url, OPENROUTER_API_KEY: key, PI_SPEECH_DIR: speechDir, PI_SPEECH_STREAM_PLAYER: player, PI_SPEECH_AUDIO_NULL: '1', HOME: home, SSH_CONNECTION: null, SSH_TTY: null, PI_SPEECH_LOCAL_MIC: null, ...env };
   const sessions = [];
   const ctx = {
     work, key, xaiKey, xai: fakeXai, player, or, llm, agentDir, speechDir, home, fetchLog,
@@ -64,6 +67,21 @@ export async function setup({ catalog, mp3OnlyModels, env = {}, xai = false, msP
     playerLog() {
       const p = path.join(work, 'player.log');
       return fs.existsSync(p) ? fs.readFileSync(p, 'utf8').split('\n').filter(Boolean) : [];
+    },
+    /** The arguments of every playback, in order: `s16le 24000 1`, `mp3`, `wav`. */
+    playerArgs() {
+      const p = path.join(work, 'player.args');
+      return fs.existsSync(p) ? fs.readFileSync(p, 'utf8').split('\n').filter(Boolean) : [];
+    },
+    /** The bytes the i-th playback was fed (negative: from the end). */
+    played(i = -1) {
+      const f = this.playerLog().at(i);
+      return f && fs.existsSync(f) ? fs.readFileSync(f) : undefined;
+    },
+    /** The audio a saved message is played with: a WAV's samples (after its 44-byte header), an MP3 whole. */
+    savedAudio(name, dir = speechDir) {
+      const b = fs.readFileSync(path.isAbsolute(name) ? name : path.join(dir, name));
+      return name.endsWith('.wav') ? b.subarray(44) : b;
     },
     /** Start times (ms since the epoch) of every playback, in order. */
     playerTimes() {

@@ -1,4 +1,4 @@
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -26,11 +26,18 @@ afterAll(async () => {
   rcv?.cleanup();
 });
 const audio = () => createBridgeAudio({ url: rcv.url, token: rcv.token });
+/** A saved WAV as a Stream: every playback is one. */
+const streamOf = (path: string) => ({
+  format: { codec: "wav" as const },
+  chunks: (async function* () {
+    yield readFileSync(path);
+  })(),
+});
 
 describe("bridge audio, held out", () => {
   it("cancels a playback through its stop()", async () => {
     rcv.mode("player", "long");
-    const p = await audio().output.play(file, "message");
+    const p = await audio().output.playStream(streamOf(file), "message");
     if (!p.ok) throw new Error(p.reason);
     await new Promise((r) => setTimeout(r, 300));
     await p.stop();
@@ -40,7 +47,7 @@ describe("bridge audio, held out", () => {
 
   it("output.stop() stops what plays", async () => {
     rcv.mode("player", "long");
-    const p = await audio().output.play(file, "sample");
+    const p = await audio().output.playStream(streamOf(file), "sample");
     if (!p.ok) throw new Error(p.reason);
     await new Promise((r) => setTimeout(r, 300));
     await audio().output.stop();
@@ -50,17 +57,18 @@ describe("bridge audio, held out", () => {
 
   it("reports a player failure as failed", async () => {
     rcv.mode("player", "fail");
-    const p = await audio().output.play(file, "message");
+    const p = await audio().output.playStream(streamOf(file), "message");
     if (p.ok) expect(await p.done).toMatchObject({ state: "failed" });
     else expect(p.reason).toMatch(/\S/);
     rcv.mode("player", "ok");
   });
 
-  it("refuses a body that is not audio with the receiver's message", async () => {
-    const bad = join(tmpdir(), `bridge-heldout-${process.pid}.wav.txt`);
-    writeFileSync(bad, "not audio at all ".repeat(40));
-    const p = await audio().output.play(bad, "message");
-    expect(p.ok).toBe(false);
+  it("refuses a Stream format it does not take, with the receiver's message", async () => {
+    const p = await audio().output.playStream(
+      { format: { codec: "pcm", rate: 1, channels: 1 }, chunks: streamOf(file).chunks },
+      "message",
+    );
+    expect(p).toMatchObject({ ok: false, reason: expect.stringMatching(/400/) });
   });
 
   it("maps recording errors to readable errors", async () => {
@@ -86,7 +94,7 @@ describe("bridge audio, held out", () => {
     await expect(a.input.start()).rejects.toThrow(/unauthori[sz]ed|401|token/i);
     const h = await a.health();
     expect(h.ok).toBe(false);
-    const p = await a.output.play(file, "message");
+    const p = await a.output.playStream(streamOf(file), "message");
     expect(p.ok).toBe(false);
   });
 
@@ -94,7 +102,7 @@ describe("bridge audio, held out", () => {
     const a = createBridgeAudio({ url: "http://127.0.0.1:9", token: rcv.token });
     const t0 = Date.now();
     await expect(a.input.start()).rejects.toThrow(/reach|connect|refused/i);
-    const p = await a.output.play(file, "message");
+    const p = await a.output.playStream(streamOf(file), "message");
     expect(p.ok).toBe(false);
     expect(Date.now() - t0).toBeLessThan(10000);
   });
@@ -103,7 +111,7 @@ describe("bridge audio, held out", () => {
     const r2 = await startReceiver();
     r2.mode("player", "long");
     const a = createBridgeAudio({ url: r2.url, token: r2.token });
-    const p = await a.output.play(file, "message");
+    const p = await a.output.playStream(streamOf(file), "message");
     if (!p.ok) throw new Error(p.reason);
     await new Promise((r) => setTimeout(r, 300));
     await r2.stop();

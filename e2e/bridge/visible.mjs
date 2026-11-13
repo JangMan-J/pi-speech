@@ -17,8 +17,8 @@ try {
   n = await command(s, '/speech hello over the bridge', 1200);
   const starts = rcv.starts('player');
   const played = rcv.lastPlayed();
-  const saved = ctx.history().map((f) => fs.readFileSync(path.join(ctx.speechDir, f)));
-  check(starts.length === 1 && played && saved.some((b) => b.equals(played)), 'the message plays on the receiver with the saved bytes', [starts.length, ctx.history()]);
+  const saved = ctx.history().map((f) => ctx.savedAudio(f));
+  check(starts.length === 1 && played && saved.some((b) => b.equals(played)), 'the message plays on the receiver as a Stream, with the saved audio', [starts.length, ctx.history(), rcv.lastArgs()]);
   check(ctx.playerLog().length === 0, 'nothing plays on the Pi host');
   check(!/not played/i.test(notes(n)), 'the result does not claim a failure', notes(n));
   await s.close();
