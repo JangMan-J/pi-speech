@@ -59,10 +59,10 @@ while :; do sleep 0.05 & wait $!; done
             &dir.join("streamer"),
             &format!(
                 r#"#!/bin/bash
+mode=$(cat {d}/streamer-mode 2>/dev/null || echo ok)
 echo "start $*" >> {d}/streamer.log
 echo $$ >> {d}/streamer.pids
 trap 'echo "signal INT" >> {d}/streamer.log; kill $c 2>/dev/null; exit 130' INT
-mode=$(cat {d}/streamer-mode 2>/dev/null || echo ok)
 case "$mode" in
   ok) cat <&0 >> {d}/streamed & c=$!;;
   early) head -c 4 <&0 >> {d}/streamed & c=$!;;

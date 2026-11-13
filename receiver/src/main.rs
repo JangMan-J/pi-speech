@@ -11,13 +11,14 @@ const SERVE_USAGE: &str =
 
 fn usage() -> String {
     format!(
-        "usage: {SERVE_USAGE}\n       {}\n       {}\n       {}\n       {}\n       {}\n       {}",
+        "usage: {SERVE_USAGE}\n       {}\n       {}\n       {}\n       {}\n       {}\n       {}\n\n{}",
         ssh::USAGE,
         ssh::PAIR_USAGE,
         play::USAGE,
         record::USAGE,
         transcribe::USAGE,
-        models::USAGE
+        models::USAGE,
+        models::HELP_NOTE
     )
 }
 
