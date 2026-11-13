@@ -210,7 +210,8 @@ connection while it waits leaves the queue. Listing models and voices is not a r
 
 #### `GET /v1/models`
 
-`200 {"models": [...]}`: the objects `pi-speech-receiver models list` prints, one per model.
+`200 {"models": [...]}`: the objects `pi-speech-receiver models list` prints, one per model
+(see "Subcommand notes: `models`"), `lexicon` included.
 
 #### `GET /v1/voices?model=<id>`
 
@@ -275,6 +276,42 @@ Local speech (Kokoro, Piper) on the machine that runs the binary; not an HTTP en
 - A Piper voice needs a lexicon (sherpa-onnx 2.0 no longer runs espeak-ng): `lexicon*.txt` in
   its directory, else the shared `lexicon-<lang>-<region>.txt` (for English voices
   `lexicon-en-us.txt`) in the model cache beside it.
+
+### Subcommand notes: `models`
+
+```
+pi-speech-receiver models list | download <id> | delete <id>
+```
+
+The local models of the catalogue and the per-user model cache. stdout: one JSON object per line.
+
+- `list`: one object per catalogue entry, `{"id", "kind": "transcription"|"speech", "name",
+  "languages": [...], "size", "downloaded", "partial", "path"}`, where `size` is the archive's bytes,
+  `partial` the bytes of an interrupted download (0 if none) and `path` the model's directory
+  in the cache, there or to be.
+  - `lexicon`: only on a voice that needs a shared lexicon (an English Piper voice; not
+    Kokoro, not a transcription model), `{"name": "lexicon-en-us.txt", "size": <bytes>,
+    "downloaded": <bool>}`. `name` is the lexicon's file name, the last part of its URL, and the
+    file of that name in the cache root, shared by every voice that names it. `downloaded` is
+    whether that file is there. Such a voice's own `downloaded` is true only when its directory
+    and its lexicon are both there.
+- `download <id>`: `{"event":"progress","id","done","total"}` (bytes of the archive) as they
+  arrive, then `{"event":"verifying","id"}` and `{"event":"unpacking","id"}`. A model already
+  downloaded gives one `progress` line with `done` = `total`.
+  - `file`: for a voice whose lexicon is not yet in the cache, the archive is followed by
+    `{"event":"progress","id","file":"<lexicon name>","done","total"}` lines, where `file` is
+    the lexicon's `name` (as in `list`) and `done` and `total` count the lexicon's bytes, not the
+    archive's. A `progress` line without `file` is about the archive. While another download
+    is fetching the same lexicon (another voice that shares it), this one waits for it and
+    its `file` lines report the other's bytes. `done` may go back to 0 when a server sends
+    the whole file instead of the rest.
+  - Then exactly one of `{"event":"done","id","path"}` (exit 0, the model and its lexicon
+    in place), `{"event":"error","id","message"}` (exit 1) or
+    `{"event":"stopped","id","done","total"}` (exit 1; with `file` when it stopped in the
+    lexicon, and then `done` and `total` are the lexicon's bytes). A download stops on SIGINT,
+    SIGTERM, or the end of its standard input, and leaves its part (`<dir>.part`, or
+    `<lexicon name>.part` in the cache root) for the next download to resume.
+- `delete <id>`: `{"event":"deleted","id","freed":<bytes>}`. A shared lexicon stays.
 
 ## SSH sessions
 

@@ -10,7 +10,8 @@
 //! - `download <id>`: `{"event":"progress","id","done","total"}` as bytes arrive, then
 //!   `{"event":"verifying"}`, `{"event":"unpacking"}`; for a voice that needs a lexicon not yet
 //!   in the cache, `{"event":"progress","id","file":"<lexicon name>","done","total"}` as its
-//!   bytes arrive; then `{"event":"done","path"}`; or `{"event":"error","message"}` (exit 1)
+//!   bytes arrive (or, while another download fetches the same lexicon, as that one's do: it
+//!   waits for it, see `download::lexicon`); then `{"event":"done","path"}`; or `{"event":"error","message"}` (exit 1)
 //!   or `{"event":"stopped","done","total"}` (exit 1, with `file` when stopped in the
 //!   lexicon) when stopped by SIGINT, SIGTERM or the closing of standard input, which leaves the
 //!   part to resume.
