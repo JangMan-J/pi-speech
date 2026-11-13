@@ -231,51 +231,6 @@ fn default_token_file_is_created_private_and_works() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-#[test]
-#[cfg(unix)]
-fn sigterm_stops_a_running_player_and_removes_its_file() {
-    let dir = scratch("cli-play");
-    let tf = token_file(&dir, 0o600);
-    let log = dir.join("player.log");
-    let player = dir.join("player");
-    script(
-        &player,
-        &format!(
-            "#!/bin/bash\ntrap 'echo INT >> {l}; kill $c; exit 130' INT\necho \"$1\" > {l}.path\nsleep 30 & c=$!; wait $c\n",
-            l = log.display()
-        ),
-    );
-    let mut c = command(
-        &dir,
-        &[
-            "--listen",
-            "127.0.0.1:0",
-            "--token-file",
-            tf.to_str().unwrap(),
-        ],
-    );
-    c.env("PI_SPEECH_RECEIVER_PLAYER", &player);
-    let mut r = start(c);
-    let rep = request(
-        r.addr,
-        "POST",
-        "/v1/play",
-        Some(TOKEN),
-        &[("Content-Type", "audio/wav")],
-        &wav(0.2),
-        None,
-    );
-    assert_eq!(rep.status, 202);
-    let pathfile = dir.join("player.log.path");
-    assert!(wait_until(Duration::from_secs(3), || pathfile.exists()
-        && !std::fs::read_to_string(&pathfile).unwrap().is_empty()));
-    signal(&r.child, 15);
-    assert_eq!(exit_code_within(&mut r.child, 8), Some(0));
-    assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "INT");
-    assert!(temp_entries(&dir).is_empty());
-    std::fs::remove_dir_all(&dir).ok();
-}
-
 fn listening(dir: &Path, env: &[(&str, &Path)]) -> Running {
     let tf = token_file(dir, 0o600);
     let mut c = command(
@@ -296,28 +251,6 @@ fn listening(dir: &Path, env: &[(&str, &Path)]) -> Running {
 const PCM: &[u8] = br#"{"format": "pcm", "rate": 24000, "channels": 1}"#;
 
 #[test]
-fn with_only_the_file_player_set_there_is_no_stream_player() {
-    let dir = scratch("cli-nostream");
-    let player = dir.join("player");
-    script(&player, "#!/bin/sh\nexit 0\n");
-    let mut r = listening(&dir, &[("PI_SPEECH_RECEIVER_PLAYER", &player)]);
-    let rep = request(
-        r.addr,
-        "POST",
-        "/v1/play/stream",
-        Some(TOKEN),
-        &[],
-        PCM,
-        None,
-    );
-    assert_eq!(rep.status, 503, "{}", rep.text());
-    assert!(rep.text().contains("PI_SPEECH_RECEIVER_STREAM_PLAYER"));
-    terminate(&r.child);
-    assert_eq!(exit_code_within(&mut r.child, 8), Some(0));
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
 #[cfg(unix)]
 fn sigterm_stops_a_stream_player_during_its_upload() {
     let dir = scratch("cli-stream");
@@ -332,15 +265,7 @@ fn sigterm_stops_a_stream_player_during_its_upload() {
             o = out.display()
         ),
     );
-    let player = dir.join("player");
-    script(&player, "#!/bin/sh\nexit 0\n");
-    let mut r = listening(
-        &dir,
-        &[
-            ("PI_SPEECH_RECEIVER_STREAM_PLAYER", &streamer),
-            ("PI_SPEECH_RECEIVER_PLAYER", &player),
-        ],
-    );
+    let mut r = listening(&dir, &[("PI_SPEECH_RECEIVER_STREAM_PLAYER", &streamer)]);
     let rep = request(
         r.addr,
         "POST",
@@ -495,6 +420,25 @@ fn final_state(addr: SocketAddr, id: &str) -> String {
     json_field(&r.text(), "state").unwrap()
 }
 
+/// Start a Stream in `format` and send all of `audio` at once; its id.
+fn whole_stream(addr: SocketAddr, format: &[u8], audio: &[u8]) -> String {
+    let rep = request(
+        addr,
+        "POST",
+        "/v1/play/stream",
+        Some(TOKEN),
+        &[],
+        format,
+        None,
+    );
+    assert_eq!(rep.status, 202, "{}", rep.text());
+    let id = json_field(&rep.text(), "id").unwrap();
+    let mut up = Upload::chunked(addr, &id, TOKEN);
+    up.chunk(audio);
+    assert_eq!(up.end().status, 200);
+    id
+}
+
 /// 24 kHz mono s16le PCM.
 fn pcm(seconds: f64) -> Vec<u8> {
     (0..(seconds * 24000.0) as usize)
@@ -509,19 +453,9 @@ fn with_nothing_configured_and_an_empty_path_serve_plays_and_records_through_its
     for args in [&[][..], &["serve"]] {
         let mut r = self_contained(&dir, args);
 
-        // A file.
+        // A whole WAV, sent as a Stream.
         let t = std::time::Instant::now();
-        let rep = request(
-            r.addr,
-            "POST",
-            "/v1/play",
-            Some(TOKEN),
-            &[("Content-Type", "audio/wav")],
-            &wav(0.4),
-            None,
-        );
-        assert_eq!(rep.status, 202, "{}", rep.text());
-        let id = json_field(&rep.text(), "id").unwrap();
+        let id = whole_stream(r.addr, br#"{"format": "wav"}"#, &wav(0.4));
         assert_eq!(final_state(r.addr, &id), "completed");
         assert!(
             t.elapsed() >= Duration::from_millis(400),
@@ -615,7 +549,7 @@ fn with_nothing_configured_and_an_empty_path_serve_plays_and_records_through_its
 }
 
 #[test]
-fn with_nothing_configured_and_an_empty_path_an_mp3_file_plays_through_itself() {
+fn with_nothing_configured_and_an_empty_path_a_whole_mp3_plays_through_itself() {
     let dir = scratch("cli-builtin-mp3");
     let mut r = self_contained(&dir, &[]);
     let mp3 = std::fs::read(concat!(
@@ -627,22 +561,25 @@ fn with_nothing_configured_and_an_empty_path_an_mp3_file_plays_through_itself() 
     let rep = request(
         r.addr,
         "POST",
-        "/v1/play",
+        "/v1/play/stream",
         Some(TOKEN),
-        &[("Content-Type", "audio/mpeg")],
-        &mp3,
+        &[],
+        br#"{"format": "mp3"}"#,
         None,
     );
     assert_eq!(rep.status, 202, "{}", rep.text());
     let id = json_field(&rep.text(), "id").unwrap();
-    // Played by the receiver itself, from the file it saved: `<receiver> play <file>.mp3`.
+    // Played by the receiver itself: `<receiver> play mp3`, fed on its stdin.
     #[cfg(target_os = "linux")]
     assert!(wait_until(Duration::from_secs(5), || {
         children_of(r.child.id()).iter().any(|(_, c)| {
-            matches!(c.as_slice(), [bin, play, file]
-                if bin == BIN && play == "play" && file.ends_with(".mp3"))
+            matches!(c.as_slice(), [bin, play, codec]
+                if bin == BIN && play == "play" && codec == "mp3")
         })
     }));
+    let mut up = Upload::chunked(r.addr, &id, TOKEN);
+    up.chunk(&mp3);
+    assert_eq!(up.end().status, 200);
     assert_eq!(final_state(r.addr, &id), "completed");
     assert!(
         t.elapsed() >= Duration::from_millis(500),

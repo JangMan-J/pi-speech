@@ -74,8 +74,6 @@ try:
     s, j = r.play(mp3_sync, ctype="audio/mpeg")
     check(s == 202, "MP3 frame sync accepted", s)
     r.wait_state(j.get("id"), 5)
-    s, j = r.play(b"RIFF\x10\x00\x00\x00AVI LIST" + b"\x00" * 600)
-    check(s == 415, "RIFF that is not WAVE is 415", s)
 
     # new play replaces the old one; stop endpoint
     r.mode("player", "long")

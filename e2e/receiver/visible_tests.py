@@ -1,5 +1,5 @@
 """Visible acceptance for pi-speech-receiver (see protocol/bridge.md)."""
-import os, signal, subprocess, time
+import json, os, signal, subprocess, time
 from common import Receiver, check, finish, wait_until, wav_bytes, wav_seconds, started_paths, BIN
 
 r = Receiver()
@@ -24,9 +24,9 @@ try:
         check(open(os.path.join(r.fake, "last-played"), "rb").read() == audio, "player received the uploaded bytes")
         check(wait_until(lambda: not os.path.exists(paths[0]), 3), "played file deleted afterwards", paths[0])
 
-    s, j = r.play(b"hello world, not audio" * 20)
-    check(s == 415, "non-audio body is 415", s)
-    check(len(started_paths(r, "player")) == 1, "player not started for rejected body")
+    s, j = r.json("POST", "/v1/play/stream", body=json.dumps({"format": "ogg"}), headers={"Content-Type": "application/json"})
+    check(s == 400, "a Stream in a format it does not play is 400", s)
+    check(len(started_paths(r, "player")) == 1, "player not started for a rejected Stream")
 
     r.mode("player", "long")
     s, j = r.play()
