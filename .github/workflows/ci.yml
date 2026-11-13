@@ -109,3 +109,14 @@ jobs:
         if: runner.os == 'Linux'
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      - name: Build the release binary
+        run: cargo build --release
+      - name: Keep the release binary for testing on real machines
+        uses: actions/upload-artifact@v4
+        with:
+          name: pi-speech-receiver-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            receiver/target/release/pi-speech-receiver
+            receiver/target/release/pi-speech-receiver.exe
+          if-no-files-found: error
+          retention-days: 14
