@@ -7,6 +7,11 @@ import { Surface } from "../../src/engine/surface";
 import { chunkedBody, makeEngine, pcmBytes, scriptedUi, until } from "./fixtures";
 
 const TOKEN = "xai-login-token-abcdef";
+/**
+ * Two seconds of 24 kHz PCM: more than the start buffer waits for before it plays the short texts here (it
+ * holds the first audio until enough has arrived; start-buffer.test.ts checks how much).
+ */
+const AHEAD = 96000;
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -63,11 +68,11 @@ describe("xai played as a Stream", () => {
     const { run, local, history, engine } = await setup();
     const spoken = run("Hello from xai");
     await until(() => x.bodies.length === 1);
-    x.bodies[0].send(pcmBytes(4800));
+    x.bodies[0].send(pcmBytes(AHEAD));
     await until(() => local.streams[0]?.chunks.length === 1);
     expect(local.streams[0].format).toEqual({ codec: "pcm", rate: 24000, channels: 1 });
     expect(history()).toHaveLength(0);
-    x.bodies[0].send(pcmBytes(4800, 4800));
+    x.bodies[0].send(pcmBytes(4800, AHEAD));
     x.bodies[0].end();
     expect((await spoken).error).toBeUndefined();
     await until(() => local.streams[0].ended);
@@ -76,7 +81,7 @@ describe("xai played as a Stream", () => {
     const wav = readFileSync(join(engine.speech.historyDir, history()[0]));
     expect(wav.toString("latin1", 0, 4)).toBe("RIFF");
     expect(wav.readUInt32LE(24)).toBe(24000);
-    expect(Array.from(wav.subarray(44))).toEqual(Array.from(pcmBytes(9600)));
+    expect(Array.from(wav.subarray(44))).toEqual(Array.from(pcmBytes(AHEAD + 4800)));
     expect(engine.player.playing).toBe(true);
     local.streams[0].finish({ state: "completed" });
     await until(() => !engine.player.playing);
@@ -87,7 +92,7 @@ describe("xai played as a Stream", () => {
     const { run, local, history, engine } = await setup();
     const spoken = run("Hello from xai");
     await until(() => x.bodies.length === 1);
-    x.bodies[0].send(pcmBytes(4800));
+    x.bodies[0].send(pcmBytes(AHEAD));
     await until(() => local.streams[0]?.chunks.length === 1);
     expect(await engine.player.stop()).toBe(true);
     const r = await spoken;
@@ -104,11 +109,11 @@ describe("xai played as a Stream", () => {
     const { run, local, history } = await setup();
     const first = run("First message");
     await until(() => x.bodies.length === 1);
-    x.bodies[0].send(pcmBytes(100));
+    x.bodies[0].send(pcmBytes(AHEAD));
     await until(() => local.streams[0]?.chunks.length === 1);
     const second = run("Second message");
     await until(() => x.bodies.length === 2);
-    x.bodies[1].send(pcmBytes(200));
+    x.bodies[1].send(pcmBytes(AHEAD));
     await until(() => local.streams[1]?.chunks.length === 1);
     expect(local.streams[0].outcome).toEqual({ state: "cancelled" });
     expect(x.bodies[0].aborted).toBe(true);
@@ -124,7 +129,7 @@ describe("xai played as a Stream", () => {
     const { run, local, history, engine } = await setup();
     const spoken = run("Hello from xai");
     await until(() => x.bodies.length === 1);
-    x.bodies[0].send(pcmBytes(100));
+    x.bodies[0].send(pcmBytes(AHEAD));
     await until(() => local.streams[0]?.chunks.length === 1);
     x.bodies[0].fail(new Error("socket hang up"));
     const r = await spoken;
@@ -144,30 +149,36 @@ describe("xai played as a Stream", () => {
     expect(history()).toHaveLength(0);
   });
 
-  it("where a Stream cannot play (the bridge), the whole clip plays once it has arrived, with one notice", async () => {
+  it("through the bridge it plays as a Stream too, on the Remote machine, with no notice", async () => {
     const x = fakeXai();
     const { run, local, bridgeOut, history, notes } = await setup();
     expect((await run("--bridge on")).error).toBeUndefined();
     const spoken = run("Hello from xai");
     await until(() => x.bodies.length === 1);
-    x.bodies[0].send(pcmBytes(100));
-    await new Promise((r) => setTimeout(r, 30));
-    expect(bridgeOut.plays).toHaveLength(0);
+    x.bodies[0].send(pcmBytes(AHEAD));
+    await until(() => bridgeOut.streams[0]?.chunks.length === 1);
+    expect(history()).toHaveLength(0);
     x.bodies[0].end();
     expect((await spoken).error).toBeUndefined();
     expect(bridgeOut.plays).toHaveLength(1);
-    expect(bridgeOut.plays[0].file).toMatch(/\.wav$/);
     expect(local.streams).toHaveLength(0);
     expect(history()).toHaveLength(1);
-    const again = run("Hello again");
-    await until(() => x.bodies.length === 2);
-    x.bodies[1].send(pcmBytes(100));
-    x.bodies[1].end();
-    await again;
-    expect(bridgeOut.plays).toHaveLength(2);
-    const warned = notes.filter((n) => /as it arrives/.test(n.message));
-    expect(warned).toHaveLength(1);
-    expect(warned[0].level).toBe("warning");
+    expect(notes.filter((n) => n.level === "warning")).toEqual([]);
+  });
+
+  it("a short first chunk is held by the start buffer until the whole clip has arrived", async () => {
+    const x = fakeXai();
+    const { run, local } = await setup();
+    const spoken = run("Hello from xai");
+    await until(() => x.bodies.length === 1);
+    x.bodies[0].send(pcmBytes(100));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(local.streams[0]?.chunks ?? []).toHaveLength(0);
+    x.bodies[0].send(pcmBytes(100, 100));
+    x.bodies[0].end();
+    expect((await spoken).error).toBeUndefined();
+    await until(() => local.streams[0]?.ended);
+    expect(Array.from(Buffer.concat(local.streams[0].chunks))).toEqual(Array.from(pcmBytes(200)));
   });
 
   it("speaking without playing saves the message and plays nothing", async () => {
@@ -188,7 +199,7 @@ describe("xai played as a Stream", () => {
     const { run, local, history } = await setup();
     const sampled = run("--sample eve");
     await until(() => x.bodies.length === 1);
-    x.bodies[0].send(pcmBytes(100));
+    x.bodies[0].send(pcmBytes(AHEAD * 4));
     await until(() => local.streams[0]?.chunks.length === 1);
     expect(local.streams[0].kind).toBe("sample");
     x.bodies[0].end();
@@ -202,7 +213,7 @@ describe("xai played as a Stream", () => {
     const caller = new AbortController();
     const spoken = engine.speech.speak("Hello from xai", { signal: caller.signal });
     await until(() => x.bodies.length === 1);
-    x.bodies[0].send(pcmBytes(100));
+    x.bodies[0].send(pcmBytes(AHEAD));
     await until(() => local.streams[0]?.chunks.length === 1);
     caller.abort();
     const r = await spoken;
@@ -236,39 +247,19 @@ describe("xai played as a Stream", () => {
     expect(history()).toHaveLength(0);
   });
 
-  it("where a Stream cannot play, stop during the download cancels the request and saves nothing", async () => {
+  it("through the bridge, stop during the download cancels the request and saves nothing", async () => {
     const x = fakeXai();
     const { run, engine, bridgeOut, history } = await setup();
     expect((await run("--bridge on")).error).toBeUndefined();
     const spoken = run("Hello from xai");
     await until(() => x.bodies.length === 1);
     x.bodies[0].send(pcmBytes(100));
+    await until(() => bridgeOut.streams.length === 1);
     await engine.player.stop();
     expect((await spoken).text).toBe("Stopped.");
     expect(x.bodies[0].aborted).toBe(true);
-    expect(bridgeOut.plays).toHaveLength(0);
+    expect(bridgeOut.streams[0].outcome).toEqual({ state: "cancelled" });
     expect(history()).toHaveLength(0);
-  });
-
-  it("where a Stream cannot play, what plays goes on until the next clip has arrived", async () => {
-    const x = fakeXai();
-    const { run, bridgeOut } = await setup();
-    expect((await run("--bridge on")).error).toBeUndefined();
-    const first = run("First");
-    await until(() => x.bodies.length === 1);
-    x.bodies[0].send(pcmBytes(100));
-    x.bodies[0].end();
-    await first;
-    expect(bridgeOut.plays).toHaveLength(1);
-    const second = run("Second");
-    await until(() => x.bodies.length === 2);
-    x.bodies[1].send(pcmBytes(100));
-    await new Promise((r) => setTimeout(r, 20));
-    expect(bridgeOut.cancelled).toBe(0);
-    x.bodies[1].end();
-    await second;
-    expect(bridgeOut.plays).toHaveLength(2);
-    expect(bridgeOut.cancelled).toBe(1);
   });
 });
 
@@ -316,10 +307,10 @@ describe("OpenRouter audio speech played as a Stream", () => {
     const { run, local, history } = await orSetup();
     const spoken = run("Hello from OpenRouter");
     await until(() => or.bodies.length === 1);
-    or.bodies[0].send(pcmBytes(4800));
+    or.bodies[0].send(pcmBytes(AHEAD));
     await until(() => local.streams[0]?.chunks.length === 1);
     expect(history()).toHaveLength(0);
-    or.bodies[0].send(pcmBytes(4800, 4800));
+    or.bodies[0].send(pcmBytes(4800, AHEAD));
     or.bodies[0].end();
     await spoken;
     expect(history().filter((f) => f.endsWith(".wav"))).toHaveLength(1);
@@ -343,7 +334,8 @@ describe("OpenRouter audio speech played as a Stream", () => {
     const { run, local, history } = await orSetup();
     const spoken = run("Hello in MP3");
     await until(() => or.bodies.length === 1);
-    or.bodies[0].send(new Uint8Array([0xff, 0xfb, 0x90, 0x00, 1, 2, 3, 4, 5, 6, 7, 8]));
+    // An MPEG frame at 128 kbit/s and two seconds of its bytes.
+    or.bodies[0].send(Buffer.concat([Buffer.from([0xff, 0xfb, 0x90, 0x00]), Buffer.alloc(32000)]));
     await until(() => local.streams[0]?.chunks.length === 1);
     expect(local.streams[0].format).toEqual({ codec: "mp3" });
     or.bodies[0].end();
@@ -356,7 +348,7 @@ describe("OpenRouter audio speech played as a Stream", () => {
     const { run, local, engine, history } = await orSetup();
     const spoken = run("Hello from OpenRouter");
     await until(() => or.bodies.length === 1);
-    or.bodies[0].send(pcmBytes(100));
+    or.bodies[0].send(pcmBytes(AHEAD));
     await until(() => local.streams[0]?.chunks.length === 1);
     await engine.player.stop();
     expect(await spoken).toBe("Stopped.");

@@ -3,7 +3,7 @@
  * user's playback machine. Which one is used is decided by the route (see routes.ts), never by fallback.
  */
 
-import type { AudioStream, StreamFormat } from "./provider";
+import type { AudioStream } from "./provider";
 
 export type PlayKind = "message" | "sample";
 
@@ -18,26 +18,15 @@ export interface Playback {
   stop(): Promise<void>;
 }
 
-export type PlayStart =
-  | ({ ok: true } & Playback)
-  | {
-      ok: false;
-      reason: string;
-      /** The output cannot play a Stream now (no player for a Stream, a route without Streams); nothing of it was read. */
-      cannotStream?: boolean;
-    };
+export type PlayStart = ({ ok: true } & Playback) | { ok: false; reason: string };
 
 export interface AudioOutput {
   readonly name: string;
-  /** Start playing `file` without waiting for it to finish. Never throws: a failure to start is `{ ok: false }`. */
-  play(file: string, kind: PlayKind): Promise<PlayStart>;
   /**
-   * Optional: start playing a Stream as its chunks arrive, without waiting for it to finish. Never throws.
-   * `{ ok: false, cannotStream: true }` when it cannot play a Stream now; the Stream is then left unread.
+   * Start playing a Stream as its chunks arrive, without waiting for it to finish. Every playback is a Stream
+   * (GLOSSARY.md), a saved message replayed included. Never throws: a failure to start is `{ ok: false }`.
    */
-  playStream?(stream: AudioStream, kind: PlayKind): Promise<PlayStart>;
-  /** Optional, with `playStream`: whether a Stream in `format` can play now, or why not. Starts nothing. */
-  canStream?(format: StreamFormat): { ok: true } | { ok: false; reason: string };
+  playStream(stream: AudioStream, kind: PlayKind): Promise<PlayStart>;
   /** Stop what this output plays: everything, or only one kind. */
   stop(kind?: PlayKind): Promise<void>;
 }

@@ -72,9 +72,9 @@ export interface FakeStreamPlay {
 }
 
 export interface FakeOutput extends AudioOutput {
-  /** Every playback in order: a file (`file`) or a Stream (`stream`); `end(i)` ends the i-th. */
-  plays: Array<{ file?: string; kind: PlayKind; stream?: FakeStreamPlay }>;
-  /** The Streams among `plays`. */
+  /** Every playback in order, each a Stream; `file` is the saved message a replay reads. `end(i)` ends the i-th. */
+  plays: Array<{ file?: string; kind: PlayKind; stream: FakeStreamPlay }>;
+  /** The Streams of `plays`. */
   streams: FakeStreamPlay[];
   /** Playbacks stopped one by one. */
   cancelled: number;
@@ -83,8 +83,8 @@ export interface FakeOutput extends AudioOutput {
   end(i: number, o: PlayOutcome): void;
 }
 
-/** A fake output; with `streams` it plays a Stream too, reading its chunks as they arrive. */
-export function fakeOutput(name: string, opts: { streams?: boolean } = {}): FakeOutput {
+/** A fake output that plays every Stream, reading its chunks as they arrive. */
+export function fakeOutput(name: string): FakeOutput {
   const endings: Array<(o: PlayOutcome) => void> = [];
   const out: FakeOutput = {
     name,
@@ -93,25 +93,7 @@ export function fakeOutput(name: string, opts: { streams?: boolean } = {}): Fake
     cancelled: 0,
     stops: 0,
     end: (i, o) => endings[i](o),
-    async play(file, kind): Promise<PlayStart> {
-      out.plays.push({ file, kind });
-      let end!: (o: PlayOutcome) => void;
-      const done = new Promise<PlayOutcome>((r) => {
-        end = r;
-      });
-      endings.push(end);
-      const stop = async () => {
-        out.cancelled++;
-        end({ state: "cancelled" });
-      };
-      return { ok: true, player: name, done, stop };
-    },
-    async stop() {
-      out.stops++;
-    },
-  };
-  if (opts.streams) {
-    out.playStream = async (stream: AudioStream, kind: PlayKind): Promise<PlayStart> => {
+    async playStream(stream: AudioStream, kind: PlayKind): Promise<PlayStart> {
       let end!: (o: PlayOutcome) => void;
       const done = new Promise<PlayOutcome>((r) => {
         end = r;
@@ -121,7 +103,7 @@ export function fakeOutput(name: string, opts: { streams?: boolean } = {}): Fake
         play.outcome = o;
       });
       out.streams.push(play);
-      out.plays.push({ kind, stream: play });
+      out.plays.push({ kind, stream: play, ...(stream.file ? { file: stream.file } : {}) });
       endings.push(end);
       void (async () => {
         try {
@@ -140,8 +122,11 @@ export function fakeOutput(name: string, opts: { streams?: boolean } = {}): Fake
         await done;
       };
       return { ok: true, player: name, done, stop };
-    };
-  }
+    },
+    async stop() {
+      out.stops++;
+    },
+  };
   return out;
 }
 
@@ -169,7 +154,7 @@ export function makeEngine(
   catalog: SpeechCatalog = CATALOG,
 ) {
   const work = mkdtempSync(join(tmpdir(), "pi-speech-engine-"));
-  const local = fakeOutput("local", { streams: true });
+  const local = fakeOutput("local");
   const bridgeOut = fakeOutput("bridge");
   const noInput: AudioInput = {
     name: "local",

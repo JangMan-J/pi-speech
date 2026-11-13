@@ -2,6 +2,7 @@ import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { type BinaryChoice, findBinary } from "../../src/engine/binary";
 import { chooseRecorder, LocalInput } from "../../src/engine/local-input";
 import { wavSeconds } from "../../src/engine/wav";
 
@@ -43,6 +44,8 @@ h.writeUInt16LE(1,22); h.writeUInt32LE(16000,24); h.writeUInt32LE(32000,28); h.w
 h.write("data",36); h.writeUInt32LE(d.length,40); return Buffer.concat([h,d]); };`;
 
 const base = { PATH: process.env.PATH };
+/** No bundled binary installed. */
+const NONE = (): BinaryChoice => ({ ok: false, reason: "the bundled pi-speech-receiver is not installed" });
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const leftovers = () => readdirSync(tmpdir()).filter((f) => f.startsWith("pi-speech-rec-"));
 
@@ -71,21 +74,37 @@ describe.skipIf(onWindows)("chooseRecorder", () => {
     expect(chooseRecorder({ ...base, PI_SPEECH_RECORDER: join(dir, "missing") })).toMatchObject({ ok: false });
   });
 
-  it("falls back to the first available of pw-record, parecord, arecord, in that order", () => {
+  it("takes the bundled binary, run as `pi-speech-receiver record <out.wav>` and stopped by its stdin too", () => {
+    writeFileSync(join(dir, "pw-record"), "");
+    chmodSync(join(dir, "pw-record"), 0o755);
+    const bin = join(dir, "pi-speech-receiver");
+    const c = chooseRecorder({ PATH: dir }, () => ({ ok: true, path: bin, from: "package" }));
+    expect(c).toMatchObject({ ok: true, name: "pi-speech-receiver", bin, stdinStops: true });
+    expect(c.ok && c.args("/o.wav")).toEqual(["record", "/o.wav"]);
+    const r = recorder("myrec", "");
+    const custom = chooseRecorder({ PATH: dir, PI_SPEECH_RECORDER: r }, () => ({
+      ok: true,
+      path: bin,
+      from: "package",
+    }));
+    expect(custom).toMatchObject({ ok: true, name: r });
+  });
+
+  it("without the bundled binary, falls back to the first available of pw-record, parecord, arecord, in that order", () => {
     for (const n of ["arecord", "parecord"]) {
       const p = join(dir, n);
       writeFileSync(p, "#!/bin/sh\n");
       chmodSync(p, 0o755);
     }
-    expect(chooseRecorder({ PATH: dir })).toMatchObject({ ok: true, name: "parecord" });
-    expect(chooseRecorder({ PATH: join(dir, "nowhere") })).toMatchObject({ ok: false });
+    expect(chooseRecorder({ PATH: dir }, NONE)).toMatchObject({ ok: true, name: "parecord" });
+    expect(chooseRecorder({ PATH: join(dir, "nowhere") }, NONE)).toMatchObject({ ok: false });
   });
 
   it("records mono 16 kHz 16-bit WAV", () => {
     const p = join(dir, "arecord");
     writeFileSync(p, "#!/bin/sh\n");
     chmodSync(p, 0o755);
-    const c = chooseRecorder({ PATH: dir });
+    const c = chooseRecorder({ PATH: dir }, NONE);
     expect(c.ok && c.args("/x.wav").join(" ")).toBe("-q -t wav -f S16_LE -r 16000 -c 1 /x.wav");
   });
 });
@@ -234,5 +253,25 @@ describe.skipIf(onWindows)("LocalInput", () => {
       const rec = await input.start();
       await rec.cancel();
     });
+  });
+});
+
+// The bundled binary on the null audio device: PATH holds no audio program. Built by cargo build in receiver/.
+const built = findBinary({});
+describe.skipIf(!built.ok || onWindows)("dictation through the bundled binary (null audio device)", () => {
+  it("records until stopped and returns a WAV of the null device's silence", async () => {
+    const input = new LocalInput({ PATH: "", PI_SPEECH_AUDIO_NULL: "1" });
+    const rec = await input.start();
+    await sleep(400);
+    const { audio, format } = await rec.stop();
+    expect(format).toBe("wav");
+    expect(wavSeconds(audio)).toBeGreaterThan(0.3);
+    expect(leftovers()).toEqual([]);
+  });
+
+  it("cancel stops it and leaves nothing behind", async () => {
+    const rec = await new LocalInput({ PATH: "", PI_SPEECH_AUDIO_NULL: "1" }).start();
+    await rec.cancel();
+    expect(leftovers()).toEqual([]);
   });
 });

@@ -5,15 +5,15 @@
  * A stop, a newer playback, or the caller's signal before the response has fully arrived cancels the request
  * and keeps nothing, whether or not the Stream plays. A response that breaks off stops the playback and throws
  * the provider's message. Once the response has fully arrived its audio is one clip for the history, whether or
- * not it still plays. Where the selected output cannot play a Stream, nothing plays here: the caller gets the
- * whole clip to play as a file.
+ * not it still plays. A service that sends its audio as one whole file at the end plays the same way, as one
+ * late chunk.
  */
 
 import type { PlayKind, PlayStart } from "./audio";
 import { ChunkBuffer, clipOf } from "./audio-stream";
 import { errorMessage } from "./env";
 import { type Player, REPLACED } from "./player";
-import type { AudioStream, StreamingProvider, SynthesisRequest, SynthesizedAudio } from "./provider";
+import type { AudioStream, SpeechProvider, SynthesisRequest, SynthesizedAudio } from "./provider";
 
 export type StreamPlay =
   /** The response fully arrived: `audio` is the whole clip; `started` says whether and where it plays. */
@@ -27,7 +27,7 @@ export type StreamPlay =
  * breaks off or holds no audio.
  */
 export async function streamAndPlay(
-  provider: StreamingProvider,
+  provider: SpeechProvider,
   req: SynthesisRequest,
   player: Player,
   kind: PlayKind,
@@ -73,7 +73,7 @@ export async function streamAndPlay(
         kept.end();
       }
     })();
-    started = await player.playStream({ format: stream.format, chunks: kept.read() }, kind, { ticket });
+    started = await player.playStream({ format: stream.format, chunks: kept.read() }, kind, { ticket, text: req.text });
     if (started.ok) {
       if (stopped) void started.stop().catch(() => {});
       void started.done.then((o) => {

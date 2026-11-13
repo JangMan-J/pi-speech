@@ -1,18 +1,20 @@
 /**
  * The player: a queue of length one over the selected route. A new playback replaces the one in progress
  * (whatever route it plays on), stop stops it, and its state drives the status indicator. Messages,
- * samples, read-aloud and replay all go through it.
+ * samples, read-aloud and replay all go through it, and every playback is a Stream (GLOSSARY.md): a saved
+ * message is replayed by feeding its file to the output as a Stream. The start of every Stream goes through
+ * the adaptive start buffer (start-buffer.ts), here, so it serves every output alike.
  *
  * A caller that must synthesize before it can play first takes a ticket; a later ticket or a stop makes
  * the earlier one stale, so audio that arrives late never plays over newer audio or after a stop.
- *
- * A reading (`read()`) is one playback made of several files played one after another, such as a long text
- * spoken in pieces: the player counts as playing from its first piece until it ends, and a newer claim,
- * playback or stop ends it at once.
  */
 
+import { readFile } from "node:fs/promises";
 import type { AudioOutput, Playback, PlayKind, PlayStart } from "./audio";
+import { streamFromBody } from "./audio-stream";
+import { errorMessage } from "./env";
 import type { AudioStream } from "./provider";
+import { bufferStart, estimateSeconds } from "./start-buffer";
 
 export interface PlayerEvents {
   /** The player started or stopped playing. */
@@ -24,12 +26,10 @@ export interface PlayerEvents {
 export interface PlayOptions {
   /** From `claim()`; the play is skipped when a newer ticket was taken or the player was stopped since. */
   ticket?: number;
-  /** Runs once the file is no longer needed: after playback, or when it does not start. */
+  /** Runs once the playback has ended, or when it does not start. */
   cleanup?: () => void;
-}
-
-interface InternalPlayOptions extends PlayOptions {
-  reading?: ReadingState;
+  /** The text the Stream speaks: its length sets how much audio the start buffer may hold. */
+  text?: string;
 }
 
 interface Current {
@@ -37,29 +37,20 @@ interface Current {
   kind: PlayKind;
 }
 
-/** What one play starts on the output: a file (kept for replay when it is a message) or a Stream. */
-type Source = { file: string } | { stream: AudioStream };
-
-/** One playback made of pieces played in order; see `Player.read()`. */
-export interface Reading {
-  /** Aborted when the reading ends: replaced, stopped, or ended by its owner. */
-  readonly signal: AbortSignal;
-  /** Whether the reading still owns the player. */
-  readonly current: boolean;
-  /** Play the next piece (after the one before it has finished); skipped when the reading is no longer current. */
-  play(file: string, cleanup?: () => void): Promise<PlayStart>;
-  /** The reading is over: the player is free once a piece still playing ends. */
-  end(): void;
-}
-
-interface ReadingState {
-  ticket: number;
-  controller: AbortController;
-  /** A piece has started: the player counts as playing until the reading ends. */
-  started: boolean;
-}
-
 export const REPLACED = "a newer playback or a stop replaced it";
+
+/** A saved message (WAV or MP3) as a Stream: the whole file in one chunk. */
+export async function streamOfFile(file: string): Promise<AudioStream> {
+  let bytes: Buffer;
+  try {
+    bytes = await readFile(file);
+  } catch (err) {
+    throw new Error(`cannot read ${file}: ${(err as NodeJS.ErrnoException).code ?? errorMessage(err)}`);
+  }
+  const type = /\.mp3$/i.test(file) ? "audio/mpeg" : "audio/wav";
+  const stream = await streamFromBody(new Response(new Uint8Array(bytes)).body, type, file);
+  return { ...stream, file };
+}
 
 export class Player {
   private current?: Current;
@@ -67,7 +58,6 @@ export class Player {
   /** Aborted when the newest ticket goes stale: a newer claim or a stop. */
   private claimed = new AbortController();
   private lastFile?: string;
-  private reading?: ReadingState;
 
   constructor(
     private readonly output: () => AudioOutput,
@@ -75,10 +65,10 @@ export class Player {
   ) {}
 
   get playing(): boolean {
-    return this.current !== undefined || this.reading?.started === true;
+    return this.current !== undefined;
   }
 
-  /** The file of the last message played (not samples), for replay. */
+  /** The file of the last message replayed (not samples). */
   get lastMessage(): string | undefined {
     return this.lastFile;
   }
@@ -88,15 +78,7 @@ export class Player {
     const ticket = ++this.tickets;
     this.claimed.abort();
     this.claimed = new AbortController();
-    this.endReading();
     return ticket;
-  }
-
-  /** Whether the selected output plays a Stream of 16-bit PCM now (the format every streaming provider can give), or why not. */
-  canStream(): { ok: true } | { ok: false; reason: string } {
-    const output = this.output();
-    if (!output.playStream) return { ok: false, reason: `${output.name} playback cannot play speech as it arrives` };
-    return output.canStream?.({ codec: "pcm", rate: 24000, channels: 1 }) ?? { ok: true };
   }
 
   /**
@@ -107,63 +89,35 @@ export class Player {
     return ticket === this.tickets ? this.claimed.signal : AbortSignal.abort();
   }
 
-  /** Start a reading: one playback of pieces played in order. It replaces a reading in progress. */
-  read(): Reading {
-    const state: ReadingState = { ticket: this.claim(), controller: new AbortController(), started: false };
-    this.reading = state;
-    const current = () => this.reading === state;
-    return {
-      signal: state.controller.signal,
-      get current() {
-        return current();
-      },
-      play: (file, cleanup) => this.start({ file }, "message", { ticket: state.ticket, cleanup, reading: state }),
-      end: () => {
-        if (this.reading === state) this.endReading();
-      },
-    };
-  }
-
+  /** Play a saved message (or any WAV or MP3 file), fed to the output as a Stream. */
   async play(file: string, kind: PlayKind, opts: PlayOptions = {}): Promise<PlayStart> {
-    return this.start({ file }, kind, opts);
+    let stream: AudioStream;
+    try {
+      stream = await streamOfFile(file);
+    } catch (err) {
+      opts.cleanup?.();
+      return { ok: false, reason: errorMessage(err) };
+    }
+    const started = await this.playStream(stream, kind, opts);
+    if (started.ok && kind === "message") this.lastFile = file;
+    return started;
   }
 
-  /**
-   * Play a Stream as its chunks arrive, under the same rules as a file. `{ ok: false, cannotStream: true }`
-   * when the selected output cannot play a Stream now; nothing of the Stream was read then.
-   */
+  /** Play a Stream as its chunks arrive, starting once the start buffer says enough has arrived. */
   async playStream(stream: AudioStream, kind: PlayKind, opts: PlayOptions = {}): Promise<PlayStart> {
-    return this.start({ stream }, kind, opts);
-  }
-
-  private stale(opts: InternalPlayOptions): boolean {
-    if (opts.reading) return this.reading !== opts.reading;
-    return opts.ticket !== undefined && opts.ticket !== this.tickets;
-  }
-
-  private async start(source: Source, kind: PlayKind, opts: InternalPlayOptions): Promise<PlayStart> {
     if (this.stale(opts)) {
       opts.cleanup?.();
       return { ok: false, reason: REPLACED };
     }
     const output = this.output();
-    if ("stream" in source) {
-      // Decided before anything stops: where a Stream cannot play, what plays now goes on until the clip is ready.
-      const can = output.playStream
-        ? (output.canStream?.(source.stream.format) ?? { ok: true as const })
-        : { ok: false as const, reason: `${output.name} playback cannot play speech as it arrives` };
-      if (!can.ok) {
-        opts.cleanup?.();
-        return { ok: false, reason: can.reason, cannotStream: true };
-      }
-    }
-    if (!opts.reading) this.endReading();
     const replacing = await this.stopCurrent(false);
+    const expected = opts.text === undefined ? undefined : estimateSeconds(opts.text);
+    const chunks = bufferStart(stream.chunks, stream.format, expected);
     let started: PlayStart;
     try {
-      started = "file" in source ? await output.play(source.file, kind) : await output.playStream!(source.stream, kind);
+      started = await output.playStream({ ...stream, chunks }, kind);
     } catch (err) {
-      started = { ok: false, reason: err instanceof Error ? err.message : String(err) };
+      started = { ok: false, reason: errorMessage(err) };
     }
     if (!started.ok) {
       if (replacing && !this.playing) this.events.onChange?.(false);
@@ -177,8 +131,6 @@ export class Player {
       if (replacing && !this.playing) this.events.onChange?.(false);
       return { ok: false, reason: REPLACED };
     }
-    if (opts.reading) opts.reading.started = true;
-    else if (kind === "message" && "file" in source) this.lastFile = source.file;
     const entry: Current = { playback: started, kind };
     // Another play may have started while this one was starting; the newest wins.
     await this.stopCurrent(false);
@@ -188,11 +140,15 @@ export class Player {
       opts.cleanup?.();
       if (this.current === entry) {
         this.current = undefined;
-        if (!this.playing) this.events.onChange?.(false);
+        this.events.onChange?.(false);
       }
       if (outcome.state === "failed") this.events.onFailed?.(outcome.error, kind);
     });
     return started;
+  }
+
+  private stale(opts: PlayOptions): boolean {
+    return opts.ticket !== undefined && opts.ticket !== this.tickets;
   }
 
   /** Stop what plays and cancel plays still being prepared. Resolves true when something was playing. */
@@ -204,15 +160,6 @@ export class Player {
       .stop()
       .catch(() => {});
     return was;
-  }
-
-  /** End the reading in progress, if any; announced when nothing plays any more. */
-  private endReading(): void {
-    const r = this.reading;
-    if (!r) return;
-    this.reading = undefined;
-    r.controller.abort();
-    if (r.started && !this.current) this.events.onChange?.(false);
   }
 
   /** Stop the current playback; `announce` false when a new one takes its place at once. */

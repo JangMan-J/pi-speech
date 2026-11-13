@@ -6,6 +6,7 @@ import { Player } from "../../src/engine/player";
 import type { AudioStream, StreamFormat, SynthesizedAudio } from "../../src/engine/provider";
 import { ReadingFailed } from "../../src/engine/reading";
 import { IN_FLIGHT, streamReading } from "../../src/engine/reading-stream";
+import { wrapPcmAsWav } from "../../src/engine/wav";
 import { fakeOutput, pcmBytes, until } from "./fixtures";
 
 const PCM: StreamFormat = { codec: "pcm", rate: 24000, channels: 1 };
@@ -22,7 +23,7 @@ interface HandPiece {
 }
 
 function harness(pieces: string[]) {
-  const out = fakeOutput("local", { streams: true });
+  const out = fakeOutput("local");
   const player = new Player(() => out);
   const asked: HandPiece[] = [];
   const saved: SynthesizedAudio[] = [];
@@ -205,30 +206,30 @@ describe("a Reading played as one Stream", () => {
     expect(err.reason).toMatch(/different audio format/);
   });
 
-  it("where the first piece cannot play as a Stream, nothing plays and the pieces asked for are handed over", async () => {
-    const h = harness(["one.", "two.", "three."]);
-    h.out.canStream = () => ({ ok: false, reason: "no player" });
+  it("pieces that come as WAV files of another encoding are joined once all have arrived and play as one chunk", async () => {
+    const h = harness(["one.", "two."]);
     await until(() => h.asked.length === 2);
-    h.asked[0].start();
-    h.asked[0].send(pcmBytes(4));
-    const r = await h.result;
-    if (r.state !== "files") throw new Error(`expected files, got ${r.state}`);
-    expect(r.reason).toBe("no player");
-    expect(h.out.plays).toHaveLength(0);
-    // No new piece is asked for, and the ones in flight are not cancelled.
-    await settle();
-    expect(h.asked).toHaveLength(2);
-    expect(h.asked.some((p) => p.aborted)).toBe(false);
-    const signal = new AbortController().signal;
-    expect(r.requested(2, signal)).toBeUndefined();
-    const first = r.requested(0, signal)!;
+    const floatWav = (n: number) => {
+      const w = Buffer.from(wrapPcmAsWav(new Uint8Array(n * 4), 24000, 1));
+      w.writeUInt16LE(3, 20); // IEEE float
+      w.writeUInt16LE(32, 34);
+      return w;
+    };
+    h.asked[0].start({ codec: "wav" });
+    h.asked[0].send(floatWav(10));
     h.asked[0].end();
-    expect(Array.from(Buffer.from((await first).audio).subarray(44))).toEqual(Array.from(pcmBytes(4)));
-    // A piece handed over is cancelled with the signal it is asked for with.
-    const stopper = new AbortController();
-    const second = r.requested(1, stopper.signal)!;
-    stopper.abort();
-    await expect(second).rejects.toThrow();
-    expect(h.asked[1].aborted).toBe(true);
+    await settle();
+    expect(h.out.streams[0]?.chunks ?? []).toHaveLength(0);
+    h.asked[1].start({ codec: "wav" });
+    h.asked[1].send(floatWav(5));
+    h.asked[1].end();
+    const r = await h.result;
+    expect(r.state).toBe("saved");
+    expect(h.out.streams).toHaveLength(1);
+    expect(h.out.streams[0].format).toEqual({ codec: "wav" });
+    expect(h.out.streams[0].chunks).toHaveLength(1);
+    const joined = Buffer.from(h.out.streams[0].chunks[0]);
+    expect(joined.readUInt32LE(40)).toBe(60);
+    expect(Buffer.from(h.saved[0].audio)).toEqual(joined);
   });
 });

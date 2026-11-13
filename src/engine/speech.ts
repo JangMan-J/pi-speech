@@ -5,8 +5,8 @@
  * Derived in part from pi-openrouter-multimodal (MIT).
  */
 
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { extname, isAbsolute, join, resolve } from "node:path";
 import { type VoiceLanguage, voiceLanguage, voiceSample } from "../voice-language/index";
 import type { PlayStart } from "./audio";
@@ -24,8 +24,8 @@ import {
 } from "./openrouter";
 import { READING_MIN_CHARS, splitForSpeech } from "./pieces";
 import { type Player, REPLACED } from "./player";
-import { type SpeechProvider, type SynthesisRequest, type SynthesizedAudio, streams } from "./provider";
-import { type ReadingResult, speakInPieces } from "./reading";
+import type { SpeechProvider, SynthesisRequest } from "./provider";
+import type { ReadingResult } from "./reading";
 import { streamReading } from "./reading-stream";
 import { DEFAULT_SETTINGS, type ModelSort, type Settings, type SettingsFile } from "./settings";
 import { streamAndPlay } from "./stream-play";
@@ -146,9 +146,6 @@ export class Speech {
   private loading: Promise<void> = Promise.resolve();
   private failedAt = 0;
   private lastSaved?: string[];
-  private samples = 0;
-  /** Reasons a Stream could not play, each told once per session. */
-  private readonly streamWarnings = new Set<string>();
   private readonly history: History;
   private readonly player: Player;
   private readonly store: SettingsFile;
@@ -679,22 +676,10 @@ export class Speech {
       return this.spoken(saved, model, voice, { ok: false, reason: "play was false" });
     }
     const ticket = this.player.claim();
-    let audio: SynthesizedAudio;
-    let started: PlayStart | undefined;
-    if (streams(provider)) {
-      const r = await streamAndPlay(provider, req, this.player, "message", ticket);
-      if (r.state === "stopped") return { files: [], model, voice, stopped: true, notPlayed: REPLACED };
-      audio = r.audio;
-      // Where a Stream cannot play, the clip plays as a file once saved.
-      if (r.started.ok || !r.started.cannotStream) started = r.started;
-      else this.warnStream(r.started.reason);
-    } else {
-      audio = await this.synthesize(text, model, voice, "auto", opts.signal);
-    }
-    const saved = await this.history.save(text, audio.audio, audio.format, async (file) => {
-      started ??= await this.player.play(file, "message", { ticket });
-    });
-    return this.spoken(saved, model, voice, started ?? { ok: false, reason: "playback did not start" });
+    const r = await streamAndPlay(provider, req, this.player, "message", ticket);
+    if (r.state === "stopped") return { files: [], model, voice, stopped: true, notPlayed: REPLACED };
+    const saved = await this.history.save(text, r.audio.audio, r.audio.format);
+    return this.spoken(saved, model, voice, r.started);
   }
 
   /** The result of a message saved in the history, played by `started` or not. */
@@ -707,8 +692,8 @@ export class Speech {
   }
 
   /**
-   * Playback-only speech (read-aloud, /speech <text>): a text longer than READING_MIN_CHARS is spoken in pieces
-   * that start playing after the first is synthesized, and saved as one message; a shorter one as `speak`.
+   * Playback-only speech (read-aloud, /speech <text>): a text longer than READING_MIN_CHARS is a Reading, spoken
+   * in pieces played as one Stream, and saved as one message; a shorter one as `speak`.
    * Stopped before every piece was synthesized, it saves nothing and is `stopped`. A failed request throws
    * ReadingFailed with the provider's message.
    */
@@ -718,36 +703,16 @@ export class Speech {
     const provider = this.provider(model);
     await provider.ensureCredential();
     const via = this.via("tts", model);
-    const pieces = splitForSpeech(text);
-    // Plain speech never names a language, as in `speak`.
-    const one = (piece: string, signal: AbortSignal) =>
-      provider.synthesize({ text: piece, model, voice, language: "auto", signal, via });
-    let asFiles: (piece: string, signal: AbortSignal, i: number) => Promise<SynthesizedAudio> = one;
-    const can = this.player.canStream();
-    if (streams(provider) && can.ok) {
-      const s = await streamReading({
-        pieces,
-        synthesize: (piece, signal) =>
-          provider.synthesizeStream({ text: piece, model, voice, language: "auto", signal, via }),
-        player: this.player,
-        save: (audio) => this.history.save(text, audio.audio, audio.format),
-        who: provider.name,
-        signal: opts.signal,
-      });
-      if (s.state !== "files") return this.readingResult(s, model, voice);
-      // It cannot play as a Stream after all: read in pieces as files, taking the pieces already asked for.
-      this.warnStream(s.reason);
-      asFiles = (piece, signal, i) => s.requested(i, signal) ?? one(piece, signal);
-    } else if (streams(provider) && !can.ok) {
-      this.warnStream(can.reason);
-    }
-    const r = await speakInPieces({
-      pieces,
-      synthesize: asFiles,
+    const r = await streamReading({
+      pieces: splitForSpeech(text),
+      // Plain speech never names a language, as in `speak`.
+      synthesize: (piece, signal) =>
+        provider.synthesizeStream({ text: piece, model, voice, language: "auto", signal, via }),
       player: this.player,
       save: (audio) => this.history.save(text, audio.audio, audio.format),
-      tmpRoot: tmpdir(),
+      who: provider.name,
       signal: opts.signal,
+      text,
     });
     return this.readingResult(r, model, voice);
   }
@@ -791,28 +756,10 @@ export class Speech {
     };
   }
 
-  /** Play a sample: as a Stream where the provider and the output can, else as a file once it has arrived. */
+  /** Play a sample as a Stream; nothing of it is kept. */
   private async playSample(provider: SpeechProvider, ticket: number, req: SynthesisRequest): Promise<PlayStart> {
-    let audio: SynthesizedAudio;
-    if (streams(provider)) {
-      const r = await streamAndPlay(provider, req, this.player, "sample", ticket);
-      if (r.state === "stopped") return { ok: false, reason: REPLACED };
-      if (r.started.ok || !r.started.cannotStream) return r.started;
-      this.warnStream(r.started.reason);
-      audio = r.audio;
-    } else {
-      audio = await this.synthesize(req.text, req.model, req.voice, req.language, req.signal);
-    }
-    const file = join(tmpdir(), `pi-speech-sample-${process.pid}-${++this.samples}.${audio.format}`);
-    writeFileSync(file, audio.audio);
-    return this.player.play(file, "sample", { ticket, cleanup: () => rmSync(file, { force: true }) });
-  }
-
-  /** Tell once per session why speech plays only once it has fully arrived. */
-  private warnStream(reason: string): void {
-    if (this.streamWarnings.has(reason)) return;
-    this.streamWarnings.add(reason);
-    this.onWarning(`Speech plays once it has fully arrived: ${reason}`);
+    const r = await streamAndPlay(provider, req, this.player, "sample", ticket);
+    return r.state === "stopped" ? { ok: false, reason: REPLACED } : r.started;
   }
 
   /** The spoken messages of the history, the newest first. */

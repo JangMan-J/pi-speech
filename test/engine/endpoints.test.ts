@@ -49,7 +49,7 @@ interface ServerOptions {
   mp3Only?: boolean;
   /** Answer speech with raw PCM (`audio/pcm;rate=24000`) instead of WAV. */
   pcm?: boolean;
-  /** Send the first part of each speech answer, then wait for `release()` before the rest. */
+  /** Send the first half second of each speech answer, then wait for `release()` before the rest. */
   hold?: boolean;
 }
 
@@ -112,9 +112,9 @@ async function serve(opts: ServerOptions = {}) {
           : [streamedWav(1), "application/octet-stream"];
       if (!opts.hold) return send(200, audio, audioType);
       res.writeHead(200, { "content-type": audioType });
-      res.write(audio.subarray(0, 2048));
+      res.write(audio.subarray(0, 24000)); // half a second: enough for the start buffer to play "Hi."
       await released;
-      return res.end(audio.subarray(2048));
+      return res.end(audio.subarray(24000));
     }
     if (entry.path === "/v1/audio/transcriptions") return send(200, { text: " heard through the endpoint " });
     if (entry.path === "/v1/chat/completions" && entry.json.stream) {
@@ -224,7 +224,7 @@ describe("a user-defined endpoint", () => {
     const { engine, local } = makeEngine();
     await engine.speech.setEndpoint("local", url);
     await engine.speech.set("tts-model", "local:kokoro");
-    const spoken = engine.speech.speak("Hello there.");
+    const spoken = engine.speech.speak("Hi.");
     await until(() => local.streams[0]?.chunks.length > 0);
     expect(local.streams[0].format).toEqual({ codec: "pcm", rate: 24000, channels: 1 });
     expect(local.streams[0].ended).toBe(false);
@@ -240,28 +240,22 @@ describe("a user-defined endpoint", () => {
     const { engine, local } = makeEngine();
     await engine.speech.setEndpoint("local", url);
     await engine.speech.set("tts-model", "local:kokoro");
-    const spoken = engine.speech.speak("Hello there.");
+    const spoken = engine.speech.speak("Hi.");
     await until(() => local.streams[0]?.chunks.length > 0);
     expect(local.streams[0].format).toEqual({ codec: "pcm", rate: 24000, channels: 1 });
     release();
     expect(wavSeconds(readFileSync((await spoken).files[0]))).toBe(1);
   });
 
-  it("plays MP3 as a Stream, and without a player for an MP3 Stream plays the clip once it has arrived", async () => {
+  it("plays MP3 as a Stream and saves it as MP3", async () => {
     const { url } = await serve({ mp3Only: true });
     const { engine, local, notes } = makeEngine();
     await engine.speech.setEndpoint("local", url);
     await engine.speech.set("tts-model", "local:kokoro");
-    await engine.speech.speak("Hi.");
-    expect(local.plays.map((p) => p.stream?.format)).toEqual([{ codec: "mp3" }]);
-    local.canStream = (f) =>
-      f.codec === "mp3"
-        ? { ok: false, reason: "no player for MP3 speech as it arrives (install one of ffplay)" }
-        : { ok: true };
-    const r = await engine.speech.speak("Hi again.");
-    expect(local.plays.at(-1)?.file).toBe(r.files[0]);
+    const r = await engine.speech.speak("Hi.");
+    expect(local.plays.map((p) => p.stream.format)).toEqual([{ codec: "mp3" }]);
     expect(r.files[0]).toMatch(/\.mp3$/);
-    expect(notes.filter((n) => /plays once it has fully arrived: no player for MP3/.test(n.message))).toHaveLength(1);
+    expect(notes).toEqual([]);
   });
 
   it("transcribes through POST /audio/transcriptions as multipart file + model + language", async () => {

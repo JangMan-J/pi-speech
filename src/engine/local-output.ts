@@ -1,26 +1,19 @@
 /**
- * Playback on the Pi host. Files: `PI_SPEECH_PLAYER`, when set, names an executable run as
- * `<player> <audio file>`; otherwise the first available of mpv, ffplay, paplay, pw-play, mpg123.
- * A Stream, fed on stdin as it arrives: `PI_SPEECH_STREAM_PLAYER`, when set, names an executable run as
- * `<player> s16le <rate> <channels>` for raw PCM and `<player> mp3` or `<player> wav` for those files;
- * otherwise for PCM the first available of pacat, pw-cat, ffplay, mpv, aplay, and for MP3 or WAV of ffplay,
- * mpv, mpg123 (MP3 only). A `PI_SPEECH_PLAYER` without `PI_SPEECH_STREAM_PLAYER` is kept to: a Stream then
- * cannot play here.
+ * Playback on this machine. Every playback is a Stream (GLOSSARY.md), fed to one player process on its stdin as
+ * it arrives. The player is, in order:
+ *   1. `PI_SPEECH_STREAM_PLAYER`, when set: an executable run as `<player> s16le <rate> <channels>` for raw PCM
+ *      and `<player> mp3` or `<player> wav` for those files.
+ *   2. The bundled binary (binary.ts), run as `pi-speech-receiver play` with the same arguments.
+ *   3. Without the bundled binary: for PCM the first available of pacat, pw-cat, ffplay, mpv, aplay, and for MP3
+ *      or WAV of ffplay, mpv, mpg123 (MP3 only).
  * Playback never blocks. Derived from pi-openrouter-multimodal (MIT).
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
 import type { AudioOutput, PlayKind, PlayOutcome, PlayStart } from "./audio";
+import { type BinaryChoice, findBinary } from "./binary";
 import { childEnv, type Env, errorMessage, findExecutable } from "./env";
 import type { AudioStream, PcmFormat, StreamFormat } from "./provider";
-
-const PLAYERS: ReadonlyArray<readonly [string, (file: string) => string[]]> = [
-  ["mpv", (f) => ["--no-video", "--really-quiet", f]],
-  ["ffplay", (f) => ["-nodisp", "-autoexit", "-loglevel", "quiet", f]],
-  ["paplay", (f) => [f]],
-  ["pw-play", (f) => [f]],
-  ["mpg123", (f) => ["-q", f]],
-];
 
 /** Players of raw signed 16-bit little-endian PCM on stdin; each exits once its input has ended and played. */
 const STREAM_PLAYERS: ReadonlyArray<readonly [string, (f: PcmFormat) => string[]]> = [
@@ -53,51 +46,33 @@ const FILE_STREAM_PLAYERS: ReadonlyArray<readonly [string, ReadonlyArray<string>
   ["mpg123", ["mp3"], ["-q", "-"]],
 ];
 
-export type PlayerChoice =
-  | { ok: true; name: string; bin: string; args: (file: string) => string[] }
-  | { ok: false; reason: string };
-
 export type StreamPlayerChoice =
   | { ok: true; name: string; bin: string; args: string[] }
   | { ok: false; reason: string };
 
-export function choosePlayer(env: Env): PlayerChoice {
-  const custom = env.PI_SPEECH_PLAYER;
-  if (custom) {
-    const bin = findExecutable(custom, env);
-    if (!bin) return { ok: false, reason: `PI_SPEECH_PLAYER (${custom}) is not an executable` };
-    return { ok: true, name: custom, bin, args: (f) => [f] };
-  }
-  for (const [name, args] of PLAYERS) {
-    const bin = findExecutable(name, env);
-    if (bin) return { ok: true, name, bin, args };
-  }
-  const names = PLAYERS.map(([n]) => n).join(", ");
-  return { ok: false, reason: `no audio player found (set PI_SPEECH_PLAYER or install one of ${names})` };
-}
-
 /** The player of a Stream in `format`, or why there is none. */
-export function chooseStreamPlayer(env: Env, format: StreamFormat): StreamPlayerChoice {
+export function chooseStreamPlayer(
+  env: Env,
+  format: StreamFormat,
+  binary: () => BinaryChoice = () => findBinary(env),
+): StreamPlayerChoice {
+  const args = format.codec === "pcm" ? ["s16le", `${format.rate}`, `${format.channels}`] : [format.codec];
   const custom = env.PI_SPEECH_STREAM_PLAYER;
   if (custom) {
     const bin = findExecutable(custom, env);
     if (!bin) return { ok: false, reason: `PI_SPEECH_STREAM_PLAYER (${custom}) is not an executable` };
-    const args = format.codec === "pcm" ? ["s16le", `${format.rate}`, `${format.channels}`] : [format.codec];
     return { ok: true, name: custom, bin, args };
   }
-  if (env.PI_SPEECH_PLAYER) {
-    return {
-      ok: false,
-      reason: "PI_SPEECH_PLAYER plays files only; set PI_SPEECH_STREAM_PLAYER to play speech as it arrives",
-    };
-  }
+  const bundled = binary();
+  if (bundled.ok) return { ok: true, name: "pi-speech-receiver", bin: bundled.path, args: ["play", ...args] };
+  if (bundled.chosen) return { ok: false, reason: bundled.reason };
   if (format.codec === "pcm") {
     for (const [name, args] of STREAM_PLAYERS) {
       const bin = findExecutable(name, env);
       if (bin) return { ok: true, name, bin, args: args(format) };
     }
     const names = STREAM_PLAYERS.map(([n]) => n).join(", ");
-    return { ok: false, reason: `no player for speech as it arrives (install one of ${names})` };
+    return { ok: false, reason: `no audio player found: ${bundled.reason}, and none of ${names} is installed` };
   }
   const players = FILE_STREAM_PLAYERS.filter(([, formats]) => formats.includes(format.codec));
   for (const [name, , args] of players) {
@@ -107,7 +82,7 @@ export function chooseStreamPlayer(env: Env, format: StreamFormat): StreamPlayer
   const names = players.map(([n]) => n).join(", ");
   return {
     ok: false,
-    reason: `no player for ${format.codec.toUpperCase()} speech as it arrives (install one of ${names})`,
+    reason: `no player for ${format.codec.toUpperCase()} audio found: ${bundled.reason}, and none of ${names} is installed`,
   };
 }
 
@@ -126,28 +101,25 @@ function kill(c: ChildProcess): void {
   }
 }
 
-/** Plays on the Pi host, each file or Stream in its own player process. */
+export interface LocalOutputOptions {
+  /** Where the bundled binary is; replaceable for tests. */
+  binary?: () => BinaryChoice;
+}
+
+/** Plays on this machine, each Stream in its own player process. */
 export class LocalOutput implements AudioOutput {
   readonly name = "local";
   private readonly playing = new Map<ChildProcess, PlayKind>();
   private readonly stopped = new WeakSet<ChildProcess>();
 
-  constructor(private readonly env: Env) {}
-
-  async play(file: string, kind: PlayKind): Promise<PlayStart> {
-    const choice = choosePlayer(this.env);
-    if (!choice.ok) return choice;
-    return this.launch(choice.name, choice.bin, choice.args(file), kind);
-  }
-
-  canStream(format: StreamFormat): { ok: true } | { ok: false; reason: string } {
-    const choice = chooseStreamPlayer(this.env, format);
-    return choice.ok ? { ok: true } : choice;
-  }
+  constructor(
+    private readonly env: Env,
+    private readonly opts: LocalOutputOptions = {},
+  ) {}
 
   async playStream(stream: AudioStream, kind: PlayKind): Promise<PlayStart> {
-    const choice = chooseStreamPlayer(this.env, stream.format);
-    if (!choice.ok) return { ...choice, cannotStream: true };
+    const choice = chooseStreamPlayer(this.env, stream.format, this.opts.binary);
+    if (!choice.ok) return choice;
     return this.launch(choice.name, choice.bin, choice.args, kind, stream.chunks);
   }
 
@@ -159,13 +131,13 @@ export class LocalOutput implements AudioOutput {
     }
   }
 
-  /** Start `bin` with `args`; with `input`, its chunks are written to the player's stdin as they arrive. */
+  /** Start `bin` with `args`; the chunks of `input` are written to the player's stdin as they arrive. */
   private launch(
     name: string,
     bin: string,
     args: string[],
     kind: PlayKind,
-    input?: AsyncIterable<Uint8Array>,
+    input: AsyncIterable<Uint8Array>,
   ): PlayStart {
     let child: ChildProcess;
     try {
@@ -174,7 +146,7 @@ export class LocalOutput implements AudioOutput {
         // open a console window instead.
         detached: process.platform !== "win32",
         windowsHide: true,
-        stdio: [input ? "pipe" : "ignore", "ignore", "ignore"],
+        stdio: ["pipe", "ignore", "ignore"],
         env: childEnv(this.env),
       });
     } catch (err) {
@@ -199,7 +171,7 @@ export class LocalOutput implements AudioOutput {
         else finish({ state: "failed", error: `${name} exited with ${code ?? signal}` });
       });
     });
-    if (input && child.stdin) void this.feed(child, input, () => exited || this.stopped.has(child));
+    if (child.stdin) void this.feed(child, input, () => exited || this.stopped.has(child));
     return {
       ok: true,
       player: name,

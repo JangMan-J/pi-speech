@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -49,16 +49,37 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-const file = (name: string, bytes = "RIFFxxxxWAVEdata") => {
-  const p = join(dir, name);
-  writeFileSync(p, bytes);
-  return p;
+/** A short Stream that has fully arrived. */
+const clip = (bytes = "abcd") => ({
+  format: { codec: "pcm" as const, rate: 24000, channels: 1 },
+  chunks: (async function* () {
+    yield Buffer.from(bytes);
+  })(),
+});
+
+const HEALTH = {
+  protocol: 1,
+  name: "pi-speech-receiver",
+  version: "0.4.0",
+  capabilities: ["play", "record", "stream"],
 };
+
+/**
+ * A receiver that starts every Stream as `ids()`, takes its audio, and answers status polls, cancels and stops
+ * with `rest`.
+ */
+const receiver =
+  (rest: (r: Seen, res: ServerResponse) => void, ids: () => string = () => "p1") =>
+  (r: Seen, res: ServerResponse) => {
+    if (r.url === "/v1/health") return send(res, 200, HEALTH);
+    if (r.method === "POST" && r.url === "/v1/play/stream") return send(res, 202, { id: ids() });
+    if (r.method === "POST" && r.url.endsWith("/audio")) return send(res, 200, { state: "playing" });
+    rest(r, res);
+  };
 
 describe("health", () => {
   it("returns the version and sends the token only in Authorization", async () => {
-    handler = (_r, res) =>
-      send(res, 200, { protocol: 1, name: "pi-speech-receiver", version: "1.2.3", capabilities: ["play"] });
+    handler = (_r, res) => send(res, 200, { ...HEALTH, version: "1.2.3" });
     const h = await createBridgeAudio({ url, token: TOKEN }).health();
     expect(h).toEqual({ ok: true, version: "1.2.3" });
     expect(seen[0].headers.authorization).toBe(`Bearer ${TOKEN}`);
@@ -86,6 +107,12 @@ describe("health", () => {
     if (!h.ok) expect(h.reason).toMatch(/401.*unauthorized/);
   });
 
+  it("a receiver without the stream capability is an error that says to update it", async () => {
+    handler = (_r, res) => send(res, 200, { ...HEALTH, capabilities: ["play", "record"] });
+    const h = await createBridgeAudio({ url, token: TOKEN }).health();
+    expect(h).toMatchObject({ ok: false, reason: expect.stringMatching(/update pi-speech-receiver/) });
+  });
+
   it("rejects something that is not a pi-speech-receiver", async () => {
     handler = (_r, res) => send(res, 200, { hello: 1 });
     expect((await createBridgeAudio({ url, token: TOKEN }).health()).ok).toBe(false);
@@ -104,7 +131,7 @@ describe("URL policy", () => {
     const b = createBridgeAudio({ url: bad, token: TOKEN });
     const h = await b.health();
     expect(h.ok).toBe(false);
-    const p = await b.output.play(file("a.wav"), "message");
+    const p = await b.output.playStream(clip(), "message");
     expect(p.ok).toBe(false);
     await expect(b.input.start()).rejects.toThrow();
     await expect(b.output.stop()).rejects.toThrow();
@@ -139,68 +166,66 @@ describe("URL policy", () => {
   });
 });
 
-describe("play", () => {
-  it("uploads wav with its kind and follows to completion", async () => {
+describe("playing a Stream", () => {
+  it("starts it with its format and kind, sends its audio, and follows it to completion", async () => {
     let polls = 0;
-    handler = (r, res) => {
-      if (r.method === "POST" && r.url === "/v1/play") return send(res, 202, { id: "p1" });
+    handler = receiver((_r, res) => {
       polls++;
       send(res, 200, { id: "p1", state: polls < 2 ? "playing" : "completed" });
-    };
-    const f = file("a.wav", "RIFF0000WAVEabc");
-    const p = await createBridgeAudio({ url, token: TOKEN }).output.play(f, "sample");
+    });
+    const p = await createBridgeAudio({ url, token: TOKEN }).output.playStream(clip("RIFF0000WAVEabc"), "sample");
     expect(p).toMatchObject({ ok: true, player: "pi-speech-receiver" });
     if (p.ok) expect(await p.done).toEqual({ state: "completed" });
-    expect(seen[0].headers["content-type"]).toBe("audio/wav");
-    expect(seen[0].headers["x-pi-speech-kind"]).toBe("sample");
-    expect(seen[0].headers.authorization).toBe(`Bearer ${TOKEN}`);
-    expect(seen[0].body.toString()).toBe("RIFF0000WAVEabc");
-    expect(seen[1].url).toMatch(/^\/v1\/play\/p1\?wait=\d+$/);
+    const start = seen.find((s) => s.url === "/v1/play/stream");
+    expect(start?.headers["x-pi-speech-kind"]).toBe("sample");
+    expect(start?.headers.authorization).toBe(`Bearer ${TOKEN}`);
+    expect(JSON.parse(start?.body.toString() ?? "")).toEqual({ format: "pcm", rate: 24000, channels: 1 });
+    expect(seen.find((s) => s.url === "/v1/play/p1/audio")?.body.toString()).toBe("RIFF0000WAVEabc");
+    expect(seen.some((s) => /^\/v1\/play\/p1\?wait=\d+$/.test(s.url))).toBe(true);
+    expect(seen.some((s) => s.url === "/v1/play")).toBe(false);
     expect(polls).toBe(2);
   });
 
-  it("sends mp3 as audio/mpeg", async () => {
-    handler = (_r, res) => send(res, 202, { id: "p1" });
-    await createBridgeAudio({ url, token: TOKEN }).output.play(file("a.mp3", "ID3"), "message");
-    expect(seen[0].headers["content-type"]).toBe("audio/mpeg");
-    expect(seen[0].headers["x-pi-speech-kind"]).toBe("message");
+  it("an MP3 Stream is started as mp3", async () => {
+    handler = receiver(() => {});
+    const out = createBridgeAudio({ url, token: TOKEN }).output;
+    await out.playStream({ format: { codec: "mp3" }, chunks: clip().chunks }, "message");
+    expect(JSON.parse(seen.find((s) => s.url === "/v1/play/stream")?.body.toString() ?? "")).toEqual({
+      format: "mp3",
+    });
   });
 
-  it("does not play other file types", async () => {
-    const p = await createBridgeAudio({ url, token: TOKEN }).output.play(file("a.ogg"), "message");
-    expect(p.ok).toBe(false);
-    expect(seen).toHaveLength(0);
-  });
-
-  it("returns the receiver's message when it cannot start", async () => {
-    handler = (_r, res) => send(res, 503, { error: "no audio player found" });
-    const p = await createBridgeAudio({ url, token: TOKEN }).output.play(file("a.wav"), "message");
-    expect(p).toMatchObject({ ok: false, reason: expect.stringMatching(/503.*no audio player found/) });
+  it("returns the receiver's message when it cannot start; nothing of the Stream is read", async () => {
+    handler = (r, res) =>
+      r.url === "/v1/health" ? send(res, 200, HEALTH) : send(res, 503, { error: "no audio device" });
+    let reads = 0;
+    const stream = {
+      format: { codec: "pcm" as const, rate: 24000, channels: 1 },
+      chunks: (async function* () {
+        reads++;
+        yield new Uint8Array(4);
+      })(),
+    };
+    const p = await createBridgeAudio({ url, token: TOKEN }).output.playStream(stream, "message");
+    expect(p).toMatchObject({ ok: false, reason: expect.stringMatching(/503.*no audio device/) });
+    expect(reads).toBe(0);
   });
 
   it("returns a reason when the receiver is not reachable", async () => {
-    const p = await createBridgeAudio({ url: "http://127.0.0.1:1", token: TOKEN }).output.play(
-      file("a.wav"),
-      "message",
-    );
+    const p = await createBridgeAudio({ url: "http://127.0.0.1:1", token: TOKEN }).output.playStream(clip(), "message");
     expect(p).toMatchObject({ ok: false, reason: expect.stringMatching(/not reachable at http:\/\/127\.0\.0\.1:1/) });
   });
 
   it("ends as failed with the receiver's error", async () => {
-    handler = (r, res) =>
-      r.method === "POST"
-        ? send(res, 202, { id: "p1" })
-        : send(res, 200, { state: "failed", error: "player exited 1" });
-    const p = await createBridgeAudio({ url, token: TOKEN }).output.play(file("a.wav"), "message");
-    if (p.ok) expect(await p.done).toEqual({ state: "failed", error: "player exited 1" });
+    handler = receiver((_r, res) => send(res, 200, { state: "failed", error: "player exited 1" }));
+    const p = await createBridgeAudio({ url, token: TOKEN }).output.playStream(clip(), "message");
+    if (!p.ok) throw new Error(p.reason);
+    expect(await p.done).toEqual({ state: "failed", error: "player exited 1" });
   });
 
   it("ends as failed when contact is lost", async () => {
-    handler = (r, res) => {
-      if (r.method === "POST") return send(res, 202, { id: "p1" });
-      res.socket?.destroy();
-    };
-    const p = await createBridgeAudio({ url, token: TOKEN }).output.play(file("a.wav"), "message");
+    handler = receiver((_r, res) => res.socket?.destroy());
+    const p = await createBridgeAudio({ url, token: TOKEN }).output.playStream(clip(), "message");
     expect(p.ok).toBe(true);
     if (p.ok) {
       const o = await p.done;
@@ -211,15 +236,17 @@ describe("play", () => {
 
   it("stop() cancels that playback", async () => {
     let cancelled = false;
-    handler = (r, res) => {
-      if (r.url === "/v1/play") return send(res, 202, { id: "p9" });
-      if (r.url === "/v1/play/p9/cancel") {
-        cancelled = true;
-        return send(res, 200, { id: "p9", state: "cancelled" });
-      }
-      setTimeout(() => send(res, 200, { state: cancelled ? "cancelled" : "playing" }), 20);
-    };
-    const p = await createBridgeAudio({ url, token: TOKEN }).output.play(file("a.wav"), "message");
+    handler = receiver(
+      (r, res) => {
+        if (r.url === "/v1/play/p9/cancel") {
+          cancelled = true;
+          return send(res, 200, { id: "p9", state: "cancelled" });
+        }
+        setTimeout(() => send(res, 200, { state: cancelled ? "cancelled" : "playing" }), 20);
+      },
+      () => "p9",
+    );
+    const p = await createBridgeAudio({ url, token: TOKEN }).output.playStream(clip(), "message");
     if (!p.ok) throw new Error("not started");
     await p.stop();
     expect(await p.done).toEqual({ state: "cancelled" });
@@ -228,15 +255,17 @@ describe("play", () => {
 
   it("output.stop() posts /v1/stop; stop(kind) cancels only that kind", async () => {
     let n = 0;
-    handler = (r, res) => {
-      if (r.url === "/v1/play") return send(res, 202, { id: `p${++n}` });
-      if (r.url === "/v1/stop") return send(res, 200, { stopped: 1 });
-      if (r.method === "POST") return send(res, 200, { state: "cancelled" });
-      // polls stay open
-    };
+    handler = receiver(
+      (r, res) => {
+        if (r.url === "/v1/stop") return send(res, 200, { stopped: 1 });
+        if (r.method === "POST") return send(res, 200, { state: "cancelled" });
+        // polls stay open
+      },
+      () => `p${++n}`,
+    );
     const b = createBridgeAudio({ url, token: TOKEN });
-    await b.output.play(file("m.wav"), "message");
-    await b.output.play(file("s.wav"), "sample");
+    await b.output.playStream(clip(), "message");
+    await b.output.playStream(clip(), "sample");
     await b.output.stop("sample");
     const cancels = seen.filter((s) => s.url.endsWith("/cancel")).map((s) => s.url);
     expect(cancels).toEqual(["/v1/play/p2/cancel"]);
@@ -248,14 +277,16 @@ describe("play", () => {
 describe("review fixes", () => {
   it("stop(kind) cancels the others and does not throw when one cancel fails", async () => {
     let n = 0;
-    handler = (r, res) => {
-      if (r.url === "/v1/play") return send(res, 202, { id: `p${++n}` });
-      if (r.url === "/v1/play/p1/cancel") return send(res, 404, { error: "unknown id" });
-      if (r.method === "POST") return send(res, 200, { state: "cancelled" });
-    };
+    handler = receiver(
+      (r, res) => {
+        if (r.url === "/v1/play/p1/cancel") return send(res, 404, { error: "unknown id" });
+        if (r.method === "POST") return send(res, 200, { state: "cancelled" });
+      },
+      () => `p${++n}`,
+    );
     const b = createBridgeAudio({ url, token: TOKEN });
-    await b.output.play(file("a.wav"), "sample");
-    await b.output.play(file("b.wav"), "sample");
+    await b.output.playStream(clip(), "sample");
+    await b.output.playStream(clip(), "sample");
     await expect(b.output.stop("sample")).resolves.toBeUndefined();
     expect(seen.filter((s) => s.url.endsWith("/cancel")).map((s) => s.url)).toEqual([
       "/v1/play/p1/cancel",
@@ -269,7 +300,7 @@ describe("review fixes", () => {
   it("refuses a token shorter than 32 characters with a readable error", async () => {
     const b = createBridgeAudio({ url, token: "short-token" });
     expect(await b.health()).toMatchObject({ ok: false, reason: expect.stringMatching(/at least 32 characters/) });
-    expect(await b.output.play(file("a.wav"), "message")).toMatchObject({ ok: false });
+    expect(await b.output.playStream(clip(), "message")).toMatchObject({ ok: false });
     expect(seen).toHaveLength(0);
   });
 });
@@ -447,7 +478,7 @@ describe("a Stream", () => {
     const rx = await streamReceiver();
     const out = createBridgeAudio({ url: rx.at, token: TOKEN }).output;
     const h = hand();
-    const r = await out.playStream!(h.stream, "sample");
+    const r = await out.playStream(h.stream, "sample");
     if (!r.ok) throw new Error(r.reason);
     expect(r.player).toBe("pi-speech-receiver");
     const start = rx.asked.find((a) => a.url === "/v1/play/stream");
@@ -463,35 +494,34 @@ describe("a Stream", () => {
     await rx.close();
   });
 
-  it("an older receiver without the stream capability cannot play it; nothing of the Stream is read", async () => {
+  it("an older receiver without the stream capability is an error that says to update it, not a fallback", async () => {
     const rx = await streamReceiver({ capabilities: ["play", "record"] });
     const out = createBridgeAudio({ url: rx.at, token: TOKEN }).output;
     const h = hand();
-    const r = await out.playStream!(h.stream, "message");
-    expect(r.ok).toBe(false);
-    expect(!r.ok && r.cannotStream).toBe(true);
-    expect(!r.ok && r.reason).toMatch(/update pi-speech-receiver/);
+    const r = await out.playStream(h.stream, "message");
+    expect(r).toMatchObject({ ok: false, reason: expect.stringMatching(/Remote machine .*update pi-speech-receiver/) });
     expect(h.reads.n).toBe(0);
-    expect(out.canStream!({ codec: "pcm", rate: 24000, channels: 1 }).ok).toBe(false);
+    expect(rx.asked.map((a) => a.url)).toEqual(["/v1/health"]);
+    // Asked again next time: it may have been updated since.
+    await out.playStream(hand().stream, "message");
+    expect(rx.asked.map((a) => a.url)).toEqual(["/v1/health", "/v1/health"]);
     await rx.close();
   });
 
-  it("a receiver with no player for a Stream (503) cannot play it, with the receiver's reason", async () => {
+  it("a receiver that cannot start the player (503) fails with its reason; nothing is sent as a file", async () => {
     const rx = await streamReceiver({ streamStatus: 503 });
     const out = createBridgeAudio({ url: rx.at, token: TOKEN }).output;
-    const r = await out.playStream!(hand().stream, "message");
-    expect(!r.ok && r.cannotStream).toBe(true);
-    expect(!r.ok && r.reason).toMatch(/install pacat/);
+    const r = await out.playStream(hand().stream, "message");
+    expect(r).toMatchObject({ ok: false, reason: expect.stringMatching(/503.*install pacat/) });
+    expect(rx.asked.some((a) => a.url === "/v1/play")).toBe(false);
     await rx.close();
   });
 
-  it("a format the receiver refuses (400) cannot play as a Stream; it is not asked again for a while", async () => {
+  it("a format the receiver refuses (400) fails with its reason", async () => {
     const rx = await streamReceiver({ streamStatus: 400 });
     const out = createBridgeAudio({ url: rx.at, token: TOKEN }).output;
-    const r = await out.playStream!(hand().stream, "message");
-    expect(!r.ok && r.cannotStream).toBe(true);
-    expect(out.canStream!({ codec: "pcm", rate: 24000, channels: 1 }).ok).toBe(false);
-    expect(out.canStream!({ codec: "mp3" }).ok).toBe(true);
+    const r = await out.playStream(hand().stream, "message");
+    expect(r).toMatchObject({ ok: false, reason: expect.stringMatching(/400.*rate must be/) });
     await rx.close();
   });
 
@@ -499,7 +529,7 @@ describe("a Stream", () => {
     const rx = await streamReceiver();
     const out = createBridgeAudio({ url: rx.at, token: TOKEN }).output;
     const h = hand();
-    const r = await out.playStream!(h.stream, "message");
+    const r = await out.playStream(h.stream, "message");
     if (!r.ok) throw new Error(r.reason);
     h.send(Buffer.alloc(100));
     await until(() => rx.bytes() === 100);

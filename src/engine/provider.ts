@@ -32,6 +32,8 @@ export type StreamFormat = PcmFormat | { codec: "mp3" } | { codec: "wav" };
 export interface AudioStream {
   format: StreamFormat;
   chunks: AsyncIterable<Uint8Array>;
+  /** The saved message this Stream reads, when it is a replay. */
+  file?: string;
 }
 
 /**
@@ -71,18 +73,11 @@ export interface SpeechProvider {
   /** Throws a readable error on failure. */
   synthesize(req: SynthesisRequest): Promise<SynthesizedAudio>;
   /**
-   * Optional: synthesize as a Stream. Resolves once the response has started; a failed request throws a
-   * readable error before any audio, a response that breaks off throws while its chunks are read.
+   * Synthesize as a Stream. Resolves once the response has started; a failed request throws a readable error
+   * before any audio, a response that breaks off throws while its chunks are read. A service that sends its
+   * audio as one whole file at the end gives a Stream of one late chunk.
    */
-  synthesizeStream?(req: SynthesisRequest): Promise<AudioStream>;
+  synthesizeStream(req: SynthesisRequest): Promise<AudioStream>;
   /** Throws a readable error on failure. */
   transcribe(req: TranscriptionRequest): Promise<string>;
-}
-
-/** A speech provider that can synthesize as a Stream. */
-export type StreamingProvider = SpeechProvider & Required<Pick<SpeechProvider, "synthesizeStream">>;
-
-/** Whether `provider` can synthesize as a Stream. */
-export function streams(provider: SpeechProvider): provider is StreamingProvider {
-  return typeof provider.synthesizeStream === "function";
 }
