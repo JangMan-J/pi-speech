@@ -204,10 +204,13 @@ export function wavFixture(samples = 1600): Buffer {
 export const STAND_IN_BINARY = process.platform !== "win32";
 
 /**
- * A stand-in for the receiver binary's `models` and `transcribe` commands, in `dir`: two transcription models
- * (parakeet-v3 downloaded, whisper-small not) and one speech model (kokoro, not downloaded). Downloads and deletes
- * change what `models list` says; `transcribe` answers `local words from <id>` for a downloaded model. Every
- * call is appended to `calls.log` in `dir`.
+ * A stand-in for the receiver binary's `models`, `transcribe` and `speak` commands, in `dir`: two transcription
+ * models (parakeet-v3 downloaded, whisper-small not) and one speech model (kokoro, not downloaded). Downloads and
+ * deletes change what `models list` says; `transcribe` answers `local words from <id>` for a downloaded model.
+ * `speak` of a downloaded model writes the format line at 24000 Hz, then 4800 bytes of PCM (value 1) per
+ * sentence of its input, then done; with a text holding "hold" it stops after the first sentence's audio and
+ * waits to be killed. Every call is appended to `calls.log` in `dir`; the text `speak` read to `speak.log`,
+ * and its process id to `speak.pid`.
  */
 export function fakeReceiver(dir: string): { path: string; log: string } {
   const path = join(dir, "fake-receiver");
@@ -233,6 +236,29 @@ if (cmd === "transcribe") {
   fs.readFileSync(id);
   process.stdout.write("local words from " + sub + "\\n");
   process.exit(0);
+}
+if (cmd === "speak") {
+  fs.writeFileSync(${JSON.stringify(join(dir, "speak.pid"))}, String(process.pid));
+  const ev = (v) => process.stderr.write(JSON.stringify(v) + "\\n");
+  if (!have.includes(sub)) {
+    ev({ event: "error", message: "the model " + sub + " is not downloaded; download it with \`pi-speech-receiver models download " + sub + "\`" });
+    process.exit(1);
+  }
+  let text = "";
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (s) => { text += s; });
+  process.stdin.on("end", () => {
+    fs.appendFileSync(${JSON.stringify(join(dir, "speak.log"))}, JSON.stringify(text) + "\\n");
+    process.stderr.write("a library warning, not JSON\\n");
+    ev({ event: "format", rate: 24000, channels: 1 });
+    const sentences = text.split(/(?<=[.!?])\\s+/).filter((x) => x.trim());
+    process.stdout.write(Buffer.alloc(4800, 1), () => {
+      if (text.includes("hold")) return setInterval(() => {}, 1000);
+      for (let i = 1; i < sentences.length; i++) process.stdout.write(Buffer.alloc(4800, 1));
+      process.stdout.end(() => { ev({ event: "done" }); process.exit(0); });
+    });
+  });
+  return;
 }
 if (cmd === "models" && sub === "list") {
   for (const m of CATALOG) out({ ...m, downloaded: have.includes(m.id), partial: 0, path: "/cache/" + m.id });
