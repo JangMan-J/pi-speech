@@ -301,6 +301,22 @@ describe("playing a Stream", () => {
     expect(seen.some((s) => s.method === "POST" && s.url === "/v1/play/p9/cancel")).toBe(true);
   });
 
+  it("every request names this Pi process, so its stop (and its exit's) stops only its own plays", async () => {
+    handler = receiver((r, res) => {
+      if (r.url === "/v1/stop") return send(res, 200, { stopped: 1 });
+      // polls stay open
+    });
+    const mine = createBridgeAudio({ url, token: TOKEN }, { clientId: "pi-one" });
+    const other = createBridgeAudio({ url, token: TOKEN }, { clientId: "pi-two" });
+    await mine.output.playStream(clip(), "message");
+    await other.output.playStream(clip(), "message");
+    await mine.output.stop();
+    const stops = seen.filter((s) => s.url === "/v1/stop");
+    expect(stops.map((s) => s.headers["x-pi-speech-client"])).toEqual(["pi-one"]);
+    const starts = seen.filter((s) => s.url === "/v1/play/stream" || s.url.endsWith("/audio"));
+    expect(starts.map((s) => s.headers["x-pi-speech-client"]).sort()).toEqual(["pi-one", "pi-one", "pi-two", "pi-two"]);
+  });
+
   it("output.stop() posts /v1/stop; stop(kind) cancels only that kind", async () => {
     let n = 0;
     handler = receiver(
@@ -650,10 +666,52 @@ describe("local models on the Remote machine", () => {
       "on the Remote machine: the model whisper is not downloaded",
     );
     answer = [409, { error: "busy" }];
-    await expect(models().speak("kokoro", "Hi.")).rejects.toThrow(
-      /already running a model for another client \(one at a time\)/,
-    );
+    await expect(models().speak("kokoro", "Hi.")).rejects.toThrow(/too many model runs waiting/);
     handler = (_r, res) => send(res, 200, HEALTH);
     await expect(models().list()).rejects.toThrow(/too old to run models: update pi-speech-receiver there/);
+  });
+});
+
+describe("the ssh forwards", () => {
+  /** A second receiver: the forward of another ssh session. */
+  async function another(): Promise<{ server: Server; port: number; seen: string[] }> {
+    const seenThere: string[] = [];
+    const s = createServer((req, res) => {
+      seenThere.push(req.url ?? "");
+      req.resume();
+      req.on("end", () => {
+        if (req.url === "/v1/health") return send(res, 200, HEALTH);
+        if (req.url === "/v1/play/stream") return send(res, 202, { id: "p2" });
+        if (req.url?.endsWith("/audio")) return send(res, 200, { state: "playing" });
+        // polls stay open
+      });
+    });
+    await new Promise<void>((r) => s.listen(0, "127.0.0.1", r));
+    return { server: s, port: (s.address() as AddressInfo).port, seen: seenThere };
+  }
+
+  it("a Pi whose forward has gone finds the next one, keeps it, and plays there", async () => {
+    handler = receiver(() => {});
+    const second = await another();
+    try {
+      const b = createBridgeAudio({ url, token: TOKEN, ports: [second.port] });
+      expect(await b.health()).toMatchObject({ ok: true });
+      expect(b.at?.()).toBe(url);
+      // The first session ends: its forward (and nothing else) goes away.
+      server.closeAllConnections();
+      await new Promise((r) => server.close(r));
+      const p = await b.output.playStream(clip(), "message");
+      expect(p).toMatchObject({ ok: true });
+      expect(b.at?.()).toBe(`http://127.0.0.1:${second.port}`);
+      expect(second.seen).toContain("/v1/play/stream");
+      const healths = () => second.seen.filter((u) => u === "/v1/health").length;
+      const asked = healths();
+      expect(await b.health()).toMatchObject({ ok: true });
+      expect(healths()).toBe(asked + 1); // kept: no new search
+      server = createServer();
+    } finally {
+      second.server.closeAllConnections();
+      await new Promise((r) => second.server.close(r));
+    }
   });
 });

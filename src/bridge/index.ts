@@ -11,5 +11,28 @@ export type {
   BridgeProbe,
   BridgeVoice,
 } from "./client";
-export { createBridgeAudio, createBridgeAudioFrom, displayUrl, loopbackBase, probeBridge } from "./client";
-export { bridgeConfig, bridgeToken, bridgeUrl, DEFAULT_URL } from "./config";
+export {
+  bridgeBase,
+  CLIENT_ID,
+  createBridgeAudio,
+  createBridgeAudioFrom,
+  displayUrl,
+  loopbackBase,
+  PairingError,
+  probeBridge,
+  requestPairingCode,
+  sendPairingCode,
+} from "./client";
+export type { BridgeTarget } from "./config";
+export {
+  addressOf,
+  addressUrl,
+  bridgeConfig,
+  bridgeTarget,
+  bridgeToken,
+  bridgeTokenFile,
+  bridgeUrl,
+  DEFAULT_URL,
+  SPARE_PORTS,
+  saveBridgeToken,
+} from "./config";

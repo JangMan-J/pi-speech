@@ -637,36 +637,91 @@ describe("the panel view model: Bridge connection's Remote machine and Pairing",
       reason: "the playback receiver is not reachable at http://127.0.0.1:47613: fetch failed",
     }) as const;
 
-  it("shows the bridge, the Remote machine's address from the environment, and a connected receiver", async () => {
+  it("shows the bridge, the Remote machine's address (the ssh forward by default), and a connected receiver", async () => {
     const p = open({}, { before: (e) => (e.probeBridge = connected) });
     await p.goTo("Bridge connection");
     await p.press("enter");
     expect(p.panel.view().rows.map((r) => r.label)).toEqual(BRIDGE_ROWS);
-    expect(p.row("Remote machine")).toMatchObject({ value: "127.0.0.1:47613", note: "from PI_SPEECH_BRIDGE_URL" });
+    expect(p.row("Remote machine")).toMatchObject({ value: "127.0.0.1:47613", note: "ssh forward" });
     expect(p.row("Remote machine")?.opens).toBeFalsy();
-    expect(p.row("Pairing")).toMatchObject({ value: "✓ Connected to 127.0.0.1:47613 · 52 ms" });
-    expect(p.row("Pairing")?.opens).toBeFalsy();
+    expect(p.row("Pairing")).toMatchObject({ value: "✓ Connected to 127.0.0.1:47613 · 52 ms", opens: true });
     await p.goTo("Remote machine");
     expect(p.hint()).toBe("Enter where it comes from · Esc back");
     await p.press("enter");
     expect(p.panel.view().status).toMatchObject({ tone: "info", text: expect.stringMatching(/PI_SPEECH_BRIDGE_URL/) });
     await p.goTo("Pairing");
-    expect(p.hint()).toBe("Esc back");
+    expect(p.hint()).toBe("Enter address, pair · Esc back");
   });
 
   it("names the address PI_SPEECH_BRIDGE_URL gives", async () => {
     const p = open({ PI_SPEECH_BRIDGE_URL: "http://localhost:5000" }, { before: (e) => (e.probeBridge = connected) });
     await p.goTo("Remote machine");
-    expect(p.row("Remote machine")?.value).toBe("localhost:5000");
+    expect(p.row("Remote machine")).toMatchObject({ value: "localhost:5000", note: "from PI_SPEECH_BRIDGE_URL" });
   });
 
-  it("an unreachable receiver is ✗ Re-pair, whose Enter says how to pair on your own computer", async () => {
+  it("an unreachable receiver is ✗ Re-pair, whose Enter opens the address field", async () => {
     const p = open({}, { before: (e) => (e.probeBridge = refused) });
     await p.goTo("Pairing");
     expect(p.row("Pairing")).toMatchObject({ value: "✗ Re-pair", note: "receiver unreachable", opens: true });
-    expect(p.hint()).toBe("Enter how to pair · Esc back");
     await p.press("enter");
-    expect(p.panel.view().status?.text).toMatch(/pi-speech-receiver pair <pi-host>.*pi-speech-receiver ssh <pi-host>/);
+    expect(p.panel.view().input).toMatchObject({ label: "Address", value: "", under: "pairing" });
+    expect(p.panel.view().status?.text).toMatch(/pi-speech-receiver ssh <pi-host>.*--network/);
+  });
+
+  it("an address whose receiver refuses this machine's token pairs with the code its terminal shows", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-speech-pair-"));
+    const tokenFile = join(dir, "bridge.token");
+    const token = "r".repeat(64);
+    const p = open({ PI_SPEECH_BRIDGE_TOKEN_FILE: tokenFile }, { before: (e) => (e.probeBridge = refused) });
+    // The receiver at a Tailscale address: it shows 123456 on its own terminal; 999999 has expired.
+    const asked: string[] = [];
+    const inner = globalThis.fetch;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: RequestInit = {}) => {
+        if (!String(url).startsWith("http://100.64.0.2:47613/")) return inner(url, init);
+        const path = new URL(url).pathname;
+        asked.push(path);
+        const auth = (init.headers as Record<string, string>)?.Authorization;
+        if (path === "/v1/health") {
+          return auth === `Bearer ${token}`
+            ? Response.json({ protocol: 1, name: "pi-speech-receiver", version: "0.4.0", capabilities: ["stream"] })
+            : Response.json({ error: "unauthorized" }, { status: 401 });
+        }
+        const { code } = JSON.parse(String(init.body)) as { code?: string };
+        if (!code) return Response.json({ expires_in: 120, attempts: 5 }, { status: 202 });
+        if (code === "123456") return Response.json({ token });
+        if (code === "999999") return Response.json({ error: "no pairing code is active" }, { status: 410 });
+        return Response.json({ error: "wrong pairing code", attempts_left: 4 }, { status: 403 });
+      }),
+    );
+    await p.goTo("Pairing");
+    await p.press("enter");
+    await p.type("100.64.0.2");
+    await p.press("enter");
+    expect(asked).toEqual(["/v1/pair"]);
+    expect(p.panel.view().input).toMatchObject({ label: "Code from 100.64.0.2:47613", value: "" });
+    expect(p.panel.view().status?.text).toMatch(/shows on its terminal.*2 min/);
+
+    await p.type("111111");
+    await p.press("enter");
+    expect(p.panel.view().status).toMatchObject({
+      tone: "error",
+      text: expect.stringMatching(/wrong.*4 attempts left/),
+    });
+    expect(p.panel.view().input).toMatchObject({ label: "Code from 100.64.0.2:47613", value: "" });
+
+    await p.type("999999");
+    await p.press("enter");
+    expect(p.panel.view().input).toMatchObject({ label: "Address", value: "100.64.0.2:47613" });
+    await p.press("enter");
+    await p.type("123 456");
+    await p.press("enter");
+    expect(p.panel.view().input).toBeUndefined();
+    expect(p.panel.view().status).toMatchObject({ tone: "success", text: expect.stringContaining(tokenFile) });
+    expect(readFileSync(tokenFile, "utf8").trim()).toBe(token);
+    expect(settingsOf(p.work).bridgeAddress).toBe("100.64.0.2:47613");
+    expect(p.row("Remote machine")).toMatchObject({ value: "100.64.0.2:47613", note: "set in Pairing" });
   });
 
   it("probes when it opens and again while it is open, and stops when it is left", async () => {

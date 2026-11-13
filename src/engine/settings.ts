@@ -109,6 +109,8 @@ export interface Settings {
   recordOn: Machine;
   /** With the bridge in use: where Local sources run their models. */
   modelsOn: Machine;
+  /** The receiver's address typed in Bridge connection's Pairing (`host:port`); unset: PI_SPEECH_BRIDGE_URL or the ssh forwards. */
+  bridgeAddress?: string;
   /** macOS: the notice that Option+letter reached Pi as a character has been shown (once per install). */
   optionKeyHintShown?: boolean;
 }
@@ -265,6 +267,8 @@ export class SettingsFile {
       const localTranscription = str(raw.localTranscriptionModel);
       if (localTranscription) s.localTranscriptionModel = localTranscription;
       if (raw.optionKeyHintShown === true) s.optionKeyHintShown = true;
+      const address = str(raw.bridgeAddress);
+      if (address) s.bridgeAddress = address;
       for (const d of DIRECTIONS) if (isMachine(raw[d])) s[d] = raw[d];
     } else if (raw) {
       // settings.json without a version
@@ -320,6 +324,7 @@ export class SettingsFile {
       ...(s.localSpeechVoice ? { localSpeechVoice: s.localSpeechVoice } : {}),
       ...(s.localTranscriptionModel ? { localTranscriptionModel: s.localTranscriptionModel } : {}),
       ...(s.optionKeyHintShown ? { optionKeyHintShown: true } : {}),
+      ...(s.bridgeAddress ? { bridgeAddress: s.bridgeAddress } : {}),
       ...Object.fromEntries(DIRECTIONS.filter((d) => s[d] !== DEFAULT_SETTINGS[d]).map((d) => [d, s[d]])),
     };
     const tmp = `${this.file}.${process.pid}.tmp`;

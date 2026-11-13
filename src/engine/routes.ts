@@ -7,8 +7,7 @@
  *   off   local
  */
 
-import { bridgeConfig } from "../bridge/config";
-import { type BridgeAudio, bridgeUrl, createBridgeAudioFrom, displayUrl } from "../bridge/index";
+import { type BridgeAudio, bridgeConfig, bridgeTarget, createBridgeAudioFrom, displayUrl } from "../bridge/index";
 import type { AudioInput, AudioOutput } from "./audio";
 import { type Env, overSsh } from "./env";
 import { LocalInput } from "./local-input";
@@ -26,6 +25,8 @@ export interface RoutesOptions {
   localInput?: AudioInput;
   /** Play audio on, Record audio on, Run models on, as saved (default: all Remote machine). */
   directions?: () => Record<DirectionSetting, Machine>;
+  /** The receiver's address saved in Bridge connection's Pairing, if any. */
+  address?: () => string | undefined;
 }
 
 /** The rows of DIRECTION, as the panel and messages name them. */
@@ -49,14 +50,17 @@ export class Routes {
   private readonly localOutput: AudioOutput;
   private readonly localInput: AudioInput;
   private readonly directions: () => Record<DirectionSetting, Machine>;
+  /** The saved address, if any. */
+  readonly address: () => string | undefined;
 
   constructor(opts: RoutesOptions) {
     this.directions = opts.directions ?? (() => DEFAULT_SETTINGS);
+    this.address = opts.address ?? (() => undefined);
     this.env = opts.env;
     this.mode = opts.mode;
     this.ssh = overSsh(opts.env);
     // The configuration is read per request, so a token file written after Pi started is picked up.
-    this.bridge = opts.bridge ?? createBridgeAudioFrom(() => bridgeConfig(this.env));
+    this.bridge = opts.bridge ?? createBridgeAudioFrom(() => bridgeConfig(this.env, this.address()));
     this.localOutput = opts.localOutput ?? new LocalOutput(opts.env);
     this.localInput = opts.localInput ?? new LocalInput(opts.env);
   }
@@ -144,9 +148,14 @@ export class Routes {
     };
   }
 
-  /** The receiver URL for display (never with credentials). */
+  /** The receiver URL for display (never with credentials): the spare forward in use once one was found. */
   get url(): string {
-    return displayUrl(bridgeUrl(this.env));
+    try {
+      const target = bridgeTarget(this.env, this.address());
+      return displayUrl((target.ports && this.bridge.at?.()) || target.url);
+    } catch {
+      return "(invalid address)";
+    }
   }
 
   private get why(): string {

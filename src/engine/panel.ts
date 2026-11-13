@@ -11,7 +11,7 @@
  */
 
 import { basename } from "node:path";
-import type { BridgeHealth, BridgeProbe } from "../bridge/index";
+import { type BridgeHealth, type BridgeProbe, bridgeTarget, displayUrl, PairingError } from "../bridge/index";
 import type { VoiceLanguage } from "../voice-language/index";
 import type { Engine } from "./engine";
 import { errorMessage } from "./env";
@@ -365,7 +365,11 @@ type Mode =
   | { kind: "picker"; picker: PickerState; back: Mode }
   | { kind: "input"; purpose: "speak"; edit: LineEdit; back: Mode; standalone?: boolean }
   | { kind: "input"; purpose: "language"; voice: string; edit: LineEdit; back: Mode }
-  | { kind: "input"; purpose: "transcribe" | "dictation" | "output"; edit: LineEdit; back: Mode };
+  | { kind: "input"; purpose: "transcribe" | "dictation" | "output"; edit: LineEdit; back: Mode }
+  /** Pairing's first step: the receiver's address. */
+  | { kind: "input"; purpose: "pairAddress"; edit: LineEdit; back: Mode }
+  /** Pairing's second step: the code the receiver at `address` shows on its terminal. */
+  | { kind: "input"; purpose: "pairCode"; address: string; edit: LineEdit; back: Mode };
 
 type RowBase = Pick<PanelRow, "id" | "section" | "label" | "opens">;
 
@@ -392,7 +396,7 @@ const HOTKEYS: RowBase[] = [
   { id: "transcribe", label: "Transcribe file…" },
 ];
 
-/** The bridge mode, the Remote machine's address (PI_SPEECH_BRIDGE_URL), and whether its receiver answers. */
+/** The bridge mode, the Remote machine's address, and Pairing: whether its receiver answers, and the address to use. */
 const BRIDGE: RowBase[] = [
   { id: "bridgeMode", label: "Bridge" },
   { id: "remoteMachine", label: "Remote machine" },
@@ -403,11 +407,13 @@ const BRIDGE: RowBase[] = [
 ];
 const MACHINE_WORDS: Record<Machine, string> = { this: "This machine", remote: "Remote machine" };
 const isDirectionRow = (id: RowId): id is DirectionSetting => (DIRECTIONS as readonly RowId[]).includes(id);
-/** How to pair: it runs on the user's own computer, not from Pi. */
+/** What the address field of Pairing takes. */
 const PAIR_HOW =
-  "Pair on your own computer: run pi-speech-receiver pair <pi-host>, or connect with pi-speech-receiver ssh <pi-host>";
+  "The receiver's address: empty for the ssh forward of pi-speech-receiver ssh <pi-host>, or a Tailscale or LAN address of pi-speech-receiver --listen <addr>:47613 --network";
 const URL_FROM =
-  "The Remote machine's address comes from PI_SPEECH_BRIDGE_URL (loopback only, default http://127.0.0.1:47613); set it before starting Pi";
+  "The Remote machine's address is the one set in Pairing, else PI_SPEECH_BRIDGE_URL (loopback only), else the ssh forward at 127.0.0.1:47613 (or a spare one, 47614-47633)";
+const ADDRESS_HINT = "host:port · empty: the ssh forward · Enter connects, or asks the receiver for a pairing code";
+const CODE_HINT = "the 6 digits the receiver shows on its own terminal";
 
 /** The host:port of a bridge URL, or undefined when it is not one. */
 function hostPort(url: string): string | undefined {
@@ -738,6 +744,12 @@ export class Panel {
         case "output":
           view.input = input("Dictation output", OUTPUT_HINT, "output");
           break;
+        case "pairAddress":
+          view.input = input("Address", ADDRESS_HINT, "pairing");
+          break;
+        case "pairCode":
+          view.input = input(`Code from ${m.address}`, CODE_HINT, "pairing");
+          break;
       }
       if (m.back.kind === "picker") view.picker = this.pickerView(m.back.picker);
     }
@@ -793,11 +805,16 @@ export class Panel {
         return { ...base, value: v, ...this.bridgeNote(mode) };
       }
       case "remoteMachine": {
-        // Settings hold no bridge URL: the address is shown, and changed only through the environment.
+        // The address in use: set in Pairing, from the environment, or the ssh forward (a spare one once found).
         const at = hostPort(this.engine.routes.url);
-        return at
-          ? { ...base, value: at, note: "from PI_SPEECH_BRIDGE_URL" }
-          : { ...base, value: "not set", note: "✗ PI_SPEECH_BRIDGE_URL is not a URL", alert: true };
+        const from = this.addressFrom();
+        if (!at) {
+          return from === "pairing"
+            ? { ...base, value: "not set", note: "✗ the address set in Pairing is not usable", alert: true }
+            : { ...base, value: "not set", note: "✗ PI_SPEECH_BRIDGE_URL is not a URL", alert: true };
+        }
+        const note = { pairing: "set in Pairing", env: "from PI_SPEECH_BRIDGE_URL", default: "ssh forward" }[from];
+        return { ...base, value: at, note };
       }
       case "pairing":
         return { ...base, ...this.pairingValue() };
@@ -892,12 +909,18 @@ export class Panel {
     return { note: `${when}${where} · ${state}`, short: state, ...(alert ? { alert } : {}) };
   }
 
-  /** Whether the receiver answers: ✓ with where and how fast, or ✗ Re-pair, whose Enter says how to pair. */
+  /** Whether the receiver answers: ✓ with where and how fast, or ✗ Re-pair. Enter opens the address field. */
   private pairingValue(): Pick<PanelRow, "value" | "note" | "opens"> {
     const p = this.pairing;
-    if (!p || p === "checking") return { value: "… checking" };
-    if (p.ok) return { value: `✓ Connected to ${p.address}:${p.port} · ${p.ms} ms` };
+    if (!p || p === "checking") return { value: "… checking", opens: true };
+    if (p.ok) return { value: `✓ Connected to ${p.address}:${p.port} · ${p.ms} ms`, opens: true };
     return { value: "✗ Re-pair", note: pairingFault(p.reason), opens: true };
+  }
+
+  /** Where the Remote machine's address comes from. */
+  private addressFrom(): "pairing" | "env" | "default" {
+    if (this.speech.settings.bridgeAddress) return "pairing";
+    return bridgeTarget(this.engine.env).from;
   }
 
   /** The models of a model list as the catalog has them (a model it does not list keeps its id). */
@@ -1041,7 +1064,16 @@ export class Panel {
     const esc = (action: string): Hint => ({ key: "Esc", action });
     const m = this.mode;
     if (m.kind === "input") {
-      const action = m.purpose === "speak" ? "speak" : m.purpose === "transcribe" ? "transcribe" : "set";
+      const action =
+        m.purpose === "speak"
+          ? "speak"
+          : m.purpose === "transcribe"
+            ? "transcribe"
+            : m.purpose === "pairAddress"
+              ? "connect"
+              : m.purpose === "pairCode"
+                ? "pair"
+                : "set";
       return [{ key: "Enter", action }, esc(m.purpose === "speak" && m.standalone ? "close" : "back")];
     }
     if (m.kind === "picker") {
@@ -1109,8 +1141,7 @@ export class Panel {
       if (id === "bridgeMode") return [{ key: "←→", action: BRIDGE_MODES.join(" · ") }, back];
       if (id === "remoteMachine") return [{ key: "Enter", action: "where it comes from" }, back];
       if (isDirectionRow(id)) return [{ key: "←→", action: MACHINES.map((m) => MACHINE_WORDS[m]).join(" · ") }, back];
-      const p = this.pairing;
-      return typeof p === "object" && !p.ok ? [{ key: "Enter", action: "how to pair" }, back] : [back];
+      return [{ key: "Enter", action: "address, pair" }, back];
     }
     if (m.menu === "readAloud") {
       const id = READ_ALOUD[m.selected].id;
@@ -1369,13 +1400,15 @@ export class Panel {
       case "remoteMachine":
         this.setStatus("info", URL_FROM);
         return;
-      case "pairing": {
-        const p = this.pairing;
-        if (typeof p === "object" && !p.ok) this.setStatus("info", PAIR_HOW);
-        else if (typeof p === "object")
-          this.setStatus("info", `The receiver ${p.version} answers at ${p.address}:${p.port}`);
+      case "pairing":
+        this.mode = {
+          kind: "input",
+          purpose: "pairAddress",
+          edit: new LineEdit(this.speech.settings.bridgeAddress ?? ""),
+          back: this.home(),
+        };
+        this.setStatus("info", PAIR_HOW);
         return;
-      }
       default:
         this.step(id, 1);
         return;
@@ -1703,8 +1736,17 @@ export class Panel {
       );
       return;
     }
+    if (m.purpose === "pairAddress") {
+      // Empty goes back to the default (the ssh forward), so the empty guard below must not apply here.
+      this.connectTo(m);
+      return;
+    }
     const text = m.edit.value.trim();
     if (!text) return;
+    if (m.purpose === "pairCode") {
+      this.pairWith(m, text.replace(/\s+/g, ""));
+      return;
+    }
     if (m.purpose === "speak") {
       m.edit.clear();
       this.speakText(text);
@@ -1734,6 +1776,72 @@ export class Panel {
           this.setStatus("success", `✓ ${summary}`);
         },
         (err) => this.setStatus("error", `✗ ${errorMessage(err)}`),
+      ),
+    );
+  }
+
+  /** Pairing's address: connect when a token works there, else ask the receiver for a code and ask for it here. */
+  private connectTo(m: Extract<Mode, { kind: "input"; purpose: "pairAddress" }>): void {
+    const address = m.edit.value.trim();
+    this.setStatus("busy", `… connecting to ${address || "the ssh forward"}`);
+    this.track(
+      this.engine.pairAt(address).then(
+        (r) => {
+          if (r.state === "connected") {
+            this.pairing = r.probe;
+            if (this.mode === m) this.mode = m.back;
+            this.setStatus("success", `✓ Connected to ${r.probe.address}:${r.probe.port}, receiver ${r.probe.version}`);
+            void this.probe();
+            return;
+          }
+          if (this.mode === m) {
+            this.mode = { kind: "input", purpose: "pairCode", address: r.address, edit: new LineEdit(), back: m.back };
+          }
+          const minutes = r.expiresIn >= 60 ? `${Math.round(r.expiresIn / 60)} min` : `${r.expiresIn} s`;
+          this.setStatus(
+            "info",
+            `No token of This machine works there: type the code the receiver at ${r.address} shows on its terminal (it expires in ${minutes})`,
+          );
+        },
+        (err) => this.setStatus("error", `✗ ${errorMessage(err)}`),
+      ),
+    );
+  }
+
+  /** Pairing's code: the token it earns is saved; a wrong code may be typed again, an expired one asked anew. */
+  private pairWith(m: Extract<Mode, { kind: "input"; purpose: "pairCode" }>, code: string): void {
+    this.setStatus("busy", "… pairing");
+    this.track(
+      this.engine.pairWithCode(m.address, code).then(
+        (r) => {
+          this.pairing = r.probe;
+          if (this.mode === m) this.mode = m.back;
+          const where = displayUrl(`http://${m.address}`).replace(/^http:\/\//, "");
+          const tail = r.overridden ? " (PI_SPEECH_BRIDGE_TOKEN is set and still wins: unset it)" : "";
+          const tone = r.probe.ok && !r.overridden ? "success" : "warning";
+          this.setStatus(
+            tone,
+            `${tone === "success" ? "✓" : "!"} Paired with ${where}: the token is in ${r.file}${tail}`,
+          );
+          void this.probe();
+        },
+        (err) => {
+          if (err instanceof PairingError && err.kind === "wrong" && err.attemptsLeft !== 0) {
+            m.edit.clear();
+            const left = err.attemptsLeft === undefined ? "" : ` (${err.attemptsLeft} attempts left)`;
+            this.setStatus("error", `✗ ${errorMessage(err)}${left}`);
+            return;
+          }
+          if (err instanceof PairingError && err.kind !== "other") {
+            // The code is void: back to the address, where Enter asks for a new one.
+            if (this.mode === m) {
+              this.mode = { kind: "input", purpose: "pairAddress", edit: new LineEdit(m.address), back: m.back };
+            }
+            this.setStatus("error", `✗ ${errorMessage(err)}: Enter asks for a new code`);
+            return;
+          }
+          this.setStatus("error", `✗ ${errorMessage(err)}`);
+        },
       ),
     );
   }
