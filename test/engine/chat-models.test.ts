@@ -129,7 +129,7 @@ describe("a chat model as the transcription model", () => {
     const panel = new Panel(engine, new Surface(engine), { ui: ui.ui, close: vi.fn(), changed: vi.fn() });
     panel.open();
     await panel.idle();
-    while (panel.view().rows[panel.view().selected].label !== "Transcription") panel.handle({ key: "down" });
+    while (panel.view().rows[panel.view().selected].label !== "Transcription model") panel.handle({ key: "down" });
     panel.handle({ key: "enter" });
     await panel.idle();
     const row = () => panel.view().picker?.items.find((i) => i.id === "google/gemini-3.8-flash");

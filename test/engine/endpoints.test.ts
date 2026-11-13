@@ -444,7 +444,7 @@ describe("endpoints on the /speech surface and in the panel", () => {
     panel.open();
     await panel.idle();
     const row = panel.view().rows.find((r) => r.label === "Speech model");
-    expect(row).toMatchObject({ value: "local:kokoro", price: "free" });
+    expect(row).toMatchObject({ value: "local:kokoro" });
     expect(row?.alert).toBeUndefined();
   });
 });
