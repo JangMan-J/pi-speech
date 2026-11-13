@@ -379,10 +379,10 @@ saved but not played, and the notification says why.
 
 Set up the receiver on your machine:
 
-1. Build it: `cargo build --release` in `receiver/`. It plays files with the first of `pw-play`, `paplay`,
-   `mpv`, `ffplay`, speech as it arrives with the first of `pacat`, `pw-cat`, `ffplay`, `mpv`, `aplay` (MP3:
-   `ffplay`, `mpv`, `mpg123`), and records with `pw-record`, `parecord`, or `arecord`. A receiver older than
-   0.2.0 plays only whole files; speech then plays once it has fully arrived.
+1. Build it: `cargo build --release` in `receiver/` (Linux needs the ALSA library, `libasound2-dev` or
+   `alsa-lib`, to build). It plays and records with its own audio engine, through PipeWire, PulseAudio or ALSA;
+   no other audio program is needed. A receiver older than 0.2.0 plays only whole files; speech then plays once
+   it has fully arrived.
 2. Start it: `pi-speech-receiver` listens on `127.0.0.1:47613` and creates its token in
    `~/.config/pi-speech/receiver.token` (mode 0600) on first start.
 3. Forward its port to the Pi host: `ssh -R 127.0.0.1:47613:127.0.0.1:47613 <pi-host>`.

@@ -1,6 +1,6 @@
 [package]
 name = "pi-speech-receiver"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Playback-machine receiver for the pi-speech playback bridge (play and record)"
 license = "MIT"
@@ -15,6 +15,9 @@ path = "src/main.rs"
 
 [dependencies]
 libc = "0.2"
+# The built-in audio engine: devices (PulseAudio when it runs, else ALSA on Linux) and decoding.
+cpal = { version = "0.18.2", features = ["pulseaudio"] }
+symphonia = { version = "0.6.1", default-features = false, features = ["pcm", "wav", "mp3", "id3v1", "id3v2"] }
 
 [profile.release]
 panic = "unwind"

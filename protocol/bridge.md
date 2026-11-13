@@ -182,20 +182,30 @@ pi-speech-receiver [--listen 127.0.0.1:47613] [--token-file PATH]
 
 The receiver runs local programs it finds itself. Requests never choose them.
 
-- Player: the first available of `pw-play`, `paplay`, `mpv`, `ffplay` (with arguments
-  that play once without a window and exit), unless the environment variable
-  `PI_SPEECH_RECEIVER_PLAYER` names an executable. That executable is run as
-  `<player> <audio-file>` and plays the file once.
-- Stream player, which reads a Stream from its standard input and exits once the input
-  has ended and played: for PCM the first available of `pacat`, `pw-cat`, `ffplay`,
-  `mpv`, `aplay`; for MP3 of `ffplay`, `mpv`, `mpg123`; for WAV of `ffplay`, `mpv`;
-  unless `PI_SPEECH_RECEIVER_STREAM_PLAYER` names an executable. That executable is run
-  as `<player> s16le <rate> <channels>` for PCM and `<player> mp3` or `<player> wav`
-  for the others. When `PI_SPEECH_RECEIVER_PLAYER` is set and
+By default it plays and records with its own built-in audio engine: it runs its own
+executable again as a child, through these subcommands, on the system's default output
+and input devices. No other program is needed.
+
+- `pi-speech-receiver play <audio-file>` plays a WAV or MP3 file once.
+- `pi-speech-receiver play s16le <rate> <channels>`, `play mp3` and `play wav` play a
+  Stream from standard input as it arrives, and exit once the input has ended and been
+  heard.
+- `pi-speech-receiver record <output.wav>` records 24 kHz mono 16-bit PCM WAV, and
+  finishes the file and exits when it receives SIGINT or its standard input ends (the
+  receiver keeps that input open while it records).
+
+Environment variables replace the built-in engine with other programs:
+
+- `PI_SPEECH_RECEIVER_PLAYER` names a player, run as `<player> <audio-file>`, which
+  plays the file once.
+- `PI_SPEECH_RECEIVER_STREAM_PLAYER` names a Stream player, which reads a Stream from
+  its standard input and exits once the input has ended and played. It is run as
+  `<player> s16le <rate> <channels>` for PCM and `<player> mp3` or `<player> wav` for
+  the others. When `PI_SPEECH_RECEIVER_PLAYER` is set and
   `PI_SPEECH_RECEIVER_STREAM_PLAYER` is not, no Stream player is used (`503`).
-- Recorder: the first available of `pw-record`, `parecord`, `arecord`, recording mono
-  16-bit PCM WAV, unless `PI_SPEECH_RECEIVER_RECORDER` names an executable. That
-  executable is run as `<recorder> <output.wav>`, writes a WAV file to that path, and
-  finishes the file and exits when it receives SIGINT.
-- To stop a player or recorder, the receiver sends SIGINT, waits up to 2 s, then sends
-  SIGKILL.
+- `PI_SPEECH_RECEIVER_RECORDER` names a recorder, run as `<recorder> <output.wav>`,
+  which records mono 16-bit PCM WAV to that path, and finishes the file and exits when
+  it receives SIGINT.
+
+A name without a `/` is looked up on `PATH`. To stop a player or recorder, built-in or
+not, the receiver sends SIGINT, waits up to 2 s, then sends SIGKILL.

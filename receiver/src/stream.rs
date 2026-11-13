@@ -1,5 +1,4 @@
-//! Streams: the formats a Stream may have and the programs that play one from their
-//! standard input.
+//! Streams: the formats a Stream may have and how a Stream player is told the format.
 
 pub const MIN_RATE: u32 = 8000;
 pub const MAX_RATE: u32 = 192000;
@@ -15,19 +14,7 @@ pub enum Format {
     Wav,
 }
 
-const PCM_PLAYERS: &[&str] = &["pacat", "pw-cat", "ffplay", "mpv", "aplay"];
-const MP3_PLAYERS: &[&str] = &["ffplay", "mpv", "mpg123"];
-const WAV_PLAYERS: &[&str] = &["ffplay", "mpv"];
-
 impl Format {
-    pub fn name(self) -> &'static str {
-        match self {
-            Format::Pcm { .. } => "PCM",
-            Format::Mp3 => "MP3",
-            Format::Wav => "WAV",
-        }
-    }
-
     /// Parse the body of `POST /v1/play/stream`: `{"format": "pcm", "rate": <Hz>,
     /// "channels": 1 | 2}`, `{"format": "mp3"}` or `{"format": "wav"}`, and nothing else.
     pub fn parse(body: &[u8]) -> Result<Format, String> {
@@ -68,48 +55,10 @@ impl Format {
     }
 }
 
-/// The known Stream players for `f`, in order of preference.
-pub fn players(f: Format) -> &'static [&'static str] {
-    match f {
-        Format::Pcm { .. } => PCM_PLAYERS,
-        Format::Mp3 => MP3_PLAYERS,
-        Format::Wav => WAV_PLAYERS,
-    }
-}
-
-/// Arguments for the known player `name` to play a Stream of `f` from its input.
-pub fn player_args(name: &str, f: Format) -> Vec<String> {
-    // Written as in the protocol; no argument contains a space.
-    let line = match (name, f) {
-        ("pacat", Format::Pcm { rate, channels }) => {
-            format!("--playback --format=s16le --rate={rate} --channels={channels}")
-        }
-        ("pw-cat", Format::Pcm { rate, channels }) => {
-            format!("--playback --raw --format s16 --rate {rate} --channels {channels} -")
-        }
-        ("ffplay", Format::Pcm { rate, channels }) => {
-            let layout = if channels == 1 { "mono" } else { "stereo" };
-            format!(
-                "-nodisp -autoexit -loglevel quiet -f s16le -ar {rate} -ch_layout {layout} -i -"
-            )
-        }
-        ("mpv", Format::Pcm { rate, channels }) => format!(
-            "--no-video --really-quiet --demuxer=rawaudio --demuxer-rawaudio-format=s16le \
-             --demuxer-rawaudio-rate={rate} --demuxer-rawaudio-channels={channels} -"
-        ),
-        ("aplay", Format::Pcm { rate, channels }) => {
-            format!("-q -t raw -f S16_LE -r {rate} -c {channels}")
-        }
-        ("ffplay", Format::Mp3 | Format::Wav) => "-nodisp -autoexit -loglevel quiet -i -".into(),
-        ("mpv", Format::Mp3 | Format::Wav) => "--no-video --really-quiet -".into(),
-        ("mpg123", Format::Mp3) => "-q -".into(),
-        _ => String::new(),
-    };
-    line.split_whitespace().map(String::from).collect()
-}
-
-/// Arguments for a configured Stream player: `s16le <rate> <channels>`, `mp3` or `wav`.
-pub fn configured_args(f: Format) -> Vec<String> {
+/// The arguments that tell a Stream player the format: `s16le <rate> <channels>`, `mp3`
+/// or `wav`. A configured Stream player gets these; the built-in one gets them after
+/// `play`.
+pub fn player_args(f: Format) -> Vec<String> {
     match f {
         Format::Pcm { rate, channels } => {
             vec!["s16le".into(), rate.to_string(), channels.to_string()]
@@ -327,57 +276,13 @@ mod tests {
     }
 
     #[test]
-    fn known_players_get_the_protocol_arguments() {
+    fn a_stream_player_gets_the_format_only() {
         let pcm = Format::Pcm {
             rate: 24000,
             channels: 1,
         };
-        let line = |name, f| player_args(name, f).join(" ");
-        assert_eq!(
-            line("pacat", pcm),
-            "--playback --format=s16le --rate=24000 --channels=1"
-        );
-        assert_eq!(
-            line("pw-cat", pcm),
-            "--playback --raw --format s16 --rate 24000 --channels 1 -"
-        );
-        assert_eq!(
-            line("ffplay", pcm),
-            "-nodisp -autoexit -loglevel quiet -f s16le -ar 24000 -ch_layout mono -i -"
-        );
-        assert_eq!(
-            line(
-                "ffplay",
-                Format::Pcm {
-                    rate: 48000,
-                    channels: 2
-                }
-            ),
-            "-nodisp -autoexit -loglevel quiet -f s16le -ar 48000 -ch_layout stereo -i -"
-        );
-        assert_eq!(
-            line("mpv", pcm),
-            "--no-video --really-quiet --demuxer=rawaudio --demuxer-rawaudio-format=s16le --demuxer-rawaudio-rate=24000 --demuxer-rawaudio-channels=1 -"
-        );
-        assert_eq!(line("aplay", pcm), "-q -t raw -f S16_LE -r 24000 -c 1");
-        for f in [Format::Mp3, Format::Wav] {
-            assert_eq!(line("ffplay", f), "-nodisp -autoexit -loglevel quiet -i -");
-            assert_eq!(line("mpv", f), "--no-video --really-quiet -");
-        }
-        assert_eq!(line("mpg123", Format::Mp3), "-q -");
-        assert_eq!(players(pcm), ["pacat", "pw-cat", "ffplay", "mpv", "aplay"]);
-        assert_eq!(players(Format::Mp3), ["ffplay", "mpv", "mpg123"]);
-        assert_eq!(players(Format::Wav), ["ffplay", "mpv"]);
-    }
-
-    #[test]
-    fn a_configured_player_gets_the_format_only() {
-        let pcm = Format::Pcm {
-            rate: 24000,
-            channels: 1,
-        };
-        assert_eq!(configured_args(pcm), ["s16le", "24000", "1"]);
-        assert_eq!(configured_args(Format::Mp3), ["mp3"]);
-        assert_eq!(configured_args(Format::Wav), ["wav"]);
+        assert_eq!(player_args(pcm), ["s16le", "24000", "1"]);
+        assert_eq!(player_args(Format::Mp3), ["mp3"]);
+        assert_eq!(player_args(Format::Wav), ["wav"]);
     }
 }

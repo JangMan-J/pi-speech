@@ -1217,3 +1217,26 @@ fn shutdown_stops_stream_players_and_leaves_no_files() {
         drop(up);
     }
 }
+
+#[test]
+fn without_a_configured_program_or_the_built_in_engine_everything_is_503() {
+    let r = Rig::with(|c| {
+        c.player = None;
+        c.stream_player = None;
+        c.recorder = None;
+        c.engine = None;
+    });
+    for rep in [
+        r.play_with("audio/wav", &wav(0.2)),
+        r.stream_with(PCM),
+        r.record_start(),
+    ] {
+        assert_eq!(rep.status, 503, "{}", rep.text());
+        assert!(
+            rep.text().contains("built-in audio engine"),
+            "{}",
+            rep.text()
+        );
+    }
+    assert_eq!(r.files_in_tmp(), 0);
+}

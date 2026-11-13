@@ -76,6 +76,8 @@ jobs:
         working-directory: receiver
     steps:
       - uses: actions/checkout@v7
+      - name: Install the ALSA development library (the audio engine links it)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test

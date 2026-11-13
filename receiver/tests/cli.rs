@@ -28,6 +28,8 @@ fn command(dir: &Path, args: &[&str]) -> Command {
         .env_remove("PI_SPEECH_RECEIVER_PLAYER")
         .env_remove("PI_SPEECH_RECEIVER_STREAM_PLAYER")
         .env_remove("PI_SPEECH_RECEIVER_RECORDER")
+        // Never the real speakers or microphone.
+        .env("PI_SPEECH_AUDIO_NULL", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     c
@@ -412,4 +414,210 @@ fn out_of_descriptors_the_receiver_backs_off_and_recovers() {
     signal(&run.child, libc::SIGTERM);
     assert_eq!(exit_code_within(&mut run.child, 10), Some(0));
     std::fs::remove_dir_all(dir).ok();
+}
+
+// ---- the built-in audio engine, through `serve` ----
+
+/// A receiver with no player or recorder configured and nothing on PATH: whatever plays
+/// or records is the receiver itself, on the null audio device.
+fn self_contained(dir: &Path, args: &[&str]) -> Running {
+    let tf = token_file(dir, 0o600);
+    let mut all = args.to_vec();
+    all.extend([
+        "--listen",
+        "127.0.0.1:0",
+        "--token-file",
+        tf.to_str().unwrap(),
+    ]);
+    let mut c = command(dir, &all);
+    c.env("PATH", "");
+    start(c)
+}
+
+/// The processes whose parent is `pid`: their ids and command lines.
+fn children_of(pid: u32) -> Vec<(u32, Vec<String>)> {
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let child: u32 = e.file_name().to_str()?.parse().ok()?;
+            let p = e.path();
+            let stat = std::fs::read_to_string(p.join("stat")).ok()?;
+            let ppid: u32 = stat
+                .rsplit_once(')')?
+                .1
+                .split_whitespace()
+                .nth(1)?
+                .parse()
+                .ok()?;
+            if ppid != pid {
+                return None;
+            }
+            let cmdline = std::fs::read(p.join("cmdline")).ok()?;
+            let args = cmdline
+                .split(|&b| b == 0)
+                .filter(|a| !a.is_empty())
+                .map(|a| String::from_utf8_lossy(a).into_owned())
+                .collect();
+            Some((child, args))
+        })
+        .collect()
+}
+
+fn call(addr: SocketAddr, method: &str, path: &str) -> Reply {
+    request(addr, method, path, Some(TOKEN), &[], &[], None)
+}
+
+fn final_state(addr: SocketAddr, id: &str) -> String {
+    let r = call(addr, "GET", &format!("/v1/play/{id}?wait=10"));
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(json_field(&r.text(), "error"), None, "{}", r.text());
+    json_field(&r.text(), "state").unwrap()
+}
+
+/// 24 kHz mono s16le PCM.
+fn pcm(seconds: f64) -> Vec<u8> {
+    (0..(seconds * 24000.0) as usize)
+        .flat_map(|i| (((i % 100) as i16 - 50) * 40).to_le_bytes())
+        .collect()
+}
+
+#[test]
+fn with_nothing_configured_and_an_empty_path_serve_plays_and_records_through_itself() {
+    let dir = scratch("cli-builtin");
+    // Also the explicit `serve` subcommand.
+    for args in [&[][..], &["serve"]] {
+        let mut r = self_contained(&dir, args);
+
+        // A file.
+        let t = std::time::Instant::now();
+        let rep = request(
+            r.addr,
+            "POST",
+            "/v1/play",
+            Some(TOKEN),
+            &[("Content-Type", "audio/wav")],
+            &wav(0.4),
+            None,
+        );
+        assert_eq!(rep.status, 202, "{}", rep.text());
+        let id = json_field(&rep.text(), "id").unwrap();
+        assert_eq!(final_state(r.addr, &id), "completed");
+        assert!(
+            t.elapsed() >= Duration::from_millis(400),
+            "{:?}",
+            t.elapsed()
+        );
+
+        // A Stream, which plays while its audio is still arriving.
+        let rep = request(
+            r.addr,
+            "POST",
+            "/v1/play/stream",
+            Some(TOKEN),
+            &[],
+            PCM,
+            None,
+        );
+        assert_eq!(rep.status, 202, "{}", rep.text());
+        let id = json_field(&rep.text(), "id").unwrap();
+        let me = BIN.to_string();
+        let player = ["play", "s16le", "24000", "1"].map(String::from);
+        assert!(wait_until(Duration::from_secs(5), || {
+            children_of(r.child.id())
+                .iter()
+                .any(|(_, c)| c[0] == me && c[1..] == player)
+        }));
+        let mut up = Upload::chunked(r.addr, &id, TOKEN);
+        let audio = pcm(0.6);
+        for piece in audio.chunks(4800) {
+            up.chunk(piece);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let rep = up.end();
+        assert_eq!(rep.status, 200, "{}", rep.text());
+        assert_eq!(final_state(r.addr, &id), "completed");
+
+        // An MP3 Stream.
+        let rep = request(
+            r.addr,
+            "POST",
+            "/v1/play/stream",
+            Some(TOKEN),
+            &[],
+            br#"{"format": "mp3"}"#,
+            None,
+        );
+        assert_eq!(rep.status, 202, "{}", rep.text());
+        let id = json_field(&rep.text(), "id").unwrap();
+        let mut up = Upload::chunked(r.addr, &id, TOKEN);
+        let mp3 = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/tone-0.5s-24k.mp3"
+        ))
+        .unwrap();
+        for piece in mp3.chunks(500) {
+            up.chunk(piece);
+        }
+        assert_eq!(up.end().status, 200);
+        assert_eq!(final_state(r.addr, &id), "completed");
+
+        // A recording.
+        let rep = call(r.addr, "POST", "/v1/record/start");
+        assert_eq!(rep.status, 201, "{}", rep.text());
+        let id = json_field(&rep.text(), "id").unwrap();
+        let recorder = children_of(r.child.id());
+        assert!(
+            recorder.iter().any(|(_, c)| c[0] == me && c[1] == "record"),
+            "{recorder:?}"
+        );
+        std::thread::sleep(Duration::from_millis(800));
+        let rep = call(r.addr, "POST", &format!("/v1/record/{id}/stop"));
+        assert_eq!(rep.status, 200, "{}", rep.text());
+        let secs = pi_speech_receiver::wav::wav_seconds(&rep.body).unwrap();
+        // The receiver answers the start once the recorder has run for 0.5 s.
+        assert!((1.2..2.5).contains(&secs), "{secs}");
+        assert_eq!(&rep.body[22..24], &1u16.to_le_bytes(), "mono");
+
+        signal(&r.child, 15);
+        assert_eq!(exit_code_within(&mut r.child, 8), Some(0));
+        assert!(temp_entries(&dir).is_empty());
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_built_in_stream_player_stopped_mid_upload_is_cancelled_and_gone_within_the_grace() {
+    let dir = scratch("cli-builtin-stop");
+    let mut r = self_contained(&dir, &[]);
+    let rep = request(
+        r.addr,
+        "POST",
+        "/v1/play/stream",
+        Some(TOKEN),
+        &[],
+        PCM,
+        None,
+    );
+    let id = json_field(&rep.text(), "id").unwrap();
+    let mut up = Upload::chunked(r.addr, &id, TOKEN);
+    up.chunk(&pcm(0.3));
+    std::thread::sleep(Duration::from_millis(200));
+    let players = children_of(r.child.id());
+    assert_eq!(players.len(), 1, "one player: {players:?}");
+    assert_eq!(players[0].1[..2], [BIN, "play"]);
+    let t = std::time::Instant::now();
+    let rep = call(r.addr, "POST", "/v1/stop");
+    assert!(rep.text().contains("\"stopped\": 1"), "{}", rep.text());
+    // Well inside the 2 s grace: it stopped on SIGINT, it was not killed.
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    assert!(wait_until(Duration::from_secs(2), || gone(players[0].0)));
+    up.chunk(&pcm(0.3));
+    let rep = up.end();
+    assert_eq!(json_field(&rep.text(), "state").unwrap(), "cancelled");
+    let rep = call(r.addr, "GET", &format!("/v1/play/{id}"));
+    assert_eq!(json_field(&rep.text(), "state").unwrap(), "cancelled");
+    signal(&r.child, 15);
+    assert_eq!(exit_code_within(&mut r.child, 8), Some(0));
+    std::fs::remove_dir_all(&dir).ok();
 }

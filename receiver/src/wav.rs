@@ -1,4 +1,10 @@
-//! Inspection of audio bytes: upload sniffing and recording duration.
+//! Inspection of audio bytes (upload sniffing and recording duration), and writing
+//! recordings.
+
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufWriter, Seek, SeekFrom, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -81,9 +87,99 @@ pub fn wav_seconds(b: &[u8]) -> Option<f64> {
     None
 }
 
+/// Writes a 16-bit PCM WAV file as its samples come; [`Writer::finish`] sets the sizes
+/// in its header.
+pub struct Writer {
+    out: BufWriter<File>,
+    channels: u16,
+    data_bytes: u64,
+}
+
+const HEADER_BYTES: u64 = 44;
+
+impl Writer {
+    /// Create (or replace) `path`, readable by its owner only.
+    pub fn create(path: &Path, rate: u32, channels: u16) -> io::Result<Writer> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        let mut out = BufWriter::new(file);
+        let block = 2 * channels;
+        let mut h = Vec::with_capacity(HEADER_BYTES as usize);
+        h.extend(b"RIFF");
+        h.extend(36u32.to_le_bytes()); // set by `finish`
+        h.extend(b"WAVEfmt ");
+        h.extend(16u32.to_le_bytes());
+        h.extend(1u16.to_le_bytes()); // PCM
+        h.extend(channels.to_le_bytes());
+        h.extend(rate.to_le_bytes());
+        h.extend((rate * block as u32).to_le_bytes());
+        h.extend(block.to_le_bytes());
+        h.extend(16u16.to_le_bytes());
+        h.extend(b"data");
+        h.extend(0u32.to_le_bytes()); // set by `finish`
+        out.write_all(&h)?;
+        Ok(Writer {
+            out,
+            channels,
+            data_bytes: 0,
+        })
+    }
+
+    /// Append interleaved samples.
+    pub fn write(&mut self, samples: &[i16]) -> io::Result<()> {
+        for s in samples {
+            self.out.write_all(&s.to_le_bytes())?;
+        }
+        self.data_bytes += 2 * samples.len() as u64;
+        Ok(())
+    }
+
+    /// Set the sizes in the header and flush the file to disk; returns the frames written.
+    pub fn finish(mut self) -> io::Result<u64> {
+        // Sizes past what 32 bits hold are clipped, which readers take as "to the end".
+        let data = u32::try_from(self.data_bytes).unwrap_or(u32::MAX - 36);
+        self.out.flush()?;
+        let mut file = self.out.into_inner().map_err(|e| e.into_error())?;
+        file.seek(SeekFrom::Start(4))?;
+        file.write_all(&(data + 36).to_le_bytes())?;
+        file.seek(SeekFrom::Start(40))?;
+        file.write_all(&data.to_le_bytes())?;
+        file.sync_all()?;
+        Ok(self.data_bytes / (2 * self.channels as u64))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_written_file_is_a_wav_of_its_length() {
+        let dir = std::env::temp_dir().join(format!(
+            "pisr-wav-{}-{}",
+            std::process::id(),
+            crate::token::random_hex(4).unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.wav");
+        let mut w = Writer::create(&path, 24000, 1).unwrap();
+        w.write(&[0i16; 12000]).unwrap();
+        w.write(&[i16::MAX, i16::MIN]).unwrap();
+        assert_eq!(w.finish().unwrap(), 12002);
+        let b = std::fs::read(&path).unwrap();
+        assert_eq!(b.len(), 44 + 2 * 12002);
+        assert_eq!(wav_seconds(&b), Some(12002.0 / 24000.0));
+        assert_eq!(&b[4..8], &(36u32 + 2 * 12002).to_le_bytes());
+        assert_eq!(&b[b.len() - 4..], &[0xFF, 0x7F, 0x00, 0x80]);
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        std::fs::remove_dir_all(dir).ok();
+    }
 
     fn wav(frames: usize, rate: u32) -> Vec<u8> {
         let data = vec![0u8; frames * 2];

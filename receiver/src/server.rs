@@ -41,45 +41,24 @@ const MAX_STREAM_REQUEST: u64 = 4096;
 pub const PLAYER_ENV: &str = "PI_SPEECH_RECEIVER_PLAYER";
 pub const STREAM_PLAYER_ENV: &str = "PI_SPEECH_RECEIVER_STREAM_PLAYER";
 pub const RECORDER_ENV: &str = "PI_SPEECH_RECEIVER_RECORDER";
-
-const PLAYERS: [(&str, &[&str]); 4] = [
-    ("pw-play", &[]),
-    ("paplay", &[]),
-    ("mpv", &["--no-video", "--really-quiet", "--no-terminal"]),
-    ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "quiet"]),
-];
-const RECORDERS: [(&str, &[&str]); 3] = [
-    (
-        "pw-record",
-        &["--rate", "16000", "--channels", "1", "--format", "s16"],
-    ),
-    (
-        "parecord",
-        &[
-            "--rate=16000",
-            "--channels=1",
-            "--format=s16le",
-            "--file-format=wav",
-        ],
-    ),
-    (
-        "arecord",
-        &["-q", "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "wav"],
-    ),
-];
+const NO_ENGINE: &str =
+    "the built-in audio engine is not available: the receiver cannot find its own executable";
 
 pub struct Config {
     pub listen: SocketAddr,
     pub token: String,
     /// The receiver's private directory for audio files; removed on shutdown.
     pub tmp_dir: PathBuf,
-    /// Player executable from the environment; `None` means search for a known player.
+    /// Player executable from the environment; `None` means the built-in engine.
     pub player: Option<PathBuf>,
-    /// Stream player executable from the environment; `None` means search for a known
-    /// one, unless `player` is set: then there is no Stream player.
+    /// Stream player executable from the environment; `None` means the built-in engine,
+    /// unless `player` is set: then there is no Stream player.
     pub stream_player: Option<PathBuf>,
-    /// Recorder executable from the environment; `None` means search for a known recorder.
+    /// Recorder executable from the environment; `None` means the built-in engine.
     pub recorder: Option<PathBuf>,
+    /// The built-in audio engine: this program, run as `<engine> play ...` and
+    /// `<engine> record <file>`. `None` when it cannot be found.
+    pub engine: Option<PathBuf>,
     pub max_body: u64,
     pub max_record_seconds: u64,
     /// How long a finished recording waits to be collected.
@@ -106,6 +85,7 @@ impl Config {
             player: from_env(PLAYER_ENV),
             stream_player: from_env(STREAM_PLAYER_ENV),
             recorder: from_env(RECORDER_ENV),
+            engine: std::env::current_exe().ok(),
             max_body: MAX_BODY,
             max_record_seconds: MAX_RECORD_SECONDS,
             pickup: Duration::from_secs(PICKUP_SECONDS),
@@ -204,6 +184,9 @@ struct Rec {
     id: String,
     path: PathBuf,
     ctl: Arc<ProcCtl>,
+    /// The built-in recorder's input, open while it records; it stops when this closes,
+    /// should the receiver go away without stopping it.
+    input: Option<ChildStdin>,
     phase: RecPhase,
     /// Set when the recorder failed while it ran; the audio is then already deleted.
     error: Option<String>,
@@ -399,24 +382,27 @@ fn configured_program(p: &Path) -> PathBuf {
     }
 }
 
-/// The configured program, or the first known one found on PATH.
-fn resolve(
-    configured: &Option<PathBuf>,
-    known: &[(&str, &[&str])],
-    what: &str,
-) -> Result<(PathBuf, Vec<String>), String> {
-    if let Some(p) = configured {
-        return Ok((configured_program(p), Vec::new()));
+/// A player or recorder to run, and the arguments it takes before its own.
+struct Program {
+    path: PathBuf,
+    args: Vec<String>,
+    /// The built-in engine rather than a configured program.
+    builtin: bool,
+}
+
+impl Program {
+    fn command(&self) -> Command {
+        let mut cmd = Command::new(&self.path);
+        cmd.args(&self.args);
+        cmd
     }
-    known
-        .iter()
-        .find_map(|(name, args)| {
-            find_in_path(name).map(|p| (p, args.iter().map(|a| a.to_string()).collect()))
-        })
-        .ok_or_else(|| {
-            let names: Vec<&str> = known.iter().map(|(n, _)| *n).collect();
-            format!("no {what} program found (tried {})", names.join(", "))
-        })
+
+    fn name(&self) -> String {
+        self.path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
 }
 
 fn query_wait(query: Option<&str>) -> Result<f64, ()> {
@@ -433,6 +419,25 @@ fn query_wait(query: Option<&str>) -> Result<f64, ()> {
 }
 
 impl Shared {
+    /// The configured program, or the built-in engine's `subcommand`.
+    fn program(&self, configured: &Option<PathBuf>, subcommand: &str) -> Result<Program, String> {
+        if let Some(p) = configured {
+            return Ok(Program {
+                path: configured_program(p),
+                args: Vec::new(),
+                builtin: false,
+            });
+        }
+        match &self.cfg.engine {
+            Some(engine) => Ok(Program {
+                path: engine.clone(),
+                args: vec![subcommand.to_string()],
+                builtin: true,
+            }),
+            None => Err(NO_ENGINE.into()),
+        }
+    }
+
     fn authorized(&self, req: &Request) -> bool {
         let presented = match (
             req.header("authorization"),
@@ -563,12 +568,12 @@ impl Shared {
             Response::error(status, &msg)
         };
         self.stop_playing();
-        let (program, args) = match resolve(&self.cfg.player, &PLAYERS, "player") {
+        let program = match self.program(&self.cfg.player, "play") {
             Ok(x) => x,
             Err(e) => return fail(503, e),
         };
-        let mut cmd = Command::new(&program);
-        cmd.args(&args).arg(&path);
+        let mut cmd = program.command();
+        cmd.arg(&path);
         let id = match random_hex(8) {
             Ok(id) => id,
             Err(e) => return fail(503, format!("no random source: {e}")),
@@ -585,12 +590,9 @@ impl Shared {
             Ok(c) => c,
             Err(e) => {
                 drop(g);
-                let name = program
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned());
                 return fail(
                     503,
-                    format!("cannot start the player {}: {e}", name.unwrap_or_default()),
+                    format!("cannot start the player {}: {e}", program.name()),
                 );
             }
         };
@@ -658,27 +660,18 @@ impl Shared {
         }
     }
 
-    /// The Stream player for `format`: the configured one, or the first known one found.
-    fn stream_player(&self, format: Format) -> Result<(PathBuf, Vec<String>), String> {
-        if let Some(p) = &self.cfg.stream_player {
-            return Ok((configured_program(p), stream::configured_args(format)));
-        }
-        if self.cfg.player.is_some() {
+    /// The Stream player for `format`: the configured one, or the built-in engine.
+    fn stream_player(&self, format: Format) -> Result<Program, String> {
+        // With only a file player configured, Streams get no player: the client then
+        // sends them as files, to that player.
+        if self.cfg.player.is_some() && self.cfg.stream_player.is_none() {
             return Err(format!(
                 "no Stream player: {PLAYER_ENV} is set and {STREAM_PLAYER_ENV} is not"
             ));
         }
-        let known = stream::players(format);
-        known
-            .iter()
-            .find_map(|name| find_in_path(name).map(|p| (p, stream::player_args(name, format))))
-            .ok_or_else(|| {
-                format!(
-                    "no Stream player for {} found (tried {})",
-                    format.name(),
-                    known.join(", ")
-                )
-            })
+        let mut program = self.program(&self.cfg.stream_player, "play")?;
+        program.args.extend(stream::player_args(format));
+        Ok(program)
     }
 
     fn start_stream(self: &Arc<Self>, format: Format) -> Response {
@@ -688,7 +681,7 @@ impl Shared {
         }
         // Without a Stream player the client sends the audio as a file later; until
         // then, what plays now keeps playing.
-        let (program, args) = match self.stream_player(format) {
+        let program = match self.stream_player(format) {
             Ok(x) => x,
             Err(e) => return Response::error(503, &e),
         };
@@ -697,8 +690,7 @@ impl Shared {
             Err(e) => return Response::error(503, &format!("no random source: {e}")),
         };
         self.stop_playing();
-        let mut cmd = Command::new(&program);
-        cmd.args(&args);
+        let cmd = program.command();
         let sh = Arc::clone(self);
         let done_id = id.clone();
         // Hold the lock across spawn so the exit callback cannot run before the entry exists.
@@ -708,15 +700,9 @@ impl Shared {
             Ok(x) => x,
             Err(e) => {
                 drop(g);
-                let name = program
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned());
                 return Response::error(
                     503,
-                    &format!(
-                        "cannot start the Stream player {}: {e}",
-                        name.unwrap_or_default()
-                    ),
+                    &format!("cannot start the Stream player {}: {e}", program.name()),
                 );
             }
         };
@@ -932,7 +918,7 @@ impl Shared {
         {
             return Response::error(409, "a recording is already active");
         }
-        let (program, args) = match resolve(&self.cfg.recorder, &RECORDERS, "recorder") {
+        let program = match self.program(&self.cfg.recorder, "record") {
             Ok(x) => x,
             Err(e) => return Response::error(503, &e),
         };
@@ -941,26 +927,27 @@ impl Shared {
             _ => return Response::error(503, "no random source"),
         };
         let path = self.cfg.tmp_dir.join(name);
-        let mut cmd = Command::new(&program);
-        cmd.args(&args).arg(&path);
+        let mut cmd = program.command();
+        cmd.arg(&path);
 
         let sh = Arc::clone(self);
         let done_id = id.clone();
         let mut g = lock(&self.inner);
-        let spawned = proc::spawn(cmd, move |exit| sh.recorder_ended(&done_id, &exit));
-        let ctl = match spawned {
-            Ok(c) => c,
+        let on_exit = move |exit: Exit| sh.recorder_ended(&done_id, &exit);
+        // The built-in recorder also ends when its input closes; a configured one keeps
+        // the closed input it always had.
+        let spawned = if program.builtin {
+            proc::spawn_with_input(cmd, on_exit).map(|(c, input)| (c, Some(input)))
+        } else {
+            proc::spawn(cmd, on_exit).map(|c| (c, None))
+        };
+        let (ctl, input) = match spawned {
+            Ok(x) => x,
             Err(e) => {
                 drop(g);
-                let name = program
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned());
                 return Response::error(
                     503,
-                    &format!(
-                        "cannot start the recorder {}: {e}",
-                        name.unwrap_or_default()
-                    ),
+                    &format!("cannot start the recorder {}: {e}", program.name()),
                 );
             }
         };
@@ -983,6 +970,7 @@ impl Shared {
             id: id.clone(),
             path: path.clone(),
             ctl: Arc::clone(&ctl),
+            input,
             phase: RecPhase::Recording,
             error: None,
             note: String::new(),
@@ -1039,6 +1027,7 @@ impl Shared {
         let mut g = lock(&self.inner);
         if let Some(r) = g.recs.iter_mut().find(|r| r.id == id) {
             r.phase = RecPhase::Ended;
+            r.input = None;
             r.finished = Some(Instant::now());
             if error.is_some() {
                 let _ = fs::remove_file(&r.path);
