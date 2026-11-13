@@ -3,7 +3,7 @@ type: glossary
 created: 2026-11-12T13:39:07Z
 created_by: claude-opus-5-5
 created_session: 01a1cfe8-fb2e-76f9-8621-eae06c80679c
-updated: 2026-11-12T17:32:09Z
+updated: 2026-11-13T10:18:02Z
 updated_by: claude-opus-5-5
 updated_session: 01a1cfe8-fb2e-76f9-8621-eae06c80679c
 ---
@@ -38,6 +38,20 @@ A chat model's reading that does not say the text it was given, word for word: i
 or leaves out words. Told by comparing the model's own transcript with the text.
 _Example_: asked to say "Turn left at the bridge", the model says "Sure! Turn left at the bridge."
 _Confirmed_: 2026-11-12, Jang (a Stray stops playback by default).
+
+**This machine**:
+The machine Pi runs on, as the /speech panel and messages name it.
+_Example_: decent-spider when Pi runs there over SSH; the laptop when Pi runs on the laptop.
+_Avoid_: local machine, Pi host (in the UI)
+_Confirmed_: 2026-11-13, Jang.
+
+**Remote machine**:
+The machine at the other end of the playback bridge from This machine: where audio can play, record, or local
+models run, chosen per direction.
+_Example_: agent-jail, the laptop with speakers, while Pi runs on decent-spider.
+_Not_: the Pi server as seen from the laptop (from Pi's side, the laptop is the Remote machine).
+_Avoid_: other machine, playback machine
+_Confirmed_: 2026-11-13, Jang ("use Remote machine rather than Other machine").
 
 ## Unresolved
 
