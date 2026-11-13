@@ -117,11 +117,11 @@ try {
   check(dock(t.lines()).some((l) => /Same model, same reply\. No extra request\./.test(l)), 'on Summarized by the line says there is no extra request');
   await t.key('Down'); await t.key('Enter');
   d = dock(t.lines());
-  check(/Length\s+Full ~60 s$/.test(rowOf(d, 'Length') ?? '') && d.some((l) => /Best effort: about 60 s\./.test(l)), 'Enter cycles Length; best effort, it says', d.slice(1, 8));
+  check(/Length\s+Abridged ~30 s$/.test(rowOf(d, 'Length') ?? '') && d.some((l) => /Best effort: about 30 s\./.test(l)), 'Enter cycles Length; best effort, it says', d.slice(1, 8));
   await t.key('Down'); await t.key('Right', 2);
   d = dock(t.lines());
   check(/Truncate at\s+30 s$/.test(rowOf(d, 'Truncate at') ?? '') && d.some((l) => /Stops at 30 s, at a sentence end\./.test(l)), 'Truncate at cycles to 30 s and says where reading stops', d.slice(1, 8));
-  check(readSettings(ctx).readAloud?.length === 'full' && readSettings(ctx).readAloud?.truncate === 30, 'Length and Truncate at are saved', readSettings(ctx).readAloud);
+  check(readSettings(ctx).readAloud?.length === 'abridged' && readSettings(ctx).readAloud?.truncate === 30, 'Length and Truncate at are saved', readSettings(ctx).readAloud);
   await t.key('Left', 2); await t.key('Up'); await t.key('Left');
   await t.key('Escape');
   check(/Read aloud options\s+Summary ›$/.test(rowOf(dock(t.lines()), 'Read aloud options') ?? ''), 'Esc goes back; the row shows Summary');
