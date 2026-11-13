@@ -3,7 +3,7 @@
 pi-speech gives [Pi](https://github.com/earendil-works/pi-coding-agent) a voice and ears, through
 [OpenRouter](https://openrouter.ai) or the xAI login in Pi: it speaks text and replies, transcribes audio
 files, and takes dictation.
-It is one small tool: one command (`/speech`), two keys (Alt+Z to dictate, Alt+S to speak what you type), one
+It is one small tool: one command (`/speech`), two keys (Alt+Z to dictate, Alt+S to speak what you type; both can be changed), one
 footer status, one settings file, and one playback at a time.
 
 ## Install
@@ -31,44 +31,86 @@ You need an OpenRouter API key or an xAI login in Pi (see [Credentials](#credent
 ## `/speech`
 
 **`/speech`** opens the dock: a compact panel in the place of Pi's editor (nothing floats over the
-conversation). It has three sections, each with its actions on one toolbar line and its settings under it. The
-header is also the top rule, and shows what speech is doing (`▶ speaking`, `● REC 0:03`, `… transcribing`)
-while it happens.
+conversation). The main view holds only settings, under three headings: SPEAK and LISTEN carry the key that
+opens the speak composer and the key that dictates, as Pi has them bound; SETTINGS holds two submenus. A row
+shows only its current value: a model or a voice by its name (its price, features and languages are in its
+picker). The header is also the top rule, and shows what speech is doing (`▶ speaking`, `● REC 0:03`,
+`… transcribing`) while it happens.
 
 ```
-Speech ──────────────────────────────────────────────────────────────────────── ▶ speaking
-SPEAK    ▸ Speak… Alt+S    Replay last r    History… h    Stop s
-           Speech model        elevenlabs/eleven-v4-turbo  ~$0.032/min   tags · 90+ langs · fast  ›
-           Voice               sarah                       ja · set by you                        ›
-           Read replies aloud  off
-LISTEN     Dictate Alt+Z    Transcribe file… t
-           Transcription       deepgram/nova-3              $0.0043/min  multilingual             ›
-           Dictation language  auto                        the model detects it                   ›
-SYSTEM     Play audio on       auto                        → this machine
-           Agent tools         on
-  ✓ Spoken
-Enter type messages to speak · ←→ more · Esc close
+Speech ──────────────────────────────────────────────────────────────── ▶ speaking
+SPEAK (Alt+S)
+  ▸ Read aloud options   Off
+    Speech source        Provider
+    Speech model         x-ai/grok-voice-tts-1.0 ›
+    Voice                eve ›
+LISTEN (Alt+Z)
+    Transcription source Provider
+    Transcription model  openai/whisper-large-v3-turbo ›
+    Dictation language   auto
+    Dictation output     Pi ›
+SETTINGS
+    Hotkeys ›
+    Bridge connection ›
+
+  ✓ Read aloud: All
+  ←→ Off · All · Esc close
 ```
 
-| Key             | In the dock                                                                                   |
-| --------------- | --------------------------------------------------------------------------------------------- |
-| `↑` `↓`         | Move line by line (they wrap); a toolbar is entered at the column it was left at              |
-| `←` `→`         | On a toolbar: the next action. On a setting: change it (audio route, on/off); saved at once   |
-| `Enter`         | Run the action; open the list or the field of a row ending in `›`; on a toggle, like `→`      |
-| `r` `h` `s` `t` | Replay last, History…, Stop, Transcribe file… (from any row that is not a model or voice row) |
-| `Alt+S`         | The speak composer, also from outside the dock                                                |
-| `Alt+Z`         | Dictate: closes the dock and starts (or stops) dictation, as anywhere                         |
-| `Tab`           | On Voice, play a sample of the current voice                                                  |
-| `F2`            | On Voice, set its language (`ja`, `pt-BR`, …, or `auto` to remove the override)               |
-| any character   | On Speech model, Voice, Transcription: open the list with it typed                            |
-| `Esc`           | Back one level; from the dock, close it                                                       |
+Values change in place with Enter or ←→ and are saved at once; a row ending in `›` opens a picker (models,
+voices), a field (Dictation output) or a submenu. **Read aloud options** is Off or All (every reply is read
+aloud; it starts Off in each session). **Speech source** and **Transcription source** are Provider, the only
+source so far. Something unavailable shows `✗` and the reason beside the value (`✗ xAI: no login`,
+`✗ models unavailable`).
 
-**Speak…** (or Alt+S from anywhere) opens the composer: type a message and press Enter. It is spoken, the field
-clears, and the composer stays ready for the next message; a new message replaces the audio that is playing. Esc
-returns to the dock, or closes the composer when Alt+S opened it. When the speech model takes inline delivery
-tags, the composer says so (`[tags] direct this model`). **History…** lists the spoken messages still on disk,
-the newest first; Enter replays one from its file, without a new request, and the list stays open.
-**Transcribe file…** asks for an audio file; its transcript goes into the editor and the dock closes.
+**Hotkeys ›** lists every action with its key; Enter runs the highlighted one:
+
+```
+Speech › Hotkeys ─────────────────────────────────────────────────────────────────
+  ▸ Speak…             Alt+S
+    Dictate            Alt+Z
+    Replay last        r
+    History…           h
+    Stop               s
+    Transcribe file…   t
+
+  Enter run · k change key · Esc back
+```
+
+`k` on Speak… or Dictate waits for a new key: Alt with a letter or a digit (Ctrl and Shift may be added, as
+in Ctrl+Alt+D). The key is saved in the settings file at once, but Pi binds an extension's keys when it loads
+the extension, so the new key works after `/reload` or the next start of Pi; until then the old key keeps
+working, and the row shows the new one waiting (`Alt+S · → Alt+D after /reload`). `r`, `h`, `s` and `t`
+also work in the main view (except on a model or voice row, where typing searches).
+
+**Bridge connection ›** holds the bridge mode, `auto` (the bridge when Pi runs over SSH), `on` or `off`,
+changed with ←→ or Enter, and says where audio plays: on This machine, or on the Remote machine with the
+receiver's state (`✓ 127.0.0.1:47613`, `✗ receiver unreachable`).
+
+| Key             | In the dock                                                                              |
+| --------------- | ---------------------------------------------------------------------------------------- |
+| `↑` `↓`         | Move row by row (they wrap)                                                              |
+| `←` `→`         | Change the value in place (Read aloud options, the bridge mode); saved at once           |
+| `Enter`         | Change the value in place; open the picker, field or submenu of a row ending in `›`;     |
+|                 | in Hotkeys, run the action                                                               |
+| `k`             | In Hotkeys, on Speak… or Dictate: set a new key (works after `/reload`)                  |
+| `r` `h` `s` `t` | Replay last, History…, Stop, Transcribe file… (in Hotkeys, and on the main view's rows   |
+|                 | that are not a model or voice row)                                                       |
+| Speak key       | The speak composer (Alt+S unless changed), also from outside the dock                    |
+| Dictate key     | Dictate (Alt+Z unless changed): closes the dock and starts (or stops) dictation          |
+| `Tab`           | On Voice, play a sample of the current voice                                             |
+| `F2`            | On Voice, set its language (`ja`, `pt-BR`, …, or `auto` to remove the override)          |
+| any character   | On Speech model, Voice, Transcription model: open the list with it typed                 |
+| `Esc`           | Back one level; from the main view, close the dock                                       |
+
+**Speak…** (or the Speak key from anywhere) opens the composer: type a message and press Enter. It is spoken,
+the field clears, and the composer stays ready for the next message; a new message replaces the audio that is
+playing. Esc returns to where it was opened, or closes the composer when the Speak key opened it. When the
+speech model takes inline delivery tags, the composer says so (`[tags] direct this model`). **History…** lists
+the spoken messages still on disk, the newest first; Enter replays one from its file, without a new request,
+and the list stays open. **Transcribe file…** asks for an audio file; its transcript goes into the editor and
+the dock closes. The agent tools (`speech_synthesize`, `speech_transcribe`) are turned on and off with
+`/speech --set tools on|off`.
 **Dictation language** is the language you speak (`ja`, `pt-BR`, or `auto`): it goes with every dictation and
 transcribed file until you change it. **Dictation output** chooses where a finished transcript lands: _Pi_
 (the default) inserts it into Pi's input box, or _User-defined_ hands it to a command you supply — `%s` stands
@@ -79,7 +121,7 @@ text falls back into Pi's input box so it is never lost.
 
 ### Choosing a model
 
-Enter on Speech model or Transcription opens the model browser:
+Enter on Speech model or Transcription model opens the model browser:
 
 ```
 Speech › Speech model ────────────────────────────────────────────────────────────────────
@@ -123,16 +165,14 @@ shows where a long list is, the current choice is marked `✓`, the selection `�
 rules.
 
 Results, refusals and errors appear in one line under the rows (`✓ Voice: Kore`, `✗ No xAI login in Pi: …`),
-not as notifications; the line is always there, so the dock does not move when they come and go. Something
-unavailable is shown with `✗` and the reason (`✗ receiver unreachable`, `✗ xAI: no login`); while the model
-catalog loads, the model rows say `loading…`. The hint line follows the row and the state, `Esc` always last.
+not as notifications; the line is always there, so the dock does not move when they come and go. The hint line
+follows the row and the state, `Esc` always last.
 
-The dock is at most 96 columns wide. Below 72 columns the section names become headings of their own; as it
-narrows further the features of the models give way first, then `/min` of the prices, then the notes that do
-not fit beside their value, then the price; values are shortened with `…` last (an alert keeps its `✗` next
-to the value). Below 40 columns the dock shows one line asking for a wider terminal. Section names are in the
-accent colour, labels, notes and hints dim, values normal, and the selection is reversed and bold; with
-`NO_COLOR` set no colour is added, but bold, reverse video and dim remain.
+The dock is at most 96 columns wide. As it narrows, a note beside a value gives way to its short form, then
+goes; values are shortened with `…` last (an alert keeps its `✗` next to the value). On a short terminal the
+headings give way. Below 40 columns the dock shows one line asking for a wider terminal. The title is in the
+accent colour, headings, labels, notes and hints dim, values normal, and the selection is reversed and bold;
+with `NO_COLOR` set no colour is added, but bold, reverse video and dim remain.
 
 Without a terminal UI (RPC mode), `/speech` opens a menu of dialogs instead: Speak text…, Stop, Replay last,
 Dictate (Alt+Z), Sample a voice…, Read-aloud, Audio, Speech model…, Voice…, Voice language…, Transcription
@@ -398,7 +438,9 @@ receiver, in the `Authorization` header.
 
 Every choice lives in one versioned file, `pi-speech/settings.json` in Pi's agent directory (`~/.pi/agent`,
 or `$PI_CODING_AGENT_DIR`): speech model, voice, transcription model, dictation language, the dictation output
-command, tools, bridge mode, the order of the model lists, voice-language overrides, and the endpoints you added. Settings persist across restarts, also with `--no-session`. Read-aloud is not saved.
+command, tools, bridge mode, the order of the model lists, voice-language overrides, the endpoints you added, and
+the keys of Speak and Dictate (only when changed, as `"hotkeys": { "speak": "alt+d", "dictate": "alt+z" }`; read
+when Pi loads the extension). Settings persist across restarts, also with `--no-session`. Read-aloud is not saved.
 
 Files from earlier versions (`settings.json` without a version, `bridge.json`, `language-overrides.json`)
 are read on load, and replaced by the versioned file the first time a setting is saved.
