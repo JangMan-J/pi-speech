@@ -202,9 +202,10 @@ try {
   d = dock(t.lines());
   check(/^ {4}Pairing\s+✗ Re-pair · .+ ›$/.test(d[3] ?? ''), 'without a receiver, Pairing is ✗ Re-pair ›', d[3]);
   await t.key('Down', 2); await sleep(200);
-  check(/Enter how to pair · Esc back/.test(hintOf(dock(t.lines()))), 'its hint offers how to pair', hintOf(dock(t.lines())));
+  check(/Enter address, pair · Esc back/.test(hintOf(dock(t.lines()))), 'its hint offers the address and pairing', hintOf(dock(t.lines())));
   await t.key('Enter'); await sleep(300);
-  check(/pi-speech-receiver pair/.test(dock(t.lines()).join('\n')), 'Enter on Re-pair says how to pair', dock(t.lines()));
+  check(/Address/.test(dock(t.lines()).join('\n')) && /receiver's address/.test(dock(t.lines()).join('\n')), 'Enter on Pairing opens the address field and says what it takes', dock(t.lines()));
+  await t.key('Escape'); await sleep(200);
   await t.key('Up', 2); await sleep(200);
   await t.key('Right'); await sleep(1200);
   check(readSettings(ctx).bridge === 'on' || /unreachable|✗/.test(dock(t.lines()).join('\n')), 'Right cycles the mode (or says why it cannot)', dock(t.lines()).slice(0, 6));

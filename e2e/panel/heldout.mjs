@@ -113,7 +113,7 @@ const rcv = await startReceiver();
     check(/Bridge\s+auto/.test(b()), 'Bridge starts at auto', b());
     await sleep(600);
     const pairing = rowOf(dock(t.lines()), 'Pairing') ?? '';
-    check(/Pairing\s+✓ Connected to 127\.0\.0\.1:\d+ · \d+ ms$/.test(pairing), 'Pairing says the receiver is connected, where and how fast', pairing);
+    check(/Pairing\s+✓ Connected to 127\.0\.0\.1:\d+ · \d+ ms( ›)?$/.test(pairing), 'Pairing says the receiver is connected, where and how fast', pairing);
     await t.key('Right'); await sleep(800);
     check(/Bridge\s+on · plays on the Remote machine · ✓/.test(b()) && readSettings(ctx).bridge === 'on', 'Right moves it to on, saves it, and shows the receiver', [b(), readSettings(ctx).bridge]);
     await t.key('Right'); await sleep(400);

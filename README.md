@@ -151,11 +151,16 @@ another key there.
 
 **Bridge connection ›** holds the bridge mode, `auto` (the bridge when Pi runs over SSH), `on` or `off`,
 changed with ←→ or Enter, and says where audio plays: on This machine, or on the Remote machine with the
-receiver's state (`✓ 127.0.0.1:47613`, `✗ receiver unreachable`). **Remote machine** is the bridge address
-(`127.0.0.1:47613`), from `PI_SPEECH_BRIDGE_URL`; it is set there, not in the dock. **Pairing** checks the
-receiver when the submenu opens and every 2 s while it is open: `✓ Connected to 127.0.0.1:47613 · 52 ms`, or
-`✗ Re-pair ›`, whose Enter says how to pair. Pairing runs on your own computer, not from Pi (see
-[The bridge](#the-bridge)).
+receiver's state (`✓ 127.0.0.1:47613`, `✗ receiver unreachable`). **Remote machine** is the address in use and
+where it comes from: `set in Pairing`, `from PI_SPEECH_BRIDGE_URL`, or `ssh forward` (127.0.0.1:47613, or the
+spare forward 47614-47633 of your session when another session holds 47613). **Pairing** checks the receiver
+when the submenu opens and every 2 s while it is open (`✓ Connected to 127.0.0.1:47613 · 52 ms`, or
+`✗ Re-pair`), and its Enter opens a field for the receiver's address: empty for the ssh forward, or a Tailscale
+or LAN address (`100.64.0.2:47613`). Enter there connects when a token of This machine works; otherwise the
+receiver prints a 6-digit code on its own terminal (never to Pi), you type it into the panel, and the token it
+returns is saved as `~/.config/pi-speech/bridge.token` (or `PI_SPEECH_BRIDGE_TOKEN_FILE`) and the address in the
+settings. A code expires after 2 minutes and takes 5 wrong attempts; Enter on the address again asks for a new
+one. With `pi-speech-receiver ssh` the token is copied for you (see [The bridge](#the-bridge)).
 
 Under **DIRECTION**, while the bridge is in use, **Play audio on**, **Record audio on** and **Run models on**
 each choose This machine or the Remote machine (←→ or Enter; all Remote machine by default). Run models on is
@@ -508,7 +513,14 @@ Any ssh options work, for example `pi-speech-receiver ssh -p 2222 -i ~/.ssh/key 
   if needed and copies it to the Pi host as `~/.config/pi-speech/bridge.token` with `sftp`. That needs key
   or agent authentication and a host key you have already accepted: for a new host, connect once with plain
   `ssh` first. A failed copy is reported and the session goes on; the next session tries again.
-- It runs a receiver for as long as the ssh session lasts and forwards it to `127.0.0.1:47613` on the Pi host.
+- All your sessions share one receiver: the first starts it, the others reuse it, and it stops a moment after
+  the last session ends, so closing one session leaves the audio of the others alone. Each session forwards it
+  to `127.0.0.1:47613` on the Pi host and to a spare port of its own (47614-47633). A second session to the
+  same host gets an ssh warning that 47613 is taken there; Pi then finds that session at its spare port, and
+  when the session behind 47613 ends, it looks again and finds the next one.
+- Several Pi sessions can play at once (each Pi tells the receiver who it is): a new message replaces only that
+  Pi's own audio, and Stop stops only its own; your system mixes the rest. Dictation records for one at a
+  time; local models on your machine run one at a time, the others waiting their turn.
 - `pi-speech-receiver pair <pi-host>` copies the token again (after a new token, or when the copy failed).
 
 The details are in the _SSH sessions_ section of `protocol/bridge.md`.
@@ -518,8 +530,12 @@ By hand instead: start `pi-speech-receiver` (it listens on `127.0.0.1:47613`), c
 `~/.config/pi-speech/bridge.token` (mode 0600), or set `PI_SPEECH_BRIDGE_TOKEN` or
 `PI_SPEECH_BRIDGE_TOKEN_FILE` there.
 
-The bridge URL must be a loopback address; the token must have at least 32 characters and is sent only to the
-receiver, in the `Authorization` header.
+Over Tailscale or a LAN instead of ssh: run `pi-speech-receiver --listen <your-address>:47613 --network` on your
+machine and pair from Pi's panel (Bridge connection, Pairing) with that address and the code the receiver prints.
+The bridge is plain HTTP: on a LAN, anyone on it can read the audio and the token; Tailscale encrypts the traffic.
+
+`PI_SPEECH_BRIDGE_URL` must be a loopback address (an address typed in Pairing may be any); the token must have
+at least 32 characters and is sent only to the receiver, in the `Authorization` header.
 
 ## Settings
 
@@ -527,7 +543,7 @@ Every choice lives in one versioned file, `pi-speech/settings.json` in Pi's agen
 or `$PI_CODING_AGENT_DIR`): speech model, voice, transcription model, dictation language, the dictation output
 command, tools, bridge mode, the order of the model lists, voice-language overrides, the endpoints you added, and
 the Speech and Transcription sources with their local models, Play audio on, Record audio on and Run models on
-(only when This machine), the keys of Speak and Dictate (only when changed, as `"hotkeys": { "speak": "alt+d", "dictate": "alt+z" }`; read
+(only when This machine), the receiver's address typed in Pairing (`bridgeAddress`), the keys of Speak and Dictate (only when changed, as `"hotkeys": { "speak": "alt+d", "dictate": "alt+z" }`; read
 when Pi loads the extension), and the read-aloud options Summarized by, Length and Truncate at. Settings persist
 across restarts, also with `--no-session`. What read-aloud reads (Read) is not saved: it starts Off.
 
@@ -562,7 +578,7 @@ of any error text. An endpoint you added with no key is sent none.
 | `PI_SPEECH_STREAM_PLAYER`     | Player of speech as it arrives, run as `<player> s16le <rate> <channels>`, PCM on stdin |
 | `PI_SPEECH_RECORDER`          | Recorder on the Pi host, run as `<recorder> <output.wav>`, stops on SIGINT              |
 | `PI_SPEECH_LOCAL_MIC`         | `1`: the Pi host's microphone is yours, even over SSH                                   |
-| `PI_SPEECH_BRIDGE_URL`        | Receiver URL (default `http://127.0.0.1:47613`; loopback only)                          |
+| `PI_SPEECH_BRIDGE_URL`        | Receiver URL (default: the ssh forwards, 47613 then 47614-47633; loopback only)         |
 | `PI_SPEECH_BRIDGE_TOKEN`      | Bridge token                                                                            |
 | `PI_SPEECH_BRIDGE_TOKEN_FILE` | File holding the bridge token (default `~/.config/pi-speech/bridge.token`)              |
 

@@ -11,13 +11,18 @@ This file is the contract between the two sides. Both sides implement it exactly
 ## Transport
 
 - The receiver listens on loopback only. It refuses to start on any address that is
-  not `127.0.0.1` or `::1`.
+  not `127.0.0.1` or `::1`, unless `--network` is given with `--listen` (a Tailscale or
+  LAN address; the traffic is plain HTTP, which Tailscale encrypts and a LAN does not).
 - When Pi runs on a remote host, the receiver's port is forwarded there with SSH. The
   usual way is `pi-speech-receiver ssh <host>` on the user's computer (see "SSH
-  sessions" below), which runs a receiver for that session and adds the forward. By
-  hand: `ssh -R 127.0.0.1:47613:127.0.0.1:47613 decent-spider` with a receiver already
-  running. Either way Pi reaches the receiver at `http://127.0.0.1:47613` on the remote
-  host.
+  sessions" below), which runs a receiver shared by the user's sessions and adds the
+  forwards. By hand: `ssh -R 127.0.0.1:47613:127.0.0.1:47613 decent-spider` with a
+  receiver already running. Either way Pi reaches the receiver at
+  `http://127.0.0.1:47613` on the remote host, or, when another session holds 47613
+  there, at the session's spare port (47614 to 47633).
+- A client that uses the forwards tries 47613, then 47614 to 47633, keeps the first that
+  answers `GET /v1/health` with its token, and tries them again when a request to it
+  cannot be made (its session has ended).
 - HTTP/1.1, one request per connection is enough. JSON bodies are UTF-8.
 - The whole request head (request line and headers) must arrive within 10 s of the
   connection opening; otherwise the receiver answers `408` if it can and closes the
@@ -26,14 +31,16 @@ This file is the contract between the two sides. Both sides implement it exactly
 
 ## Authentication
 
-- Every request, including `GET /v1/health`, carries `Authorization: Bearer <token>`.
+- Every request, including `GET /v1/health`, carries `Authorization: Bearer <token>`,
+  except `POST /v1/pair`, which is how a client without the token gets it.
 - A missing or wrong token gets `401` with `{"error": "unauthorized"}` and has no
   other effect. The receiver compares tokens in constant time.
 - The token is a random string of at least 32 characters. The receiver reads it from
   the file named by `--token-file`. With no `--token-file`, it uses
   `$XDG_CONFIG_HOME/pi-speech/receiver.token` (`~/.config/...` when the variable is
   unset); if that file does not exist, the receiver creates it with mode `0600` and a
-  new random token. A `--token-file` that does not exist is an error. The receiver
+  new random token, written whole to a file of its own and then linked to that name
+  only if it still does not exist. A `--token-file` that does not exist is an error. The receiver
   refuses to start if the token file is readable by group or others.
 - The receiver never logs the token or request bodies.
 
@@ -41,17 +48,29 @@ This file is the contract between the two sides. Both sides implement it exactly
 
 Every non-2xx response has the body `{"error": "<readable message>"}`.
 
-| Status | Meaning                                                                          |
-| ------ | -------------------------------------------------------------------------------- |
-| 400    | Malformed request, or a body that breaks off (interrupted transfer).             |
-| 401    | Missing or wrong token.                                                          |
-| 408    | The request head did not arrive within 10 s.                                     |
-| 404    | Unknown endpoint, or unknown playback or recording id.                           |
-| 409    | A recording or a model run is already active, or a Stream cannot take audio.     |
-| 413    | Body larger than the receiver's limit (default 64 MiB).                          |
-| 415    | `POST /v1/transcribe` with audio that is not WAV or MP3.                         |
-| 422    | The recording holds less than 0.1 s of audio, or a model run failed (see below). |
-| 503    | The player or the microphone is not available; the message says why.             |
+| Status | Meaning                                                                                    |
+| ------ | ------------------------------------------------------------------------------------------ |
+| 400    | Malformed request, or a body that breaks off (interrupted transfer).                       |
+| 401    | Missing or wrong token.                                                                    |
+| 403    | `POST /v1/pair` with a wrong code.                                                         |
+| 408    | The request head did not arrive within 10 s.                                               |
+| 404    | Unknown endpoint, or unknown playback or recording id.                                     |
+| 409    | A recording is already active, the model-run queue is full, or a Stream cannot take audio. |
+| 410    | `POST /v1/pair` with a code when none is active (expired, used, out of attempts).          |
+| 413    | Body larger than the receiver's limit (default 64 MiB).                                    |
+| 415    | `POST /v1/transcribe` with audio that is not WAV or MP3.                                   |
+| 422    | The recording holds less than 0.1 s of audio, or a model run failed (see below).           |
+| 503    | The player or the microphone is not available; the message says why.                       |
+
+## Clients
+
+The user may run several Pi processes against one receiver at once. Each sends
+`X-Pi-Speech-Client: <id>` on every request: an id it picks at random when it starts, 1 to
+64 letters, digits, `-`, `_` or `.` (anything else gets `400`). Requests without the header
+belong to one client of their own. The header decides which playbacks a new play replaces
+and which `POST /v1/stop` stops: those of the same client only. Playbacks of different
+clients play at the same time (the system's mixer blends them). Recording stays one at a
+time for all clients.
 
 ## Endpoints
 
@@ -82,8 +101,9 @@ Starts a player that reads a Stream from its input, without any audio yet.
   format sent as it is produced. A rate outside 8000..=192000 or another format gets
   `400`.
 - Optional header `X-Pi-Speech-Kind: message | sample` (default `message`).
-- A new play request (of either kind) stops the playback in progress; that playback
-  becomes `cancelled`.
+- A new play request (of either kind) stops the playback in progress of the same client
+  (`X-Pi-Speech-Client`, see "Clients"); that playback becomes `cancelled`. Other
+  clients' playbacks go on.
 - Response: `202 {"id": "<playback id>"}` once the player has started, in state
   `playing`. If no player for that format can start, `503`; the playback then fails
   with that message.
@@ -126,10 +146,25 @@ and `POST /v1/stop` apply to it.
 
 ### `POST /v1/play/<id>/cancel` and `POST /v1/stop`
 
-Stop that playback (or whatever plays now) and mark it `cancelled`.
+Stop that playback (or, for `POST /v1/stop`, what plays now) and mark it `cancelled`.
 `200 {"id": "...", "state": "cancelled"}`. A playback that had already ended keeps
-its final state, and the answer reports that state. `POST /v1/stop` answers
-`200 {"stopped": <number of playbacks stopped>}`.
+its final state, and the answer reports that state. `POST /v1/stop` with
+`X-Pi-Speech-Client` stops that client's playbacks only, without it every playback, and
+answers `200 {"stopped": <number of playbacks stopped>}`.
+
+### `POST /v1/pair`
+
+Gives the token to a client that does not have it, once the user has typed the code the
+receiver shows on its own terminal (standard error; for the shared receiver of "SSH
+sessions", the terminals of its sessions). Needs no `Authorization`. Body (JSON, optional):
+
+- Empty or `{}`: a new code. The receiver prints six random digits, valid for 120 s,
+  replacing any earlier code, and answers `202 {"expires_in": 120, "attempts": 5}`. The
+  code is never sent to the client.
+- `{"code": "<6 digits>"}`: the right code gets `200 {"token": "<token>"}` and is used up.
+  A wrong one gets `403 {"error": "...", "attempts_left": <n>}`; after 5 wrong attempts the
+  code is void. With no code active (none asked for, expired, used, void) `410`. Not six
+  digits: `400`.
 
 ### `POST /v1/record/start`
 
@@ -168,8 +203,10 @@ A model id has only letters, digits, `.`, `_` and `-`, and does not start with `
 anything else gets `400`. A failed run gets `422` with the model's own message (for example a
 model that is not downloaded, naming `pi-speech-receiver models download <id>`).
 
-One transcription or speech runs at a time: another `POST /v1/transcribe` or `POST /v1/speak`
-while one runs gets `409`. Listing models and voices is not a run.
+One transcription or speech runs at a time. Another `POST /v1/transcribe` or `POST /v1/speak`
+(of any client) waits, after its body has arrived, until the runs before it have ended, in
+the order they came; up to 8 wait, and one more gets `409`. A client that closes its
+connection while it waits leaves the queue. Listing models and voices is not a run.
 
 #### `GET /v1/models`
 
@@ -200,11 +237,12 @@ while one runs gets `409`. Listing models and voices is not a run.
 ## Receiver command line
 
 ```
-pi-speech-receiver [--listen 127.0.0.1:47613] [--token-file PATH]
+pi-speech-receiver [--listen 127.0.0.1:47613 [--network]] [--token-file PATH]
 ```
 
 - On start it prints exactly one line to stdout, `listening <address>:<port>`, with the
   port actually bound (so `--listen 127.0.0.1:0` works in tests).
+- `--network` lets `--listen` name an address that is not loopback (see "Transport").
 - It stops cleanly on SIGINT and SIGTERM: playback and recording stop, temporary
   files are deleted.
 
@@ -245,7 +283,8 @@ pi-speech-receiver ssh [ssh-args...] <host> [command...]
 pi-speech-receiver pair [ssh-args...] <host>
 ```
 
-`ssh` runs the user's own `ssh` (found on `PATH`) with the bridge for that session only:
+`ssh` runs the user's own `ssh` (found on `PATH`) with the bridge, through one receiver shared
+by all of the user's sessions:
 
 1. **Pairing**, on the first connection to a host: the local token file (made if missing,
    as above) is uploaded to the remote host as `.config/pi-speech/bridge.token` under the
@@ -269,12 +308,25 @@ pi-speech-receiver pair [ssh-args...] <host>
    every host again. A failed pairing is reported (with the end of `sftp`'s error
    output) and the session goes on without it; the next session tries again. `pair`
    uploads the token whether or not the host was paired and exits non-zero when it fails.
-2. **Receiver**: a receiver starts on `127.0.0.1:0` with the local token.
-3. **Session**: `ssh -R 127.0.0.1:47613:127.0.0.1:<port> <ssh-args...> <host> [command...]`,
-   the user's arguments unchanged after the added forward, with the terminal as it is.
-4. **End**: when `ssh` exits, the receiver stops and its files are deleted, and
-   `pi-speech-receiver` exits with `ssh`'s status (128 + the signal when a signal ended
-   it). Ctrl+C is left to `ssh`; a SIGTERM is passed on to it.
+   Sessions that pair at once lock `paired-hosts.lock` around the update.
+2. **Receiver**: the session takes a lease on the shared receiver, and starts it when none
+   runs: `pi-speech-receiver shared <dir>` on `127.0.0.1:0` with the local token, in a
+   process of its own outside the terminal's session (Ctrl+C and closing the terminal do
+   not reach it). Its state is in the token file's directory: `receiver.lock` (locked by
+   the shared receiver while it serves), `receiver.port`, `receiver.start` (locked while a
+   session joins or leaves), and `leases/<spare port>`, one per session, locked by it and
+   holding its terminal, where pairing codes are shown. The locks are the system's file
+   locks, which a process gives up when it dies.
+3. **Session**: `ssh -R 127.0.0.1:47613:127.0.0.1:<port> -R 127.0.0.1:<spare>:127.0.0.1:<port>
+   <ssh-args...> <host> [command...]`, the user's arguments unchanged after the added
+   forwards, with the terminal as it is. `<spare>` is the first of 47614 to 47633 no other
+   session holds (none when all are held). When another session to the same host already
+   forwards 47613 there, `ssh` warns that that forward failed, and Pi finds this session
+   at its spare port.
+4. **End**: when `ssh` exits, the session gives up its lease and `pi-speech-receiver` exits
+   with `ssh`'s status (128 + the signal when a signal ended it). Ctrl+C is left to `ssh`;
+   a SIGTERM is passed on to it. The shared receiver stops, and its files are deleted,
+   within a moment of the last lease ending.
 
 The ssh arguments are read as OpenSSH's `ssh` reads them: options until the destination
 (flags may be clustered, `-p22` and `-p 22` alike), options again after it, and from the
