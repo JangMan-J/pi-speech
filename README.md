@@ -87,21 +87,19 @@ also work in the main view (except on a model or voice row, where typing searche
 changed with ←→ or Enter, and says where audio plays: on This machine, or on the Remote machine with the
 receiver's state (`✓ 127.0.0.1:47613`, `✗ receiver unreachable`).
 
-| Key             | In the dock                                                                              |
-| --------------- | ---------------------------------------------------------------------------------------- |
-| `↑` `↓`         | Move row by row (they wrap)                                                              |
-| `←` `→`         | Change the value in place (Read aloud options, the bridge mode); saved at once           |
-| `Enter`         | Change the value in place; open the picker, field or submenu of a row ending in `›`;     |
-|                 | in Hotkeys, run the action                                                               |
-| `k`             | In Hotkeys, on Speak… or Dictate: set a new key (works after `/reload`)                  |
-| `r` `h` `s` `t` | Replay last, History…, Stop, Transcribe file… (in Hotkeys, and on the main view's rows   |
-|                 | that are not a model or voice row)                                                       |
-| Speak key       | The speak composer (Alt+S unless changed), also from outside the dock                    |
-| Dictate key     | Dictate (Alt+Z unless changed): closes the dock and starts (or stops) dictation          |
-| `Tab`           | On Voice, play a sample of the current voice                                             |
-| `F2`            | On Voice, set its language (`ja`, `pt-BR`, …, or `auto` to remove the override)          |
-| any character   | On Speech model, Voice, Transcription model: open the list with it typed                 |
-| `Esc`           | Back one level; from the main view, close the dock                                       |
+| Key             | In the dock                                                                                                     |
+| --------------- | --------------------------------------------------------------------------------------------------------------- |
+| `↑` `↓`         | Move row by row (they wrap)                                                                                     |
+| `←` `→`         | Change the value in place (Read aloud options, the bridge mode); saved at once                                  |
+| `Enter`         | Change the value in place; open the picker, field or submenu of a row ending in `›`; in Hotkeys, run the action |
+| `k`             | In Hotkeys, on Speak… or Dictate: set a new key (works after `/reload`)                                         |
+| `r` `h` `s` `t` | Replay last, History…, Stop, Transcribe file…: in Hotkeys, and on the main view's other rows                    |
+| Speak key       | The speak composer (Alt+S unless changed), also from outside the dock                                           |
+| Dictate key     | Dictate (Alt+Z unless changed): closes the dock and starts (or stops) dictation                                 |
+| `Tab`           | On Voice, play a sample of the current voice                                                                    |
+| `F2`            | On Voice, set its language (`ja`, `pt-BR`, …, or `auto` to remove the override)                                 |
+| any character   | On Speech model, Voice, Transcription model: open the list with it typed                                        |
+| `Esc`           | Back one level; from the main view, close the dock                                                              |
 
 **Speak…** (or the Speak key from anywhere) opens the composer: type a message and press Enter. It is spoken,
 the field clears, and the composer stays ready for the next message; a new message replaces the audio that is
