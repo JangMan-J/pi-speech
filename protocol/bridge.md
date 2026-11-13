@@ -167,6 +167,36 @@ pi-speech-receiver [--listen 127.0.0.1:47613] [--token-file PATH]
 - It stops cleanly on SIGINT and SIGTERM: playback and recording stop, temporary
   files are deleted.
 
+### Subcommand notes: `speak`
+
+```
+pi-speech-receiver speak <model-dir>|<model-id> [--voice <name-or-number>] [--speed <x>]
+pi-speech-receiver speak <model-dir>|<model-id> --list-voices
+```
+
+Local speech (Kokoro, Piper) on the machine that runs the binary; not an HTTP endpoint.
+
+- Input: the whole text on stdin, read to its end before synthesis starts.
+- stdout: raw signed 16-bit little-endian mono PCM at the model's own rate (Kokoro 24000 Hz,
+  Piper 22050 Hz; not resampled), written sentence by sentence as sherpa-onnx generates it.
+  Nothing else is written to stdout.
+- stderr: JSON lines `{"event": ...}`, in order: `{"event":"format","rate":<Hz>,"channels":1}`
+  before the first byte of audio, then exactly one of `{"event":"done"}` (exit 0, all audio
+  written), `{"event":"error","message":"..."}` (exit 1; may come without a format line when the
+  model cannot be found or loaded, the voice is unknown, or the text is empty) or
+  `{"event":"stopped"}` (exit 1). The model's libraries may write other lines (warnings), which
+  are not JSON objects with an `event` and are to be skipped.
+- A catalogue id names a downloaded speech model; one not downloaded is an error naming
+  `pi-speech-receiver models download <id>`.
+- SIGINT, SIGTERM, or the reader closing stdout stop it at once (`stopped`), even
+  mid-sentence.
+- `--voice`: a voice name or number (default 0). `--speed`: 0.25 to 4, 1 normal.
+- `--list-voices`: `{"name":"af_maple","number":0}` lines on stdout, one per voice.
+- Usage errors print the usage on stderr and exit 2.
+- A Piper voice needs a lexicon (sherpa-onnx 2.0 no longer runs espeak-ng): `lexicon*.txt` in
+  its directory, else the shared `lexicon-<lang>-<region>.txt` (for English voices
+  `lexicon-en-us.txt`) in the model cache beside it.
+
 ## SSH sessions
 
 ```

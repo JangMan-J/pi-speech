@@ -3,3 +3,4 @@
 
 pub mod model;
 pub mod recognize;
+pub mod synthesize;

@@ -1,6 +1,6 @@
 use pi_speech_receiver::audio::{play, record};
 use pi_speech_receiver::server::{self, Config, Server, DEFAULT_PORT};
-use pi_speech_receiver::{models, signals, ssh, token, transcribe};
+use pi_speech_receiver::{models, signals, speak, ssh, token, transcribe};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -11,13 +11,15 @@ const SERVE_USAGE: &str =
 
 fn usage() -> String {
     format!(
-        "usage: {SERVE_USAGE}\n       {}\n       {}\n       {}\n       {}\n       {}\n       {}\n\n{}",
+        "usage: {SERVE_USAGE}\n       {}\n       {}\n       {}\n       {}\n       {}\n       {}\n       {}\n\n{}\n\n{}",
         ssh::USAGE,
         ssh::PAIR_USAGE,
         play::USAGE,
         record::USAGE,
         transcribe::USAGE,
+        speak::USAGE,
         models::USAGE,
+        speak::HELP_NOTE,
         models::HELP_NOTE
     )
 }
@@ -90,6 +92,7 @@ fn main() -> ExitCode {
         Some("play") => return play::main(&args[1..]),
         Some("record") => return record::main(&args[1..]),
         Some("transcribe") => return transcribe::main(&args[1..]),
+        Some("speak") => return speak::main(&args[1..]),
         Some("models") => return models::main(&args[1..]),
         Some("ssh") => return ssh::ssh_main(&args[1..]),
         Some("pair") => return ssh::pair_main(&args[1..]),
