@@ -12,7 +12,7 @@ try:
         check(s == 401, f"401 for {name}", s)
     s, _, _ = r.req("POST", "/v1/record/start", token=None)
     check(s == 401 and not r.log("recorder"), "unauthenticated record start never starts the recorder", s)
-    s, _, _ = r.req("POST", "/v1/play", body=wav_bytes(), headers={"Content-Type": "audio/wav"}, token="Bearer nope")
+    s, _, _ = r.req("POST", "/v1/play/stream", body=b'{"format": "wav"}', headers={"Content-Type": "application/json"}, token="Bearer nope")
     check(s == 401 and not r.log("player"), "unauthenticated play never starts the player", s)
 
     s, j = r.json("GET", "/v1/nowhere")
