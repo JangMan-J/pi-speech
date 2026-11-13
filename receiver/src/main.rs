@@ -1,6 +1,6 @@
 use pi_speech_receiver::audio::{play, record};
 use pi_speech_receiver::server::{self, Config, Server, DEFAULT_PORT};
-use pi_speech_receiver::{signals, token, transcribe};
+use pi_speech_receiver::{models, signals, token, transcribe};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -11,10 +11,11 @@ const SERVE_USAGE: &str =
 
 fn usage() -> String {
     format!(
-        "usage: {SERVE_USAGE}\n       {}\n       {}\n       {}",
+        "usage: {SERVE_USAGE}\n       {}\n       {}\n       {}\n       {}",
         play::USAGE,
         record::USAGE,
-        transcribe::USAGE
+        transcribe::USAGE,
+        models::USAGE
     )
 }
 
@@ -86,6 +87,7 @@ fn main() -> ExitCode {
         Some("play") => return play::main(&args[1..]),
         Some("record") => return record::main(&args[1..]),
         Some("transcribe") => return transcribe::main(&args[1..]),
+        Some("models") => return models::main(&args[1..]),
         Some("serve") => &args[1..],
         _ => &args[..],
     };

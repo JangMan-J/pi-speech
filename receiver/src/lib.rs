@@ -5,6 +5,7 @@ pub mod audio;
 pub mod engines;
 pub mod front;
 pub mod http;
+pub mod models;
 mod private;
 pub mod proc;
 pub mod server;
