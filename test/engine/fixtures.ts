@@ -209,7 +209,8 @@ export const STAND_IN_BINARY = process.platform !== "win32";
  * deletes change what `models list` says; `transcribe` answers `local words from <id>` for a downloaded model.
  * `speak` of a downloaded model writes the format line at 24000 Hz, then 4800 bytes of PCM (value 1) per
  * sentence of its input, then done; with a text holding "hold" it stops after the first sentence's audio and
- * waits to be killed. Every call is appended to `calls.log` in `dir`; the text `speak` read to `speak.log`,
+ * waits to be killed; `speak <id> --list-voices` names three voices (af_alloy, af_sol, bm_lewis), and `--voice` must
+ * be one of them. Every call is appended to `calls.log` in `dir`; the text `speak` read to `speak.log`,
  * and its process id to `speak.pid`.
  */
 export function fakeReceiver(dir: string): { path: string; log: string } {
@@ -242,6 +243,16 @@ if (cmd === "speak") {
   const ev = (v) => process.stderr.write(JSON.stringify(v) + "\\n");
   if (!have.includes(sub)) {
     ev({ event: "error", message: "the model " + sub + " is not downloaded; download it with \`pi-speech-receiver models download " + sub + "\`" });
+    process.exit(1);
+  }
+  const VOICES = ["af_alloy", "af_sol", "bm_lewis"];
+  if (process.argv.includes("--list-voices")) {
+    VOICES.forEach((name, number) => out({ name, number }));
+    process.exit(0);
+  }
+  const voice = process.argv[process.argv.indexOf("--voice") + 1];
+  if (process.argv.includes("--voice") && !VOICES.includes(voice)) {
+    ev({ event: "error", message: "unknown voice " + JSON.stringify(voice) + "; the voices are " + VOICES.join(", ") });
     process.exit(1);
   }
   let text = "";

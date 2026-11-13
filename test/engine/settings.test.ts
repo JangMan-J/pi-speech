@@ -47,6 +47,22 @@ describe("the settings file", () => {
     expect(f.load()).toMatchObject({ speechSource: "provider", transcriptionSource: "local" });
   });
 
+  it("saves the local speech voice only when it is set", () => {
+    const f = new SettingsFile(dir);
+    const s = f.load();
+    s.speechSource = "local";
+    s.localSpeechModel = "kokoro-multi-lang-v1.1-int8";
+    f.save(s);
+    expect(JSON.parse(readFileSync(f.file, "utf8")).localSpeechVoice).toBeUndefined();
+    expect(f.load().localSpeechVoice).toBeUndefined();
+    s.localSpeechVoice = "af_sol";
+    f.save(s);
+    expect(JSON.parse(readFileSync(f.file, "utf8")).localSpeechVoice).toBe("af_sol");
+    expect(f.load()).toMatchObject({ localSpeechModel: "kokoro-multi-lang-v1.1-int8", localSpeechVoice: "af_sol" });
+    writeFileSync(f.file, JSON.stringify({ version: 1, localSpeechVoice: 3 }));
+    expect(f.load().localSpeechVoice).toBeUndefined();
+  });
+
   it("saves the read-aloud options that differ from the defaults, and ignores values that are not choices", () => {
     const f = new SettingsFile(dir);
     const s = f.load();

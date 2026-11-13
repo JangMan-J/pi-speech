@@ -351,17 +351,12 @@ describe("the panel view model: keys in the main view", () => {
     await p.goTo("Speech source");
     await p.press("enter");
     expect(p.row("Speech source")?.value).toBe("Local");
-    expect(p.panel.view().status).toEqual({
-      tone: "warning",
-      text: "! Speech source: Local · local speech is not available yet",
-    });
-    expect(p.row("Speech model")).toMatchObject({
-      value: "none",
-      note: "✗ local speech not available yet",
-      alert: true,
-    });
-    // Without the binary the local model rows say so.
-    expect(p.row("Transcription model")).toMatchObject({ value: "none", note: "✗ local models unavailable" });
+    expect(p.panel.view().status).toEqual({ tone: "success", text: "✓ Speech source: Local" });
+    expect(p.row("Speech model")).toMatchObject({ value: "none", note: "✗ choose a model", alert: true });
+    expect(p.row("Transcription model")).toMatchObject({ value: "none", note: "✗ choose a model", alert: true });
+    // Without the binary a chosen local model's row says so.
+    p.engine.speech.setLocalModel("transcription", "whisper-small");
+    expect(p.row("Transcription model")).toMatchObject({ value: "whisper-small", note: "✗ local models unavailable" });
     await p.press("left");
     expect(p.row("Speech source")?.value).toBe("Provider");
     expect(p.row("Speech model")?.value).toBe("google/gemini-3.8-flash-tts");
@@ -1324,11 +1319,12 @@ describe.skipIf(!STAND_IN_BINARY)("the panel view model: Local sources", () => {
     expect(p.panel.view().picker?.items.map((i) => i.id)).toEqual(["parakeet-v3"]);
   });
 
-  it("Local speech lists the on-device speech models but says plainly that it cannot speak yet", async () => {
+  it("Local speech lists the on-device speech models; with none chosen, speaking says to choose one", async () => {
     const p = local();
     await p.goTo("Speech source");
     await p.press("right");
     await p.goTo("Speech model");
+    expect(p.row("Speech model")).toMatchObject({ value: "none", note: "✗ choose a model", alert: true });
     await p.press("enter");
     expect(p.panel.view().picker?.items.map((i) => [i.id, i.cols?.[0]])).toEqual([["kokoro", "not downloaded"]]);
     await p.press("escape");
@@ -1336,9 +1332,39 @@ describe.skipIf(!STAND_IN_BINARY)("the panel view model: Local sources", () => {
     await p.press("enter", "enter");
     await p.type("hello");
     await p.press("enter");
-    expect(p.panel.view().status?.text).toBe(
-      "✗ Local speech is not available yet: set Speech source to Provider in /speech to speak",
-    );
+    expect(p.panel.view().status?.text).toBe("✗ Choose a local speech model first: /speech, Speech model");
     expect(p.requests.filter((r) => r.url.endsWith("/audio/speech"))).toEqual([]);
+  });
+
+  it("with Speech source Local the Voice row picks a voice the binary lists for the local model", async () => {
+    const p = local();
+    await p.engine.speech.local.download("kokoro").result;
+    p.engine.speech.setSource("speech", "local");
+    await p.goTo("Speech model");
+    await p.press("enter");
+    await p.press("enter");
+    expect(p.panel.view().status?.text).toBe("✓ Speech model: kokoro (local)");
+    expect(p.row("Speech model")?.note).toBeUndefined();
+    await p.goTo("Voice");
+    expect(p.row("Voice")).toMatchObject({ value: "default" });
+    expect(p.row("Voice")?.note).toBeUndefined();
+    await p.press("enter");
+    const picker = p.panel.view().picker;
+    expect(picker).toMatchObject({ title: "Voice", noun: "voices", total: 3, loading: false });
+    expect(picker?.items.map((i) => [i.id, i.cols?.[0], i.current])).toEqual([
+      ["af_alloy", "default", true],
+      ["af_sol", "", false],
+      ["bm_lewis", "", false],
+    ]);
+    expect(p.calls()).toContain("speak kokoro --list-voices");
+    // A local voice has no language to set.
+    expect(p.hint()).not.toMatch(/F2/);
+    await p.press("down", "enter");
+    expect(p.panel.view().picker).toBeUndefined();
+    expect(p.row("Voice")?.value).toBe("af_sol");
+    expect(p.panel.view().status?.text).toBe("✓ Voice: af_sol (local)");
+    expect(settingsOf(p.work)).toMatchObject({ localSpeechVoice: "af_sol" });
+    // The provider voice is kept for Provider.
+    expect(settingsOf(p.work).voice).toBe("Kore");
   });
 });

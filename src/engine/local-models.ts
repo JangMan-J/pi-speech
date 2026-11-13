@@ -26,13 +26,18 @@ export interface LocalModel {
   downloaded: boolean;
   /** Bytes of an interrupted download that the next download resumes from. */
   partial: number;
+  /** The shared lexicon the voice needs (an English Piper voice), and whether it is in the cache. */
+  lexicon?: { name: string; size: number; downloaded: boolean };
   /** Where the model is, or will be once downloaded. */
   path: string;
 }
 
-/** A step of a download, in order: progress (repeated), verifying, unpacking. */
+/**
+ * A step of a download, in order: progress (repeated), verifying, unpacking; then, for a voice that needs a lexicon
+ * not yet in the cache (an English Piper voice), progress of that file, named by `file`.
+ */
 export type DownloadProgress =
-  | { phase: "progress"; done: number; total: number }
+  | { phase: "progress"; done: number; total: number; file?: string }
   | { phase: "verifying" }
   | { phase: "unpacking" };
 
@@ -110,7 +115,8 @@ function failure(stderr: string, code: number | null, message?: unknown): LocalM
 }
 
 function toModel(v: Record<string, unknown>): LocalModel | undefined {
-  const { id, kind, name, languages, size, downloaded, partial, path } = v;
+  const { id, kind, name, languages, size, downloaded, partial, path, lexicon } = v;
+  const lex = lexicon && typeof lexicon === "object" ? (lexicon as Record<string, unknown>) : undefined;
   if (typeof id !== "string" || (kind !== "transcription" && kind !== "speech")) return undefined;
   return {
     id,
@@ -121,6 +127,15 @@ function toModel(v: Record<string, unknown>): LocalModel | undefined {
     downloaded: downloaded === true,
     partial: typeof partial === "number" ? partial : 0,
     path: typeof path === "string" ? path : "",
+    ...(lex && typeof lex.name === "string"
+      ? {
+          lexicon: {
+            name: lex.name,
+            size: typeof lex.size === "number" ? lex.size : 0,
+            downloaded: lex.downloaded === true,
+          },
+        }
+      : {}),
   };
 }
 
@@ -203,7 +218,8 @@ export function downloadModel(binary: string, id: string, options: DownloadOptio
         if (v.event === "progress" && typeof v.done === "number" && typeof v.total === "number") {
           done = v.done;
           total = v.total;
-          deliver({ phase: "progress", done, total });
+          const file = typeof v.file === "string" && v.file ? v.file : undefined;
+          deliver({ phase: "progress", done, total, ...(file ? { file } : {}) });
         } else if (v.event === "verifying" || v.event === "unpacking") {
           deliver({ phase: v.event });
         } else if (v.event === "done" || v.event === "stopped" || v.event === "error") {

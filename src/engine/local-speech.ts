@@ -4,7 +4,7 @@
  * audio, sentence by sentence, and JSON lines on its standard error: `{"event":"format","rate","channels"}` before
  * any audio, then `{"event":"done"}`, `{"event":"error","message"}` or `{"event":"stopped"}` (protocol/bridge.md,
  * "Subcommand notes: speak"). The audio is an AudioStream, played as a Stream. Nothing goes over the network.
- * Aborting kills the process, which stops at once.
+ * Aborting kills the process, which stops at once. `speak <id> --list-voices` names the model's voices.
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
@@ -44,6 +44,71 @@ function parse(line: string): Record<string, unknown> | undefined {
     return v && typeof v === "object" && !Array.isArray(v) && typeof v.event === "string" ? v : undefined;
   } catch {
     return undefined;
+  }
+}
+
+/** A voice of a local speech model, as `speak <id> --list-voices` prints it. */
+export interface LocalVoice {
+  name: string;
+  number: number;
+}
+
+/**
+ * The voices of the downloaded voice model `id`, in the model's order (the first is its default): Kokoro v1.1 has
+ * 103, a Piper voice one. Rejects with the binary's message (a model not downloaded).
+ */
+export async function listVoices(
+  binary: string,
+  id: string,
+  options: Pick<LocalSpeechOptions, "env" | "signal"> = {},
+): Promise<LocalVoice[]> {
+  options.signal?.throwIfAborted();
+  const child = spawn(binary, ["speak", id, "--list-voices"], {
+    env: options.env ?? process.env,
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout?.setEncoding("utf8");
+  child.stderr?.setEncoding("utf8");
+  child.stdout?.on("data", (d: string) => {
+    stdout += d;
+  });
+  child.stderr?.on("data", (d: string) => {
+    stderr += d;
+  });
+  const onAbort = () => kill(child);
+  options.signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    const code = await new Promise<number | null>((resolve, reject) => {
+      child.once("error", (e) => reject(new LocalSpeechError(`cannot run ${binary}: ${e.message}`)));
+      child.once("close", (c) => resolve(c));
+    });
+    options.signal?.throwIfAborted();
+    if (code !== 0) {
+      const lines = stderr.trim().split("\n");
+      const event = lines
+        .map((l) => parse(l.trim()))
+        .filter((v) => v?.event === "error")
+        .at(-1);
+      const why =
+        typeof event?.message === "string" ? event.message : lines.at(-1)?.replace(/^pi-speech-receiver: /, "");
+      throw new LocalSpeechError(why || `the speak command exited with ${code}`);
+    }
+    const voices: LocalVoice[] = [];
+    for (const line of stdout.split("\n")) {
+      try {
+        const v = JSON.parse(line);
+        if (v && typeof v.name === "string" && typeof v.number === "number")
+          voices.push({ name: v.name, number: v.number });
+      } catch {
+        /* not a voice line */
+      }
+    }
+    return voices;
+  } finally {
+    options.signal?.removeEventListener("abort", onAbort);
   }
 }
 
@@ -155,6 +220,11 @@ export class LocalSpeechProvider implements SpeechProvider {
   ) {}
 
   async ensureCredential(): Promise<void> {}
+
+  /** The voices of the downloaded voice model `id`. */
+  voices(id: string, signal?: AbortSignal): Promise<LocalVoice[]> {
+    return listVoices(this.binary(), id, { signal, env: this.env() });
+  }
 
   async synthesizeStream(req: SynthesisRequest): Promise<AudioStream> {
     return speakLocal(this.binary(), req.model, req.text, { voice: req.voice, signal: req.signal, env: this.env() });

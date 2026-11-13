@@ -466,7 +466,8 @@ function downloadLine(id: string, p: DownloadProgress): string {
   if (p.phase === "verifying") return `… verifying ${id}`;
   if (p.phase === "unpacking") return `… unpacking ${id}`;
   const pct = p.total ? Math.floor((p.done / p.total) * 100) : 0;
-  return `… downloading ${id} ${pct}% (${formatSize(p.done)} of ${formatSize(p.total)})`;
+  const what = p.file ? `${id}'s ${p.file}` : id;
+  return `… downloading ${what} ${pct}% (${formatSize(p.done)} of ${formatSize(p.total)})`;
 }
 
 /** The Read values as shown. */
@@ -730,18 +731,20 @@ export class Panel {
     switch (base.id) {
       // Only the name of a model or a voice: what it costs and offers is in its picker.
       case "speechModel": {
-        if (s.speechSource === "local") return { ...base, ...this.localRow("speech", s.localSpeechModel) };
+        if (s.speechSource === "local") return { ...base, ...this.localRow(s.localSpeechModel) };
         const v = value(s.speechModel);
         return { ...base, value: modelLabel(v), ...this.modelAlert("tts", v) };
       }
       case "transcription": {
         if (s.transcriptionSource === "local") {
-          return { ...base, ...this.localRow("transcription", s.localTranscriptionModel) };
+          return { ...base, ...this.localRow(s.localTranscriptionModel) };
         }
         const v = value(s.transcriptionModel);
         return { ...base, value: modelLabel(v), ...this.modelAlert("stt", v) };
       }
       case "voice": {
+        if (s.speechSource === "local")
+          return { ...base, value: value(s.localSpeechVoice ?? "default"), ...this.voiceAlert() };
         const v = value(s.voice);
         return { ...base, value: v, ...this.voiceAlert() };
       }
@@ -833,11 +836,10 @@ export class Panel {
   }
 
   /** A model row while its source is Local: the chosen on-device model, and why it cannot be used. */
-  private localRow(kind: Direction, id: string | undefined): Pick<PanelRow, "value" | "note" | "alert"> {
+  private localRow(id: string | undefined): Pick<PanelRow, "value" | "note" | "alert"> {
     const value = id ?? "none";
-    if (kind === "speech") return { value, note: "✗ local speech not available yet", alert: true };
-    if (this.localError) return { value, note: "✗ local models unavailable", alert: true };
     if (!id) return { value, note: "✗ choose a model", alert: true };
+    if (this.localError) return { value, note: "✗ local models unavailable", alert: true };
     const m = this.localModels?.find((x) => x.id === id);
     if (this.localModels && !m?.downloaded) return { value, note: "✗ not downloaded", alert: true };
     return { value };
@@ -845,8 +847,7 @@ export class Panel {
 
   /** Why the voices are not usable; nothing when they are (a voice's language is in the picker). */
   private voiceAlert(): Pick<PanelRow, "note" | "alert"> {
-    const model = this.speech.settings.speechModel;
-    const v = this.voices?.model === model ? this.voices : undefined;
+    const v = this.voices?.model === this.voicesKey() ? this.voices : undefined;
     if (v?.error) return { note: "✗ voices unavailable", alert: true };
     if (v?.ids && v.ids.length === 0) return { note: "✗ xAI lists no voices", alert: true };
     return {};
@@ -920,6 +921,15 @@ export class Panel {
       );
       return matchItems(all, p.edit.value, (i) => i.label);
     }
+    if (p.row === "voice" && s.speechSource === "local") {
+      // A local model's voices, in its order: the first is its default.
+      const ids = p.ids ?? [];
+      const current = s.localSpeechVoice ?? ids[0];
+      const all = ids.map(
+        (id, i): PickerItem => ({ id, label: id, cols: [i === 0 ? "default" : ""], current: id === current }),
+      );
+      return matchItems(all, p.edit.value, (i) => i.id);
+    }
     if (p.row === "voice") {
       const all = (p.ids ?? []).map(
         (id): PickerItem => ({
@@ -958,9 +968,13 @@ export class Panel {
     const none =
       p.row === "history"
         ? "Nothing spoken yet"
-        : p.row === "voice" && this.speech.settings.speechModel === XAI_MODEL
-          ? "xAI lists no voices"
-          : "None offered";
+        : p.row === "voice" && this.speech.settings.speechSource === "local"
+          ? this.speech.settings.localSpeechModel
+            ? "The model lists no voices"
+            : "Choose a local speech model first"
+          : p.row === "voice" && this.speech.settings.speechModel === XAI_MODEL
+            ? "xAI lists no voices"
+            : "None offered";
     const view: PickerView = {
       title: LABEL_OF[p.row],
       noun: p.row === "voice" ? "voices" : p.row === "history" ? "messages" : "models",
@@ -1084,6 +1098,8 @@ export class Panel {
   }
 
   private voiceKeys(): Hint[] {
+    // A local voice has no language to set.
+    if (this.speech.settings.speechSource === "local") return [{ key: "Tab", action: "sample", optional: true }];
     return [
       { key: "Tab", action: "sample", optional: true },
       { key: "F2", action: "language", optional: true },
@@ -1147,7 +1163,7 @@ export class Panel {
       } else if (key === "backtab") {
         if (isModelRow(p.row)) this.nextShow({ ...p, row: p.row }, p);
       } else if (key === "language") {
-        if (p.row === "voice" && highlighted) this.askLanguage(highlighted.id);
+        if (p.row === "voice" && highlighted && !this.localVoice()) this.askLanguage(highlighted.id);
       } else {
         const before = p.edit.value;
         p.edit.edit(key);
@@ -1185,10 +1201,10 @@ export class Panel {
         this.activate(id);
         return;
       case "tab":
-        if (id === "voice") this.sample(this.speech.settings.voice);
+        if (id === "voice") this.sample(this.localVoice()?.voice ?? this.speech.settings.voice);
         return;
       case "language":
-        if (id === "voice") this.askLanguage(this.speech.settings.voice);
+        if (id === "voice" && !this.localVoice()) this.askLanguage(this.speech.settings.voice);
         return;
       case "escape":
         this.deps.close();
@@ -1357,9 +1373,8 @@ export class Panel {
       const next = cycle(SOURCES, direction === "speech" ? s.speechSource : s.transcriptionSource, dir);
       const summary = this.speech.setSource(direction, next);
       if (next === "local") this.track(this.loadLocal());
-      // Local speech is listed but cannot speak yet: say so plainly.
-      if (direction === "speech" && next === "local") this.setStatus("warning", `! ${summary}`);
-      else this.setStatus("success", `✓ ${summary}`);
+      if (direction === "speech") this.track(this.loadVoices());
+      this.setStatus("success", `✓ ${summary}`);
     } else if (id === "bridgeMode") {
       const i = BRIDGE_MODES.indexOf(this.shown("bridgeMode") as BridgeMode);
       const next = BRIDGE_MODES[(i + dir + BRIDGE_MODES.length) % BRIDGE_MODES.length];
@@ -1504,8 +1519,8 @@ export class Panel {
       this.offer = undefined;
       this.mode = m.back;
       const summary = this.speech.setLocalModel(direction, id);
-      if (direction === "speech") this.setStatus("warning", `! ${summary} · local speech is not available yet`);
-      else this.setStatus("success", `✓ ${summary}`);
+      if (direction === "speech") this.track(this.loadVoices());
+      this.setStatus("success", `✓ ${summary}`);
       return;
     }
     if (this.offer === id) {
@@ -1604,9 +1619,8 @@ export class Panel {
           }
           const summary = this.speech.setLocalModel(chosen.direction, id);
           if (this.mode === chosen.picker) this.mode = chosen.picker.back;
-          if (chosen.direction === "speech") {
-            this.setStatus("warning", `! ${id} downloaded · ${summary} · local speech is not available yet`);
-          } else this.setStatus("success", `✓ ${id} downloaded · ${summary}`);
+          if (chosen.direction === "speech") this.track(this.loadVoices());
+          this.setStatus("success", `✓ ${id} downloaded · ${summary}`);
         })
         .catch((err) => {
           this.downloading = undefined;
@@ -1785,10 +1799,16 @@ export class Panel {
     void this.engine.dictation.toggle(this.deps.ui).catch((err) => this.deps.ui.notify(errorMessage(err), "error"));
   }
 
+  /** With Speech source Local, the chosen local voice: a name, or empty for the model's first voice. */
+  private localVoice(): { voice: string } | undefined {
+    const s = this.speech.settings;
+    return s.speechSource === "local" ? { voice: s.localSpeechVoice ?? "" } : undefined;
+  }
+
   /** A sample of `voice` (the `--sample` rules); a newer sample replaces the line of an older one. */
   private sample(voice: string): void {
     const seq = ++this.sampleSeq;
-    this.setStatus("busy", `♪ sampling ${voice}…`);
+    this.setStatus("busy", `♪ sampling ${voice || "default"}…`);
     const mine = () => seq === this.sampleSeq;
     this.track(
       this.speech.sample(voice).then(
@@ -1842,18 +1862,35 @@ export class Panel {
     return this.localLoad;
   }
 
-  private currentVoices(): string[] | undefined {
-    const v = this.voices;
-    return v?.model === this.speech.settings.speechModel ? v.ids : undefined;
+  /** What the voices are of: the speech model, or with Speech source Local `local:<model>`. */
+  private voicesKey(): string {
+    const s = this.speech.settings;
+    return s.speechSource === "local" ? `local:${s.localSpeechModel ?? ""}` : s.speechModel;
   }
 
-  /** The voices of the current speech model (for xai the xAI voice list, which also gives the languages). */
+  private currentVoices(): string[] | undefined {
+    const v = this.voices;
+    return v?.model === this.voicesKey() ? v.ids : undefined;
+  }
+
+  /**
+   * The voices of the current speech model (for xai the xAI voice list, which also gives the languages); with
+   * Speech source Local, those the binary lists for the local model (none while no model is chosen).
+   */
   private loadVoices(): Promise<string[]> {
-    const model = this.speech.settings.speechModel;
+    const s = this.speech.settings;
+    const model = this.voicesKey();
     if (this.voices?.model === model && !this.voices.error) return this.voices.load;
+    const local = s.speechSource === "local" ? s.localSpeechModel : undefined;
+    const voices =
+      s.speechSource !== "local"
+        ? this.speech.voicesFor(model)
+        : local
+          ? this.speech.localVoices(local)
+          : Promise.resolve([]);
     const entry: NonNullable<Panel["voices"]> = {
       model,
-      load: this.speech.voicesFor(model).then(
+      load: voices.then(
         (ids) => {
           entry.ids = ids;
           return ids;

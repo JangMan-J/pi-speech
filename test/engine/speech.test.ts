@@ -126,6 +126,36 @@ describe.skipIf(!STAND_IN_BINARY)("Speech source Local", () => {
     expect(speechRequests(requests)).toEqual([]);
   });
 
+  it("the chosen local voice goes to speak, a Reading and a sample as --voice; a new local model resets it", async () => {
+    fakeOpenRouter();
+    const { engine, calls } = await localEngine();
+    expect(await engine.speech.voicesReport()).toBe("Voices of kokoro (local):\naf_alloy\naf_sol\nbm_lewis");
+    await expect(engine.speech.set("voice", "eve")).rejects.toThrow(
+      "eve is not a voice of kokoro; choose one of: af_alloy, af_sol, bm_lewis",
+    );
+    expect(await engine.speech.set("voice", "bm_lewis")).toBe("Voice: bm_lewis (local)");
+    expect(engine.speech.settings).toMatchObject({ localSpeechVoice: "bm_lewis", voice: "Kore" });
+    expect(await engine.status()).toMatch(/Speech model: kokoro \(local\)\nVoice: bm_lewis\n/);
+    const r = await engine.speech.speak("Hello.");
+    expect(r.voice).toBe("bm_lewis");
+    expect(calls().at(-1)).toBe("speak kokoro --voice bm_lewis");
+    await engine.speech.say(LONG);
+    expect(calls().at(-1)).toBe("speak kokoro --voice bm_lewis");
+    await engine.speech.sample();
+    expect(calls().at(-1)).toBe("speak kokoro --voice bm_lewis");
+    // A voice named for one call wins.
+    await engine.speech.sample("af_sol");
+    expect(calls().at(-1)).toBe("speak kokoro --voice af_sol");
+    // The same model keeps the voice; another one resets it to its default.
+    engine.speech.setLocalModel("speech", "kokoro");
+    expect(engine.speech.settings.localSpeechVoice).toBe("bm_lewis");
+    expect(await engine.speech.set("voice", "default")).toBe("Voice: default (local)");
+    expect(engine.speech.settings.localSpeechVoice).toBeUndefined();
+    await engine.speech.set("voice", "af_sol");
+    engine.speech.setLocalModel("speech", "parakeet-v3");
+    expect(engine.speech.settings.localSpeechVoice).toBeUndefined();
+  });
+
   it("without a chosen local speech model, speaking says so", async () => {
     fakeOpenRouter();
     const { engine } = await localEngine("kokoro", false);

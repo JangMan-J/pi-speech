@@ -88,8 +88,7 @@ export const SETTING_NAMES: SettingName[] = [
 ];
 
 /** What speaking says while the Speech source is Local and no local speech model is chosen. */
-export const LOCAL_SPEECH_UNAVAILABLE =
-  "Local speech is not available yet: set Speech source to Provider in /speech to speak";
+export const LOCAL_SPEECH_UNAVAILABLE = "Choose a local speech model first: /speech, Speech model";
 
 /** The direction of a source: speech (text to speech) or transcription. */
 export type Direction = "speech" | "transcription";
@@ -488,6 +487,13 @@ export class Speech {
   }
 
   async voicesReport(): Promise<string> {
+    const target = this.localTarget();
+    if (target) {
+      const voices = await this.localVoices(target.model);
+      return [`Voices of ${target.model} (local):`, ...(voices.length ? voices : ["(the model lists no voices)"])].join(
+        "\n",
+      );
+    }
     const model = this.settings.speechModel;
     const voices = await this.voicesFor(model);
     return [`Voices of ${model}:`, ...(voices.length ? voices : ["(xAI lists no voices)"])].join("\n");
@@ -501,9 +507,8 @@ export class Speech {
     return [
       ...(s.speechSource === "local"
         ? [
-            s.localSpeechModel
-              ? `Speech model: ${local(s.localSpeechModel)}`
-              : `Speech model: ${local()}; local speech is not available yet`,
+            `Speech model: ${local(s.localSpeechModel)}`,
+            ...(s.localSpeechModel ? [`Voice: ${voiceName(s.localSpeechVoice ?? "")}`] : []),
           ]
         : [`Speech model: ${s.speechModel}`, `Voice: ${s.voice}`]),
       `Transcription model: ${s.transcriptionSource === "local" ? local(s.localTranscriptionModel) : s.transcriptionModel}`,
@@ -544,6 +549,7 @@ export class Speech {
         return `Speech model: ${s.speechModel}, voice: ${s.voice}`;
       }
       case "voice": {
+        if (s.speechSource === "local") return this.setLocalVoice(value);
         const voices = await this.voicesFor(s.speechModel);
         if (!voices.includes(value) && !(value && this.anyVoice(s.speechModel))) {
           throw new Error(`${value || "(empty)"} is not a voice of ${s.speechModel}; choose one of: ${list(voices)}`);
@@ -602,28 +608,52 @@ export class Speech {
     this.save();
     const name = direction === "speech" ? "Speech source" : "Transcription source";
     const word = source === "local" ? "Local" : "Provider";
-    return direction === "speech" && source === "local" && !this.settings.localSpeechModel
-      ? `${name}: ${word} · local speech is not available yet`
-      : `${name}: ${word}`;
+    return `${name}: ${word}`;
   }
 
   /** Choose and save the on-device model of a direction (an id of the local catalogue). */
   setLocalModel(direction: Direction, id: string): string {
-    if (direction === "speech") this.settings.localSpeechModel = id;
-    else this.settings.localTranscriptionModel = id;
+    if (direction === "speech") {
+      // A voice belongs to its model.
+      if (id !== this.settings.localSpeechModel) delete this.settings.localSpeechVoice;
+      this.settings.localSpeechModel = id;
+    } else this.settings.localTranscriptionModel = id;
     this.save();
     return `${direction === "speech" ? "Speech" : "Transcription"} model: ${id} (local)`;
   }
 
+  /** The voice names of a downloaded local speech model, the default (voice 0) first. */
+  async localVoices(model: string, signal?: AbortSignal): Promise<string[]> {
+    return (await this.localSpeech.voices(model, signal)).map((v) => v.name);
+  }
+
+  /** Choose and save the voice of the local speech model (`default` or empty: its first voice). */
+  async setLocalVoice(value: string): Promise<string> {
+    const model = this.settings.localSpeechModel;
+    if (!model) throw new Error(LOCAL_SPEECH_UNAVAILABLE);
+    if (!value || value === "default") {
+      delete this.settings.localSpeechVoice;
+    } else {
+      const voices = await this.localVoices(model);
+      if (!voices.includes(value)) {
+        throw new Error(`${value} is not a voice of ${model}; choose one of: ${voices.join(", ")}`);
+      }
+      this.settings.localSpeechVoice = value;
+    }
+    this.save();
+    return `Voice: ${voiceName(this.settings.localSpeechVoice ?? "")} (local)`;
+  }
+
   /**
-   * With Speech source Local, the chosen local speech model and the voice (a name or number of the model; empty is
-   * its first voice); throws when none is chosen. Undefined with Speech source Provider.
+   * With Speech source Local, the chosen local speech model and the voice: the one given, else the chosen local
+   * voice (a name or number of the model; empty is its first voice); throws when no model is chosen. Undefined
+   * with Speech source Provider.
    */
   private localTarget(voice?: string): { model: string; voice: string } | undefined {
     if (this.settings.speechSource !== "local") return undefined;
     const model = this.settings.localSpeechModel;
     if (!model) throw new Error(LOCAL_SPEECH_UNAVAILABLE);
-    return { model, voice: voice ?? "" };
+    return { model, voice: voice || this.settings.localSpeechVoice || "" };
   }
 
   /** The local transcription model to use; throws when none is chosen. */

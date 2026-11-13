@@ -220,7 +220,7 @@ describe.skipIf(!STAND_IN_BINARY)("Speech source and Transcription source in one
     expect(requests.filter((r) => r.url.endsWith("/audio/transcriptions"))).toEqual([]);
   });
 
-  it("Local speech says plainly that it is not available yet; Provider transcription still works", async () => {
+  it("Local speech without a model says to choose one; Provider transcription still works", async () => {
     const requests = fakeOpenRouter("from the provider");
     const { engine, calls } = engineWithReceiver();
     engine.speech.setSource("speech", "local");
@@ -230,6 +230,8 @@ describe.skipIf(!STAND_IN_BINARY)("Speech source and Transcription source in one
     expect(requests.filter((r) => r.url.endsWith("/audio/speech"))).toEqual([]);
     expect(await engine.speech.transcribeAudio(wavFixture(), "wav")).toBe("from the provider");
     expect(calls().filter((c) => c.startsWith("transcribe"))).toEqual([]);
-    expect(await engine.status()).toMatch(/Speech model: none chosen \(local\); local speech is not available yet/);
+    const status = await engine.status();
+    expect(status).toMatch(/Speech model: none chosen \(local\)\n/);
+    expect(status).not.toMatch(/not available/);
   });
 });

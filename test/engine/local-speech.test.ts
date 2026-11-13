@@ -2,7 +2,13 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { LocalSpeechError, LocalSpeechProvider, speakArgs, speakLocal } from "../../src/engine/local-speech";
+import {
+  LocalSpeechError,
+  LocalSpeechProvider,
+  listVoices,
+  speakArgs,
+  speakLocal,
+} from "../../src/engine/local-speech";
 import { STAND_IN_BINARY, until } from "./fixtures";
 
 let dir: string;
@@ -30,6 +36,11 @@ const ev = (v) => process.stderr.write(JSON.stringify(v) + "\\n");
 if (cmd !== "speak") process.exit(2);
 if (id === "missing") { ev({ event: "error", message: "the model missing is not downloaded; download it with \`pi-speech-receiver models download missing\`" }); process.exit(1); }
 if (id === "noise") { process.stderr.write("pi-speech-receiver: something odd\\n"); process.exit(3); }
+if (rest.includes("--list-voices")) {
+  for (const [number, name] of ["af_maple", "bf_vale"].entries()) process.stdout.write(JSON.stringify({ name, number }) + "\\n");
+  process.stdout.write("not a voice\\n");
+  process.exit(0);
+}
 let text = "";
 process.stdin.on("data", (d) => { text += d; });
 process.stdin.on("end", () => {
@@ -151,6 +162,21 @@ describe.skipIf(!STAND_IN_BINARY)("LocalSpeechProvider", () => {
     expect(wav.readUInt32LE(24)).toBe(22050);
     expect([...wav.subarray(44)]).toEqual([1, 2, 3, 4, 5, 6]);
     await expect(provider.transcribe()).rejects.toThrow(/does not transcribe/);
+  });
+
+  it("lists a model's voices from speak --list-voices, and says why it cannot", async () => {
+    const bin = fakeSpeak();
+    expect(await listVoices(bin, "ok")).toEqual([
+      { name: "af_maple", number: 0 },
+      { name: "bf_vale", number: 1 },
+    ]);
+    expect(await new LocalSpeechProvider(() => bin).voices("ok")).toHaveLength(2);
+    await expect(listVoices(bin, "missing")).rejects.toThrow(
+      new LocalSpeechError(
+        "the model missing is not downloaded; download it with `pi-speech-receiver models download missing`",
+      ),
+    );
+    await expect(listVoices(bin, "noise")).rejects.toThrow("something odd");
   });
 
   it("says why there is no binary", async () => {

@@ -45,6 +45,8 @@ if (sub === "list") {
         downloaded: true, partial: 0, path: "/cache/sherpa-onnx-whisper-small" });
   out({ id: "kokoro", kind: "speech", name: "Kokoro", languages: ["en", "zh"], size: 100, downloaded: false,
         partial: 40, path: "/cache/kokoro" });
+  out({ id: "piper", kind: "speech", name: "Piper", languages: ["en"], size: 60, downloaded: false, partial: 0,
+        path: "/cache/piper", lexicon: { name: "lexicon-en-us.txt", size: 6305773, downloaded: false } });
   process.exit(0);
 }
 if (sub === "delete") {
@@ -71,6 +73,7 @@ if (sub === "download") {
   for (const done of [0, 50, 100]) out({ event: "progress", id, done, total: 100 });
   out({ event: "verifying", id });
   out({ event: "unpacking", id });
+  if (id === "piper") for (const done of [0, 10]) out({ event: "progress", id, file: "lexicon-en-us.txt", done, total: 10 });
   out({ event: "done", id, path: "/cache/" + id });
   process.exit(0);
 }
@@ -107,6 +110,17 @@ describe.skipIf(WINDOWS)("listModels", () => {
         partial: 40,
         path: "/cache/kokoro",
       },
+      {
+        id: "piper",
+        kind: "speech",
+        name: "Piper",
+        languages: ["en"],
+        size: 60,
+        downloaded: false,
+        partial: 0,
+        path: "/cache/piper",
+        lexicon: { name: "lexicon-en-us.txt", size: 6305773, downloaded: false },
+      },
     ]);
   });
 
@@ -131,6 +145,17 @@ describe.skipIf(WINDOWS)("downloadModel", () => {
       { phase: "progress", done: 100, total: 100 },
       { phase: "verifying" },
       { phase: "unpacking" },
+    ]);
+  });
+
+  it("reports the progress of a voice's lexicon, named by its file, after the archive", async () => {
+    const seen: DownloadProgress[] = [];
+    const d = downloadModel(fakeBinary(), "piper", { onProgress: (p) => void seen.push(p) });
+    await expect(d.result).resolves.toEqual({ status: "done", path: "/cache/piper" });
+    expect(seen.slice(-3)).toEqual([
+      { phase: "unpacking" },
+      { phase: "progress", done: 0, total: 10, file: "lexicon-en-us.txt" },
+      { phase: "progress", done: 10, total: 10, file: "lexicon-en-us.txt" },
     ]);
   });
 
@@ -205,7 +230,7 @@ describe.skipIf(WINDOWS)("transcription with a local model", () => {
 
   it("LocalModels finds the binary, lists by kind, and transcribes audio in memory through a temporary file", async () => {
     const local = new LocalModels({ PI_SPEECH_BINARY: fakeBinary(), PATH: process.env.PATH });
-    expect((await local.list("speech")).map((m) => m.id)).toEqual(["kokoro"]);
+    expect((await local.list("speech")).map((m) => m.id)).toEqual(["kokoro", "piper"]);
     expect((await local.list("transcription")).map((m) => m.id)).toEqual(["whisper-small"]);
     await expect(local.transcribe("whisper-small", Buffer.from("RIFFabcdef"), "wav")).resolves.toBe(
       "heard whisper-small .wav 10",

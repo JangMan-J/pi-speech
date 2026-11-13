@@ -127,13 +127,13 @@ try {
   check(/Read aloud options\s+Summary ›$/.test(rowOf(dock(t.lines()), 'Read aloud options') ?? ''), 'Esc goes back; the row shows Summary');
   await t.key('Enter'); await t.key('Left'); await t.key('Escape');
   check(/Read aloud options\s+Off ›$/.test(rowOf(dock(t.lines()), 'Read aloud options') ?? ''), 'Read set back to Off');
-  // Speech source Local: the local speech models are listed, and the panel says plainly that it cannot speak yet
+  // Speech source Local: the local speech models are listed, and with none chosen the Speech model row asks for one
   await goTo(t, 'Speech source');
   check(/←→ Provider · Local/.test(hintOf(dock(t.lines()))), 'on Speech source the hint names Provider and Local', hintOf(dock(t.lines())));
   await t.key('Right'); await sleep(300);
   d = dock(t.lines());
-  check(/Speech source\s+Local$/.test(rowOf(d, 'Speech source') ?? '') && d.some((l) => /! Speech source: Local · local speech is not available yet/.test(l)), 'Right sets Speech source to Local and says local speech is not available yet', d.slice(-6));
-  check(/Speech model\s+none · ✗ local speech not available yet ›$/.test(rowOf(d, 'Speech model') ?? ''), 'the Speech model row says local speech is not available yet', rowOf(d, 'Speech model'));
+  check(/Speech source\s+Local$/.test(rowOf(d, 'Speech source') ?? '') && d.some((l) => /✓ Speech source: Local/.test(l)) && !d.some((l) => /not available yet/.test(l)), 'Right sets Speech source to Local', d.slice(-6));
+  check(/Speech model\s+none · ✗ choose a model ›$/.test(rowOf(d, 'Speech model') ?? ''), 'the Speech model row asks for a model', rowOf(d, 'Speech model'));
   check(/Transcription source\s+Provider$/.test(rowOf(d, 'Transcription source') ?? '') && readSettings(ctx).speechSource === 'local' && readSettings(ctx).transcriptionSource === undefined, 'Speech source is saved; Transcription source stays Provider', readSettings(ctx));
   await goTo(t, 'Speech model');
   await t.key('Enter');

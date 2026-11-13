@@ -92,6 +92,8 @@ export interface Settings {
   transcriptionSource: Source;
   /** The on-device speech model (an id of `pi-speech-receiver models list`). */
   localSpeechModel?: string;
+  /** A voice of the local speech model (a name of `speak <id> --list-voices`); unset is the model's first voice. */
+  localSpeechVoice?: string;
   /** The on-device transcription model. */
   localTranscriptionModel?: string;
   /** macOS: the notice that Option+letter reached Pi as a character has been shown (once per install). */
@@ -237,6 +239,8 @@ export class SettingsFile {
       if (isSource(raw.transcriptionSource)) s.transcriptionSource = raw.transcriptionSource;
       const localSpeech = str(raw.localSpeechModel);
       if (localSpeech) s.localSpeechModel = localSpeech;
+      const localVoice = str(raw.localSpeechVoice);
+      if (localVoice) s.localSpeechVoice = localVoice;
       const localTranscription = str(raw.localTranscriptionModel);
       if (localTranscription) s.localTranscriptionModel = localTranscription;
       if (raw.optionKeyHintShown === true) s.optionKeyHintShown = true;
@@ -291,6 +295,7 @@ export class SettingsFile {
       ...(s.speechSource !== "provider" ? { speechSource: s.speechSource } : {}),
       ...(s.transcriptionSource !== "provider" ? { transcriptionSource: s.transcriptionSource } : {}),
       ...(s.localSpeechModel ? { localSpeechModel: s.localSpeechModel } : {}),
+      ...(s.localSpeechVoice ? { localSpeechVoice: s.localSpeechVoice } : {}),
       ...(s.localTranscriptionModel ? { localTranscriptionModel: s.localTranscriptionModel } : {}),
       ...(s.optionKeyHintShown ? { optionKeyHintShown: true } : {}),
     };
