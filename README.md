@@ -597,6 +597,15 @@ Releases: the platform packages (one per system and processor, each with only th
 are stamped into `package.json` at publish (`node npm/platforms.mjs stamp`) and not committed, because
 `npm ci` fails while a version is not on npm yet.
 
+A release is a version bump (`npm version patch`; 0.1.0 is already on npm, and the tag must match
+`package.json`) and a push of its `v*` tag (`git push --follow-tags`). `.github/workflows/publish.yml` then
+builds the five receivers (`node npm/platforms.mjs targets`), publishes the platform packages, and publishes the
+main package last. Before the first release with platform packages, the maintainer runs `npm run bootstrap:npm`
+once, with the version bump committed and pushed and CI green: it creates the five
+`@jangmanj/pi-speech-<os>-<cpu>` packages on npm and links each to the trusted publisher (five extra 2FA
+approvals; add `--only <package>` for each of the five, or it also re-links the main package), then pushes the
+tag itself. `npm run bootstrap:npm -- --dry-run` prints the plan without changing anything.
+
 Layout: `src/engine/` is the Pi-independent engine (the speech providers, `provider.ts`, with OpenRouter in
 `openrouter.ts` and xAI in `xai.ts`; the model features, `features.ts`; settings, routes, player, recorder,
 history, dictation, read-aloud, the `/speech` surface, the dock's view model `panel.ts`, the status); `src/bridge/` is the receiver client;
