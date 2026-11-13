@@ -969,13 +969,16 @@ fn stream_requests_are_checked() {
         None,
     );
     assert_eq!(kind.status, 400);
-    assert_eq!(
+    // Two players started: the first Stream's and the held one's (its log line may still be on the way).
+    let starts = || {
         r.log("streamer")
             .iter()
             .filter(|l| l.starts_with("start"))
-            .count(),
-        2
-    );
+            .count()
+    };
+    assert!(wait_until(Duration::from_secs(5), || starts() == 2));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(starts(), 2);
     assert_eq!(
         r.state(&held, 0),
         "playing",

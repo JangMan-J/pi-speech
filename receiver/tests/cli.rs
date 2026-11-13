@@ -231,6 +231,7 @@ fn default_token_file_is_created_private_and_works() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[cfg(unix)]
 fn listening(dir: &Path, env: &[(&str, &Path)]) -> Running {
     let tf = token_file(dir, 0o600);
     let mut c = command(
