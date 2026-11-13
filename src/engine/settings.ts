@@ -20,6 +20,38 @@ export type BridgeMode = "auto" | "on" | "off";
 export type ModelSort = "price" | "provider" | "features" | "newest" | "name";
 export const MODEL_SORTS: ModelSort[] = ["price", "provider", "features", "newest", "name"];
 
+/** The keys of the two Pi shortcuts, as Pi names them (`alt+s`). Pi binds them when the extension loads. */
+export interface Hotkeys {
+  /** Opens the speak composer. */
+  speak: string;
+  /** Starts and stops dictation. */
+  dictate: string;
+}
+
+export const DEFAULT_HOTKEYS: Readonly<Hotkeys> = Object.freeze({ speak: "alt+s", dictate: "alt+z" });
+
+/**
+ * A key a hotkey may be set to, in Pi's spelling, or undefined: Alt with a letter or a digit, optionally with
+ * Ctrl or Shift as well (`alt+d`, `ctrl+alt+d`). Pi keeps Ctrl alone and Alt with other keys for itself.
+ */
+export function hotkeyId(key: string): string | undefined {
+  const parts = key.trim().toLowerCase().split("+");
+  const base = parts.pop() ?? "";
+  if (!/^[a-z0-9]$/.test(base)) return undefined;
+  const mods = new Set(parts);
+  if (!mods.has("alt") || mods.size !== parts.length || [...mods].some((m) => !["ctrl", "alt", "shift"].includes(m)))
+    return undefined;
+  return [...["ctrl", "alt", "shift"].filter((m) => mods.has(m)), base].join("+");
+}
+
+/** A key as the panel shows it: `alt+s` as Alt+S. */
+export function keyLabel(key: string): string {
+  return key
+    .split("+")
+    .map((p) => (p.length === 1 ? p.toUpperCase() : p[0].toUpperCase() + p.slice(1)))
+    .join("+");
+}
+
 /** Language overrides by speech model, then voice: a language tag such as "ja" or "pt-BR". */
 export type LanguageOverrides = Record<string, Record<string, string>>;
 
@@ -39,6 +71,8 @@ export interface Settings {
   modelSort: ModelSort;
   /** User-defined OpenAI-compatible speech endpoints, by name (src/engine/endpoints.ts). */
   endpoints: Record<string, EndpointConfig>;
+  /** The keys of Speak and Dictate; a change applies when Pi next loads the extension. */
+  hotkeys: Hotkeys;
 }
 
 export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
@@ -50,6 +84,7 @@ export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
   languages: {},
   modelSort: "price",
   endpoints: {},
+  hotkeys: DEFAULT_HOTKEYS,
 });
 
 const LEGACY_FILES = ["bridge.json", "language-overrides.json"];
@@ -107,8 +142,20 @@ function endpointsFrom(raw: unknown): Record<string, EndpointConfig> {
   return out;
 }
 
+/** Saved hotkeys over the defaults; a key that is not a valid hotkey, or both on one key, keeps the default. */
+function hotkeysFrom(raw: unknown): Hotkeys {
+  const out = { ...DEFAULT_HOTKEYS };
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  const r = raw as Json;
+  const speak = typeof r.speak === "string" ? hotkeyId(r.speak) : undefined;
+  const dictate = typeof r.dictate === "string" ? hotkeyId(r.dictate) : undefined;
+  if (speak) out.speak = speak;
+  if (dictate) out.dictate = dictate;
+  return out.speak === out.dictate ? { ...DEFAULT_HOTKEYS } : out;
+}
+
 function copyDefaults(): Settings {
-  return { ...DEFAULT_SETTINGS, languages: {}, endpoints: {} };
+  return { ...DEFAULT_SETTINGS, languages: {}, endpoints: {}, hotkeys: { ...DEFAULT_HOTKEYS } };
 }
 
 export class SettingsFile {
@@ -136,6 +183,7 @@ export class SettingsFile {
       if (output) s.dictationOutput = output;
       if (isSort(raw.modelSort)) s.modelSort = raw.modelSort;
       s.endpoints = endpointsFrom(raw.endpoints);
+      s.hotkeys = hotkeysFrom(raw.hotkeys);
     } else if (raw) {
       // settings.json without a version
       legacy = true;
@@ -180,6 +228,9 @@ export class SettingsFile {
       ...(s.dictationOutput ? { dictationOutput: s.dictationOutput } : {}),
       ...(s.modelSort !== DEFAULT_SETTINGS.modelSort ? { modelSort: s.modelSort } : {}),
       ...(Object.keys(s.endpoints).length ? { endpoints: s.endpoints } : {}),
+      ...(s.hotkeys.speak !== DEFAULT_HOTKEYS.speak || s.hotkeys.dictate !== DEFAULT_HOTKEYS.dictate
+        ? { hotkeys: { speak: s.hotkeys.speak, dictate: s.hotkeys.dictate } }
+        : {}),
     };
     const tmp = `${this.file}.${process.pid}.tmp`;
     writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`);

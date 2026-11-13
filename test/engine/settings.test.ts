@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { DEFAULT_SETTINGS, SettingsFile } from "../../src/engine/settings";
+import { DEFAULT_SETTINGS, hotkeyId, keyLabel, SettingsFile } from "../../src/engine/settings";
 
 let dir: string;
 beforeEach(() => {
@@ -22,6 +22,7 @@ describe("the settings file", () => {
       languages: {},
       modelSort: "price",
       endpoints: {},
+      hotkeys: { speak: "alt+s", dictate: "alt+z" },
     });
   });
 
@@ -123,5 +124,44 @@ describe("the settings file", () => {
     writeFileSync(join(dir, "settings.json"), JSON.stringify({ version: 1, tools: "yes", bridge: "maybe", voice: 3 }));
     expect(new SettingsFile(dir).load()).toEqual({ ...DEFAULT_SETTINGS, languages: {} });
     expect(existsSync(join(dir, "settings.json"))).toBe(true);
+  });
+});
+
+describe("the hotkeys", () => {
+  it("are saved only when changed, and read back", () => {
+    const f = new SettingsFile(dir);
+    const s = f.load();
+    f.save(s);
+    expect(JSON.parse(readFileSync(join(dir, "settings.json"), "utf8")).hotkeys).toBeUndefined();
+    s.hotkeys = { speak: "alt+d", dictate: "alt+z" };
+    f.save(s);
+    expect(JSON.parse(readFileSync(join(dir, "settings.json"), "utf8")).hotkeys).toEqual({
+      speak: "alt+d",
+      dictate: "alt+z",
+    });
+    expect(new SettingsFile(dir).load().hotkeys).toEqual({ speak: "alt+d", dictate: "alt+z" });
+  });
+
+  it("keep the default for a key that is not a hotkey, and for both on one key", () => {
+    mkdirSync(dir, { recursive: true });
+    const write = (hotkeys: unknown) =>
+      writeFileSync(join(dir, "settings.json"), JSON.stringify({ version: 1, hotkeys }));
+    write({ speak: "ctrl+c", dictate: "Alt+X" });
+    expect(new SettingsFile(dir).load().hotkeys).toEqual({ speak: "alt+s", dictate: "alt+x" });
+    write({ speak: "alt+q", dictate: "alt+q" });
+    expect(new SettingsFile(dir).load().hotkeys).toEqual({ speak: "alt+s", dictate: "alt+z" });
+    write("alt+q");
+    expect(new SettingsFile(dir).load().hotkeys).toEqual({ speak: "alt+s", dictate: "alt+z" });
+  });
+
+  it("are Alt with a letter or digit, in Pi's spelling, shown capitalised", () => {
+    expect(hotkeyId("alt+d")).toBe("alt+d");
+    expect(hotkeyId("Shift+Alt+7")).toBe("alt+shift+7");
+    expect(hotkeyId("alt+ctrl+k")).toBe("ctrl+alt+k");
+    for (const bad of ["ctrl+s", "d", "alt+enter", "alt+up", "alt+meta+d", "alt+alt", ""]) {
+      expect(hotkeyId(bad)).toBeUndefined();
+    }
+    expect(keyLabel("ctrl+alt+d")).toBe("Ctrl+Alt+D");
+    expect(keyLabel("alt+s")).toBe("Alt+S");
   });
 });
