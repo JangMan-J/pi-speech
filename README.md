@@ -221,7 +221,7 @@ starts a turn. Text is always spoken, never interpreted: `/speech stop the press
 | `--models`                                         | Speech and transcription models with their prices and features                                                           |
 | `--voices`                                         | Voices of the current speech model                                                                                       |
 | `--languages`                                      | The voice language of each voice, with its evidence                                                                      |
-| `--read-aloud on\|off\|summary\|thinking\|all`      | Speak the final reply of each run (`on` is All), or a spoken summary of it (see [Read aloud options](#speech))           |
+| `--read-aloud on\|off\|summary\|thinking\|all`     | Speak the final reply of each run (`on` is All), or a spoken summary of it (see [Read aloud options](#speech))           |
 | `--bridge auto\|on\|off\|status`                   | Where audio plays and records (see [The bridge](#the-bridge))                                                            |
 | `--language <voice> <tag\|auto>`                   | Set the language of a voice (`ja`, `pt-BR`, …), or remove it                                                             |
 | `--set <setting> <value>`                          | Change a setting: `tts-model`, `voice`, `stt-model`, `stt-language`, `tools`, `dictation-output`                         |
