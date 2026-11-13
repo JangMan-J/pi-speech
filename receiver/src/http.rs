@@ -92,6 +92,15 @@ impl Response {
         Response::json(status, format!("{{\"error\": {}}}", json_str(msg)))
     }
 
+    /// The handler has answered on the connection itself (a chunked body); `finish` sends nothing.
+    pub fn sent() -> Response {
+        Response {
+            status: 0,
+            content_type: "",
+            body: Vec::new(),
+        }
+    }
+
     pub fn wav(body: Vec<u8>) -> Response {
         Response {
             status: 200,
@@ -444,9 +453,54 @@ impl Conn {
         r
     }
 
+    /// Begin a `200` answer whose body follows with `Transfer-Encoding: chunked`: each
+    /// [`Conn::write_chunk`] as it is produced, then [`Conn::end_chunked`]. A body that is
+    /// never ended (the connection closes first) is how the client learns it broke off.
+    pub fn begin_chunked(
+        &mut self,
+        content_type: &str,
+        headers: &[(&str, String)],
+    ) -> io::Result<()> {
+        let mut head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nConnection: close\r\n"
+        );
+        for (k, v) in headers {
+            head.push_str(&format!("{k}: {v}\r\n"));
+        }
+        head.push_str("\r\n");
+        self.stream.write_all(head.as_bytes())?;
+        self.stream.flush()
+    }
+
+    pub fn write_chunk(&mut self, data: &[u8]) -> io::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        self.stream
+            .write_all(format!("{:x}\r\n", data.len()).as_bytes())?;
+        self.stream.write_all(data)?;
+        self.stream.write_all(b"\r\n")?;
+        self.stream.flush()
+    }
+
+    pub fn end_chunked(&mut self) -> io::Result<()> {
+        self.stream.write_all(b"0\r\n\r\n")?;
+        self.stream.flush()
+    }
+
+    /// Close the connection at once, leaving a chunked body unfinished.
+    pub fn break_off(&mut self) {
+        let _ = self.stream.shutdown(Shutdown::Both);
+    }
+
     /// Send the response, then read and drop the rest of the request body (bounded) so
     /// the client sees the answer instead of a reset.
     pub fn finish(mut self, resp: Response) {
+        if resp.status == 0 {
+            let _ = self.stream.flush();
+            let _ = self.stream.shutdown(Shutdown::Write);
+            return;
+        }
         let head = render_head(&resp);
         if self.stream.write_all(head.as_bytes()).is_err()
             || self.stream.write_all(&resp.body).is_err()

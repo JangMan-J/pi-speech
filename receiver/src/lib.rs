@@ -8,6 +8,7 @@ pub mod http;
 pub mod models;
 mod private;
 pub mod proc;
+pub mod remote_models;
 pub mod server;
 pub mod signals;
 pub mod speak;

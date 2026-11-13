@@ -240,7 +240,7 @@ fn health_reports_protocol_and_capabilities() {
     let t = rep.text();
     assert!(t.contains("\"protocol\": 1"));
     assert!(t.contains("\"name\": \"pi-speech-receiver\""));
-    assert!(t.contains("\"capabilities\": [\"play\", \"record\", \"stream\"]"));
+    assert!(t.contains("\"capabilities\": [\"play\", \"record\", \"stream\", \"models\"]"));
 }
 
 #[test]

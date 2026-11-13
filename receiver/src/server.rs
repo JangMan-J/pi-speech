@@ -4,6 +4,7 @@ use crate::front::{self, Ready};
 use crate::http::{answer_nonblocking, json_str, BodyFault, Conn, Framing, Request, Response};
 use crate::private;
 use crate::proc::{self, lock, start_thread, Exit, ProcCtl};
+use crate::remote_models::{self, Jobs, MODELS_ENV};
 use crate::stream::{self, Format};
 use crate::token::{ct_eq, random_hex};
 use crate::wav;
@@ -52,6 +53,9 @@ pub struct Config {
     pub stream_player: Option<PathBuf>,
     /// Recorder executable from the environment; `None` means the built-in engine.
     pub recorder: Option<PathBuf>,
+    /// The program that runs local models (`models list`, `speak`, `transcribe`) for the
+    /// model endpoints; `None` means this program (the built-in engine).
+    pub models: Option<PathBuf>,
     /// The built-in audio engine: this program, run as `<engine> play ...` and
     /// `<engine> record <file>`. `None` when it cannot be found.
     pub engine: Option<PathBuf>,
@@ -80,6 +84,7 @@ impl Config {
             tmp_dir,
             stream_player: from_env(STREAM_PLAYER_ENV),
             recorder: from_env(RECORDER_ENV),
+            models: from_env(MODELS_ENV),
             engine: std::env::current_exe().ok(),
             max_body: MAX_BODY,
             max_record_seconds: MAX_RECORD_SECONDS,
@@ -205,6 +210,8 @@ struct Shared {
     rec_lock: Mutex<()>,
     down: AtomicBool,
     conns: AtomicUsize,
+    /// The one model run (transcription or speech) at a time.
+    jobs: Jobs,
 }
 
 pub struct Server {
@@ -226,6 +233,7 @@ impl Server {
             rec_lock: Mutex::new(()),
             down: AtomicBool::new(false),
             conns: AtomicUsize::new(0),
+            jobs: Jobs::default(),
         });
         let sh = Arc::clone(&shared);
         let started = start_thread("accept", move || accept_loop(sh, listener)).and_then(|_| {
@@ -602,13 +610,32 @@ impl Shared {
         ok && !presented.is_empty()
     }
 
+    /// Answer with `f` given the program that runs local models, or 503 without one.
+    fn with_models(&self, f: impl FnOnce(&Path) -> Response) -> Response {
+        match self.cfg.models.as_ref().or(self.cfg.engine.as_ref()) {
+            Some(p) => f(p),
+            None => Response::error(503, NO_ENGINE),
+        }
+    }
+
+    fn models_ctx<'a>(&'a self, program: &'a Path) -> remote_models::Ctx<'a> {
+        remote_models::Ctx {
+            program,
+            tmp_dir: &self.cfg.tmp_dir,
+            max_body: self.cfg.max_body,
+            idle: self.cfg.stream_idle,
+            jobs: &self.jobs,
+            down: &self.down,
+        }
+    }
+
     fn route(self: &Arc<Self>, conn: &mut Conn, req: &Request) -> Response {
         let segs: Vec<&str> = req.path.trim_start_matches('/').split('/').collect();
         match (req.method.as_str(), segs.as_slice()) {
             ("GET", ["v1", "health"]) => Response::json(
                 200,
                 format!(
-                    "{{\"protocol\": 1, \"name\": \"pi-speech-receiver\", \"version\": {}, \"capabilities\": [\"play\", \"record\", \"stream\"]}}",
+                    "{{\"protocol\": 1, \"name\": \"pi-speech-receiver\", \"version\": {}, \"capabilities\": [\"play\", \"record\", \"stream\", \"models\"]}}",
                     json_str(env!("CARGO_PKG_VERSION"))
                 ),
             ),
@@ -627,6 +654,14 @@ impl Shared {
             ("POST", ["v1", "record", "start"]) => self.start_recording(),
             ("POST", ["v1", "record", id, "stop"]) => self.stop_recording(id),
             ("POST", ["v1", "record", id, "cancel"]) => self.cancel_recording(id),
+            ("GET", ["v1", "models"]) => self.with_models(remote_models::list),
+            ("GET", ["v1", "voices"]) => self.with_models(|p| remote_models::voices(p, req)),
+            ("POST", ["v1", "transcribe"]) => {
+                self.with_models(|p| remote_models::transcribe(&self.models_ctx(p), conn, req))
+            }
+            ("POST", ["v1", "speak"]) => {
+                self.with_models(|p| remote_models::speak(&self.models_ctx(p), conn, req))
+            }
             _ => not_found(),
         }
     }
@@ -1128,6 +1163,7 @@ impl Shared {
 
     fn shutdown(&self) {
         self.down.store(true, Ordering::SeqCst);
+        self.jobs.stop();
         let _p = lock(&self.play_lock);
         let _r = lock(&self.rec_lock);
         let ctls: Vec<Arc<ProcCtl>> = {
