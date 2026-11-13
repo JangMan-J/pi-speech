@@ -2,19 +2,21 @@
 //! "Running local models"): `GET /v1/models`, `GET /v1/voices`, `POST /v1/transcribe` and
 //! `POST /v1/speak`. Each runs this program's own `models list`, `speak` or `transcribe`
 //! (or the program named by `PI_SPEECH_RECEIVER_MODELS`) as a child, as the extension does
-//! on its own machine. One transcription or speech runs at a time; another gets 409.
+//! on its own machine. One transcription or speech runs at a time; the others wait their
+//! turn in a bounded queue, which a client that goes away leaves.
 
 use crate::http::{json_str, BodyFault, Conn, Framing, Request, Response};
 use crate::private;
 use crate::proc::lock;
 use crate::token::random_hex;
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -23,13 +25,46 @@ pub const MODELS_ENV: &str = "PI_SPEECH_RECEIVER_MODELS";
 /// The largest body of `POST /v1/speak`.
 pub const MAX_SPEAK_REQUEST: u64 = 1024 * 1024;
 const POLL: Duration = Duration::from_millis(20);
-const BUSY: &str = "a model is already running on this machine; one runs at a time";
+/// How many model runs may wait for the one running.
+pub const MAX_WAITING: usize = 8;
+/// How often a waiting run looks whether its client is still there.
+const QUEUE_POLL: Duration = Duration::from_millis(100);
+const FULL: &str = "too many model runs are waiting on this machine; try again when they are done";
 
-/// The one model job (a transcription or a speech) that may run, and its child.
+/// The one model job (a transcription or a speech) that may run, its child, and the jobs
+/// waiting for it in turn.
 #[derive(Default)]
 pub struct Jobs {
-    busy: AtomicBool,
+    queue: Mutex<Queue>,
+    turn: Condvar,
     child: Mutex<Option<Arc<Mutex<Child>>>>,
+}
+
+#[derive(Default)]
+struct Queue {
+    busy: bool,
+    waiting: VecDeque<u64>,
+    next: u64,
+}
+
+/// Why a job did not get its turn.
+pub enum Refused {
+    /// The queue is full.
+    Full,
+    /// The client went away while it waited.
+    Gone,
+    /// The receiver shuts down.
+    Down,
+}
+
+impl Refused {
+    fn answer(self) -> Response {
+        match self {
+            Refused::Full => Response::error(409, FULL),
+            Refused::Gone => Response::error(400, "the client left while its model run waited"),
+            Refused::Down => Response::error(503, "the receiver is shutting down"),
+        }
+    }
 }
 
 /// The running job; dropping it kills its child if it still runs and frees the slot.
@@ -38,11 +73,45 @@ pub struct Job<'a> {
 }
 
 impl Jobs {
-    pub fn claim(&self) -> Option<Job<'_>> {
-        self.busy
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .ok()
-            .map(|_| Job { jobs: self })
+    /// Wait for this job's turn, first come first served. `gone` tells whether the client
+    /// has left; it is asked every 100 ms while the job waits.
+    pub fn claim(&self, gone: impl Fn() -> bool, down: &AtomicBool) -> Result<Job<'_>, Refused> {
+        let mut q = lock(&self.queue);
+        if !q.busy && q.waiting.is_empty() {
+            q.busy = true;
+            return Ok(Job { jobs: self });
+        }
+        if q.waiting.len() >= MAX_WAITING {
+            return Err(Refused::Full);
+        }
+        let me = q.next;
+        q.next += 1;
+        q.waiting.push_back(me);
+        loop {
+            if !q.busy && q.waiting.front() == Some(&me) {
+                q.waiting.pop_front();
+                q.busy = true;
+                return Ok(Job { jobs: self });
+            }
+            let why = if down.load(Ordering::SeqCst) {
+                Some(Refused::Down)
+            } else {
+                drop(q);
+                let left = gone();
+                q = lock(&self.queue);
+                left.then_some(Refused::Gone)
+            };
+            if let Some(why) = why {
+                q.waiting.retain(|&t| t != me);
+                self.turn.notify_all();
+                return Err(why);
+            }
+            q = self
+                .turn
+                .wait_timeout(q, QUEUE_POLL)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
     }
 
     /// Kill the running job's child (at shutdown).
@@ -68,7 +137,8 @@ impl Drop for Job<'_> {
             let _ = c.kill();
             let _ = c.wait();
         }
-        self.jobs.busy.store(false, Ordering::SeqCst);
+        lock(&self.jobs.queue).busy = false;
+        self.jobs.turn.notify_all();
     }
 }
 
@@ -276,15 +346,12 @@ pub fn transcribe(ctx: &Ctx, conn: &mut Conn, req: &Request) -> Response {
     if matches!(framing, Framing::Length(n) if n > ctx.max_body) {
         return Response::error(413, &too_large);
     }
-    let Some(job) = ctx.jobs.claim() else {
-        return Response::error(409, BUSY);
-    };
     let name = match random_hex(8) {
         Ok(h) => format!("transcribe-{h}.{ext}"),
         Err(e) => return Response::error(503, &format!("no random source: {e}")),
     };
     let path = ctx.tmp_dir.join(name);
-    let r = transcribe_file(ctx, conn, req, framing, &job, &model, &path, &too_large);
+    let r = transcribe_file(ctx, conn, req, framing, &model, &path, &too_large);
     let _ = fs::remove_file(&path);
     r
 }
@@ -295,7 +362,6 @@ fn transcribe_file(
     conn: &mut Conn,
     req: &Request,
     framing: Framing,
-    job: &Job,
     model: &str,
     path: &PathBuf,
     too_large: &str,
@@ -320,6 +386,11 @@ fn transcribe_file(
         return Response::error(503, &format!("cannot keep the audio: {e}"));
     }
     drop(file);
+    // The audio is here; now wait for the turn to run the model.
+    let job = match ctx.jobs.claim(|| conn.peer_gone(), ctx.down) {
+        Ok(j) => j,
+        Err(why) => return why.answer(),
+    };
     let path_arg = path.to_string_lossy();
     let child = match job.spawn(command(ctx.program, &["transcribe", model, &path_arg])) {
         Ok(c) => c,
@@ -367,9 +438,6 @@ pub fn speak(ctx: &Ctx, conn: &mut Conn, req: &Request) -> Response {
         Ok(f) => f,
         Err(e) => return Response::error(400, e),
     };
-    let Some(job) = ctx.jobs.claim() else {
-        return Response::error(409, BUSY);
-    };
     conn.send_continue(req);
     let mut body = Vec::new();
     match conn.read_pieces(framing, MAX_SPEAK_REQUEST, ctx.idle, |p| {
@@ -409,6 +477,10 @@ pub fn speak(ctx: &Ctx, conn: &mut Conn, req: &Request) -> Response {
         }
         _ => return Response::error(400, "speed must be a number from 0.25 to 4"),
     }
+    let job = match ctx.jobs.claim(|| conn.peer_gone(), ctx.down) {
+        Ok(j) => j,
+        Err(why) => return why.answer(),
+    };
     let mut cmd = Command::new(ctx.program);
     cmd.args(&args)
         .stdin(Stdio::piped())

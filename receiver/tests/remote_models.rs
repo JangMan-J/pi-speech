@@ -226,31 +226,58 @@ fn transcribe_runs_the_model_on_the_audio_and_deletes_it() {
     assert_eq!(rep.status, 413);
 }
 
+fn calls(r: &Rig) -> Vec<String> {
+    fs::read_to_string(r.dir.join("calls.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(String::from)
+        .collect()
+}
+
 #[test]
-fn one_model_runs_at_a_time_and_a_client_that_leaves_stops_it() {
+fn model_runs_of_several_clients_queue_and_a_client_that_leaves_stops_its_own() {
     let r = Rig::new(1 << 20);
     let (held, head) = open_speak(r.addr, r#"{"model":"kokoro","text":"hold on"}"#);
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-    let busy = r.speak_json(r#"{"model":"kokoro","text":"Next."}"#);
-    assert_eq!(busy.status, 409, "{}", busy.text());
-    let busy = r.call(
-        "POST",
-        "/v1/transcribe?model=parakeet",
-        &[("Content-Type", "audio/wav")],
-        &wav(0.2),
+    let running = r.pid();
+    // A client that gives up while it waits leaves the queue and never runs.
+    let body = r#"{"model":"kokoro","text":"Never mind."}"#;
+    let mut leaver = TcpStream::connect(r.addr).unwrap();
+    let req = format!(
+        "POST /v1/speak HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {TOKEN}\r\nContent-Length: {}\r\n\r\n{body}",
+        r.addr,
+        body.len()
     );
-    assert_eq!(busy.status, 409);
-    // Listing is not a model run.
-    assert_eq!(r.call("GET", "/v1/models", &[], &[]).status, 200);
-    let pid = r.pid();
-    drop(held);
-    assert!(
-        wait_until(Duration::from_secs(5), || gone(pid)),
-        "the speech still runs"
-    );
-    assert!(wait_until(Duration::from_secs(5), || {
-        r.speak_json(r#"{"model":"kokoro","text":"Again."}"#).status == 200
-    }));
+    leaver.write_all(req.as_bytes()).unwrap();
+    std::thread::scope(|s| {
+        let speak = s.spawn(|| r.speak_json(r#"{"model":"kokoro","text":"Next."}"#));
+        let transcribe = s.spawn(|| {
+            r.call(
+                "POST",
+                "/v1/transcribe?model=parakeet",
+                &[("Content-Type", "audio/wav")],
+                &wav(0.2),
+            )
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(calls(&r).len(), 1, "the others wait for the one running");
+        drop(leaver);
+        // Listing is not a model run.
+        assert_eq!(r.call("GET", "/v1/models", &[], &[]).status, 200);
+        std::thread::sleep(Duration::from_millis(300));
+        drop(held);
+        assert!(
+            wait_until(Duration::from_secs(5), || gone(running)),
+            "the speech of the client that left still runs"
+        );
+        let speak = speak.join().unwrap();
+        assert_eq!(speak.status, 200, "{}", speak.text());
+        assert_eq!(speak.body, b"AAAABBBB");
+        let transcribe = transcribe.join().unwrap();
+        assert_eq!(transcribe.status, 200, "{}", transcribe.text());
+    });
+    // The held speech, the listing, and the two that waited: never the one that left.
+    assert_eq!(calls(&r).len(), 4, "{:?}", calls(&r));
 }
 
 #[test]

@@ -118,7 +118,9 @@ fn reason(status: u16) -> &'static str {
         202 => "Accepted",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
+        410 => "Gone",
         409 => "Conflict",
         408 => "Request Timeout",
         413 => "Payload Too Large",
@@ -486,6 +488,25 @@ impl Conn {
     pub fn end_chunked(&mut self) -> io::Result<()> {
         self.stream.write_all(b"0\r\n\r\n")?;
         self.stream.flush()
+    }
+
+    /// Whether the client has closed the connection (or it broke), looking without
+    /// reading: for a request that waits before it answers.
+    pub fn peer_gone(&self) -> bool {
+        if self.stream.set_nonblocking(true).is_err() {
+            return true;
+        }
+        let mut b = [0u8; 1];
+        let gone = match self.stream.peek(&mut b) {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(e) => !matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ),
+        };
+        let _ = self.stream.set_nonblocking(false);
+        gone
     }
 
     /// Close the connection at once, leaving a chunked body unfinished.

@@ -1,17 +1,18 @@
 use pi_speech_receiver::audio::{play, record};
 use pi_speech_receiver::server::{self, Config, Server, DEFAULT_PORT};
-use pi_speech_receiver::{models, signals, speak, ssh, token, transcribe};
+use pi_speech_receiver::{models, shared, signals, speak, ssh, token, transcribe};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::{fs, io::Read};
 
 const SERVE_USAGE: &str =
-    "pi-speech-receiver [serve] [--listen 127.0.0.1:47613] [--token-file PATH]";
+    "pi-speech-receiver [serve] [--listen 127.0.0.1:47613 [--network]] [--token-file PATH]";
+const NETWORK_NOTE: &str = "--network allows a --listen address that is not loopback (a Tailscale or LAN address):\nthe bridge is plain HTTP, so on a LAN anyone on it can read the audio and the token; Tailscale encrypts.";
 
 fn usage() -> String {
     format!(
-        "usage: {SERVE_USAGE}\n       {}\n       {}\n       {}\n       {}\n       {}\n       {}\n       {}\n\n{}\n\n{}",
+        "usage: {SERVE_USAGE}\n       {}\n       {}\n       {}\n       {}\n       {}\n       {}\n       {}\n\n{NETWORK_NOTE}\n\n{}\n\n{}",
         ssh::USAGE,
         ssh::PAIR_USAGE,
         play::USAGE,
@@ -27,11 +28,13 @@ fn usage() -> String {
 struct Args {
     listen: SocketAddr,
     token_file: Option<PathBuf>,
+    network: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut listen = SocketAddr::from(([127, 0, 0, 1], DEFAULT_PORT));
     let mut token_file = None;
+    let mut network = false;
     let mut it = args.iter().cloned();
     while let Some(a) = it.next() {
         let (name, inline) = match a.split_once('=') {
@@ -52,6 +55,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
                 })?;
             }
             "--token-file" => token_file = Some(PathBuf::from(value("--token-file")?)),
+            "--network" if inline.is_none() => network = true,
             "-h" | "--help" => {
                 println!("{}", usage());
                 std::process::exit(0);
@@ -59,17 +63,26 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             _ => return Err(format!("unknown argument {a:?}")),
         }
     }
-    Ok(Args { listen, token_file })
+    Ok(Args {
+        listen,
+        token_file,
+        network,
+    })
 }
 
 fn serve(args: &[String]) -> Result<(), String> {
     let args = parse_args(args)?;
-    server::check_loopback(&args.listen)?;
+    if !args.network {
+        server::check_loopback(&args.listen)
+            .map_err(|e| format!("{e} (--network allows another address)"))?;
+    }
     let signals = signals::pipe().map_err(|e| format!("cannot handle signals: {e}"))?;
     let token = token::load_token(args.token_file.as_deref()).map_err(|e| e.to_string())?;
     let tmp = server::private_tmp_dir()
         .map_err(|e| format!("cannot create the temporary directory: {e}"))?;
-    let srv = match Server::start(Config::new(args.listen, token, tmp.clone())) {
+    let mut cfg = Config::new(args.listen, token, tmp.clone());
+    cfg.network = args.network;
+    let srv = match Server::start(cfg) {
         Ok(s) => s,
         Err(e) => {
             let _ = fs::remove_dir_all(&tmp);
@@ -77,6 +90,9 @@ fn serve(args: &[String]) -> Result<(), String> {
         }
     };
     println!("listening {}", srv.local_addr());
+    if server::check_loopback(&srv.local_addr()).is_err() {
+        eprintln!("pi-speech-receiver: listening beyond this machine; the bridge is plain HTTP: on a LAN anyone on it can read the audio and the token, Tailscale encrypts");
+    }
 
     let mut byte = [0u8; 1];
     let mut signals = signals;
@@ -96,6 +112,7 @@ fn main() -> ExitCode {
         Some("models") => return models::main(&args[1..]),
         Some("ssh") => return ssh::ssh_main(&args[1..]),
         Some("pair") => return ssh::pair_main(&args[1..]),
+        Some("shared") => return shared::shared_main(&args[1..]),
         Some("serve") => &args[1..],
         _ => &args[..],
     };

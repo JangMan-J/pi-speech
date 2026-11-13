@@ -2,6 +2,7 @@
 
 use crate::front::{self, Ready};
 use crate::http::{answer_nonblocking, json_str, BodyFault, Conn, Framing, Request, Response};
+use crate::pair::{self, Notice, Pairing};
 use crate::private;
 use crate::proc::{self, lock, start_thread, Exit, ProcCtl};
 use crate::remote_models::{self, Jobs, MODELS_ENV};
@@ -38,6 +39,11 @@ pub const STREAM_START: Duration = Duration::from_secs(120);
 pub const STREAM_IDLE: Duration = Duration::from_secs(120);
 /// The largest body of `POST /v1/play/stream`; a valid one is far smaller.
 const MAX_STREAM_REQUEST: u64 = 4096;
+/// The largest body of `POST /v1/pair`.
+const MAX_PAIR_REQUEST: u64 = 4096;
+/// The header that names the Pi process a request comes from: its plays replace only its
+/// own, and `POST /v1/stop` stops only its own.
+pub const CLIENT_HEADER: &str = "x-pi-speech-client";
 
 pub const STREAM_PLAYER_ENV: &str = "PI_SPEECH_RECEIVER_STREAM_PLAYER";
 pub const RECORDER_ENV: &str = "PI_SPEECH_RECEIVER_RECORDER";
@@ -69,6 +75,12 @@ pub struct Config {
     pub stream_start: Duration,
     /// How long a Stream's audio may go without any byte.
     pub stream_idle: Duration,
+    /// Listen on an address that is not loopback (`--network`).
+    pub network: bool,
+    /// How long a pairing code is valid.
+    pub pair_ttl: Duration,
+    /// Where pairing codes are shown: the receiver's own terminal.
+    pub notice: Notice,
 }
 
 impl Config {
@@ -92,6 +104,9 @@ impl Config {
             head_timeout: HEAD_TIMEOUT,
             stream_start: STREAM_START,
             stream_idle: STREAM_IDLE,
+            network: false,
+            pair_ttl: pair::PAIR_TTL,
+            notice: pair::stderr_notice(),
         }
     }
 }
@@ -153,6 +168,8 @@ enum Feed {
 
 struct Play {
     id: String,
+    /// The `X-Pi-Speech-Client` of the request that started it, if it had one.
+    client: Option<String>,
     state: PlayState,
     error: Option<String>,
     ctl: Arc<ProcCtl>,
@@ -210,8 +227,9 @@ struct Shared {
     rec_lock: Mutex<()>,
     down: AtomicBool,
     conns: AtomicUsize,
-    /// The one model run (transcription or speech) at a time.
+    /// The one model run (transcription or speech) at a time, and those waiting for it.
     jobs: Jobs,
+    pairing: Pairing,
 }
 
 pub struct Server {
@@ -222,10 +240,14 @@ pub struct Server {
 impl Server {
     /// Bind the listener and start serving on background threads.
     pub fn start(cfg: Config) -> io::Result<Server> {
-        check_loopback(&cfg.listen).map_err(io::Error::other)?;
+        if !cfg.network {
+            check_loopback(&cfg.listen).map_err(io::Error::other)?;
+        }
         let listener = TcpListener::bind(cfg.listen)?;
         let addr = listener.local_addr()?;
+        let pairing = Pairing::new(cfg.pair_ttl, Arc::clone(&cfg.notice));
         let shared = Arc::new(Shared {
+            pairing,
             cfg,
             inner: Mutex::new(Inner::default()),
             cv: Condvar::new(),
@@ -321,7 +343,9 @@ fn serve(sh: &Arc<Shared>, ready: Ready) {
     let Ok(mut conn) = Conn::resume(stream, ahead, &req) else {
         return;
     };
-    let resp = if !sh.authorized(&req) {
+    // Pairing is how a client without the token gets it, so it needs none.
+    let pairing = req.method == "POST" && req.path == "/v1/pair";
+    let resp = if !pairing && !sh.authorized(&req) {
         Response::error(401, "unauthorized")
     } else if sh.down.load(Ordering::SeqCst) {
         Response::error(503, "the receiver is shutting down")
@@ -342,6 +366,26 @@ fn check_kind(req: &Request) -> Result<(), Response> {
         _ => Err(Response::error(
             400,
             "X-Pi-Speech-Kind must be message or sample",
+        )),
+    }
+}
+
+/// The optional `X-Pi-Speech-Client` header: a client id of 1 to 64 letters, digits, `-`,
+/// `_` or `.`.
+fn client_of(req: &Request) -> Result<Option<String>, Response> {
+    match req.header(CLIENT_HEADER) {
+        None => Ok(None),
+        Some(v)
+            if req.header_count(CLIENT_HEADER) == 1
+                && (1..=64).contains(&v.len())
+                && v.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) =>
+        {
+            Ok(Some(v.to_string()))
+        }
+        Some(_) => Err(Response::error(
+            400,
+            "X-Pi-Speech-Client must be 1 to 64 letters, digits, -, _ or .",
         )),
     }
 }
@@ -647,10 +691,16 @@ impl Shared {
             },
             ("POST", ["v1", "play", id, "cancel"]) => self.cancel_play(id),
             ("POST", ["v1", "stop"]) => {
+                let client = match client_of(req) {
+                    Ok(c) => c,
+                    Err(resp) => return resp,
+                };
                 let _p = lock(&self.play_lock);
-                let n = self.stop_playing();
+                // With the header only that client's playbacks; without it, every one.
+                let n = self.stop_playing(|p| client.is_none() || p.client == client);
                 Response::json(200, format!("{{\"stopped\": {n}}}"))
             }
+            ("POST", ["v1", "pair"]) => self.pair(conn, req),
             ("POST", ["v1", "record", "start"]) => self.start_recording(),
             ("POST", ["v1", "record", id, "stop"]) => self.stop_recording(id),
             ("POST", ["v1", "record", id, "cancel"]) => self.cancel_recording(id),
@@ -703,6 +753,10 @@ impl Shared {
         if let Err(resp) = check_kind(req) {
             return resp;
         }
+        let client = match client_of(req) {
+            Ok(c) => c,
+            Err(resp) => return resp,
+        };
         let framing = match Framing::of(req) {
             Ok(f) => f,
             Err(e) => return Response::error(400, e),
@@ -716,7 +770,7 @@ impl Shared {
             return Response::error(400, &format!("unusable Stream request: {}", e.describe()));
         }
         match Format::parse(&body) {
-            Ok(format) => self.start_stream(format),
+            Ok(format) => self.start_stream(format, client),
             Err(e) => Response::error(400, &e),
         }
     }
@@ -728,7 +782,28 @@ impl Shared {
         Ok(program)
     }
 
-    fn start_stream(self: &Arc<Self>, format: Format) -> Response {
+    /// `POST /v1/pair`: a new pairing code, or the token for the right one.
+    fn pair(&self, conn: &mut Conn, req: &Request) -> Response {
+        let bodiless =
+            req.header("content-length").is_none() && req.header("transfer-encoding").is_none();
+        let framing = match Framing::of(req) {
+            Ok(f) => f,
+            Err(_) if bodiless => Framing::Length(0),
+            Err(e) => return Response::error(400, e),
+        };
+        conn.send_continue(req);
+        let mut body = Vec::new();
+        let read = conn.read_pieces(framing, MAX_PAIR_REQUEST, self.cfg.stream_idle, |p| {
+            body.extend_from_slice(p)
+        });
+        if let Err(e) = read {
+            return Response::error(400, &format!("unusable pairing request: {}", e.describe()));
+        }
+        self.pairing.answer(&body, &self.cfg.token)
+    }
+
+    /// Start a Stream player for `client`; it replaces what that client plays, and only that.
+    fn start_stream(self: &Arc<Self>, format: Format, client: Option<String>) -> Response {
         let _p = lock(&self.play_lock);
         if self.down.load(Ordering::SeqCst) {
             return Response::error(503, "the receiver is shutting down");
@@ -743,7 +818,7 @@ impl Shared {
             Ok(id) => id,
             Err(e) => return Response::error(503, &format!("no random source: {e}")),
         };
-        self.stop_playing();
+        self.stop_playing(|p| p.client == client);
         let cmd = program.command();
         let sh = Arc::clone(self);
         let done_id = id.clone();
@@ -771,6 +846,7 @@ impl Shared {
         }
         g.plays.push(Play {
             id: id.clone(),
+            client,
             state: PlayState::Playing,
             error: None,
             ctl,
@@ -905,17 +981,21 @@ impl Shared {
         });
     }
 
-    /// Stop every playback in progress and wait until they are marked. The caller holds
-    /// `play_lock`. Returns how many were playing.
-    fn stop_playing(&self) -> usize {
-        let ctls: Vec<Arc<ProcCtl>> = lock(&self.inner)
+    /// Stop the playbacks in progress that `which` picks and wait until they are marked.
+    /// The caller holds `play_lock`. Returns how many were playing.
+    fn stop_playing(&self, which: impl Fn(&Play) -> bool) -> usize {
+        let (ids, ctls): (Vec<String>, Vec<Arc<ProcCtl>>) = lock(&self.inner)
             .plays
             .iter()
-            .filter(|p| p.state == PlayState::Playing)
-            .map(|p| Arc::clone(&p.ctl))
-            .collect();
+            .filter(|p| p.state == PlayState::Playing && which(p))
+            .map(|p| (p.id.clone(), Arc::clone(&p.ctl)))
+            .unzip();
         let stopped = stop_all(&ctls);
-        self.settle(|g| g.plays.iter().all(|p| p.state != PlayState::Playing));
+        self.settle(|g| {
+            g.plays
+                .iter()
+                .all(|p| p.state != PlayState::Playing || !ids.contains(&p.id))
+        });
         stopped
     }
 

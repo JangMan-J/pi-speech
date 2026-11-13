@@ -1055,3 +1055,192 @@ fn without_a_configured_program_or_the_built_in_engine_everything_is_503() {
     }
     assert_eq!(r.files_in_tmp(), 0);
 }
+
+// ---- several Pi clients ----
+
+const CLIENT: &str = "X-Pi-Speech-Client";
+
+#[cfg_attr(windows, allow(dead_code))]
+impl Rig {
+    /// Start a 24 kHz mono PCM Stream as Pi process `client`; its id.
+    fn stream_as(&self, client: &str) -> String {
+        let r = request(
+            self.addr,
+            "POST",
+            "/v1/play/stream",
+            Some(TOKEN),
+            &[("Content-Type", "application/json"), (CLIENT, client)],
+            PCM.as_bytes(),
+            None,
+        );
+        assert_eq!(r.status, 202, "{}", r.text());
+        json_field(&r.text(), "id").unwrap()
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn streams_of_two_clients_overlap_and_both_complete() {
+    let r = Rig::new();
+    let a = r.stream_as("pi-a");
+    let mut up_a = r.upload(&a);
+    up_a.chunk(&[1u8; 960]);
+    let b = r.stream_as("pi-b");
+    let mut up_b = r.upload(&b);
+    up_b.chunk(&[2u8; 960]);
+    assert_eq!(
+        r.state(&a, 0),
+        "playing",
+        "the other client's play replaced it"
+    );
+    assert_eq!(r.state(&b, 0), "playing");
+    up_a.chunk(&[1u8; 960]);
+    assert_eq!(up_b.end().status, 200);
+    assert_eq!(up_a.end().status, 200);
+    assert_eq!(r.state(&a, 10), "completed");
+    assert_eq!(r.state(&b, 10), "completed");
+}
+
+#[test]
+#[cfg(unix)]
+fn one_client_s_new_play_and_stop_leave_another_client_s_audio_alone() {
+    let r = Rig::new();
+    let a = r.stream_as("pi-a");
+    let mut up_a = r.upload(&a);
+    up_a.chunk(&[1u8; 960]);
+    let c1 = r.stream_as("pi-c");
+    let c2 = r.stream_as("pi-c");
+    assert_eq!(
+        r.state(&c1, 0),
+        "cancelled",
+        "a client's new play replaces its own"
+    );
+    assert_eq!(r.state(&a, 0), "playing");
+    let stop = request(
+        r.addr,
+        "POST",
+        "/v1/stop",
+        Some(TOKEN),
+        &[(CLIENT, "pi-c")],
+        b"",
+        None,
+    );
+    assert!(stop.text().contains("\"stopped\": 1"), "{}", stop.text());
+    assert_eq!(r.state(&c2, 0), "cancelled");
+    assert_eq!(
+        r.state(&a, 0),
+        "playing",
+        "another client's stop leaves it alone"
+    );
+    assert_eq!(up_a.end().status, 200);
+    assert_eq!(r.state(&a, 10), "completed");
+}
+
+// ---- pairing ----
+
+use std::sync::{Arc, Mutex};
+
+/// A receiver whose pairing codes are kept in `shown` instead of printed.
+fn pairing_rig(ttl: Duration) -> (Rig, Arc<Mutex<Vec<String>>>) {
+    let shown = Arc::new(Mutex::new(Vec::new()));
+    let kept = Arc::clone(&shown);
+    let r = Rig::with(move |cfg| {
+        cfg.pair_ttl = ttl;
+        cfg.notice = Arc::new(move |m: &str| kept.lock().unwrap().push(m.to_string()));
+    });
+    (r, shown)
+}
+
+impl Rig {
+    /// `POST /v1/pair` without the token.
+    fn pair(&self, body: &str) -> Reply {
+        request(
+            self.addr,
+            "POST",
+            "/v1/pair",
+            None,
+            &[("Content-Type", "application/json")],
+            body.as_bytes(),
+            None,
+        )
+    }
+
+    /// Ask for a code; the code the receiver showed.
+    fn pairing_code(&self, shown: &Mutex<Vec<String>>) -> String {
+        let r = self.pair("");
+        assert_eq!(r.status, 202, "{}", r.text());
+        let said = shown
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("a code was shown");
+        let code: String = said
+            .split(|c: char| !c.is_ascii_digit())
+            .find(|w| w.len() == 6)
+            .expect("six digits")
+            .to_string();
+        assert!(
+            !r.text().contains(&code),
+            "the code never goes to the client"
+        );
+        code
+    }
+}
+
+fn other_code(code: &str) -> String {
+    format!("{:06}", (code.parse::<u32>().unwrap() + 1) % 1_000_000)
+}
+
+fn code_body(code: &str) -> String {
+    format!("{{\"code\": \"{code}\"}}")
+}
+
+#[test]
+fn the_code_shown_by_the_receiver_earns_the_token_once() {
+    let (r, shown) = pairing_rig(Duration::from_secs(120));
+    let code = r.pairing_code(&shown);
+    let wrong = r.pair(&code_body(&other_code(&code)));
+    assert_eq!(wrong.status, 403);
+    assert!(
+        wrong.text().contains("\"attempts_left\": 4"),
+        "{}",
+        wrong.text()
+    );
+    let right = r.pair(&code_body(&code));
+    assert_eq!(right.status, 200, "{}", right.text());
+    assert_eq!(json_field(&right.text(), "token").as_deref(), Some(TOKEN));
+    assert_eq!(r.pair(&code_body(&code)).status, 410, "a code is used once");
+}
+
+#[test]
+fn a_pairing_code_expires() {
+    let (r, shown) = pairing_rig(Duration::from_millis(300));
+    let code = r.pairing_code(&shown);
+    std::thread::sleep(Duration::from_millis(500));
+    let late = r.pair(&code_body(&code));
+    assert_eq!(late.status, 410, "{}", late.text());
+    assert!(!late.text().contains(TOKEN));
+}
+
+#[test]
+fn five_wrong_attempts_void_the_code_and_a_new_one_works() {
+    let (r, shown) = pairing_rig(Duration::from_secs(120));
+    let code = r.pairing_code(&shown);
+    for left in (0..5).rev() {
+        let wrong = r.pair(&code_body(&other_code(&code)));
+        assert_eq!(wrong.status, 403);
+        assert!(
+            wrong.text().contains(&format!("\"attempts_left\": {left}")),
+            "{}",
+            wrong.text()
+        );
+    }
+    assert_eq!(
+        r.pair(&code_body(&code)).status,
+        410,
+        "the right code is void now"
+    );
+    let code = r.pairing_code(&shown);
+    assert_eq!(r.pair(&code_body(&code)).status, 200);
+}
