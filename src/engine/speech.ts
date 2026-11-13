@@ -164,7 +164,7 @@ export class Speech {
   settings: Settings;
   /** Pi's credential store; set by the adapter. */
   registry?: KeyRegistry;
-  /** The on-device models of This machine. */
+  /** The on-device models: This machine's, or the Remote machine's while Run models on says so. */
   readonly local: LocalModels;
   /** Hears warnings found while loading, such as a replaced model. */
   onWarning: (message: string) => void = () => {};
@@ -203,6 +203,7 @@ export class Speech {
     this.localSpeech = new LocalSpeechProvider(
       () => this.local.binary(),
       () => childEnv(opts.env),
+      () => this.local.remote(),
     );
     this.settings = this.store.load();
   }

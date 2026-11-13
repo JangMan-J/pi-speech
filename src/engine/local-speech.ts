@@ -9,6 +9,7 @@
 
 import { type ChildProcess, spawn } from "node:child_process";
 import { createInterface } from "node:readline";
+import type { BridgeModels } from "../bridge/index";
 import { ChunkBuffer, clipOf } from "./audio-stream";
 import type { AudioStream, SpeechProvider, SynthesisRequest, SynthesizedAudio } from "./provider";
 
@@ -217,16 +218,22 @@ export class LocalSpeechProvider implements SpeechProvider {
     /** The binary's path; throws why there is none. */
     private readonly binary: () => string,
     private readonly env: () => NodeJS.ProcessEnv = () => process.env,
+    /** The Remote machine's models when they run there (Run models on), else undefined. */
+    private readonly remote: () => BridgeModels | undefined = () => undefined,
   ) {}
 
   async ensureCredential(): Promise<void> {}
 
   /** The voices of the downloaded voice model `id`. */
   voices(id: string, signal?: AbortSignal): Promise<LocalVoice[]> {
+    const remote = this.remote();
+    if (remote) return remote.voices(id, signal);
     return listVoices(this.binary(), id, { signal, env: this.env() });
   }
 
   async synthesizeStream(req: SynthesisRequest): Promise<AudioStream> {
+    const remote = this.remote();
+    if (remote) return remote.speak(req.model, req.text, { voice: req.voice, signal: req.signal });
     return speakLocal(this.binary(), req.model, req.text, { voice: req.voice, signal: req.signal, env: this.env() });
   }
 

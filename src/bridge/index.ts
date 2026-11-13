@@ -3,6 +3,13 @@
  * pi-speech-receiver (protocol/bridge.md). Which route is used is decided in src/engine/routes.ts.
  */
 
-export type { BridgeAudio, BridgeConfig, BridgeHealth, BridgeProbe } from "./client";
+export type {
+  BridgeAudio,
+  BridgeConfig,
+  BridgeHealth,
+  BridgeModels,
+  BridgeProbe,
+  BridgeVoice,
+} from "./client";
 export { createBridgeAudio, createBridgeAudioFrom, displayUrl, loopbackBase, probeBridge } from "./client";
 export { bridgeConfig, bridgeToken, bridgeUrl, DEFAULT_URL } from "./config";

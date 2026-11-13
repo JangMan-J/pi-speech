@@ -5,10 +5,11 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { extname, join } from "node:path";
 import { createInterface } from "node:readline";
+import type { BridgeModels } from "../bridge/index";
 import { type BinaryChoice, findBinary } from "./binary";
 import { childEnv, type Env } from "./env";
 
@@ -313,11 +314,20 @@ export async function transcribeLocal(
   }
 }
 
+/** What a download or delete says while Run models on is the Remote machine. */
+export function remoteOnly(what: string, id: string): string {
+  return `Run models on is Remote machine: ${what} ${id} there with pi-speech-receiver models ${what} ${id}, or set Run models on to This machine (/speech, SETTINGS, Bridge connection)`;
+}
+
 /**
- * The on-device models of this machine through the bundled binary (found as src/engine/binary.ts says): the
- * catalogue, downloads, deletes, and transcription with a downloaded model.
+ * The on-device models through the bundled binary (found as src/engine/binary.ts says): the catalogue, downloads,
+ * deletes, and transcription with a downloaded model. While `remote` gives the Remote machine's models (Run models
+ * on is Remote machine with the bridge in use), the catalogue and the runs are the receiver's there instead.
  */
 export class LocalModels {
+  /** The Remote machine's models when they are the ones to use; set by the engine. */
+  remote: () => BridgeModels | undefined = () => undefined;
+
   constructor(
     private readonly env: Env,
     private readonly locate: () => BinaryChoice = () => findBinary(env),
@@ -336,15 +346,20 @@ export class LocalModels {
 
   /** The catalogue, of one kind when given, with each model's state. */
   async list(kind?: ModelKind): Promise<LocalModel[]> {
-    const all = await listModels(this.binary(), this.childEnv);
+    const remote = this.remote();
+    const all = remote
+      ? (await remote.list()).flatMap((v) => toModel(v) ?? [])
+      : await listModels(this.binary(), this.childEnv);
     return kind ? all.filter((m) => m.kind === kind) : all;
   }
 
   download(id: string, options: Omit<DownloadOptions, "env"> = {}): Download {
+    if (this.remote()) throw new LocalModelsError(remoteOnly("download", id));
     return downloadModel(this.binary(), id, { ...options, env: this.childEnv });
   }
 
   delete(id: string): Promise<number> {
+    if (this.remote()) return Promise.reject(new LocalModelsError(remoteOnly("delete", id)));
     return deleteModel(this.binary(), id, this.childEnv);
   }
 
@@ -356,6 +371,8 @@ export class LocalModels {
         `local models transcribe ${LOCAL_AUDIO.join(" and ")} files, not ${ext || "this file"}`,
       );
     }
+    const remote = this.remote();
+    if (remote) return remote.transcribe(id, readFileSync(file), ext as "wav" | "mp3", signal);
     return transcribeLocal(this.binary(), id, file, { signal, env: this.childEnv });
   }
 
@@ -364,6 +381,8 @@ export class LocalModels {
     if (!LOCAL_AUDIO.includes(format)) {
       throw new LocalModelsError(`local models transcribe ${LOCAL_AUDIO.join(" and ")} audio, not ${format}`);
     }
+    const remote = this.remote();
+    if (remote) return remote.transcribe(id, audio, format as "wav" | "mp3", signal);
     const dir = mkdtempSync(join(tmpdir(), "pi-speech-local-"));
     try {
       const file = join(dir, `audio.${format}`);

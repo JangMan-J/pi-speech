@@ -26,7 +26,22 @@ describe("the settings file", () => {
       readAloud: { length: "abridged", truncate: 0 },
       speechSource: "provider",
       transcriptionSource: "provider",
+      playOn: "remote",
+      recordOn: "remote",
+      modelsOn: "remote",
     });
+  });
+
+  it("keeps a direction set to This machine, and a value that is not a machine keeps Remote machine", () => {
+    const f = new SettingsFile(dir);
+    const s = f.load();
+    s.recordOn = "this";
+    f.save(s);
+    const saved = JSON.parse(readFileSync(f.file, "utf8"));
+    expect(saved.recordOn).toBe("this");
+    expect(saved.playOn).toBeUndefined();
+    writeFileSync(f.file, JSON.stringify({ ...saved, playOn: "laptop" }));
+    expect(f.load()).toMatchObject({ playOn: "remote", recordOn: "this", modelsOn: "remote" });
   });
 
   it("saves each source and local model, independently; an unknown source keeps Provider", () => {

@@ -23,6 +23,13 @@ export const SETTINGS_VERSION = 1;
 /** auto: the bridge when Pi runs over SSH, else local. on: always the bridge. off: always local. */
 export type BridgeMode = "auto" | "on" | "off";
 
+/**
+ * Where something runs while the bridge is in use: This machine (Pi's) or the Remote machine (the receiver's).
+ * Without the bridge everything runs on This machine, whatever is saved.
+ */
+export type Machine = "this" | "remote";
+export const MACHINES: Machine[] = ["this", "remote"];
+
 /** Where speech or transcription comes from: a provider over the network, or a model on This machine. */
 export type Source = "provider" | "local";
 export const SOURCES: Source[] = ["provider", "local"];
@@ -96,6 +103,12 @@ export interface Settings {
   localSpeechVoice?: string;
   /** The on-device transcription model. */
   localTranscriptionModel?: string;
+  /** With the bridge in use: where audio plays. */
+  playOn: Machine;
+  /** With the bridge in use: where dictation records. */
+  recordOn: Machine;
+  /** With the bridge in use: where Local sources run their models. */
+  modelsOn: Machine;
   /** macOS: the notice that Option+letter reached Pi as a character has been shown (once per install). */
   optionKeyHintShown?: boolean;
 }
@@ -113,7 +126,14 @@ export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
   readAloud: DEFAULT_READ_ALOUD,
   speechSource: "provider",
   transcriptionSource: "provider",
+  playOn: "remote",
+  recordOn: "remote",
+  modelsOn: "remote",
 });
+
+/** The saved directions, in the order the panel shows them. */
+export const DIRECTIONS = ["playOn", "recordOn", "modelsOn"] as const;
+export type DirectionSetting = (typeof DIRECTIONS)[number];
 
 const LEGACY_FILES = ["bridge.json", "language-overrides.json"];
 
@@ -132,6 +152,7 @@ const str = (v: unknown): string | undefined => (typeof v === "string" && v ? v 
 const isMode = (v: unknown): v is BridgeMode => v === "auto" || v === "on" || v === "off";
 const isSort = (v: unknown): v is ModelSort => MODEL_SORTS.includes(v as ModelSort);
 const isSource = (v: unknown): v is Source => SOURCES.includes(v as Source);
+const isMachine = (v: unknown): v is Machine => MACHINES.includes(v as Machine);
 
 function languagesFrom(raw: unknown): LanguageOverrides {
   const out: LanguageOverrides = {};
@@ -244,6 +265,7 @@ export class SettingsFile {
       const localTranscription = str(raw.localTranscriptionModel);
       if (localTranscription) s.localTranscriptionModel = localTranscription;
       if (raw.optionKeyHintShown === true) s.optionKeyHintShown = true;
+      for (const d of DIRECTIONS) if (isMachine(raw[d])) s[d] = raw[d];
     } else if (raw) {
       // settings.json without a version
       legacy = true;
@@ -298,6 +320,7 @@ export class SettingsFile {
       ...(s.localSpeechVoice ? { localSpeechVoice: s.localSpeechVoice } : {}),
       ...(s.localTranscriptionModel ? { localTranscriptionModel: s.localTranscriptionModel } : {}),
       ...(s.optionKeyHintShown ? { optionKeyHintShown: true } : {}),
+      ...Object.fromEntries(DIRECTIONS.filter((d) => s[d] !== DEFAULT_SETTINGS[d]).map((d) => [d, s[d]])),
     };
     const tmp = `${this.file}.${process.pid}.tmp`;
     writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`);

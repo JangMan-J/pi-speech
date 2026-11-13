@@ -28,7 +28,7 @@ const ROWS = [
 const ACTIONS = ["Speak…", "Dictate", "Replay last", "History…", "Stop", "Transcribe file…"];
 
 /** The rows of Bridge connection. */
-const BRIDGE_ROWS = ["Bridge", "Remote machine", "Pairing"];
+const BRIDGE_ROWS = ["Bridge", "Remote machine", "Pairing", "Play audio on", "Record audio on", "Run models on"];
 
 const XAI_TOKEN = "xai-login-token-abcdef";
 
@@ -551,7 +551,7 @@ describe("the panel view model: Bridge connection", () => {
     await p.press("enter");
     const v = p.panel.view();
     expect(v).toMatchObject({ menu: "bridge", crumb: "Bridge connection", selected: 0 });
-    expect(v.headings).toBeUndefined();
+    expect(v.headings).toEqual({ direction: "DIRECTION" });
     expect(p.row("Bridge")).toMatchObject({ value: "auto", note: "on over SSH · plays on This machine" });
     expect(p.hint()).toBe("←→ auto · on · off · Esc back");
     p.engine.routes.bridge.health = async () => ({ ok: false, reason: "connection refused" });
@@ -590,6 +590,39 @@ describe("the panel view model: Bridge connection", () => {
       note: "on over SSH · plays on the Remote machine · ✗ receiver unreachable",
       alert: true,
     });
+  });
+});
+
+describe("the panel view model: Bridge connection's DIRECTION", () => {
+  it("without the bridge in use, each row is This machine and does not change; the status line says why", async () => {
+    const p = open();
+    await p.goTo("Record audio on");
+    expect(p.row("Record audio on")).toMatchObject({ value: "This machine", note: "no bridge in use" });
+    await p.press("enter");
+    expect(p.panel.view().status?.text).toMatch(/Without the bridge in use .*This machine/);
+    expect(p.engine.speech.settings.recordOn).toBe("remote");
+  });
+
+  it("over SSH each row cycles This machine | Remote machine and is saved; a choice that needs this host's microphone warns", async () => {
+    const p = open({ SSH_CONNECTION: "1 2 3 4" });
+    await p.goTo("Record audio on");
+    expect(p.panel.view().rows.filter((r) => r.section === "direction").map((r) => r.value)).toEqual([
+      "Remote machine",
+      "Remote machine",
+      "Remote machine",
+    ]);
+    expect(p.hint()).toBe("←→ This machine · Remote machine · Esc back");
+    await p.press("right");
+    expect(p.row("Record audio on")?.value).toBe("This machine");
+    expect(p.panel.view().status).toMatchObject({ tone: "warning", text: expect.stringMatching(/needs a microphone/) });
+    expect(settingsOf(p.work).recordOn).toBe("this");
+    expect(p.engine.routes.inputRoute).toBe("local");
+    await p.goTo("Run models on");
+    await p.press("left");
+    expect(settingsOf(p.work).modelsOn).toBe("this");
+    expect(p.engine.routes.modelsRoute).toBe("local");
+    await p.press("enter");
+    expect(settingsOf(p.work).modelsOn).toBeUndefined();
   });
 });
 

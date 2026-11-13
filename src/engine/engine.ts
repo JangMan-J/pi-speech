@@ -14,8 +14,8 @@ import type { LocalModels } from "./local-models";
 import type { SpeechCatalog } from "./openrouter";
 import { Player } from "./player";
 import { type Notify, ReadAloud, type ReadAloudOptions } from "./read-aloud";
-import { type Notice, Routes } from "./routes";
-import { type BridgeMode, SettingsFile } from "./settings";
+import { DIRECTION_LABELS, type Notice, Routes } from "./routes";
+import { type BridgeMode, type DirectionSetting, type Machine, SettingsFile } from "./settings";
 import { Speech } from "./speech";
 
 export interface EngineOptions {
@@ -56,6 +56,7 @@ export class Engine {
       bridge: opts.bridge,
       localOutput: opts.localOutput,
       localInput: opts.localInput,
+      directions: () => this.speech.settings,
     });
     this.indicator = new Indicator(() => ({
       dictation: this.dictation.indicator(),
@@ -66,7 +67,7 @@ export class Engine {
       onChange: () => this.indicator.update(),
       onFailed: (error, kind) =>
         this.notify(
-          `${kind === "sample" ? "The voice sample" : "Playback"} failed (${this.routes.route}): ${error}`,
+          `${kind === "sample" ? "The voice sample" : "Playback"} failed (${this.routes.outputRoute}): ${error}`,
           "error",
         ),
     });
@@ -80,6 +81,14 @@ export class Engine {
       local: opts.local,
     });
     this.speech.onWarning = (message) => this.notify(message, "warning");
+    // Run models on: Local sources run on the Remote machine while the bridge is in use and it says so.
+    this.speech.local.remote = () => {
+      if (this.routes.modelsRoute !== "bridge") return undefined;
+      const models = this.routes.bridge.models;
+      if (models) return models;
+      const no = () => Promise.reject(new Error("this bridge cannot run models on the Remote machine"));
+      return { list: no, voices: no, transcribe: no, speak: no };
+    };
     this.dictation = new Dictation({
       input: () => this.routes.input(),
       transcribe: (audio, format, signal, language) => this.speech.transcribeAudio(audio, format, { signal, language }),
@@ -117,6 +126,27 @@ export class Engine {
     this.speech.save();
     this.indicator.update();
     return notice;
+  }
+
+  /**
+   * Set Play audio on, Record audio on or Run models on, and save it. Without the bridge in use everything runs on
+   * This machine, so it throws why instead. Returns what to tell the user, with a warning for a choice that needs
+   * this host's own speakers or microphone while Pi runs over SSH.
+   */
+  setDirection(direction: DirectionSetting, machine: Machine): Notice {
+    if (this.routes.route !== "bridge") {
+      throw new Error(
+        `Without the bridge in use (Bridge ${this.routes.mode}${this.routes.mode === "auto" ? ", Pi does not run over SSH" : ""}), audio plays and records and models run on This machine`,
+      );
+    }
+    this.speech.settings[direction] = machine;
+    this.speech.save();
+    const said = `${DIRECTION_LABELS[direction]}: ${machine === "this" ? "This machine" : "Remote machine"}`;
+    if (machine === "this" && this.routes.ssh && direction !== "modelsOn") {
+      const needs = direction === "playOn" ? "speakers" : "a microphone";
+      return { message: `${said} (Pi runs over SSH: this needs ${needs} on This machine)`, level: "warning" };
+    }
+    return { message: said, level: "info" };
   }
 
   /** Change read-aloud's options and save them. */

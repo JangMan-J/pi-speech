@@ -32,9 +32,13 @@ import {
 import { ReadingFailed, readingFailedMessage } from "./reading";
 import {
   type BridgeMode,
+  DIRECTIONS,
+  type DirectionSetting,
   type Hotkeys,
   hotkeyId,
   keyLabel,
+  MACHINES,
+  type Machine,
   MODEL_SORTS,
   type ModelSort,
   SOURCES,
@@ -67,14 +71,21 @@ export type RowId =
   | "bridgeMode"
   | "remoteMachine"
   | "pairing"
+  // Bridge connection, DIRECTION
+  | "playOn"
+  | "recordOn"
+  | "modelsOn"
   // Read aloud options
   | "readMode"
   | "summarizer"
   | "summaryLength"
   | "truncate";
 
-/** The sections of the main view: turning text into speech, speech into text, and the rest. */
-export type SectionId = "speak" | "listen" | "settings";
+/**
+ * The sections of the main view (turning text into speech, speech into text, and the rest), and Bridge
+ * connection's DIRECTION.
+ */
+export type SectionId = "speak" | "listen" | "settings" | "direction";
 
 /** What the panel shows: the main view, or one of its submenus. */
 export type MenuId = "main" | "hotkeys" | "bridge" | "readAloud";
@@ -168,7 +179,7 @@ export interface PanelView {
   /** A submenu: its title, after the panel's (`Speech › Hotkeys`). */
   crumb?: string;
   /** The main view: the heading of each section, with its key as Pi has it bound (`SPEAK (Alt+S)`). */
-  headings?: Record<SectionId, string>;
+  headings?: Partial<Record<SectionId, string>>;
   rows: PanelRow[];
   selected: number;
   picker?: PickerView;
@@ -386,7 +397,12 @@ const BRIDGE: RowBase[] = [
   { id: "bridgeMode", label: "Bridge" },
   { id: "remoteMachine", label: "Remote machine" },
   { id: "pairing", label: "Pairing" },
+  { id: "playOn", section: "direction", label: "Play audio on" },
+  { id: "recordOn", section: "direction", label: "Record audio on" },
+  { id: "modelsOn", section: "direction", label: "Run models on" },
 ];
+const MACHINE_WORDS: Record<Machine, string> = { this: "This machine", remote: "Remote machine" };
+const isDirectionRow = (id: RowId): id is DirectionSetting => (DIRECTIONS as readonly RowId[]).includes(id);
 /** How to pair: it runs on the user's own computer, not from Pi. */
 const PAIR_HOW =
   "Pair on your own computer: run pi-speech-receiver pair <pi-host>, or connect with pi-speech-receiver ssh <pi-host>";
@@ -673,7 +689,10 @@ export class Panel {
         listen: `LISTEN (${keyLabel(this.bound.dictate)})`,
         settings: "SETTINGS",
       };
-    } else view.crumb = MENUS[home.menu].title;
+    } else {
+      view.crumb = MENUS[home.menu].title;
+      if (home.menu === "bridge") view.headings = { direction: "DIRECTION" };
+    }
     if (this.status) view.status = this.status;
     else if (home.kind === "menu" && home.menu === "readAloud" && this.mode === home) {
       // One short line on what the highlighted option does.
@@ -782,6 +801,13 @@ export class Panel {
       }
       case "pairing":
         return { ...base, ...this.pairingValue() };
+      case "playOn":
+      case "recordOn":
+      case "modelsOn":
+        // Without the bridge in use everything runs on This machine, whatever is saved.
+        if (this.engine.routes.route !== "bridge")
+          return { ...base, value: MACHINE_WORDS.this, note: "no bridge in use" };
+        return { ...base, value: value(MACHINE_WORDS[s[base.id]]) };
       default: {
         const letter = LETTERS[base.id];
         return letter ? { ...base, value: letter } : { ...base };
@@ -862,7 +888,8 @@ export class Panel {
     const host = routes.url.replace(/^[a-z]+:\/\//, "");
     const state = !r || r === "checking" ? "… checking" : r.ok ? `✓ ${host}` : "✗ receiver unreachable";
     const alert = typeof r === "object" && !r.ok;
-    return { note: `${when}plays on the Remote machine · ${state}`, short: state, ...(alert ? { alert } : {}) };
+    const where = this.speech.settings.playOn === "remote" ? "plays on the Remote machine" : "bridge in use";
+    return { note: `${when}${where} · ${state}`, short: state, ...(alert ? { alert } : {}) };
   }
 
   /** Whether the receiver answers: ✓ with where and how fast, or ✗ Re-pair, whose Enter says how to pair. */
@@ -988,7 +1015,10 @@ export class Panel {
     };
     if (p.local) {
       view.keepColumns = true;
-      view.detail = "Runs on This machine, with no network request once downloaded.";
+      view.detail =
+        this.engine.routes.modelsRoute === "bridge"
+          ? "Runs on the Remote machine (Run models on); download there with pi-speech-receiver models download <id>."
+          : "Runs on This machine, with no network request once downloaded.";
       if (p.ids?.length === 0) view.empty = "No local models of this kind";
     } else if (isModelRow(p.row)) {
       const id = items[selected]?.id;
@@ -1078,6 +1108,7 @@ export class Panel {
       const id = BRIDGE[m.selected].id;
       if (id === "bridgeMode") return [{ key: "←→", action: BRIDGE_MODES.join(" · ") }, back];
       if (id === "remoteMachine") return [{ key: "Enter", action: "where it comes from" }, back];
+      if (isDirectionRow(id)) return [{ key: "←→", action: MACHINES.map((m) => MACHINE_WORDS[m]).join(" · ") }, back];
       const p = this.pairing;
       return typeof p === "object" && !p.ok ? [{ key: "Enter", action: "how to pair" }, back] : [back];
     }
@@ -1375,6 +1406,22 @@ export class Panel {
       if (next === "local") this.track(this.loadLocal());
       if (direction === "speech") this.track(this.loadVoices());
       this.setStatus("success", `✓ ${summary}`);
+    } else if (isDirectionRow(id)) {
+      try {
+        const notice = this.engine.setDirection(id, cycle(MACHINES, this.speech.settings[id], dir));
+        this.setStatus(
+          notice.level === "info" ? "success" : "warning",
+          `${notice.level === "info" ? "✓" : "!"} ${notice.message}`,
+        );
+      } catch (err) {
+        this.setStatus("info", errorMessage(err));
+        return;
+      }
+      if (id === "modelsOn") {
+        const s = this.speech.settings;
+        if (s.speechSource === "local" || s.transcriptionSource === "local") this.track(this.loadLocal(true));
+        if (s.speechSource === "local") this.track(this.loadVoices());
+      }
     } else if (id === "bridgeMode") {
       const i = BRIDGE_MODES.indexOf(this.shown("bridgeMode") as BridgeMode);
       const next = BRIDGE_MODES[(i + dir + BRIDGE_MODES.length) % BRIDGE_MODES.length];
@@ -1862,10 +1909,12 @@ export class Panel {
     return this.localLoad;
   }
 
-  /** What the voices are of: the speech model, or with Speech source Local `local:<model>`. */
+  /** What the voices are of: the speech model, or with Speech source Local `local:<where>:<model>`. */
   private voicesKey(): string {
     const s = this.speech.settings;
-    return s.speechSource === "local" ? `local:${s.localSpeechModel ?? ""}` : s.speechModel;
+    return s.speechSource === "local"
+      ? `local:${this.engine.routes.modelsRoute}:${s.localSpeechModel ?? ""}`
+      : s.speechModel;
   }
 
   private currentVoices(): string[] | undefined {

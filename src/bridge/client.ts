@@ -15,10 +15,36 @@ export interface BridgeConfig {
 
 export type BridgeHealth = { ok: true; version: string } | { ok: false; reason: string };
 
+/** A voice of a speech model, as `speak <id> --list-voices` names it. */
+export interface BridgeVoice {
+  name: string;
+  number: number;
+}
+
+/**
+ * Local models run by the receiver on the Remote machine (protocol/bridge.md, "Running local models"). The
+ * receiver runs one transcription or speech at a time; these calls wait for each other, so only another
+ * client's run is refused.
+ */
+export interface BridgeModels {
+  /** The catalogue with each model's state on the Remote machine, as `models list` prints it. */
+  list(): Promise<Record<string, unknown>[]>;
+  voices(id: string, signal?: AbortSignal): Promise<BridgeVoice[]>;
+  transcribe(id: string, audio: Buffer, format: "wav" | "mp3", signal?: AbortSignal): Promise<string>;
+  /** Resolves once the model has loaded there; the chunks are the PCM as it is generated. */
+  speak(
+    id: string,
+    text: string,
+    opts?: { voice?: string; speed?: number; signal?: AbortSignal },
+  ): Promise<AudioStream>;
+}
+
 export interface BridgeAudio {
   output: AudioOutput;
   input: AudioInput;
   health(): Promise<BridgeHealth>;
+  /** Local models run on the Remote machine; absent in stand-ins that have none. */
+  models?: BridgeModels;
 }
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "[::1]", "localhost"]);
@@ -64,10 +90,17 @@ class ReceiverError extends Error {
   constructor(
     message: string,
     readonly status?: number,
+    /** The receiver's own message of an error answer. */
+    readonly detail?: string,
   ) {
     super(message);
   }
 }
+
+const TRANSCRIBE_TIMEOUT_MS = 10 * 60_000;
+const MODELS_TIMEOUT_MS = 60_000;
+const BUSY =
+  "the Remote machine is already running a model for another client (one at a time); try again when it is done";
 
 interface Reply {
   status: number;
@@ -101,7 +134,13 @@ export function createBridgeAudioFrom(getConfig: () => BridgeConfig): BridgeAudi
   async function call(
     method: "GET" | "POST",
     path: string,
-    opts: { body?: Buffer; contentType?: string; headers?: Record<string, string>; timeoutMs?: number } = {},
+    opts: {
+      body?: Buffer;
+      contentType?: string;
+      headers?: Record<string, string>;
+      timeoutMs?: number;
+      signal?: AbortSignal;
+    } = {},
   ): Promise<Reply> {
     const { base, token, scrub } = resolve();
     const headers: Record<string, string> = { Authorization: `Bearer ${token}`, ...opts.headers };
@@ -114,10 +153,14 @@ export function createBridgeAudioFrom(getConfig: () => BridgeConfig): BridgeAudi
         headers,
         body: opts.body ? new Uint8Array(opts.body) : undefined,
         redirect: "error",
-        signal: AbortSignal.timeout(opts.timeoutMs ?? CONTROL_TIMEOUT_MS),
+        signal: AbortSignal.any([
+          AbortSignal.timeout(opts.timeoutMs ?? CONTROL_TIMEOUT_MS),
+          ...(opts.signal ? [opts.signal] : []),
+        ]),
       });
       body = Buffer.from(await res.arrayBuffer());
     } catch (err) {
+      opts.signal?.throwIfAborted();
       throw new ReceiverError(
         scrub(`the playback receiver is not reachable at ${displayUrl(base)}: ${describeError(err)}`),
       );
@@ -132,7 +175,11 @@ export function createBridgeAudioFrom(getConfig: () => BridgeConfig): BridgeAudi
         /* not JSON: keep the status text */
       }
       const hint = res.status === 401 ? " (check the bridge token)" : "";
-      throw new ReceiverError(scrub(`the playback receiver answered ${res.status}: ${message}${hint}`), res.status);
+      throw new ReceiverError(
+        scrub(`the playback receiver answered ${res.status}: ${message}${hint}`),
+        res.status,
+        scrub(message),
+      );
     }
     return { status: res.status, type, body };
   }
@@ -315,7 +362,171 @@ export function createBridgeAudioFrom(getConfig: () => BridgeConfig): BridgeAudi
     },
   };
 
-  return { output, input, health };
+  // ── Local models on the Remote machine ─────────────────────────────────
+
+  /** Whether the receiver at a base URL runs models (its health lists `models`). */
+  const modelsCapable = new Map<string, boolean>();
+  const MODELS_TOO_OLD =
+    "the receiver on the Remote machine is too old to run models: update pi-speech-receiver there and restart it, or set Run models on to This machine";
+
+  async function requireModels(): Promise<void> {
+    const at = base();
+    if (modelsCapable.get(at)) return;
+    const reply = await call("GET", "/v1/health");
+    const h = await json<{ capabilities?: unknown }>(reply);
+    const can = Array.isArray(h.capabilities) && h.capabilities.includes("models");
+    modelsCapable.set(at, can);
+    if (!can) throw new Error(MODELS_TOO_OLD);
+  }
+
+  /** A model run's failure in plain words: the receiver's own message, said to be on the Remote machine. */
+  function modelError(err: unknown): Error {
+    if (err instanceof ReceiverError && err.status === 409) return new Error(BUSY);
+    if (err instanceof ReceiverError && err.detail && (err.status === 422 || err.status === 503)) {
+      return new Error(`on the Remote machine: ${err.detail}`);
+    }
+    return err instanceof Error ? err : new Error(String(err));
+  }
+
+  /** One model run at a time from here: each waits for the one before it to end. */
+  let queue: Promise<void> = Promise.resolve();
+  function turn(): Promise<() => void> {
+    let release!: () => void;
+    const mine = new Promise<void>((r) => {
+      release = r;
+    });
+    const before = queue;
+    queue = before.then(() => mine);
+    return before.then(() => release);
+  }
+
+  const models: BridgeModels = {
+    async list() {
+      try {
+        await requireModels();
+        const r = await json<{ models?: unknown }>(await call("GET", "/v1/models", { timeoutMs: MODELS_TIMEOUT_MS }));
+        return Array.isArray(r.models) ? r.models.filter((m) => m && typeof m === "object") : [];
+      } catch (err) {
+        throw modelError(err);
+      }
+    },
+
+    async voices(id, signal) {
+      try {
+        await requireModels();
+        const r = await json<{ voices?: unknown }>(
+          await call("GET", `/v1/voices?model=${encodeURIComponent(id)}`, { timeoutMs: MODELS_TIMEOUT_MS, signal }),
+        );
+        const list = Array.isArray(r.voices) ? (r.voices as Array<Record<string, unknown>>) : [];
+        return list.flatMap((v) =>
+          typeof v.name === "string" && typeof v.number === "number" ? [{ name: v.name, number: v.number }] : [],
+        );
+      } catch (err) {
+        throw modelError(err);
+      }
+    },
+
+    async transcribe(id, audio, format, signal) {
+      const release = await turn();
+      try {
+        await requireModels();
+        const r = await json<{ text?: unknown }>(
+          await call("POST", `/v1/transcribe?model=${encodeURIComponent(id)}`, {
+            body: audio,
+            contentType: format === "mp3" ? "audio/mpeg" : "audio/wav",
+            timeoutMs: TRANSCRIBE_TIMEOUT_MS,
+            signal,
+          }),
+        );
+        if (typeof r.text !== "string") throw new Error("the receiver on the Remote machine sent no text");
+        return r.text.trim();
+      } catch (err) {
+        throw modelError(err);
+      } finally {
+        release();
+      }
+    },
+
+    async speak(id, text, opts = {}) {
+      const { signal } = opts;
+      signal?.throwIfAborted();
+      const release = await turn();
+      const ending = new AbortController();
+      // Aborting frees the turn even when the chunks are never read.
+      const onAbort = () => {
+        ending.abort(signal?.reason);
+        release();
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      const finish = () => {
+        signal?.removeEventListener("abort", onAbort);
+        ending.abort();
+        release();
+      };
+      let res: Response;
+      try {
+        await requireModels();
+        const { base: at, token, scrub } = resolve();
+        try {
+          res = await fetch(`${at}/v1/speak`, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+            body: JSON.stringify({
+              model: id,
+              text,
+              ...(opts.voice ? { voice: opts.voice } : {}),
+              ...(opts.speed !== undefined && opts.speed !== 1 ? { speed: opts.speed } : {}),
+            }),
+            redirect: "error",
+            signal: ending.signal,
+          });
+        } catch (err) {
+          signal?.throwIfAborted();
+          throw new Error(scrub(`the playback receiver is not reachable at ${displayUrl(at)}: ${describeError(err)}`));
+        }
+        if (!res.ok) {
+          let detail = res.statusText || "speak failed";
+          try {
+            const parsed = (await res.json()) as { error?: unknown };
+            if (typeof parsed.error === "string" && parsed.error) detail = parsed.error;
+          } catch {
+            /* keep the status text */
+          }
+          throw new ReceiverError(`the playback receiver answered ${res.status}: ${detail}`, res.status, scrub(detail));
+        }
+      } catch (err) {
+        finish();
+        throw modelError(err);
+      }
+      const rate = Number(res.headers.get("x-pi-speech-rate"));
+      const channels = Number(res.headers.get("x-pi-speech-channels")) || 1;
+      if (!res.body || !(rate > 0)) {
+        finish();
+        throw new Error("the receiver on the Remote machine sent speech without its format");
+      }
+      const reader = res.body.getReader();
+      async function* chunks(): AsyncGenerator<Uint8Array> {
+        try {
+          for (;;) {
+            let n: ReadableStreamReadResult<Uint8Array>;
+            try {
+              n = await reader.read();
+            } catch {
+              signal?.throwIfAborted();
+              throw new Error("the speech broke off on the Remote machine before its end");
+            }
+            if (n.done) return;
+            yield n.value;
+          }
+        } finally {
+          finish();
+        }
+      }
+      return { format: { codec: "pcm", rate, channels }, chunks: chunks() };
+    },
+  };
+
+  return { output, input, health, models };
 }
 
 export function createBridgeAudio(config: BridgeConfig): BridgeAudio {
