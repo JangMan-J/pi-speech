@@ -9,6 +9,10 @@
 //!   `{"event":"verifying"}`, `{"event":"unpacking"}` and `{"event":"done","path"}`; or
 //!   `{"event":"error","message"}` (exit 1) or `{"event":"stopped","done","total"}` (exit 1) when
 //!   stopped by SIGINT, SIGTERM or the closing of standard input, which leaves the part to resume.
+//!   The extension cancels a download by closing its standard input, so a download stops at
+//!   once when standard input closes or is at its end (e.g. `< /dev/null`, or a script run
+//!   without a terminal). From a script, keep standard input open for the whole download:
+//!   `sleep 3600 | pi-speech-receiver models download <id>`.
 //! - `delete <id>`: `{"event":"deleted","id","freed":bytes}`.
 
 pub mod cache;
@@ -28,6 +32,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub const USAGE: &str = "pi-speech-receiver models list | download <id> | delete <id>";
+/// What `--help` adds to [`USAGE`].
+pub const HELP_NOTE: &str = "download stops at once when its standard input closes (that is how \
+it is cancelled); from a script, keep standard input open for the whole download, e.g.\n  \
+sleep 3600 | pi-speech-receiver models download <id>";
 
 /// How long a stopped download may take to wind down before the process exits anyway (a
 /// network read can block); the part on disk stays a valid prefix either way.
@@ -116,7 +124,7 @@ fn fail(id: Option<&str>, message: &str) -> ExitCode {
 pub fn main(args: &[String]) -> ExitCode {
     let command = match parse_args(args) {
         Ok(Command::Help) => {
-            println!("usage: {USAGE}");
+            println!("usage: {USAGE}\n\n{HELP_NOTE}");
             return ExitCode::SUCCESS;
         }
         Ok(c) => c,
