@@ -1,4 +1,4 @@
-//! Audio input decoded piece by piece as it arrives: raw PCM, or WAV and MP3 through
+//! Audio input decoded chunk by chunk as it arrives: raw PCM, or WAV and MP3 through
 //! symphonia, which reads non-seekable input (a pipe) without waiting for its end.
 
 use std::io::{self, Read};
@@ -12,7 +12,7 @@ use symphonia::core::io::{
 };
 use symphonia::core::meta::MetadataOptions;
 
-/// A piece of decoded audio: interleaved `f32` frames.
+/// A chunk of decoded audio: interleaved `f32` frames.
 pub struct Chunk<'a> {
     pub rate: u32,
     pub channels: usize,
@@ -20,7 +20,7 @@ pub struct Chunk<'a> {
 }
 
 pub trait Decode {
-    /// The next piece of audio; `None` once the input has ended.
+    /// The next chunk of audio; `None` once the input has ended.
     fn next_chunk(&mut self) -> Result<Option<Chunk<'_>>, String>;
 }
 
@@ -81,26 +81,26 @@ impl<R: Read> Decode for Pcm<R> {
     }
 }
 
-/// WAV or MP3, from a file or from a stream.
-pub struct Coded {
+/// A WAV or MP3 decoder, for a file or for non-seekable input.
+pub struct WavOrMp3 {
     format: Box<dyn FormatReader>,
     decoder: Box<dyn AudioDecoder>,
     track: u32,
     out: Vec<f32>,
 }
 
-impl Coded {
-    /// Decode a stream that cannot seek, such as standard input. `extension` (`wav`,
+impl WavOrMp3 {
+    /// Decode non-seekable input, such as standard input. `extension` (`wav`,
     /// `mp3`) is a hint; the content decides.
-    pub fn from_stream<R>(reader: R, extension: Option<&str>) -> Result<Coded, String>
+    pub fn from_non_seekable<R>(reader: R, extension: Option<&str>) -> Result<WavOrMp3, String>
     where
         R: Read + Send + Sync + 'static,
     {
-        Coded::open(Box::new(ReadOnlySource::new(reader)), extension)
+        WavOrMp3::open(Box::new(ReadOnlySource::new(reader)), extension)
     }
 
-    pub fn open(source: Box<dyn MediaSource>, extension: Option<&str>) -> Result<Coded, String> {
-        let stream = MediaSourceStream::new(source, MediaSourceStreamOptions::default());
+    pub fn open(source: Box<dyn MediaSource>, extension: Option<&str>) -> Result<WavOrMp3, String> {
+        let input = MediaSourceStream::new(source, MediaSourceStreamOptions::default());
         let mut hint = Hint::new();
         if let Some(ext) = extension {
             hint.with_extension(ext);
@@ -108,7 +108,7 @@ impl Coded {
         let format = symphonia::default::get_probe()
             .probe(
                 &hint,
-                stream,
+                input,
                 FormatOptions::default(),
                 MetadataOptions::default(),
             )
@@ -130,7 +130,7 @@ impl Coded {
         let decoder = symphonia::default::get_codecs()
             .make_audio_decoder(&params, &AudioDecoderOptions::default())
             .map_err(|e| format!("cannot decode the audio: {e}"))?;
-        Ok(Coded {
+        Ok(WavOrMp3 {
             format,
             decoder,
             track,
@@ -139,13 +139,13 @@ impl Coded {
     }
 }
 
-impl Decode for Coded {
+impl Decode for WavOrMp3 {
     fn next_chunk(&mut self) -> Result<Option<Chunk<'_>>, String> {
         loop {
             let packet = match self.format.next_packet() {
                 Ok(Some(p)) => p,
                 Ok(None) => return Ok(None),
-                // A stream whose header promised more than came (an open-ended WAV).
+                // Input whose header promised more than came (an open-ended WAV).
                 Err(SymError::IoError(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
                     return Ok(None)
                 }
@@ -184,7 +184,7 @@ pub(crate) mod tests {
     use super::*;
 
     /// A reader that cannot seek and hands out at most `step` bytes per read, as a pipe
-    /// fed piece by piece does.
+    /// fed a little at a time does.
     pub(crate) struct Dribble {
         data: Vec<u8>,
         at: usize,
@@ -264,7 +264,7 @@ pub(crate) mod tests {
             .map(|i| ((i % 200) * 100 - 10000) as i16)
             .collect();
         let wav = open_wav(24000, 1, &samples);
-        let mut d = Coded::from_stream(Dribble::new(wav, 1000), Some("wav")).unwrap();
+        let mut d = WavOrMp3::from_non_seekable(Dribble::new(wav, 1000), Some("wav")).unwrap();
         let (rate, channels, got) = drain(&mut d);
         assert_eq!((rate, channels), (24000, 1));
         assert_eq!(got.len(), samples.len());
@@ -279,7 +279,8 @@ pub(crate) mod tests {
             .map(|i| if i % 2 == 0 { 8000 } else { -8000 })
             .collect();
         let mut d =
-            Coded::from_stream(Dribble::new(open_wav(48000, 2, &samples), 777), None).unwrap();
+            WavOrMp3::from_non_seekable(Dribble::new(open_wav(48000, 2, &samples), 777), None)
+                .unwrap();
         let (rate, channels, got) = drain(&mut d);
         assert_eq!((rate, channels, got.len()), (48000, 2, samples.len()));
         assert!(got[0] > 0.2 && got[1] < -0.2);
@@ -287,7 +288,8 @@ pub(crate) mod tests {
 
     #[test]
     fn mp3_is_decoded_from_a_pipe() {
-        let mut d = Coded::from_stream(Dribble::new(MP3.to_vec(), 200), Some("mp3")).unwrap();
+        let mut d =
+            WavOrMp3::from_non_seekable(Dribble::new(MP3.to_vec(), 200), Some("mp3")).unwrap();
         let (rate, channels, got) = drain(&mut d);
         assert_eq!((rate, channels), (24000, 1));
         let secs = got.len() as f64 / 24000.0;
@@ -300,7 +302,7 @@ pub(crate) mod tests {
     #[test]
     fn what_is_not_audio_is_refused_with_a_reason() {
         for bytes in [b"hello, this is not audio at all".repeat(100), Vec::new()] {
-            let e = Coded::from_stream(Dribble::new(bytes, 64), Some("mp3")).err();
+            let e = WavOrMp3::from_non_seekable(Dribble::new(bytes, 64), Some("mp3")).err();
             assert!(e.is_some_and(|e| !e.is_empty() && !e.contains('\n')));
         }
     }

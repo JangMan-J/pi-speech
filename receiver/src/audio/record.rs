@@ -1,29 +1,35 @@
 //! `record <out.wav>`: the default input device to a 16-bit mono WAV file, until SIGINT,
 //! SIGTERM or the end of standard input. The file is finished either way.
 //!
-//! The device's callback hands each captured buffer to a writer thread through a bounded
-//! channel (it never waits: a buffer that finds the channel full is lost and counted);
-//! the writer converts to 24 kHz mono and writes. On a stop the device closes first, so
-//! everything it captured is written before the file is finished.
+//! The device's callback puts each captured buffer into a lock-free ring that holds
+//! [`BACKLOG`]; it never waits and allocates nothing. Audio that finds the ring full is
+//! lost and counted, and as much silence takes its place once there is room, so the
+//! recording keeps its timeline. A writer thread takes from the ring, converts to 24 kHz
+//! mono and writes. On a stop the device closes first, so everything it captured is
+//! written before the file is finished.
 
 use super::convert::Converter;
-use super::device::Input;
+use super::device::{Format, Input};
+use super::fail;
+use super::ring::{self, Consumer, Producer};
 use crate::proc::start_thread;
 use crate::signals;
 use crate::wav;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
-use std::thread;
+use std::time::Duration;
 
 pub const USAGE: &str = "pi-speech-receiver record <out.wav>";
 /// The rate of recordings (the protocol asks for 16 kHz or more).
 pub const RATE: u32 = 24000;
-/// Captured buffers waiting for the writer: about 5 s at 20 ms per buffer.
-const BACKLOG: usize = 256;
+/// Captured audio the ring holds while the writer catches up.
+const BACKLOG: Duration = Duration::from_secs(5);
+/// How often the writer looks for captured audio.
+const POLL: Duration = Duration::from_millis(20);
 
 /// What ends a recording.
 pub enum Event {
@@ -33,9 +39,42 @@ pub enum Event {
     Failed(String),
 }
 
-enum Msg {
-    Audio(Vec<f32>),
-    End,
+/// Captured audio the ring had no room for, in samples.
+#[derive(Default)]
+struct Lost {
+    /// All of it.
+    total: AtomicU64,
+    /// What has no silence in the ring yet; the device's callback keeps it, and the
+    /// writer reads it once the device has closed.
+    owed: AtomicU64,
+}
+
+/// The device's side of the ring.
+struct Capture {
+    ring: Producer,
+    /// Silence still to be put in the ring for audio lost, in samples.
+    owed: usize,
+    lost: Arc<Lost>,
+}
+
+impl Capture {
+    /// The device's callback.
+    fn take(&mut self, buf: &[f32]) {
+        // The silence for audio lost earlier goes first, so what follows keeps its place.
+        self.owed -= self.ring.push_silence(self.owed);
+        let n = if self.owed == 0 {
+            self.ring.push(buf)
+        } else {
+            0
+        };
+        if n < buf.len() {
+            self.owed += buf.len() - n;
+            self.lost
+                .total
+                .fetch_add((buf.len() - n) as u64, Ordering::Relaxed);
+        }
+        self.lost.owed.store(self.owed as u64, Ordering::Relaxed);
+    }
 }
 
 /// Record from `input` into a new WAV file at `path` until `events` says to end; `tx`
@@ -46,59 +85,54 @@ pub fn record(
     tx: Sender<Event>,
     events: Receiver<Event>,
 ) -> Result<f64, String> {
-    let format = input.format();
-    let mut file = wav::Writer::create(path, RATE, 1)
-        .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
-    let (audio_tx, audio_rx) = mpsc::sync_channel::<Msg>(BACKLOG);
-    let writer_tx = tx.clone();
-    let writer = thread::Builder::new()
-        .name("wav-writer".into())
-        .spawn(move || -> Result<u64, String> {
-            let mut conv = Converter::new(format.rate, format.channels, RATE, 1);
-            let (mut mono, mut pcm) = (Vec::new(), Vec::new());
-            let mut write = |mono: &[f32]| {
-                pcm.clear();
-                pcm.extend(
-                    mono.iter()
-                        .map(|s| (s.clamp(-1.0, 1.0) * 32767.0).round() as i16),
-                );
-                file.write(&pcm).map_err(|e| {
-                    let why = format!("cannot write the recording: {e}");
-                    let _ = writer_tx.send(Event::Failed(why.clone()));
-                    why
-                })
-            };
-            while let Ok(Msg::Audio(buf)) = audio_rx.recv() {
-                mono.clear();
-                conv.push(&buf, &mut mono);
-                write(&mono)?;
-            }
-            mono.clear();
-            conv.finish(&mut mono);
-            write(&mono)?;
-            drop(write);
-            file.finish()
-                .map_err(|e| format!("cannot finish the recording: {e}"))
-        })
-        .map_err(|e| format!("cannot start the writer: {e}"))?;
+    record_with(path, input, tx, events, BACKLOG)
+}
 
-    let lost = Arc::new(AtomicU64::new(0));
-    let (cb_tx, cb_lost) = (audio_tx.clone(), Arc::clone(&lost));
+fn record_with(
+    path: &Path,
+    input: Input,
+    tx: Sender<Event>,
+    events: Receiver<Event>,
+    backlog: Duration,
+) -> Result<f64, String> {
+    let format = input.format();
+    let file = wav::Writer::create(path, RATE, 1)
+        .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+    let frames = (format.samples_in(backlog) / format.channels).max(1);
+    let (producer, consumer) = ring::ring(frames, format.channels);
+    let lost = Arc::new(Lost::default());
+    let device_closed = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (lost, closed, failed) = (Arc::clone(&lost), Arc::clone(&device_closed), tx.clone());
+        start_thread("wav-writer", move || {
+            write_wav(file, consumer, format, &closed, &lost).inspect_err(|why| {
+                let _ = failed.send(Event::Failed(why.clone()));
+            })
+        })
+        .map_err(|e| format!("cannot start the writer: {e}"))?
+    };
+    // Once set, the device has closed: the writer drains the ring and finishes.
+    let finish_writer = || {
+        device_closed.store(true, Ordering::Release);
+        writer.thread().unpark();
+    };
+
+    let mut capture = Capture {
+        ring: producer,
+        owed: 0,
+        lost: Arc::clone(&lost),
+    };
     let fatal_tx = tx;
     let started = input.start(
-        move |buf| {
-            if cb_tx.try_send(Msg::Audio(buf.to_vec())).is_err() {
-                cb_lost.fetch_add(buf.len() as u64, Ordering::Relaxed);
-            }
-        },
+        move |buf| capture.take(buf),
         move |why| {
             let _ = fatal_tx.send(Event::Failed(why));
         },
     );
-    let stream = match started {
-        Ok(s) => s,
+    let device = match started {
+        Ok(d) => d,
         Err(e) => {
-            let _ = audio_tx.send(Msg::End);
+            finish_writer();
             let _ = writer.join();
             let _ = std::fs::remove_file(path);
             return Err(e);
@@ -106,15 +140,15 @@ pub fn record(
     };
 
     let event = events.recv().unwrap_or(Event::Stop);
-    // Closed first, so all it captured is queued ahead of the end.
-    drop(stream);
-    let _ = audio_tx.send(Msg::End);
+    // Closed first, so all it captured is in the ring before the writer finishes.
+    drop(device);
+    finish_writer();
     let frames = writer
         .join()
         .unwrap_or_else(|_| Err("the writer failed".into()))?;
-    let lost = lost.load(Ordering::Relaxed);
+    let lost = lost.total.load(Ordering::Relaxed);
     if lost > 0 {
-        let ms = lost as f64 * 1000.0 / format.channels as f64 / format.rate as f64;
+        let ms = format.duration_of(lost as usize).as_secs_f64() * 1000.0;
         eprintln!(
             "pi-speech-receiver: {ms:.0} ms of audio were lost: the file was written too slowly"
         );
@@ -123,6 +157,61 @@ pub fn record(
         Event::Stop => Ok(frames as f64 / RATE as f64),
         Event::Failed(why) => Err(why),
     }
+}
+
+/// The writer thread: what the ring holds, converted to 24 kHz mono and written, until
+/// the device has closed; then the silence still owed for lost audio, and the file is
+/// finished. Returns the frames written.
+fn write_wav(
+    mut file: wav::Writer,
+    mut ring: Consumer,
+    format: Format,
+    device_closed: &AtomicBool,
+    lost: &Lost,
+) -> Result<u64, String> {
+    let mut conv = Converter::new(format.rate, format.channels, RATE, 1);
+    let mut buf = vec![0.0f32; format.samples_in(POLL * 4).max(format.channels)];
+    let (mut mono, mut pcm) = (Vec::new(), Vec::new());
+    let mut write = |samples: &[f32], conv: &mut Converter, end: bool| {
+        mono.clear();
+        conv.push(samples, &mut mono);
+        if end {
+            conv.finish(&mut mono);
+        }
+        pcm.clear();
+        pcm.extend(
+            mono.iter()
+                .map(|s| (s.clamp(-1.0, 1.0) * 32767.0).round() as i16),
+        );
+        file.write(&pcm)
+            .map_err(|e| format!("cannot write the recording: {e}"))
+    };
+    loop {
+        // Read before draining: once it is set, all the device captured is in the ring.
+        let closed = device_closed.load(Ordering::Acquire);
+        loop {
+            let n = ring.pop(&mut buf);
+            if n == 0 {
+                break;
+            }
+            write(&buf[..n], &mut conv, false)?;
+        }
+        if closed {
+            break;
+        }
+        std::thread::park_timeout(POLL);
+    }
+    let mut owed = lost.owed.load(Ordering::Relaxed) as usize;
+    buf.fill(0.0);
+    while owed > 0 {
+        let n = owed.min(buf.len());
+        write(&buf[..n], &mut conv, false)?;
+        owed -= n;
+    }
+    write(&[], &mut conv, true)?;
+    drop(write);
+    file.finish()
+        .map_err(|e| format!("cannot finish the recording: {e}"))
 }
 
 /// `pi-speech-receiver record <out.wav>`
@@ -165,48 +254,107 @@ pub fn main(args: &[String]) -> ExitCode {
     }
 }
 
-fn fail(why: &str, code: u8) -> ExitCode {
-    eprintln!("pi-speech-receiver: {why}");
-    ExitCode::from(code)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::audio::device::Input;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
-    #[test]
-    fn the_null_input_records_a_wav_of_the_time_it_ran() {
+    fn scratch() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "pisr-rec-{}-{}",
             std::process::id(),
             crate::token::random_hex(4).unwrap()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("out.wav");
+        dir
+    }
+
+    /// Record from the null input for `run`, with a ring of `backlog`.
+    fn record_null(path: &Path, run: Duration, backlog: Duration) -> (f64, f64) {
         let (tx, rx) = mpsc::channel();
         let stop = tx.clone();
         let t = Instant::now();
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(600));
+            std::thread::sleep(run);
             stop.send(Event::Stop).unwrap();
         });
-        let secs = record(&path, Input::null(), tx, rx).unwrap();
-        let ran = t.elapsed().as_secs_f64();
+        let secs = record_with(path, Input::null(), tx, rx, backlog).unwrap();
+        (secs, t.elapsed().as_secs_f64())
+    }
+
+    fn samples(bytes: &[u8]) -> Vec<i16> {
+        bytes[44..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&b| i16::from_le_bytes(b))
+            .collect()
+    }
+
+    #[test]
+    fn the_null_input_records_a_wav_of_the_time_it_ran() {
+        let dir = scratch();
+        let path = dir.join("out.wav");
+        let (secs, ran) = record_null(&path, Duration::from_millis(600), BACKLOG);
         assert!((secs - ran).abs() < 0.1, "{secs} s recorded in {ran} s");
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(wav::wav_seconds(&bytes), Some(secs));
         assert_eq!(&bytes[22..24], &1u16.to_le_bytes(), "mono");
         assert_eq!(&bytes[24..28], &RATE.to_le_bytes());
-        let peak = bytes[44..]
-            .as_chunks::<2>()
-            .0
+        let peak = samples(&bytes)
             .iter()
-            .map(|&b| i16::from_le_bytes(b).unsigned_abs())
+            .map(|s| s.unsigned_abs())
             .max()
             .unwrap();
         assert!(peak > 2000, "the null input's tone, not silence: {peak}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn audio_lost_to_a_full_ring_is_recorded_as_silence_in_its_place() {
+        let (p, mut c) = ring::ring(4, 1);
+        let lost = Arc::new(Lost::default());
+        let mut cap = Capture {
+            ring: p,
+            owed: 0,
+            lost: Arc::clone(&lost),
+        };
+        cap.take(&[1.0, 2.0, 3.0]);
+        cap.take(&[4.0, 5.0, 6.0]); // room for one
+        cap.take(&[7.0]); // no room
+        assert_eq!(lost.total.load(Ordering::Relaxed), 3);
+        assert_eq!(lost.owed.load(Ordering::Relaxed), 3);
+        let mut out = [9.0; 4];
+        assert_eq!(c.pop(&mut out), 4);
+        assert_eq!(out, [1.0, 2.0, 3.0, 4.0]);
+        cap.take(&[8.0, 9.0]); // the silence for 5 to 7 first, then room for 8 only
+        assert_eq!(lost.total.load(Ordering::Relaxed), 4);
+        assert_eq!(c.pop(&mut out), 4);
+        assert_eq!(out, [0.0, 0.0, 0.0, 8.0]);
+        cap.take(&[10.0]); // the silence for 9, then 10
+        assert_eq!(lost.owed.load(Ordering::Relaxed), 0);
+        let mut out = [9.0; 4];
+        assert_eq!(c.pop(&mut out), 2);
+        assert_eq!(
+            out[..2],
+            [0.0, 10.0],
+            "every sample in its own place in time"
+        );
+    }
+
+    #[test]
+    fn a_recording_that_loses_audio_keeps_its_length() {
+        let dir = scratch();
+        let path = dir.join("out.wav");
+        // A ring smaller than one of the null input's periods: most of each is lost.
+        let (secs, ran) = record_null(&path, Duration::from_millis(600), Duration::from_millis(4));
+        assert!((secs - ran).abs() < 0.1, "{secs} s recorded in {ran} s");
+        let pcm = samples(&std::fs::read(&path).unwrap());
+        let silent = pcm.iter().filter(|&&s| s == 0).count() as f64 / pcm.len() as f64;
+        assert!(silent > 0.3, "the lost audio is silence: {silent}");
+        let peak = pcm.iter().map(|s| s.unsigned_abs()).max().unwrap();
+        assert!(peak > 2000, "and the rest is the tone: {peak}");
         std::fs::remove_dir_all(dir).ok();
     }
 

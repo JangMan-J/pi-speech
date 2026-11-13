@@ -88,14 +88,36 @@ pub fn wav_seconds(b: &[u8]) -> Option<f64> {
 }
 
 /// Writes a 16-bit PCM WAV file as its samples come; [`Writer::finish`] sets the sizes
-/// in its header.
+/// in its header. Samples past what a WAV can hold (its sizes are 32-bit) are dropped.
 pub struct Writer {
     out: BufWriter<File>,
     channels: u16,
     data_bytes: u64,
+    /// The most data bytes this file takes: [`max_data`].
+    limit: u64,
 }
 
 const HEADER_BYTES: u64 = 44;
+/// The bytes the RIFF size counts besides the data: `WAVE`, the `fmt ` chunk and the
+/// `data` chunk's header.
+const RIFF_OVERHEAD: u64 = HEADER_BYTES - 8;
+
+/// The most data bytes a 16-bit WAV of `channels` holds, in whole frames: the RIFF size
+/// (the data plus [`RIFF_OVERHEAD`]) must fit in 32 bits.
+fn max_data(channels: u16) -> u64 {
+    let block = 2 * channels as u64;
+    (u32::MAX as u64 - RIFF_OVERHEAD) / block * block
+}
+
+/// The header's RIFF and data sizes for `data_bytes` of data, each saturated at what 32
+/// bits hold (which readers take as "to the end of the file").
+fn header_sizes(data_bytes: u64) -> (u32, u32) {
+    let clip = |n: u64| u32::try_from(n).unwrap_or(u32::MAX);
+    (
+        clip(data_bytes.saturating_add(RIFF_OVERHEAD)),
+        clip(data_bytes),
+    )
+}
 
 impl Writer {
     /// Create (or replace) `path`, readable by its owner only.
@@ -110,7 +132,7 @@ impl Writer {
         let block = 2 * channels;
         let mut h = Vec::with_capacity(HEADER_BYTES as usize);
         h.extend(b"RIFF");
-        h.extend(36u32.to_le_bytes()); // set by `finish`
+        h.extend((RIFF_OVERHEAD as u32).to_le_bytes()); // set by `finish`
         h.extend(b"WAVEfmt ");
         h.extend(16u32.to_le_bytes());
         h.extend(1u16.to_le_bytes()); // PCM
@@ -126,11 +148,16 @@ impl Writer {
             out,
             channels,
             data_bytes: 0,
+            limit: max_data(channels),
         })
     }
 
-    /// Append interleaved samples.
+    /// Append interleaved samples (whole frames); those past what the file can hold are
+    /// dropped.
     pub fn write(&mut self, samples: &[i16]) -> io::Result<()> {
+        let block = 2 * self.channels as u64;
+        let room = (self.limit.saturating_sub(self.data_bytes) / block * block / 2) as usize;
+        let samples = &samples[..samples.len().min(room)];
         for s in samples {
             self.out.write_all(&s.to_le_bytes())?;
         }
@@ -140,12 +167,11 @@ impl Writer {
 
     /// Set the sizes in the header and flush the file to disk; returns the frames written.
     pub fn finish(mut self) -> io::Result<u64> {
-        // Sizes past what 32 bits hold are clipped, which readers take as "to the end".
-        let data = u32::try_from(self.data_bytes).unwrap_or(u32::MAX - 36);
+        let (riff, data) = header_sizes(self.data_bytes);
         self.out.flush()?;
         let mut file = self.out.into_inner().map_err(|e| e.into_error())?;
         file.seek(SeekFrom::Start(4))?;
-        file.write_all(&(data + 36).to_le_bytes())?;
+        file.write_all(&riff.to_le_bytes())?;
         file.seek(SeekFrom::Start(40))?;
         file.write_all(&data.to_le_bytes())?;
         file.sync_all()?;
@@ -178,6 +204,49 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn the_header_sizes_saturate_near_the_32_bit_limit() {
+        let max = u32::MAX as u64;
+        assert_eq!(header_sizes(0), (36, 0));
+        assert_eq!(header_sizes(max - 36), (u32::MAX, u32::MAX - 36));
+        for data in [max - 35, max - 1, max, max + 1, u64::MAX] {
+            let (riff, size) = header_sizes(data);
+            assert_eq!(riff, u32::MAX, "{data}");
+            assert_eq!(size as u64, data.min(max), "{data}");
+        }
+    }
+
+    #[test]
+    fn the_data_stops_at_what_a_wav_can_hold_in_whole_frames() {
+        assert_eq!(max_data(1), 4_294_967_258);
+        assert_eq!(max_data(2), 4_294_967_256);
+        assert!(36 + max_data(1) <= u32::MAX as u64);
+
+        let dir = std::env::temp_dir().join(format!(
+            "pisr-wav-full-{}-{}",
+            std::process::id(),
+            crate::token::random_hex(4).unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.wav");
+        let mut w = Writer::create(&path, 8000, 2).unwrap();
+        w.limit = 4 * 10; // 10 stereo frames, standing in for the 32-bit limit
+        w.write(&[1; 14]).unwrap();
+        w.write(&[2; 14]).unwrap();
+        w.write(&[3; 4]).unwrap();
+        assert_eq!(w.finish().unwrap(), 10);
+        let b = std::fs::read(&path).unwrap();
+        assert_eq!(b.len(), 44 + 40);
+        assert_eq!(&b[40..44], &40u32.to_le_bytes());
+        assert_eq!(&b[4..8], &76u32.to_le_bytes());
+        assert_eq!(
+            &b[b.len() - 4..],
+            &[2, 0, 2, 0],
+            "the last whole frame that fit"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 

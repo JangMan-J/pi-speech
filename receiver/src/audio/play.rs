@@ -1,33 +1,40 @@
 //! `play`: audio from standard input or a file to the default output device, played as
-//! it arrives.
+//! it arrives (a Stream, when the input is one).
 //!
 //! A feeder thread decodes the input, converts it to the device's format and pushes it
-//! into a bounded queue; when the queue is full the feeder (and so whoever writes to our
-//! input) waits. The device's callback takes from the queue, and plays silence while the
-//! input stalls. After the input has ended and the queue has drained, the stream stays
-//! open until the device has played what it holds: the largest latency it reported, one
-//! period, and a margin. A stop empties nothing and waits for nothing: the device closes
-//! at once.
+//! into a lock-free ring; when the ring is full the feeder (and so whoever writes to our
+//! input) waits. The device's callback takes from the ring, and plays silence while the
+//! input stalls. After the input has ended and the ring has drained, the device stream
+//! stays open until the device has played what it holds: the largest latency it reported,
+//! one period, and a margin. A stop empties nothing and waits for nothing: the device
+//! closes at once. A device that stops calling back for [`STALL`] fails the playback.
 
 use super::convert::Converter;
-use super::decode::{Coded, Decode, Pcm};
+use super::decode::{Decode, Pcm, WavOrMp3};
 use super::device::{Format, Output};
+use super::fail;
+use super::ring::{self, Consumer, Producer};
 use crate::proc::{lock, start_thread};
 use crate::signals;
 use crate::stream::{MAX_RATE, MIN_RATE};
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 pub const USAGE: &str = "pi-speech-receiver play (s16le <rate> <channels> | mp3 | wav | <file>)";
 
-/// How much converted audio the queue holds before the feeder waits.
+/// How much converted audio the ring holds before the feeder waits.
 pub const QUEUE: Duration = Duration::from_millis(500);
-/// Added to the device's own latency before the stream closes.
+/// Added to the device's own latency before the device stream closes.
 pub const TAIL_MARGIN: Duration = Duration::from_millis(80);
+/// How long the device may go without calling back, while there is input to come or to
+/// drain, before the playback fails.
+pub const STALL: Duration = Duration::from_secs(2);
+pub const STALLED: &str = "the audio device stopped responding";
+/// How often the waiting thread looks for callbacks.
+const WATCH: Duration = Duration::from_millis(100);
 
 /// What to play.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,18 +75,19 @@ impl Source {
         }
     }
 
-    /// Open the input: blocks until a stream's header has arrived.
+    /// Open the input: for WAV or MP3 on standard input (non-seekable input), blocks
+    /// until its header has arrived.
     fn open(self) -> Result<Box<dyn Decode>, String> {
         let stdin = std::io::stdin;
         Ok(match self {
             Source::Pcm { rate, channels } => Box::new(Pcm::new(stdin(), rate, channels)),
-            Source::Mp3 => Box::new(Coded::from_stream(stdin(), Some("mp3"))?),
-            Source::Wav => Box::new(Coded::from_stream(stdin(), Some("wav"))?),
+            Source::Mp3 => Box::new(WavOrMp3::from_non_seekable(stdin(), Some("mp3"))?),
+            Source::Wav => Box::new(WavOrMp3::from_non_seekable(stdin(), Some("wav"))?),
             Source::File(path) => {
                 let file = std::fs::File::open(&path)
                     .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
                 let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase());
-                Box::new(Coded::open(Box::new(file), ext.as_deref())?)
+                Box::new(WavOrMp3::open(Box::new(file), ext.as_deref())?)
             }
         })
     }
@@ -95,177 +103,253 @@ pub enum Outcome {
 }
 
 /// Why a playback ended early.
+#[derive(Debug)]
 enum End {
     Stopped(i32),
     Failed(String),
 }
 
+/// What the feeder, the device's callback and the waiting thread share. The audio itself
+/// goes through a lock-free ring; the lock guards only how the playback ended early, and
+/// the callback takes it only to wake a thread that can go on (the feeder when the ring
+/// is no longer full, the waiting thread when the input has drained), for as long as a
+/// waiter takes to look at its condition.
 #[derive(Default)]
-struct State {
-    samples: VecDeque<f32>,
-    input_ended: bool,
+struct Shared {
+    end: Mutex<Option<End>>,
+    /// The feeder waits here for room in the ring.
+    room: Condvar,
+    /// The waiting thread waits here for the input to drain or the playback to end.
+    done: Condvar,
+    /// Set with `end`: the device plays silence and the feeder stops.
+    ended: AtomicBool,
+    input_ended: AtomicBool,
     /// The input has ended and the device has taken all of it.
-    drained: bool,
-    end: Option<End>,
-}
-
-/// The audio between the feeder and the device, in the device's format.
-struct Queue {
-    st: Mutex<State>,
-    cv: Condvar,
-    cap: usize,
-    format: Format,
+    drained: AtomicBool,
+    /// The feeder waits, or is about to, for room in the ring.
+    wants_room: AtomicBool,
+    /// The device's callbacks so far, for the watchdog.
+    callbacks: AtomicU64,
     /// The largest latency the device reported, and its longest period, in ns.
     latency: AtomicU64,
     period: AtomicU64,
 }
 
-impl Queue {
-    fn new(format: Format) -> Queue {
-        Queue {
-            st: Mutex::new(State::default()),
-            cv: Condvar::new(),
-            cap: format.samples_in(QUEUE).max(1),
-            format,
-            latency: AtomicU64::new(0),
-            period: AtomicU64::new(0),
-        }
-    }
-
-    /// Add audio, waiting while the queue is full. False once the playback has ended.
-    fn push(&self, mut samples: &[f32]) -> bool {
-        let mut st = lock(&self.st);
-        while !samples.is_empty() {
-            st = self
-                .cv
-                .wait_while(st, |s| s.end.is_none() && s.samples.len() >= self.cap)
-                .unwrap_or_else(|e| e.into_inner());
-            if st.end.is_some() {
-                return false;
-            }
-            let n = samples.len().min(self.cap - st.samples.len());
-            st.samples.extend(&samples[..n]);
-            samples = &samples[n..];
-        }
-        st.end.is_none()
-    }
-
-    fn end_input(&self) {
-        let mut st = lock(&self.st);
-        st.input_ended = true;
-        st.drained = st.samples.is_empty();
-        self.cv.notify_all();
+impl Shared {
+    fn lock_end(&self) -> MutexGuard<'_, Option<End>> {
+        lock(&self.end)
     }
 
     /// End the playback early, unless it already ended.
-    fn end(&self, end: End) {
-        let mut st = lock(&self.st);
-        if st.end.is_none() {
-            st.end = Some(end);
-        }
-        self.cv.notify_all();
+    fn end(&self, why: End) {
+        let mut end = self.lock_end();
+        self.end_locked(&mut end, why);
     }
 
-    /// The device's callback: the next audio, or silence when there is none.
-    fn fill(&self, out: &mut [f32], latency: Duration) {
-        let period = self.format.duration_of(out.len());
-        self.latency
-            .fetch_max(latency.as_nanos() as u64, Ordering::Relaxed);
-        self.period
-            .fetch_max(period.as_nanos() as u64, Ordering::Relaxed);
-        let mut st = lock(&self.st);
-        let n = if st.end.is_some() {
-            0
-        } else {
-            out.len().min(st.samples.len())
-        };
-        for (o, s) in out.iter_mut().zip(st.samples.drain(..n)) {
-            *o = s;
+    fn end_locked(&self, end: &mut Option<End>, why: End) {
+        if end.is_none() {
+            *end = Some(why);
         }
-        out[n..].fill(0.0);
-        if st.input_ended && st.samples.is_empty() {
-            st.drained = true;
-        }
-        self.cv.notify_all();
+        self.ended.store(true, Ordering::Release);
+        self.room.notify_all();
+        self.done.notify_all();
     }
 
-    /// Wait until the device has taken all the input, or the playback ended early.
-    fn wait_drained(&self) -> Option<End> {
-        let st = lock(&self.st);
-        let mut st = self
-            .cv
-            .wait_while(st, |s| s.end.is_none() && !s.drained)
-            .unwrap_or_else(|e| e.into_inner());
-        st.end.take()
+    /// Wait until the device has taken all the input, or the playback ended early. A
+    /// device that has not called back for `stall` ends it.
+    fn wait_drained(&self, stall: Duration) -> Option<End> {
+        let mut end = self.lock_end();
+        let mut seen = self.callbacks.load(Ordering::Relaxed);
+        let mut since = Instant::now();
+        while end.is_none() && !self.drained.load(Ordering::Acquire) {
+            end = self
+                .done
+                .wait_timeout(end, WATCH)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+            let now = self.callbacks.load(Ordering::Relaxed);
+            if now != seen {
+                (seen, since) = (now, Instant::now());
+            } else if since.elapsed() >= stall {
+                self.end_locked(&mut end, End::Failed(STALLED.into()));
+            }
+        }
+        end.take()
     }
 
     /// Wait for the device to play what it was given, unless the playback ends early.
     fn wait_heard(&self) -> Option<End> {
         let ns = |a: &AtomicU64| Duration::from_nanos(a.load(Ordering::Relaxed));
         let tail = ns(&self.latency) + ns(&self.period) + TAIL_MARGIN;
-        let st = lock(&self.st);
-        let (mut st, _) = self
-            .cv
-            .wait_timeout_while(st, tail, |s| s.end.is_none())
+        let end = self.lock_end();
+        let (mut end, _) = self
+            .done
+            .wait_timeout_while(end, tail, |e| e.is_none())
             .unwrap_or_else(|e| e.into_inner());
-        st.end.take()
+        end.take()
     }
 }
 
-/// A playback on an output device.
+/// The feeder's side of the ring.
+struct Feeder {
+    ring: Producer,
+    shared: Arc<Shared>,
+    channels: usize,
+}
+
+impl Feeder {
+    /// Add audio (whole frames), waiting while the ring is full. False once the playback
+    /// has ended.
+    fn push(&mut self, samples: &[f32]) -> bool {
+        let mut rest = &samples[..samples.len() - samples.len() % self.channels];
+        loop {
+            if self.shared.ended.load(Ordering::Acquire) {
+                return false;
+            }
+            let n = self.ring.push(rest);
+            rest = &rest[n..];
+            if rest.is_empty() {
+                return true;
+            }
+            self.wait_for_room();
+        }
+    }
+
+    fn wait_for_room(&self) {
+        let s = &self.shared;
+        let end = s.lock_end();
+        s.wants_room.store(true, Ordering::Relaxed);
+        // Paired with the fence in `Tap::fill`: either the callback sees `wants_room` and
+        // wakes us, or we see the room it made and do not wait.
+        fence(Ordering::SeqCst);
+        let _end = s
+            .room
+            .wait_while(end, |_| {
+                self.ring.free() == 0 && !s.ended.load(Ordering::Acquire)
+            })
+            .unwrap_or_else(|e| e.into_inner());
+        s.wants_room.store(false, Ordering::Relaxed);
+    }
+
+    fn end_input(&self) {
+        self.shared.input_ended.store(true, Ordering::Release);
+    }
+}
+
+/// The device's side of the ring.
+struct Tap {
+    ring: Consumer,
+    shared: Arc<Shared>,
+    format: Format,
+}
+
+impl Tap {
+    /// The device's callback: the next audio, or silence when there is none. Waits for
+    /// no one; takes the lock only to wake a waiter that can go on.
+    fn fill(&mut self, out: &mut [f32], latency: Duration) {
+        let s = &self.shared;
+        s.callbacks.fetch_add(1, Ordering::Relaxed);
+        let period = self.format.duration_of(out.len());
+        s.latency
+            .fetch_max(latency.as_nanos() as u64, Ordering::Relaxed);
+        s.period
+            .fetch_max(period.as_nanos() as u64, Ordering::Relaxed);
+        let n = if s.ended.load(Ordering::Acquire) {
+            0
+        } else {
+            self.ring.pop(out)
+        };
+        out[n..].fill(0.0);
+        // See `Feeder::wait_for_room`.
+        fence(Ordering::SeqCst);
+        if n > 0 && s.wants_room.swap(false, Ordering::Relaxed) {
+            let _end = s.lock_end();
+            s.room.notify_all();
+        }
+        if s.input_ended.load(Ordering::Acquire)
+            && self.ring.is_empty()
+            && !s.drained.swap(true, Ordering::AcqRel)
+        {
+            let _end = s.lock_end();
+            s.done.notify_all();
+        }
+    }
+}
+
+/// A playback; it may be stopped before its output device is open.
+#[derive(Default)]
 pub struct Player {
-    output: Output,
-    queue: Arc<Queue>,
+    shared: Arc<Shared>,
 }
 
 impl Player {
-    pub fn new(output: Output) -> Player {
-        let queue = Arc::new(Queue::new(output.format()));
-        Player { output, queue }
+    pub fn new() -> Player {
+        Player::default()
     }
 
     /// Something any thread may call to stop the playback at once, as by signal `sig`.
     pub fn stopper(&self) -> impl FnOnce(i32) + Send + 'static {
-        let q = Arc::clone(&self.queue);
-        move |sig| q.end(End::Stopped(sig))
+        let s = Arc::clone(&self.shared);
+        move |sig| s.end(End::Stopped(sig))
     }
 
-    /// Play `source` to its end, or until stopped.
-    pub fn play(self, source: Source) -> Result<Outcome, String> {
-        self.play_from(move || source.open())
+    /// Play `source` on `output` to its end, or until stopped.
+    pub fn play(self, output: Output, source: Source) -> Result<Outcome, String> {
+        self.play_from(output, move || source.open())
     }
 
     /// Play what `open` gives, on the feeder thread.
-    pub fn play_from<F>(self, open: F) -> Result<Outcome, String>
+    pub fn play_from<F>(self, output: Output, open: F) -> Result<Outcome, String>
     where
         F: FnOnce() -> Result<Box<dyn Decode>, String> + Send + 'static,
     {
-        let Player { output, queue } = self;
+        let shared = self.shared;
+        if shared.ended.load(Ordering::Acquire) {
+            // Stopped while the output was being opened: nothing to play.
+            return outcome(shared.lock_end().take());
+        }
         let format = output.format();
-        let (q, f) = (Arc::clone(&queue), Arc::clone(&queue));
-        let stream = output.start(
-            move |buf, latency| q.fill(buf, latency),
+        let (producer, consumer) = ring::ring(
+            (format.samples_in(QUEUE) / format.channels).max(1),
+            format.channels,
+        );
+        let mut tap = Tap {
+            ring: consumer,
+            shared: Arc::clone(&shared),
+            format,
+        };
+        let f = Arc::clone(&shared);
+        let device = output.start(
+            move |buf, latency| tap.fill(buf, latency),
             move |why| f.end(End::Failed(why)),
         )?;
-        let q = Arc::clone(&queue);
-        start_thread("feeder", move || match feed(open, &q, format) {
-            Ok(()) => q.end_input(),
-            Err(e) => q.end(End::Failed(e)),
+        let mut feeder = Feeder {
+            ring: producer,
+            shared: Arc::clone(&shared),
+            channels: format.channels,
+        };
+        start_thread("feeder", move || match feed(open, &mut feeder, format) {
+            Ok(()) => feeder.end_input(),
+            Err(e) => feeder.shared.end(End::Failed(e)),
         })
         .map_err(|e| format!("cannot start the feeder: {e}"))?;
-        let end = queue.wait_drained().or_else(|| queue.wait_heard());
-        drop(stream);
-        match end {
-            None => Ok(Outcome::Played),
-            Some(End::Stopped(sig)) => Ok(Outcome::Stopped(sig)),
-            Some(End::Failed(why)) => Err(why),
-        }
+        let end = shared.wait_drained(STALL).or_else(|| shared.wait_heard());
+        drop(device);
+        outcome(end)
+    }
+}
+
+fn outcome(end: Option<End>) -> Result<Outcome, String> {
+    match end {
+        None => Ok(Outcome::Played),
+        Some(End::Stopped(sig)) => Ok(Outcome::Stopped(sig)),
+        Some(End::Failed(why)) => Err(why),
     }
 }
 
 /// Decode the input and queue it in the device's format, until it ends or the playback
 /// does.
-fn feed<F>(open: F, queue: &Queue, format: Format) -> Result<(), String>
+fn feed<F>(open: F, feeder: &mut Feeder, format: Format) -> Result<(), String>
 where
     F: FnOnce() -> Result<Box<dyn Decode>, String>,
 {
@@ -292,14 +376,14 @@ where
         if let Some(c) = conv.as_mut() {
             c.push(chunk.samples, &mut out);
         }
-        if !queue.push(&out) {
+        if !feeder.push(&out) {
             return Ok(());
         }
     }
     if let Some(c) = conv.as_mut() {
         out.clear();
         c.finish(&mut out);
-        queue.push(&out);
+        feeder.push(&out);
     }
     Ok(())
 }
@@ -310,32 +394,28 @@ pub fn main(args: &[String]) -> ExitCode {
         Ok(s) => s,
         Err(e) => return fail(&e, 2),
     };
+    // Before the device is opened, which can take a while: a signal meanwhile still stops.
+    let player = Player::new();
+    if let Err(e) = signals::on_first(player.stopper()) {
+        return fail(&format!("cannot handle signals: {e}"), 1);
+    }
     let output = match Output::open_default() {
         Ok(o) => o,
         Err(e) => return fail(&e, 1),
     };
-    let player = Player::new(output);
-    if let Err(e) = signals::on_first(player.stopper()) {
-        return fail(&format!("cannot handle signals: {e}"), 1);
-    }
-    match player.play(source) {
+    match player.play(output, source) {
         Ok(Outcome::Played) => ExitCode::SUCCESS,
-        // As a shell reports a program a signal ended: 128 + its number.
+        // As a shell reports a program a signal ended: 128 + its number. (`record` exits 0
+        // instead: a signal is how a recording is meant to end, but it cuts a playback short.)
         Ok(Outcome::Stopped(sig)) => ExitCode::from(128u8.wrapping_add(sig as u8)),
         Err(e) => fail(&e, 1),
     }
-}
-
-fn fail(why: &str, code: u8) -> ExitCode {
-    eprintln!("pi-speech-receiver: {why}");
-    ExitCode::from(code)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::audio::decode::tests::{open_wav, pcm_bytes, Dribble};
-    use std::time::Instant;
 
     fn args(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()
@@ -367,78 +447,125 @@ mod tests {
         }
     }
 
-    fn queue() -> Queue {
-        Queue::new(Format {
-            rate: 1000,
+    const FORMAT: Format = Format {
+        rate: 1000,
+        channels: 1,
+    };
+
+    /// A feeder and a device side around a ring of 0.5 s at 1000 Hz mono.
+    fn pair() -> (Arc<Shared>, Feeder, Tap) {
+        let shared = Arc::new(Shared::default());
+        let (p, c) = ring::ring(FORMAT.samples_in(QUEUE), 1);
+        let feeder = Feeder {
+            ring: p,
+            shared: Arc::clone(&shared),
             channels: 1,
-        })
+        };
+        let tap = Tap {
+            ring: c,
+            shared: Arc::clone(&shared),
+            format: FORMAT,
+        };
+        (shared, feeder, tap)
     }
 
     #[test]
     fn a_stall_plays_silence_and_the_audio_resumes_after_it() {
-        let q = queue();
-        assert!(q.push(&[0.5; 30]));
+        let (s, mut feeder, mut tap) = pair();
+        assert!(feeder.push(&[0.5; 30]));
         let mut out = [9.0; 20];
-        q.fill(&mut out, Duration::ZERO);
+        tap.fill(&mut out, Duration::ZERO);
         assert_eq!(out, [0.5; 20]);
-        q.fill(&mut out, Duration::ZERO);
+        tap.fill(&mut out, Duration::ZERO);
         assert_eq!(out[..10], [0.5; 10]);
         assert_eq!(out[10..], [0.0; 10], "silence while the input stalls");
-        q.fill(&mut out, Duration::ZERO);
+        tap.fill(&mut out, Duration::ZERO);
         assert_eq!(out, [0.0; 20]);
-        assert!(!lock(&q.st).drained, "a stall is not the end");
-        assert!(q.push(&[0.25; 5]));
-        q.end_input();
-        q.fill(&mut out, Duration::ZERO);
+        assert!(!s.drained.load(Ordering::Relaxed), "a stall is not the end");
+        assert!(feeder.push(&[0.25; 5]));
+        feeder.end_input();
+        tap.fill(&mut out, Duration::ZERO);
         assert_eq!(out[..5], [0.25; 5]);
-        assert!(lock(&q.st).drained);
+        assert!(s.drained.load(Ordering::Relaxed));
+        assert!(s.wait_drained(STALL).is_none());
     }
 
     #[test]
-    fn a_full_queue_holds_the_feeder_until_the_device_takes_audio() {
-        let q = Arc::new(queue());
-        let cap = q.cap; // 0.5 s at 1000 Hz
-        assert_eq!(cap, 500);
-        let feeder = {
-            let q = Arc::clone(&q);
-            std::thread::spawn(move || q.push(&vec![0.1; cap + 100]))
-        };
+    fn a_full_ring_holds_the_feeder_until_the_device_takes_audio() {
+        let (_s, mut feeder, mut tap) = pair();
+        let feeder = std::thread::spawn(move || {
+            let ok = feeder.push(&[0.1; 600]); // 0.1 s more than the ring holds
+            (ok, feeder)
+        });
         std::thread::sleep(Duration::from_millis(200));
         assert!(
             !feeder.is_finished(),
-            "the feeder waits while the queue is full"
+            "the feeder waits while the ring is full"
         );
-        assert_eq!(lock(&q.st).samples.len(), cap);
-        let mut out = vec![0.0; 100];
-        q.fill(&mut out, Duration::ZERO);
-        assert!(feeder.join().unwrap());
-        assert_eq!(lock(&q.st).samples.len(), cap);
+        assert_eq!(tap.ring.len(), 500);
+        tap.fill(&mut [0.0; 100], Duration::ZERO);
+        let (ok, feeder) = feeder.join().unwrap();
+        assert!(ok);
+        assert_eq!(tap.ring.len(), 500);
+        assert!(!feeder.shared.wants_room.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn the_device_side_waits_for_no_lock_when_no_one_waits_on_it() {
+        let (s, mut feeder, mut tap) = pair();
+        assert!(feeder.push(&[0.5; 100]));
+        let held = s.lock_end(); // as a waiter looking at its condition would
+        let device = std::thread::spawn(move || {
+            let mut out = [0.0; 20];
+            tap.fill(&mut out, Duration::ZERO);
+            out
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(device.is_finished(), "the callback waited for the lock");
+        drop(held);
+        assert_eq!(device.join().unwrap(), [0.5; 20]);
     }
 
     #[test]
     fn a_stop_frees_a_waiting_feeder_and_silences_the_device() {
-        let q = Arc::new(queue());
-        let feeder = {
-            let q = Arc::clone(&q);
-            std::thread::spawn(move || q.push(&vec![0.1; 2000]))
-        };
+        let (s, mut feeder, mut tap) = pair();
+        let feeder = std::thread::spawn(move || feeder.push(&[0.1; 2000]));
         std::thread::sleep(Duration::from_millis(100));
-        q.end(End::Stopped(2));
+        s.end(End::Stopped(2));
         assert!(!feeder.join().unwrap());
         let mut out = [9.0; 10];
-        q.fill(&mut out, Duration::ZERO);
+        tap.fill(&mut out, Duration::ZERO);
         assert_eq!(out, [0.0; 10]);
-        assert!(matches!(q.wait_drained(), Some(End::Stopped(2))));
+        assert!(matches!(s.wait_drained(STALL), Some(End::Stopped(2))));
+    }
+
+    #[test]
+    fn a_device_without_callbacks_fails_the_wait_and_frees_the_feeder() {
+        let (s, mut feeder, mut tap) = pair();
+        let feeder = std::thread::spawn(move || feeder.push(&[0.1; 2000]));
+        tap.fill(&mut [0.0; 10], Duration::ZERO);
+        let t = Instant::now();
+        let end = s.wait_drained(Duration::from_millis(300));
+        let waited = t.elapsed();
+        assert!(
+            matches!(&end, Some(End::Failed(w)) if w == STALLED),
+            "{end:?}"
+        );
+        assert!(
+            waited >= Duration::from_millis(300) && waited < Duration::from_millis(600),
+            "{waited:?}"
+        );
+        assert!(!feeder.join().unwrap(), "the feeder is freed");
     }
 
     #[test]
     fn the_tail_wait_is_the_largest_latency_plus_a_period_and_the_margin() {
-        let q = queue();
-        q.fill(&mut [0.0; 20], Duration::from_millis(40)); // 20 ms period
-        q.fill(&mut [0.0; 10], Duration::from_millis(100));
-        q.fill(&mut [0.0; 10], Duration::from_millis(10));
+        let (s, _feeder, mut tap) = pair();
+        tap.fill(&mut [0.0; 20], Duration::from_millis(40)); // 20 ms period
+        tap.fill(&mut [0.0; 10], Duration::from_millis(100));
+        tap.fill(&mut [0.0; 10], Duration::from_millis(10));
         let t = Instant::now();
-        assert!(q.wait_heard().is_none());
+        assert!(s.wait_heard().is_none());
         let waited = t.elapsed();
         let want = Duration::from_millis(100 + 20) + TAIL_MARGIN;
         assert!(
@@ -447,38 +574,67 @@ mod tests {
         );
     }
 
-    /// Play `bytes` of `source`'s kind through the null output, as `play` does.
-    fn play_null(
+    /// Play what `make` gives through `output`, as `play` does.
+    fn play_on(
+        output: Output,
         make: impl FnOnce() -> Result<Box<dyn Decode>, String> + Send + 'static,
     ) -> (Result<Outcome, String>, Duration) {
-        let player = Player::new(Output::null());
         let t = Instant::now();
-        let r = player.play_from(make);
+        let r = Player::new().play_from(output, make);
         (r, t.elapsed())
+    }
+
+    fn pcm_source(seconds: f64) -> impl FnOnce() -> Result<Box<dyn Decode>, String> + Send {
+        let pcm = pcm_bytes(&vec![1000i16; (24000.0 * seconds) as usize]);
+        move || Ok(Box::new(Pcm::new(Dribble::new(pcm, 4801), 24000, 1)) as Box<dyn Decode>)
     }
 
     #[test]
     fn pcm_and_an_open_ended_wav_play_to_their_end_on_the_null_device() {
-        let pcm = pcm_bytes(&vec![1000i16; 24000 * 3 / 10]); // 0.3 s
-        let (r, took) = play_null(move || {
-            Ok(Box::new(Pcm::new(Dribble::new(pcm, 4801), 24000, 1)) as Box<dyn Decode>)
-        });
+        let (r, took) = play_on(Output::null(), pcm_source(0.3));
         assert_eq!(r, Ok(Outcome::Played));
         assert!(took >= Duration::from_millis(300), "cut short: {took:?}");
         assert!(took < Duration::from_millis(1300), "{took:?}");
 
         let wav = open_wav(16000, 2, &vec![1000i16; 2 * 16000 * 3 / 10]);
-        let (r, took) = play_null(move || {
-            Ok(Box::new(Coded::from_stream(Dribble::new(wav, 999), None)?) as Box<dyn Decode>)
+        let (r, took) = play_on(Output::null(), move || {
+            Ok(
+                Box::new(WavOrMp3::from_non_seekable(Dribble::new(wav, 999), None)?)
+                    as Box<dyn Decode>,
+            )
         });
         assert_eq!(r, Ok(Outcome::Played));
         assert!(took >= Duration::from_millis(300), "cut short: {took:?}");
     }
 
     #[test]
+    fn a_device_that_stops_calling_back_fails_the_playback() {
+        let (r, took) = play_on(
+            Output::null_stuck(Duration::from_millis(200)),
+            pcm_source(10.0),
+        );
+        assert_eq!(r, Err(STALLED.to_string()));
+        let least = Duration::from_millis(200) + STALL;
+        assert!(
+            took >= least && took < least + Duration::from_millis(500),
+            "{took:?}"
+        );
+    }
+
+    #[test]
+    fn a_playback_stopped_before_its_device_opened_plays_nothing() {
+        let player = Player::new();
+        player.stopper()(15);
+        let t = Instant::now();
+        let r = player.play_from(Output::null(), || panic!("the input was opened"));
+        assert_eq!(r, Ok(Outcome::Stopped(15)));
+        assert!(t.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
     fn undecodable_input_fails_with_a_reason() {
-        let (r, _) = play_null(|| {
-            Ok(Box::new(Coded::from_stream(
+        let (r, _) = play_on(Output::null(), || {
+            Ok(Box::new(WavOrMp3::from_non_seekable(
                 Dribble::new(b"not audio".repeat(50), 64),
                 None,
             )?) as Box<dyn Decode>)

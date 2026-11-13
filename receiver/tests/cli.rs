@@ -587,6 +587,46 @@ fn with_nothing_configured_and_an_empty_path_serve_plays_and_records_through_its
 }
 
 #[test]
+fn with_nothing_configured_and_an_empty_path_an_mp3_file_plays_through_itself() {
+    let dir = scratch("cli-builtin-mp3");
+    let mut r = self_contained(&dir, &[]);
+    let mp3 = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/tone-0.5s-24k.mp3"
+    ))
+    .unwrap();
+    let t = std::time::Instant::now();
+    let rep = request(
+        r.addr,
+        "POST",
+        "/v1/play",
+        Some(TOKEN),
+        &[("Content-Type", "audio/mpeg")],
+        &mp3,
+        None,
+    );
+    assert_eq!(rep.status, 202, "{}", rep.text());
+    let id = json_field(&rep.text(), "id").unwrap();
+    // Played by the receiver itself, from the file it saved: `<receiver> play <file>.mp3`.
+    assert!(wait_until(Duration::from_secs(5), || {
+        children_of(r.child.id()).iter().any(|(_, c)| {
+            matches!(c.as_slice(), [bin, play, file]
+                if bin == BIN && play == "play" && file.ends_with(".mp3"))
+        })
+    }));
+    assert_eq!(final_state(r.addr, &id), "completed");
+    assert!(
+        t.elapsed() >= Duration::from_millis(500),
+        "{:?}",
+        t.elapsed()
+    );
+    signal(&r.child, 15);
+    assert_eq!(exit_code_within(&mut r.child, 8), Some(0));
+    assert!(temp_entries(&dir).is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn a_built_in_stream_player_stopped_mid_upload_is_cancelled_and_gone_within_the_grace() {
     let dir = scratch("cli-builtin-stop");
     let mut r = self_contained(&dir, &[]);

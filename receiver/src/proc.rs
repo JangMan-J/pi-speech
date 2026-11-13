@@ -16,9 +16,10 @@ const TAIL_BYTES: usize = 2048;
 const TAIL_CHARS: usize = 400;
 
 /// Start a named thread; an error (the system cannot start one) is returned, not a panic.
-pub(crate) fn start_thread<F>(name: &str, f: F) -> io::Result<thread::JoinHandle<()>>
+pub(crate) fn start_thread<F, T>(name: &str, f: F) -> io::Result<thread::JoinHandle<T>>
 where
-    F: FnOnce() + Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
 {
     #[cfg(test)]
     if tests::thread_fails() {

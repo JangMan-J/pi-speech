@@ -16,9 +16,9 @@ pub fn map_frame(src: &[f32], out: &mut [f32]) {
     }
 }
 
-/// Converts a stream of interleaved frames from one rate and channel count to another,
-/// with linear interpolation between neighbouring frames. Feed it in pieces of any size;
-/// the result is the same as feeding it all at once.
+/// Converts interleaved frames from one rate and channel count to another, with linear
+/// interpolation between neighbouring frames. Feed it in pieces of any size; the result
+/// is the same as feeding it all at once.
 pub struct Converter {
     src_rate: u32,
     src_channels: usize,

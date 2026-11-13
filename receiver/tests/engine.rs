@@ -190,6 +190,76 @@ fn undecodable_input_or_no_device_fails_with_a_one_line_reason() {
 }
 
 #[test]
+fn an_unknown_null_device_value_fails_and_never_falls_back_to_a_real_device() {
+    let dir = scratch("engine-unknown-null");
+    let out = dir.join("out.wav");
+    for args in [
+        &["play", "s16le", "24000", "1"][..],
+        &["play", MP3],
+        &["record", out.to_str().unwrap()],
+    ] {
+        let mut c = engine(args);
+        c.env("PI_SPEECH_AUDIO_NULL", "no-such-mode");
+        let t = Instant::now();
+        let err = one_line_failure(c.spawn().unwrap());
+        assert!(
+            err.contains("unknown PI_SPEECH_AUDIO_NULL value: \"no-such-mode\""),
+            "{args:?}: {err}"
+        );
+        assert!(t.elapsed() < Duration::from_secs(2), "{args:?}");
+    }
+    assert!(!out.exists(), "no recording was started");
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn a_device_that_stops_calling_back_fails_the_playback_instead_of_hanging() {
+    let mut c = engine(&["play", "s16le", "24000", "1"]);
+    // The null output stops calling back after 0.3 s, as a hung device does.
+    c.env("PI_SPEECH_AUDIO_NULL", "stuck");
+    let t = Instant::now();
+    let mut child = c.spawn().unwrap();
+    // More than the queue holds, so the feeder is waiting for room when the device stops.
+    let writer = feed(child.stdin.take().unwrap(), pcm(10.0));
+    let Some(status) = wait_within(&mut child, Duration::from_secs(8)) else {
+        child.kill().unwrap();
+        panic!("the playback hung on a device that stopped calling back");
+    };
+    let took = t.elapsed();
+    let err = stderr_of(&mut child);
+    assert_eq!(status.code(), Some(1), "{err}");
+    assert_eq!(err.trim_end().lines().count(), 1, "{err:?}");
+    assert!(err.contains("the audio device stopped responding"), "{err}");
+    assert!(
+        took >= Duration::from_secs(2) && took < Duration::from_secs(4),
+        "{took:?}"
+    );
+    writer.join().unwrap();
+}
+
+#[test]
+fn a_signal_while_the_output_is_being_opened_stops_the_playback() {
+    let mut c = engine(&["play", "s16le", "24000", "1"]);
+    // The null output takes 1 s to open, as a sound server slow to answer does.
+    c.env("PI_SPEECH_AUDIO_NULL", "slow");
+    let t = Instant::now();
+    let mut child = c.spawn().unwrap();
+    let writer = feed(child.stdin.take().unwrap(), pcm(5.0));
+    std::thread::sleep(Duration::from_millis(400));
+    signal(&child, libc::SIGINT);
+    let status = wait_within(&mut child, Duration::from_secs(5)).expect("did not stop");
+    assert_eq!(
+        status.code(),
+        Some(128 + libc::SIGINT),
+        "{status:?}: {}",
+        stderr_of(&mut child)
+    );
+    // Ended once the output was open, without playing the 5 s it was given.
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    writer.join().unwrap();
+}
+
+#[test]
 fn bad_arguments_are_a_usage_error() {
     for args in [
         &["play"][..],
