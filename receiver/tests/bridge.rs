@@ -1,4 +1,5 @@
-//! The bridge, end to end over HTTP, with fake player and recorder programs.
+//! The bridge, end to end over HTTP, with fake Stream player and recorder programs. Every
+//! playback is a Stream: `POST /v1/play` (a whole file) is gone.
 //!
 //! The fake programs are Unix shell scripts that log the SIGINT they get, so the tests
 //! that run them are Unix only. The rest (authentication, request checks, the front
@@ -38,22 +39,6 @@ impl Rig {
         fs::write(&fake_wav, wav(1.0)).unwrap();
         let d = dir.display();
         script(
-            &dir.join("player"),
-            &format!(
-                r#"#!/bin/bash
-trap 'echo "signal INT" >> {d}/player.log; kill $c 2>/dev/null; exit 130' INT
-echo "start $1" >> {d}/player.log
-cp "$1" {d}/last-played
-mode=$(cat {d}/player-mode 2>/dev/null || echo ok)
-case "$mode" in
-  ok) sleep 0.2 & c=$!; wait $c; exit 0;;
-  long) sleep 30 & c=$!; wait $c; exit 0;;
-  fail) echo "no audio device here" >&2; exit 3;;
-esac
-"#
-            ),
-        );
-        script(
             &dir.join("recorder"),
             &format!(
                 r#"#!/bin/bash
@@ -92,7 +77,6 @@ exit 0
             ),
         );
         let mut cfg = Config::new("127.0.0.1:0".parse().unwrap(), TOKEN.into(), tmp.clone());
-        cfg.player = Some(dir.join("player"));
         cfg.stream_player = Some(dir.join("streamer"));
         cfg.recorder = Some(dir.join("recorder"));
         tweak(&mut cfg);
@@ -129,22 +113,25 @@ exit 0
         request(self.addr, method, path, Some(TOKEN), &[], &[], None)
     }
 
-    fn play_with(&self, ctype: &str, body: &[u8]) -> Reply {
-        request(
+    /// Start a Stream and send it `audio` whole (with a Content-Length); its id.
+    fn play_audio(&self, audio: &[u8]) -> String {
+        let id = self.stream();
+        let r = request(
             self.addr,
             "POST",
-            "/v1/play",
+            &format!("/v1/play/{id}/audio"),
             Some(TOKEN),
-            &[("Content-Type", ctype)],
-            body,
+            &[],
+            audio,
             None,
-        )
+        );
+        assert_eq!(r.status, 200, "{}", r.text());
+        id
     }
 
+    /// A short Stream sent whole; its id.
     fn play(&self) -> String {
-        let r = self.play_with("audio/wav", &wav(0.2));
-        assert_eq!(r.status, 202, "{}", r.text());
-        json_field(&r.text(), "id").unwrap()
+        self.play_audio(&vec![7u8; 9600])
     }
 
     fn state(&self, id: &str, wait: u32) -> String {
@@ -229,7 +216,7 @@ fn every_endpoint_rejects_a_missing_or_wrong_token_without_effect() {
     for tok in [None, Some("wrong"), Some(wrong.as_str()), Some("")] {
         for (m, p) in [
             ("GET", "/v1/health"),
-            ("POST", "/v1/play"),
+            ("POST", "/v1/play/stream"),
             ("POST", "/v1/stop"),
             ("POST", "/v1/record/start"),
             ("GET", "/v1/nothing"),
@@ -240,7 +227,7 @@ fn every_endpoint_rejects_a_missing_or_wrong_token_without_effect() {
             assert!(rep.text().contains("\"error\""));
         }
     }
-    assert!(r.log("player").is_empty());
+    assert!(r.log("streamer").is_empty());
     assert!(r.log("recorder").is_empty());
     assert_eq!(r.files_in_tmp(), 0);
 }
@@ -269,169 +256,58 @@ fn unknown_endpoint_is_404_with_error_body() {
 }
 
 #[test]
-#[cfg(unix)]
-fn completed_only_when_the_player_exits_zero_and_the_file_is_deleted() {
+fn post_v1_play_is_gone_every_playback_is_a_stream() {
     let r = Rig::new();
-    let audio = wav(0.2);
-    let rep = r.play_with("audio/wav", &audio);
-    assert_eq!(rep.status, 202);
-    let id = json_field(&rep.text(), "id").unwrap();
-    assert_eq!(r.state(&id, 10), "completed");
-    assert_eq!(fs::read(r.dir.join("last-played")).unwrap(), audio);
-    let paths = r.started("player");
-    assert_eq!(paths.len(), 1);
-    assert!(paths[0].starts_with(&r.tmp));
-    assert!(wait_until(Duration::from_secs(3), || !paths[0].exists()));
-    assert_eq!(r.files_in_tmp(), 0);
-}
-
-#[test]
-#[cfg(unix)]
-fn mp3_is_accepted_and_kind_header_is_checked() {
-    let r = Rig::new();
-    let mp3 = [b"ID3\x04\0\0\0\0\0\0".as_slice(), &[0u8; 64]].concat();
-    let ok = request(
+    let rep = request(
         r.addr,
         "POST",
         "/v1/play",
         Some(TOKEN),
-        &[
-            ("Content-Type", "audio/mpeg"),
-            ("X-Pi-Speech-Kind", "sample"),
-        ],
-        &mp3,
-        None,
-    );
-    assert_eq!(ok.status, 202, "{}", ok.text());
-    let id = json_field(&ok.text(), "id").unwrap();
-    assert_eq!(r.state(&id, 10), "completed");
-    let bad = request(
-        r.addr,
-        "POST",
-        "/v1/play",
-        Some(TOKEN),
-        &[("Content-Type", "audio/wav"), ("X-Pi-Speech-Kind", "shell")],
+        &[("Content-Type", "audio/wav")],
         &wav(0.2),
         None,
     );
-    assert_eq!(bad.status, 400);
-}
-
-#[test]
-fn bytes_that_are_not_the_declared_audio_are_415_and_never_play() {
-    let r = Rig::new();
-    assert_eq!(
-        r.play_with("audio/wav", b"hello world, not audio").status,
-        415
-    );
-    assert_eq!(r.play_with("audio/mpeg", &wav(0.2)).status, 415);
-    let empty = request(
-        r.addr,
-        "POST",
-        "/v1/play",
-        Some(TOKEN),
-        &[("Content-Type", "audio/wav")],
-        b"",
-        Some(0),
-    );
-    assert_eq!(empty.status, 415);
-    assert_eq!(r.play_with("text/plain", &wav(0.2)).status, 415);
-    assert!(r.log("player").is_empty());
+    assert_eq!(rep.status, 404, "{}", rep.text());
+    assert!(r.log("streamer").is_empty());
     assert_eq!(r.files_in_tmp(), 0);
-}
-
-#[test]
-fn a_truncated_upload_is_400_and_never_plays() {
-    let r = Rig::new();
-    let audio = wav(0.5);
-    let rep = request(
-        r.addr,
-        "POST",
-        "/v1/play",
-        Some(TOKEN),
-        &[("Content-Type", "audio/wav")],
-        &audio[..audio.len() / 2],
-        Some(audio.len()),
-    );
-    assert_eq!(rep.status, 400);
-    assert!(r.log("player").is_empty());
-    assert_eq!(r.files_in_tmp(), 0);
-}
-
-#[test]
-fn missing_content_length_is_400() {
-    let r = Rig::new();
-    let rep = request(
-        r.addr,
-        "POST",
-        "/v1/play",
-        Some(TOKEN),
-        &[("Content-Type", "audio/wav")],
-        b"",
-        None,
-    );
-    assert_eq!(rep.status, 400);
-    assert!(r.log("player").is_empty());
 }
 
 #[test]
 #[cfg(unix)]
-fn oversized_body_is_413_and_never_plays() {
-    let r = Rig::with(|c| c.max_body = 1000);
-    let big = [wav(0.2), vec![0u8; 5000]].concat();
-    assert_eq!(r.play_with("audio/wav", &big).status, 413);
-    assert!(r.log("player").is_empty());
-    assert_eq!(r.play_with("audio/wav", &wav(0.01)).status, 202);
+fn completed_only_when_the_player_exits_zero_and_nothing_is_stored() {
+    let r = Rig::new();
+    let audio = vec![5u8; 4800];
+    let id = r.play_audio(&audio);
+    assert_eq!(r.state(&id, 10), "completed");
+    assert_eq!(r.streamed(), audio);
+    assert_eq!(r.files_in_tmp(), 0);
 }
 
 #[test]
 #[cfg(unix)]
 fn a_new_play_cancels_the_one_in_progress() {
     let r = Rig::new();
-    r.mode("player", "long");
+    r.mode("streamer", "deaf");
     let first = r.play();
     assert!(wait_until(Duration::from_secs(3), || r
-        .started("player")
+        .started("streamer")
         .len()
         == 1));
-    r.mode("player", "ok");
+    r.mode("streamer", "ok");
     let second = r.play();
     assert_eq!(r.state(&first, 0), "cancelled");
     assert_eq!(r.state(&second, 10), "completed");
-    assert!(r.log("player").iter().any(|l| l == "signal INT"));
-}
-
-#[test]
-#[cfg(unix)]
-fn player_failure_is_failed_with_its_error_text() {
-    let r = Rig::new();
-    r.mode("player", "fail");
-    let id = r.play();
-    let rep = r.call("GET", &format!("/v1/play/{id}?wait=10"));
-    let t = rep.text();
-    assert_eq!(json_field(&t, "state").unwrap(), "failed");
-    assert!(t.contains("status 3"), "{t}");
-    assert!(t.contains("no audio device here"), "{t}");
-    assert_eq!(r.files_in_tmp(), 0);
-}
-
-#[test]
-fn missing_player_is_503() {
-    let r = Rig::with(|c| c.player = Some("/nonexistent/player".into()));
-    let rep = r.play_with("audio/wav", &wav(0.2));
-    assert_eq!(rep.status, 503);
-    assert!(rep.text().contains("\"error\""));
-    assert_eq!(r.files_in_tmp(), 0);
+    assert!(r.log("streamer").iter().any(|l| l == "signal INT"));
 }
 
 #[test]
 #[cfg(unix)]
 fn cancel_and_stop_mark_playback_cancelled() {
     let r = Rig::new();
-    r.mode("player", "long");
+    r.mode("streamer", "deaf");
     let id = r.play();
     assert!(wait_until(Duration::from_secs(3), || r
-        .started("player")
+        .started("streamer")
         .len()
         == 1));
     let rep = r.call("POST", &format!("/v1/play/{id}/cancel"));
@@ -441,7 +317,7 @@ fn cancel_and_stop_mark_playback_cancelled() {
 
     let id2 = r.play();
     assert!(wait_until(Duration::from_secs(3), || r
-        .started("player")
+        .started("streamer")
         .len()
         == 2));
     let rep = r.call("POST", "/v1/stop");
@@ -456,7 +332,7 @@ fn cancel_and_stop_mark_playback_cancelled() {
 #[cfg(unix)]
 fn wait_returns_at_the_deadline_while_still_playing() {
     let r = Rig::new();
-    r.mode("player", "long");
+    r.mode("streamer", "deaf");
     let id = r.play();
     let t = std::time::Instant::now();
     assert_eq!(r.state(&id, 1), "playing");
@@ -588,15 +464,15 @@ fn recording_stops_itself_at_the_time_limit_and_is_dropped_if_uncollected() {
 #[cfg(unix)]
 fn shutdown_stops_players_and_recorders_and_removes_the_directory() {
     let r = Rig::new();
-    r.mode("player", "long");
+    r.mode("streamer", "deaf");
     r.play();
     assert!(wait_until(Duration::from_secs(3), || r
-        .started("player")
+        .started("streamer")
         .len()
         == 1));
     assert_eq!(r.record_start().status, 201);
     r.srv.shutdown();
-    let log = r.log("player");
+    let log = r.log("streamer");
     assert!(log.iter().any(|l| l == "signal INT"), "{log:?}");
     assert!(r.log("recorder").iter().any(|l| l == "signal INT"));
     assert!(!r.tmp.exists());
@@ -716,103 +592,33 @@ fn a_slow_request_does_not_hold_up_another_and_still_completes() {
 #[cfg(unix)]
 fn a_body_that_arrives_with_the_head_is_not_lost() {
     let r = Rig::new();
-    let audio = wav(0.2);
     let mut req = format!(
-        "POST /v1/play HTTP/1.1\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\n\r\n",
-        audio.len()
+        "POST /v1/play/stream HTTP/1.1\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        PCM.len()
     )
     .into_bytes();
-    req.extend_from_slice(&audio);
+    req.extend_from_slice(PCM.as_bytes());
     let mut s = TcpStream::connect(r.addr).unwrap();
     s.write_all(&req).unwrap(); // head and body in one segment
     let mut raw = Vec::new();
     s.read_to_end(&mut raw).unwrap();
     assert_eq!(parse_reply(raw).status, 202);
     assert!(wait_until(Duration::from_secs(5), || r
-        .dir
-        .join("last-played")
-        .exists()));
-    assert_eq!(fs::read(r.dir.join("last-played")).unwrap(), audio);
-}
-
-// Unix only: it times uploads against the deletion of 50,000 files, far slower on NTFS.
-#[test]
-#[cfg(unix)]
-fn no_audio_is_stored_once_shutdown_is_deleting_the_directory() {
-    const FILLER: usize = 50_000;
-    let r = Rig::new();
-    // Many files make the directory's removal slow, so uploads can finish while it runs.
-    for i in 0..FILLER {
-        fs::write(r.tmp.join(format!("filler-{i}")), b"").unwrap();
-    }
-    let audio = wav(0.1);
-    // Uploads whose head passed the receiver's checks and whose bodies are still to come.
-    let mut uploads: Vec<TcpStream> = (0..6)
-        .map(|_| {
-            let mut s = TcpStream::connect(r.addr).unwrap();
-            let head = format!(
-                "POST /v1/play HTTP/1.1\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\n\r\n",
-                audio.len()
-            );
-            s.write_all(head.as_bytes()).unwrap();
-            s.write_all(&audio[..10]).unwrap();
-            s
-        })
-        .collect();
-    std::thread::sleep(Duration::from_millis(300));
-    let names = |tmp: &PathBuf| -> Option<Vec<String>> {
-        Some(
-            fs::read_dir(tmp)
-                .ok()?
-                .filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect(),
-        )
-    };
-    let mut late = std::collections::BTreeSet::new();
-    std::thread::scope(|s| {
-        let down = s.spawn(|| r.srv.shutdown());
-        // Once fillers start disappearing, shutdown holds its locks and is deleting.
-        let mut snapshot: Option<Vec<String>> = None;
-        let mut sent = false;
-        while let Some(now) = names(&r.tmp) {
-            let fillers = now.iter().filter(|n| n.starts_with("filler-")).count();
-            match &snapshot {
-                None if fillers < FILLER => snapshot = Some(now),
-                None => {}
-                Some(before) => {
-                    if !sent {
-                        sent = true;
-                        for u in &mut uploads {
-                            u.write_all(&audio[10..]).unwrap();
-                        }
-                    }
-                    late.extend(
-                        now.into_iter()
-                            .filter(|n| n.starts_with("play-") && !before.contains(n)),
-                    );
-                }
-            }
-            if down.is_finished() {
-                break;
-            }
-        }
-        down.join().unwrap();
-    });
-    assert!(late.is_empty(), "audio stored during shutdown: {late:?}");
-    assert!(!r.tmp.exists() || r.files_in_tmp() == 0);
-    assert!(r.log("player").is_empty(), "a player was started");
+        .log("streamer")
+        .iter()
+        .any(|l| l.ends_with("s16le 24000 1"))));
 }
 
 #[test]
 fn a_play_after_shutdown_is_503_and_stores_nothing() {
     let r = Rig::new();
     r.srv.shutdown();
-    // The listener may already be closed; either way nothing may be stored.
-    let res = std::panic::catch_unwind(|| r.play_with("audio/wav", &wav(0.2)).status);
+    // The listener may already be closed; either way nothing may start or be stored.
+    let res = std::panic::catch_unwind(|| r.stream_with(PCM).status);
     if let Ok(status) = res {
         assert_eq!(status, 503);
     }
+    assert!(r.log("streamer").is_empty());
     assert!(!r.tmp.exists() || r.files_in_tmp() == 0);
 }
 
@@ -885,10 +691,6 @@ fn a_stream_player_gets_the_format_as_its_arguments() {
         assert_eq!(r.state(&id, 10), "completed");
         assert_eq!(r.log("streamer").last().unwrap(), &format!("start {args}"));
     }
-    assert!(
-        r.log("player").is_empty(),
-        "the file player is never used for a Stream"
-    );
 }
 
 #[test]
@@ -1138,10 +940,9 @@ fn stream_requests_are_checked() {
     assert_eq!(first.end().status, 200);
     assert_eq!(r.state(&id, 10), "completed");
     assert_eq!(r.upload(&id).reply().status, 409, "no longer playing");
-    // A file playback takes no audio request.
-    r.mode("player", "long");
-    let file = r.play();
-    assert_eq!(r.upload(&file).reply().status, 409);
+    // A Stream that plays on while the requests below are refused.
+    r.mode("streamer", "deaf");
+    let held = r.play();
 
     for body in [
         "",
@@ -1173,10 +974,10 @@ fn stream_requests_are_checked() {
             .iter()
             .filter(|l| l.starts_with("start"))
             .count(),
-        1
+        2
     );
     assert_eq!(
-        r.state(&file, 0),
+        r.state(&held, 0),
         "playing",
         "refused requests stop nothing"
     );
@@ -1201,42 +1002,11 @@ fn a_chunked_stream_request_body_is_accepted() {
 }
 
 #[test]
-#[cfg(unix)]
-fn no_stream_player_when_only_the_file_player_is_configured() {
-    let r = Rig::with(|c| c.stream_player = None);
-    let rep = r.stream_with(PCM);
-    assert_eq!(rep.status, 503, "{}", rep.text());
-    assert!(
-        rep.text().contains("PI_SPEECH_RECEIVER_STREAM_PLAYER"),
-        "{}",
-        rep.text()
-    );
-    // The file player still works, and the 503 stopped nothing.
-    r.mode("player", "long");
-    let id = r.play();
-    assert_eq!(r.stream_with(r#"{"format": "mp3"}"#).status, 503);
-    assert_eq!(r.state(&id, 0), "playing");
-
+fn a_stream_player_that_cannot_start_is_503() {
     let r = Rig::with(|c| c.stream_player = Some("/nonexistent/streamer".into()));
     let rep = r.stream_with(PCM);
     assert_eq!(rep.status, 503);
     assert!(rep.text().contains("\"error\""));
-}
-
-#[test]
-#[cfg(unix)]
-fn a_stream_stops_the_file_playback_in_progress() {
-    let r = Rig::new();
-    r.mode("player", "long");
-    let file = r.play();
-    assert!(wait_until(Duration::from_secs(3), || r
-        .started("player")
-        .len()
-        == 1));
-    let id = r.stream();
-    assert_eq!(r.state(&file, 0), "cancelled");
-    assert!(r.log("player").iter().any(|l| l == "signal INT"));
-    assert_eq!(r.state(&id, 0), "playing");
 }
 
 #[test]
@@ -1268,16 +1038,11 @@ fn shutdown_stops_stream_players_and_leaves_no_files() {
 #[test]
 fn without_a_configured_program_or_the_built_in_engine_everything_is_503() {
     let r = Rig::with(|c| {
-        c.player = None;
         c.stream_player = None;
         c.recorder = None;
         c.engine = None;
     });
-    for rep in [
-        r.play_with("audio/wav", &wav(0.2)),
-        r.stream_with(PCM),
-        r.record_start(),
-    ] {
+    for rep in [r.stream_with(PCM), r.record_start()] {
         assert_eq!(rep.status, 503, "{}", rep.text());
         assert!(
             rep.text().contains("built-in audio engine"),

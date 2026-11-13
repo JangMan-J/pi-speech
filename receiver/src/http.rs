@@ -118,13 +118,6 @@ fn reason(status: u16) -> &'static str {
         _ => "Service Unavailable",
     }
 }
-
-pub enum BodyError {
-    /// The peer sent fewer bytes than its Content-Length.
-    Short,
-    Io(io::Error),
-}
-
 /// How a request body is delimited.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Framing {
@@ -426,31 +419,6 @@ impl Conn {
             let _ = self.stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
             self.body_left = self.held;
         }
-    }
-
-    /// Read exactly `len` body bytes (the request's Content-Length).
-    pub fn read_body(&mut self, len: u64) -> Result<Vec<u8>, BodyError> {
-        let mut body = Vec::with_capacity(len.min(1 << 20) as usize);
-        let mut buf = vec![0u8; 64 * 1024];
-        while (body.len() as u64) < len {
-            let want = ((len - body.len() as u64) as usize).min(buf.len());
-            match self.reader.read(&mut buf[..want]) {
-                Ok(0) => return Err(BodyError::Short),
-                Ok(n) => body.extend_from_slice(&buf[..n]),
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    return Err(BodyError::Short)
-                }
-                Err(e) => return Err(BodyError::Io(e)),
-            }
-        }
-        self.body_left = self.body_left.saturating_sub(len);
-        Ok(body)
     }
 
     /// Read the body piece by piece, handing each piece to `sink` as it arrives, with

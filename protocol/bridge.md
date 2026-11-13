@@ -3,7 +3,8 @@
 The playback bridge connects pi-speech on the Pi host to `pi-speech-receiver` on the
 playback machine (the user's local Linux computer with speakers and a microphone).
 The receiver plays audio that Pi sends and, for Alt+Z dictation, records the local
-microphone and returns the recording to Pi.
+microphone and returns the recording to Pi. Every playback is a Stream (`GLOSSARY.md`):
+the audio is sent as it arrives, and a saved message is sent whole as a Stream.
 
 This file is the contract between the two sides. Both sides implement it exactly.
 
@@ -39,13 +40,12 @@ Every non-2xx response has the body `{"error": "<readable message>"}`.
 
 | Status | Meaning                                                                                |
 | ------ | -------------------------------------------------------------------------------------- |
-| 400    | Malformed request, or a body shorter than its `Content-Length` (interrupted transfer). |
+| 400    | Malformed request, or a body that breaks off (interrupted transfer).                   |
 | 401    | Missing or wrong token.                                                                |
 | 408    | The request head did not arrive within 10 s.                                           |
 | 404    | Unknown endpoint, or unknown playback or recording id.                                 |
 | 409    | A recording is already active, or a Stream's playback cannot take audio (see below).   |
 | 413    | Body larger than the receiver's limit (default 64 MiB).                                |
-| 415    | The body is not WAV or MP3.                                                            |
 | 422    | The recording holds less than 0.1 s of audio.                                          |
 | 503    | The player or the microphone is not available; the message says why.                   |
 
@@ -55,32 +55,18 @@ Every non-2xx response has the body `{"error": "<readable message>"}`.
 
 `200 {"protocol": 1, "name": "pi-speech-receiver", "version": "<semver>", "capabilities": ["play", "record", "stream"]}`
 
-A receiver that lists `stream` has the two endpoints under "Playing a Stream". A client
-checks for it before using them; an older receiver without it gets whole files only.
-
-### `POST /v1/play`
-
-Plays one audio file on the playback machine.
-
-- Body: the raw audio bytes. `Content-Type` is `audio/wav` or `audio/mpeg`;
-  `Content-Length` is required (a chunked body or a missing length gets `400`).
-- Optional header `X-Pi-Speech-Kind: message | sample` (default `message`).
-- The receiver checks the bytes (`RIFF....WAVE` for WAV; an `ID3` tag or an MPEG frame
-  sync for MP3) and answers `415` when they do not match the declared `Content-Type`.
-- The receiver writes the audio only into its own private temporary directory, under a
-  name it generates, and deletes it when playback ends. No request names a path,
-  a command, or a player argument.
-- A new play request stops the playback in progress; that playback becomes
-  `cancelled`.
-- Response: `202 {"id": "<playback id>"}` once the player has started. If no player can
-  start, `503`.
+A receiver that lists `stream` has the two endpoints under "Playing a Stream", the only
+way to play. A client checks for it: a receiver without it is too old, and the client
+says to update it rather than play any other way.
 
 ### Playing a Stream
 
 A Stream is audio that plays while the rest of it is still arriving (speech the Pi host
-receives from a provider in pieces). It takes two requests, because a client cannot read
-a response before it has sent its whole request body: one starts the player and returns
-its id, the other carries the audio.
+receives from a provider in pieces). Audio that is already whole (a saved message, or a
+provider that sends one file at the end) is sent the same way, as one late part. It
+takes two requests, because a client cannot read a response before it has sent its
+whole request body: one starts the player and returns its id, the other carries the
+audio.
 
 #### `POST /v1/play/stream`
 
@@ -94,8 +80,8 @@ Starts a player that reads a Stream from its input, without any audio yet.
 - A new play request (of either kind) stops the playback in progress; that playback
   becomes `cancelled`.
 - Response: `202 {"id": "<playback id>"}` once the player has started, in state
-  `playing`. If no player for that format can start, `503`; the client then sends the
-  audio as one file with `POST /v1/play` once it has all of it.
+  `playing`. If no player for that format can start, `503`; the playback then fails
+  with that message.
 - A playback whose audio does not begin to arrive within 120 s of this answer is stopped
   and becomes `failed`.
 
@@ -186,7 +172,8 @@ By default it plays and records with its own built-in audio engine: it runs its 
 executable again as a child, through these subcommands, on the system's default output
 and input devices. No other program is needed.
 
-- `pi-speech-receiver play <audio-file>` plays a WAV or MP3 file once.
+- `pi-speech-receiver play <audio-file>` plays a WAV or MP3 file once (a command-line
+  convenience; the receiver itself only plays Streams).
 - `pi-speech-receiver play s16le <rate> <channels>`, `play mp3` and `play wav` play a
   Stream from standard input as it arrives, and exit once the input has ended and been
   heard.
@@ -196,16 +183,16 @@ and input devices. No other program is needed.
 
 Environment variables replace the built-in engine with other programs:
 
-- `PI_SPEECH_RECEIVER_PLAYER` names a player, run as `<player> <audio-file>`, which
-  plays the file once.
 - `PI_SPEECH_RECEIVER_STREAM_PLAYER` names a Stream player, which reads a Stream from
   its standard input and exits once the input has ended and played. It is run as
   `<player> s16le <rate> <channels>` for PCM and `<player> mp3` or `<player> wav` for
-  the others. When `PI_SPEECH_RECEIVER_PLAYER` is set and
-  `PI_SPEECH_RECEIVER_STREAM_PLAYER` is not, no Stream player is used (`503`).
+  the others.
 - `PI_SPEECH_RECEIVER_RECORDER` names a recorder, run as `<recorder> <output.wav>`,
   which records mono 16-bit PCM WAV to that path, and finishes the file and exits when
   it receives SIGINT.
+
+The same executable is the extension's bundled binary on This machine: pi-speech plays
+and records there through `play` and `record` too (`src/engine/binary.ts`).
 
 A name without a `/` is looked up on `PATH`. To stop a player or recorder, built-in or
 not, the receiver sends SIGINT, waits up to 2 s, then sends SIGKILL.

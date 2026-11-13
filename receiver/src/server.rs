@@ -1,14 +1,12 @@
 //! The playback bridge: endpoints, playback and recording state.
 
 use crate::front::{self, Ready};
-use crate::http::{
-    answer_nonblocking, json_str, BodyError, BodyFault, Conn, Framing, Request, Response,
-};
+use crate::http::{answer_nonblocking, json_str, BodyFault, Conn, Framing, Request, Response};
 use crate::private;
 use crate::proc::{self, lock, start_thread, Exit, ProcCtl};
 use crate::stream::{self, Format};
 use crate::token::{ct_eq, random_hex};
-use crate::wav::{self, Kind};
+use crate::wav;
 use std::fs;
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
@@ -40,7 +38,6 @@ pub const STREAM_IDLE: Duration = Duration::from_secs(120);
 /// The largest body of `POST /v1/play/stream`; a valid one is far smaller.
 const MAX_STREAM_REQUEST: u64 = 4096;
 
-pub const PLAYER_ENV: &str = "PI_SPEECH_RECEIVER_PLAYER";
 pub const STREAM_PLAYER_ENV: &str = "PI_SPEECH_RECEIVER_STREAM_PLAYER";
 pub const RECORDER_ENV: &str = "PI_SPEECH_RECEIVER_RECORDER";
 const NO_ENGINE: &str =
@@ -51,10 +48,7 @@ pub struct Config {
     pub token: String,
     /// The receiver's private directory for audio files; removed on shutdown.
     pub tmp_dir: PathBuf,
-    /// Player executable from the environment; `None` means the built-in engine.
-    pub player: Option<PathBuf>,
-    /// Stream player executable from the environment; `None` means the built-in engine,
-    /// unless `player` is set: then there is no Stream player.
+    /// Stream player executable from the environment; `None` means the built-in engine.
     pub stream_player: Option<PathBuf>,
     /// Recorder executable from the environment; `None` means the built-in engine.
     pub recorder: Option<PathBuf>,
@@ -84,7 +78,6 @@ impl Config {
             listen,
             token,
             tmp_dir,
-            player: from_env(PLAYER_ENV),
             stream_player: from_env(STREAM_PLAYER_ENV),
             recorder: from_env(RECORDER_ENV),
             engine: std::env::current_exe().ok(),
@@ -147,8 +140,6 @@ impl PlayState {
 
 /// Where a playback's audio comes from.
 enum Feed {
-    /// A file, stored before the player started.
-    File,
     /// A Stream whose audio request has not begun: the player's input, kept open.
     Waiting(ChildStdin),
     /// A Stream whose input was taken: by its audio request, or closed when it ended.
@@ -621,7 +612,6 @@ impl Shared {
                     json_str(env!("CARGO_PKG_VERSION"))
                 ),
             ),
-            ("POST", ["v1", "play"]) => self.play(conn, req),
             ("POST", ["v1", "play", "stream"]) => self.play_stream(conn, req),
             ("POST", ["v1", "play", id, "audio"]) => self.stream_audio(conn, req, id),
             ("GET", ["v1", "play", id]) => match query_wait(req.query.as_deref()) {
@@ -642,125 +632,6 @@ impl Shared {
     }
 
     // ---- playback ----
-
-    fn play(self: &Arc<Self>, conn: &mut Conn, req: &Request) -> Response {
-        if let Err(resp) = check_kind(req) {
-            return resp;
-        }
-        if req.header("transfer-encoding").is_some() {
-            return Response::error(400, "send the audio with Content-Length, not chunked");
-        }
-        let len = match (
-            req.header("content-length"),
-            req.header_count("content-length"),
-        ) {
-            (Some(v), 1) => match v.parse::<u64>() {
-                Ok(n) => n,
-                Err(_) => return Response::error(400, "invalid Content-Length"),
-            },
-            _ => return Response::error(400, "exactly one Content-Length is required"),
-        };
-        if len > self.cfg.max_body {
-            return Response::error(
-                413,
-                &format!("body larger than the limit of {} bytes", self.cfg.max_body),
-            );
-        }
-        let ctype = req.header("content-type").unwrap_or("");
-        let kind = match ctype
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "audio/wav" => Kind::Wav,
-            "audio/mpeg" => Kind::Mp3,
-            _ => return Response::error(415, "Content-Type must be audio/wav or audio/mpeg"),
-        };
-        conn.send_continue(req);
-        let body = match conn.read_body(len) {
-            Ok(b) => b,
-            Err(BodyError::Short) => {
-                return Response::error(400, "body shorter than its Content-Length")
-            }
-            Err(BodyError::Io(_)) => return Response::error(400, "could not read the body"),
-        };
-        if !wav::matches(kind, &body) {
-            return Response::error(415, "the body is not WAV or MP3 audio of the declared type");
-        }
-        self.start_playback(kind, &body)
-    }
-
-    fn store(&self, prefix: &str, ext: &str, bytes: &[u8]) -> io::Result<PathBuf> {
-        let path = self
-            .cfg
-            .tmp_dir
-            .join(format!("{prefix}-{}.{ext}", random_hex(8)?));
-        // On Windows the directory's default ACLs (it is in the user's profile) keep it private.
-        let mut f = private::file().write(true).create_new(true).open(&path)?;
-        if let Err(e) = f.write_all(bytes).and_then(|_| f.flush()) {
-            let _ = fs::remove_file(&path);
-            return Err(e);
-        }
-        Ok(path)
-    }
-
-    fn start_playback(self: &Arc<Self>, kind: Kind, audio: &[u8]) -> Response {
-        // Shutdown takes this lock before it deletes the directory, so audio is only
-        // ever stored while the receiver is known to be up.
-        let _p = lock(&self.play_lock);
-        if self.down.load(Ordering::SeqCst) {
-            return Response::error(503, "the receiver is shutting down");
-        }
-        let path = match self.store("play", kind.extension(), audio) {
-            Ok(p) => p,
-            Err(e) => return Response::error(503, &format!("cannot store the audio: {e}")),
-        };
-        let fail = |status: u16, msg: String| {
-            let _ = fs::remove_file(&path);
-            Response::error(status, &msg)
-        };
-        self.stop_playing();
-        let program = match self.program(&self.cfg.player, "play") {
-            Ok(x) => x,
-            Err(e) => return fail(503, e),
-        };
-        let mut cmd = program.command();
-        cmd.arg(&path);
-        let id = match random_hex(8) {
-            Ok(id) => id,
-            Err(e) => return fail(503, format!("no random source: {e}")),
-        };
-        let sh = Arc::clone(self);
-        let (done_id, done_path) = (id.clone(), path.clone());
-        // Hold the lock across spawn so the exit callback cannot run before the entry exists.
-        let mut g = lock(&self.inner);
-        let spawned = proc::spawn(cmd, move |exit| {
-            let _ = fs::remove_file(&done_path);
-            sh.player_ended(&done_id, &exit);
-        });
-        let ctl = match spawned {
-            Ok(c) => c,
-            Err(e) => {
-                drop(g);
-                return fail(
-                    503,
-                    format!("cannot start the player {}: {e}", program.name()),
-                );
-            }
-        };
-        g.plays.push(Play {
-            id: id.clone(),
-            state: PlayState::Playing,
-            error: None,
-            ctl,
-            feed: Feed::File,
-        });
-        prune(&mut g);
-        Response::json(202, format!("{{\"id\": {}}}", json_str(&id)))
-    }
 
     /// Mark playback `id` by how its player ended.
     fn player_ended(&self, id: &str, exit: &Exit) {
@@ -817,13 +688,6 @@ impl Shared {
 
     /// The Stream player for `format`: the configured one, or the built-in engine.
     fn stream_player(&self, format: Format) -> Result<Program, String> {
-        // With only a file player configured, Streams get no player: the client then
-        // sends them as files, to that player.
-        if self.cfg.player.is_some() && self.cfg.stream_player.is_none() {
-            return Err(format!(
-                "no Stream player: {PLAYER_ENV} is set and {STREAM_PLAYER_ENV} is not"
-            ));
-        }
         let mut program = self.program(&self.cfg.stream_player, "play")?;
         program.args.extend(stream::player_args(format));
         Ok(program)
@@ -931,7 +795,6 @@ impl Shared {
                 other => {
                     let msg = match other {
                         _ if !playing => "the playback is no longer playing",
-                        Feed::File => "the playback is not a Stream",
                         _ => "the Stream already has its audio request",
                     };
                     p.feed = other;
