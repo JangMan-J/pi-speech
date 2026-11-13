@@ -212,7 +212,10 @@ try {
   check(d.some((l) => /✓ Speak is Alt\+D$/.test(l)) && !d.some((l) => /reload/.test(l)), 'the status line confirms the key and mentions no /reload', d.slice(-5));
   await t.key('Escape'); await sleep(3000);
   lines = t.lines();
-  check(dock(lines).length === 0 && !lines.some((l) => /\/reload|[Rr]eloaded/.test(l)), 'leaving Hotkeys closes the dock and reloads silently, without /reload typed', lines.slice(-8));
+  // Pi's own reload prints its "Reloaded keybindings, extensions, …" status line; pi-speech adds no message.
+  const reloaded = lines.some((l) => /Reloaded keybindings, extensions/.test(l));
+  const ours = lines.filter((l) => /\/reload|Alt\+D|Speak is|Speech:/.test(l));
+  check(dock(lines).length === 0 && reloaded && ours.length === 0, 'leaving Hotkeys closes the dock and reloads Pi without /reload typed, with no message of its own', [dock(lines), reloaded, ours]);
   await t.key('alt+d'); await sleep(600);
   check(/^Speak ─/.test(dock(t.lines())[0] ?? ''), 'Alt+D opens the speak composer at once', t.lines().slice(-8));
   await t.key('Escape'); await sleep(300);
