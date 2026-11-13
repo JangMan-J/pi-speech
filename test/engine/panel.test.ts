@@ -259,7 +259,7 @@ describe("the panel view model: keys in the main view", () => {
     expect(v.rows.map((r) => [r.label, r.value, !!r.opens])).toEqual([
       ["Read", "Off", false],
       ["Summarized by", "Same model", true],
-      ["Length", "Abridged ~30 s", false],
+      ["Length", "Minimum ~15 s", false],
       ["Truncate at", "Off", false],
     ]);
     expect(v.status).toEqual({ tone: "info", text: "Off: nothing is read aloud." });
@@ -293,13 +293,13 @@ describe("the panel view model: keys in the main view", () => {
   it("Length and Truncate at cycle in place, are saved, and their lines say what they promise", async () => {
     const p = open();
     await p.press("enter", "down", "down");
-    expect(p.panel.view().status?.text).toBe("Best effort: about 30 s.");
+    expect(p.panel.view().status?.text).toBe("Best effort: about 15 s.");
     expect(p.hint()).toBe("←→ Minimum · Abridged · Full · Esc back");
     await p.press("right");
-    expect(p.row("Length")?.value).toBe("Full ~60 s");
-    expect(p.panel.view().status?.text).toBe("Best effort: about 60 s.");
+    expect(p.row("Length")?.value).toBe("Abridged ~30 s");
+    expect(p.panel.view().status?.text).toBe("Best effort: about 30 s.");
     await p.press("enter");
-    expect(p.row("Length")?.value).toBe("Minimum ~15 s");
+    expect(p.row("Length")?.value).toBe("Full ~60 s");
     await p.press("down");
     expect(p.panel.view().status?.text).toBe("Off: length not guaranteed.");
     expect(p.hint()).toBe("←→ Off · 15 s · 30 s · 60 s · 120 s · Esc back");
@@ -309,7 +309,7 @@ describe("the panel view model: keys in the main view", () => {
     await p.press("left", "left", "left");
     expect(p.row("Truncate at")?.value).toBe("120 s");
     const saved = JSON.parse(readFileSync(join(p.work, "agent", "pi-speech", "settings.json"), "utf8"));
-    expect(saved.readAloud).toEqual({ length: "minimum", truncate: 120 });
+    expect(saved.readAloud).toEqual({ length: "full", truncate: 120 });
   });
 
   it("Summarized by opens a picker of Same model and the user's Pi models", async () => {

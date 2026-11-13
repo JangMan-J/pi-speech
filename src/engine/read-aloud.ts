@@ -41,7 +41,7 @@ export interface ReadAloudOptions {
   truncate: number;
 }
 
-export const DEFAULT_READ_ALOUD: Readonly<ReadAloudOptions> = Object.freeze({ length: "abridged", truncate: 0 });
+export const DEFAULT_READ_ALOUD: Readonly<ReadAloudOptions> = Object.freeze({ length: "minimum", truncate: 0 });
 
 /** The markers around the spoken summary at the end of a reply. */
 export const SUMMARY_OPEN = "<spoken_summary>";

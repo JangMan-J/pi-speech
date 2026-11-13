@@ -106,7 +106,7 @@ try {
   check(JSON.stringify(d.slice(1, 5)) === JSON.stringify([
     '  ▸ Read               Off',
     '    Summarized by      Same model ›',
-    '    Length             Abridged ~30 s',
+    '    Length             Minimum ~15 s',
     '    Truncate at        Off',
   ]), 'it has Read, Summarized by, Length and Truncate at', d.slice(1, 5));
   check(d.some((l) => /Off: nothing is read aloud\./.test(l)), 'one line says what the highlighted row does', d.slice(-5));

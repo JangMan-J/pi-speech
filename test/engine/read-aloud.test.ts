@@ -116,7 +116,7 @@ describe("read-aloud summaries", () => {
     h.r.mode = "all";
     expect(h.r.guideline()).toBeUndefined();
     h.r.mode = "summary";
-    expect(h.r.guideline()).toBe(guidelineFor("summary", "abridged"));
+    expect(h.r.guideline()).toBe(guidelineFor("summary", "minimum"));
     h.opts.length = "full";
     h.r.mode = "thinking";
     expect(h.r.guideline()).toBe(guidelineFor("thinking", "full"));
@@ -130,7 +130,7 @@ describe("read-aloud summaries", () => {
     const list = ["other rule"];
     h.r.onRunStart(list);
     h.r.onRunStart(list);
-    expect(list).toEqual(["other rule", guidelineFor("summary", "abridged")]);
+    expect(list).toEqual(["other rule", guidelineFor("summary", "minimum")]);
     h.r.mode = "off";
     expect(h.r.onRunStart(list)).toEqual(["other rule"]);
   });

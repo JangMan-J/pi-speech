@@ -101,7 +101,7 @@ the highlighted one does:
 Speech › Read aloud options ──────────────────────────────────────────────────────
   ▸ Read               Summary
     Summarized by      Same model ›
-    Length             Abridged ~30 s
+    Length             Minimum ~15 s
     Truncate at        Off
 
   Reads the model's spoken summary of its reply.

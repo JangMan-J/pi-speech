@@ -41,7 +41,7 @@ export function tui(ctx, rec, extraEnv = {}) {
   const tt = (...args) => execFileSync('tui-test', args, { encoding: 'utf8', timeout: 30000, env: { ...process.env, TUI_TEST_SESSION: session } });
   tt('run', '--cols', '110', '--rows', '30', '--cwd', cwd, 'env', '-u', 'SSH_CONNECTION', '-u', 'SSH_TTY', '-u', 'PI_SPEECH_LOCAL_MIC',
     ...Object.entries(env).map(([k, v]) => `${k}=${v}`), 'pi', '--no-extensions', '-e', path.join(process.cwd(), 'index.ts'),
-    '--no-skills', '--no-prompt-templates', '--no-context-files', '--no-themes', '--offline', '--no-mcp', '--no-session',
+    '--no-skills', '--no-prompt-templates', '--no-context-files', '--no-themes', '--offline', '--no-mcp', '--no-session', '--no-approve',
     '--provider', 'fake', '--model', 'fake-model');
   return {
     text: () => tt('text'),

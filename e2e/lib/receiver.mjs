@@ -8,14 +8,17 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
-/** Build receiver/ of the tree in `root` (shared, locked cargo target dir); returns the binary path. */
+/**
+ * Build receiver/ of the tree in `root` (locked cargo target dir, one per tree: a target dir shared by trees can
+ * hand one tree another's binary when its sources are older); returns the binary path.
+ */
 export function buildReceiver(root = process.cwd()) {
   const cache = path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'speech-refactor');
   fs.mkdirSync(cache, { recursive: true });
   const out = fs.mkdtempSync(path.join(os.tmpdir(), 'recv-bin-'));
   execFileSync('flock', [path.join(cache, 'receiver-build.lock'), 'bash', '-c',
-    'export CARGO_TARGET_DIR="$1/receiver-target"; cd "$2/receiver" && cargo build --release --locked --quiet && cp "$CARGO_TARGET_DIR/release/pi-speech-receiver" "$3/"',
-    '_', cache, root, out], { stdio: ['ignore', 2, 2] });
+    'export CARGO_TARGET_DIR="$1/receiver-target-$4"; cd "$2/receiver" && cargo build --release --locked --quiet && cp "$CARGO_TARGET_DIR/release/pi-speech-receiver" "$3/"',
+    '_', cache, root, out, crypto.createHash('sha256').update(fs.realpathSync(root)).digest('hex').slice(0, 12)], { stdio: ['ignore', 2, 2] });
   return path.join(out, 'pi-speech-receiver');
 }
 

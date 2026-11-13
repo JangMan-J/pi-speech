@@ -20,7 +20,7 @@ export async function openPanelPi(ctx, { cols = 110, rows = 34, env: extra = {},
   tt('run', '--cols', String(cols), '--rows', String(rows), '--cwd', cwd, 'env', ...unset.flatMap((k) => ['-u', k]),
     ...Object.entries(env).filter(([, v]) => v != null).map(([k, v]) => `${k}=${v}`),
     'pi', '--no-extensions', '-e', path.join(process.cwd(), 'index.ts'),
-    '--no-skills', '--no-prompt-templates', '--no-context-files', '--no-themes', '--offline', '--no-mcp', '--no-session',
+    '--no-skills', '--no-prompt-templates', '--no-context-files', '--no-themes', '--offline', '--no-mcp', '--no-session', '--no-approve',
     '--provider', 'fake', '--model', 'fake-model');
   let started = false;
   const term = {
