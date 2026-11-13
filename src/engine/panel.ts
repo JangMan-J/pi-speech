@@ -453,8 +453,13 @@ export class Panel {
   private mode: Mode = { kind: "list" };
   /** The selected row of the main view. */
   private selected = 0;
-  /** The keys Pi has bound; a changed key shows beside them until Pi loads the extension again. */
+  /** The keys Pi has bound (from the settings when the extension loaded). */
   private readonly bound: Hotkeys;
+  /**
+   * The panel closed on leaving Hotkeys with a changed key: Pi binds an extension's keys when it loads the
+   * extension, so the host reloads it for the new key to work at once.
+   */
+  rebind = false;
   private transcribing = false;
   private status?: Status;
   private statusTimer?: ReturnType<typeof setTimeout>;
@@ -636,12 +641,16 @@ export class Panel {
     }
   }
 
-  /** The key of Speak or Dictate: the bound one, then a changed one that waits for Pi to load it. */
+  /** The key of Speak or Dictate as saved: a changed one is bound when the user leaves Hotkeys. */
   private hotkeyValue(name: HotkeyName, home: { kind: "list" } | MenuMode): Pick<PanelRow, "value" | "note"> {
     if (home.kind === "menu" && home.capture === name) return { value: "press a key…" };
-    const saved = this.speech.settings.hotkeys[name];
-    const value = keyLabel(this.bound[name]);
-    return saved === this.bound[name] ? { value } : { value, note: `→ ${keyLabel(saved)} after /reload` };
+    return { value: keyLabel(this.speech.settings.hotkeys[name]) };
+  }
+
+  /** A saved key of Speak or Dictate differs from the one Pi has bound. */
+  private hotkeysChanged(): boolean {
+    const saved = this.speech.settings.hotkeys;
+    return saved.speak !== this.bound.speak || saved.dictate !== this.bound.dictate;
   }
 
   /** The value a row shows now, a pending one included. */
@@ -901,7 +910,13 @@ export class Panel {
         m.selected = (m.selected + (key === "up" ? rows.length - 1 : 1)) % rows.length;
       else if (key === "enter") this.activate(id);
       else if (key === "left" || key === "right") this.step(id, key === "left" ? -1 : 1);
-      else if (key === "escape") this.mode = { kind: "list" };
+      else if (key === "escape") {
+        // Leaving Hotkeys with a changed key closes the panel, and the host reloads Pi to bind it.
+        if (m.menu === "hotkeys" && this.hotkeysChanged()) {
+          this.rebind = true;
+          this.deps.close();
+        } else this.mode = { kind: "list" };
+      }
       return;
     }
     const id = MAIN[this.selected].id;
@@ -961,7 +976,7 @@ export class Panel {
 
   /**
    * The new key of Speak or Dictate, saved in the settings. Pi binds an extension's shortcuts when it loads the
-   * extension, so the key works from the next /reload or start of Pi; until then the bound key keeps working.
+   * extension: leaving Hotkeys closes the panel and the host reloads Pi, so the key works at once.
    */
   private capture(m: MenuMode, name: HotkeyName, k: PanelKey): void {
     if ("key" in k && k.key === "escape") {
@@ -993,7 +1008,7 @@ export class Panel {
       "success",
       key === this.bound[name]
         ? `✓ ${HOTKEY_NAMES[name]} is ${keyLabel(key)} again`
-        : `✓ ${HOTKEY_NAMES[name]} is ${keyLabel(key)} from the next /reload or start of Pi`,
+        : `✓ ${HOTKEY_NAMES[name]} is ${keyLabel(key)}`,
     );
   }
 

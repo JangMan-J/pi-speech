@@ -16,6 +16,11 @@ import { openPanel } from "./panel";
 import { pick } from "./picker";
 
 export const SYNTHESIZE_TOOL = "speech_synthesize";
+/**
+ * The hidden argument of /speech that reloads Pi: sent from agent_settled when a changed hotkey asked for a
+ * reload while the agent was running (Pi cannot reload then).
+ */
+export const RELOAD_ARG = "--reload-hotkeys";
 export const TRANSCRIBE_TOOL = "speech_transcribe";
 const TOOLS = [SYNTHESIZE_TOOL, TRANSCRIBE_TOOL];
 
@@ -135,8 +140,17 @@ export function registerPi(pi: ExtensionAPI, engine: Engine, env: NodeJS.Process
     void engine.readAloud.onRunEnd(event.messages ?? []);
   });
 
-  // Pi binds an extension's shortcuts when it loads the extension: a key changed in Hotkeys applies from the
-  // next /reload or start of Pi, and until then these stay bound.
+  /** A changed hotkey asked for a reload while the agent was running: it runs once the agent has settled. */
+  let reloadRequested = false;
+  pi.on("agent_settled", async () => {
+    if (!reloadRequested) return;
+    reloadRequested = false;
+    // Sent from agent_settled, the command runs after every settled handler finishes, while Pi is idle.
+    void pi.sendUserMessage(`/speech ${RELOAD_ARG}`, { expandPromptTemplates: true });
+  });
+
+  // Pi binds an extension's shortcuts when it loads the extension: leaving Hotkeys with a changed key closes
+  // the panel and reloads Pi, which loads the extension again with the new keys.
   const hotkeys = { ...engine.speech.settings.hotkeys };
   const open = (ctx: ExtensionContext, speak: boolean) =>
     openPanel(
@@ -187,9 +201,22 @@ export function registerPi(pi: ExtensionAPI, engine: Engine, env: NodeJS.Process
     async handler(args, ctx) {
       attach(ctx);
       try {
+        if (args.trim() === RELOAD_ARG) {
+          await ctx.reload();
+          return;
+        }
         // With a terminal UI, /speech alone opens the settings panel; elsewhere (RPC) the menu of dialogs.
         if (parse(args).kind === "menu" && hasTerminal(ctx)) {
-          await open(ctx, false);
+          const rebind = await open(ctx, false);
+          // A changed hotkey: reload Pi silently so it is bound at once (later, if the agent is running).
+          if (rebind) {
+            if (!ctx.isIdle()) {
+              reloadRequested = true;
+              return;
+            }
+            await ctx.reload();
+            return;
+          }
           return;
         }
         await surface.run(args, surfaceUi(ctx));

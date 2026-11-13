@@ -125,8 +125,9 @@ const MARGIN_FROM = 80;
 const KEPT_ROWS = 3;
 
 /**
- * Open the panel in the place of Pi's editor; settles when it closes. `track` hears the panel while it is
- * open. With `speak` it opens on the speak composer, and Esc closes it.
+ * Open the panel in the place of Pi's editor; settles when it closes, with true when it closed on leaving
+ * Hotkeys with a changed key (Pi must load the extension again to bind it). `track` hears the panel while it
+ * is open. With `speak` it opens on the speak composer, and Esc closes it.
  */
 export function openPanel(
   ctx: ExtensionContext,
@@ -137,15 +138,15 @@ export function openPanel(
   track: (panel: Panel | undefined) => void,
   speak = false,
   hotkeys: Hotkeys = DEFAULT_HOTKEYS,
-): Promise<void> {
-  return ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
+): Promise<boolean> {
+  return ctx.ui.custom<boolean>((tui, theme, _keybindings, done) => {
     let closed = false;
     const close = () => {
       if (closed) return;
       closed = true;
       panel.dispose();
       track(undefined);
-      done(undefined);
+      done(panel.rebind);
     };
     const panel = new Panel(engine, surface, {
       ui,
