@@ -9,9 +9,12 @@
 //!    place, so a model directory in the cache is always complete. The part is deleted last.
 //!
 //! A stop (the `stop` flag) leaves the `.part` as it is, to be resumed by the next download.
+//!
+//! A shared lexicon (see [`lexicon`]) is fetched the same way into `<name>.part` in the cache
+//! root, checked, and renamed to `<name>`.
 
 use super::cache;
-use super::catalog::Entry;
+use super::catalog::{Entry, Lexicon};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
@@ -24,6 +27,12 @@ use std::time::{Duration, Instant};
 pub enum Event {
     /// `done` of `total` archive bytes are in the cache.
     Progress {
+        done: u64,
+        total: u64,
+    },
+    /// `done` of `total` bytes of the lexicon `name` are in the cache.
+    LexiconProgress {
+        name: String,
         done: u64,
         total: u64,
     },
@@ -86,7 +95,10 @@ pub fn download(
         let _ = cache::remove(&leftover);
     }
     let part = cache::part_path(root, entry);
-    fetch(entry, &part, allow_http, stop, emit)?;
+    let source = Source::archive(entry);
+    fetch(&source, &part, allow_http, stop, &mut |done, total| {
+        emit(Event::Progress { done, total })
+    })?;
 
     emit(Event::Verifying);
     // `fetch` checked the size and the checksum as the bytes arrived.
@@ -104,6 +116,79 @@ pub fn download(
     let _ = fs::remove_file(&part);
     emit(Event::Done { path: path.clone() });
     Ok(path)
+}
+
+/// Download the shared `lexicon` into the cache at `root` unless it is there; returns its path.
+/// Reports `Event::LexiconProgress` only while it fetches. Plain `http://` only when
+/// `allow_http`.
+pub fn lexicon(
+    lexicon: &Lexicon,
+    root: &Path,
+    allow_http: bool,
+    stop: &AtomicBool,
+    emit: &mut dyn FnMut(Event),
+) -> Result<PathBuf, Failure> {
+    let target = cache::lexicon_path(root, lexicon);
+    if target.is_file() {
+        return Ok(target);
+    }
+    if !allow_http && !lexicon.url.starts_with("https://") {
+        return Err(Failure::Failed(format!(
+            "refusing to download the lexicon {} over plain HTTP: {}",
+            lexicon.name, lexicon.url
+        )));
+    }
+    fs::create_dir_all(root)
+        .map_err(|e| format!("cannot create the model cache {}: {e}", root.display()))?;
+    let part = cache::lexicon_part_path(root, lexicon);
+    let source = Source {
+        what: format!("the lexicon {}", lexicon.name),
+        file: format!("the lexicon {}", lexicon.name),
+        url: &lexicon.url,
+        size: lexicon.size,
+        sha256: &lexicon.sha256,
+    };
+    let name = lexicon.name.clone();
+    fetch(&source, &part, allow_http, stop, &mut |done, total| {
+        emit(Event::LexiconProgress {
+            name: name.clone(),
+            done,
+            total,
+        })
+    })?;
+    match fs::rename(&part, &target) {
+        Ok(()) => Ok(target),
+        // Another download got there first.
+        Err(_) if target.is_file() => Ok(target),
+        Err(e) => Err(Failure::Failed(format!(
+            "cannot move the lexicon {} into place at {}: {e}",
+            lexicon.name,
+            target.display()
+        ))),
+    }
+}
+
+/// A file to fetch: an archive or a lexicon.
+struct Source<'a> {
+    /// How messages name what is downloaded: a model's id, or `the lexicon <name>`.
+    what: String,
+    /// How messages name the file: `the archive of <id>`, or `the lexicon <name>`.
+    file: String,
+    url: &'a str,
+    size: u64,
+    sha256: &'a str,
+}
+
+impl<'a> Source<'a> {
+    fn archive(entry: &'a Entry) -> Source<'a> {
+        Source {
+            what: entry.id.clone(),
+            file: format!("the archive of {}", entry.id),
+            url: &entry.url,
+            size: entry.size,
+            sha256: &entry.sha256,
+        }
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -156,7 +241,7 @@ fn open_part(part: &Path, size: u64, stop: &AtomicBool) -> Result<(File, u64, Sh
 /// The response to a request for the archive from byte `from`: its body, and the byte it
 /// starts at (`from`, or 0 when the server sends the whole file).
 fn request(
-    entry: &Entry,
+    entry: &Source,
     from: u64,
     allow_http: bool,
 ) -> Result<(Box<dyn Read + Send>, u64), Failure> {
@@ -166,7 +251,7 @@ fn request(
         .https_only(!allow_http)
         .user_agent(concat!("pi-speech-receiver/", env!("CARGO_PKG_VERSION")))
         .build();
-    let mut req = agent.get(&entry.url);
+    let mut req = agent.get(entry.url);
     if from > 0 {
         req = req.set("Range", &format!("bytes={from}-"));
     }
@@ -175,13 +260,13 @@ fn request(
         Err(ureq::Error::Status(code, _)) => {
             return Err(Failure::Failed(format!(
                 "cannot download {}: the server answered {code} for {}",
-                entry.id, entry.url
+                entry.what, entry.url
             )))
         }
         Err(e) => {
             return Err(Failure::Failed(format!(
                 "cannot download {}: {e}",
-                entry.id
+                entry.what
             )))
         }
     };
@@ -189,7 +274,7 @@ fn request(
         206 => content_range_start(resp.header("Content-Range")).ok_or_else(|| {
             format!(
                 "cannot download {}: the server sent part of the file without saying which",
-                entry.id
+                entry.what
             )
         })?,
         _ => 0,
@@ -204,16 +289,16 @@ fn content_range_start(header: Option<&str>) -> Option<u64> {
 }
 
 fn fetch(
-    entry: &Entry,
+    entry: &Source,
     part: &Path,
     allow_http: bool,
     stop: &AtomicBool,
-    emit: &mut dyn FnMut(Event),
+    progress: &mut dyn FnMut(u64, u64),
 ) -> Result<(), Failure> {
     let total = entry.size;
     let shown = part.display();
     let (mut file, mut done, mut hasher) = open_part(part, total, stop)?;
-    emit(Event::Progress { done, total });
+    progress(done, total);
     if done < total {
         let (mut body, start) = request(entry, done, allow_http)?;
         if start != done {
@@ -221,7 +306,7 @@ fn fetch(
             if start != 0 {
                 return Err(Failure::Failed(format!(
                     "cannot download {}: the server sent bytes from {start}, not {done}",
-                    entry.id
+                    entry.what
                 )));
             }
             file.set_len(0)
@@ -229,7 +314,7 @@ fn fetch(
                 .map_err(|e| format!("cannot truncate {shown}: {e}"))?;
             done = 0;
             hasher = Sha256::new();
-            emit(Event::Progress { done, total });
+            progress(done, total);
         }
         let mut buf = vec![0u8; CHUNK];
         let mut last = Instant::now();
@@ -247,7 +332,7 @@ fn fetch(
                     return Err(Failure::Failed(format!(
                         "the download of {} broke off at {done} of {total} bytes ({e}); \
                          run it again to resume",
-                        entry.id
+                        entry.what
                     )));
                 }
             };
@@ -255,9 +340,8 @@ fn fetch(
                 drop(file);
                 let _ = fs::remove_file(part);
                 return Err(Failure::Failed(format!(
-                    "the archive of {} is larger than the catalogue's {total} bytes; \
-                     the download was deleted",
-                    entry.id
+                    "{} is larger than the catalogue's {total} bytes; the download was deleted",
+                    entry.file
                 )));
             }
             file.write_all(&buf[..n])
@@ -265,7 +349,7 @@ fn fetch(
             hasher.update(&buf[..n]);
             done += n as u64;
             if done == total || last.elapsed() >= PROGRESS_EVERY {
-                emit(Event::Progress { done, total });
+                progress(done, total);
                 last = Instant::now();
             }
         }
@@ -274,7 +358,7 @@ fn fetch(
         if done < total {
             return Err(Failure::Failed(format!(
                 "the download of {} broke off at {done} of {total} bytes; run it again to resume",
-                entry.id
+                entry.what
             )));
         }
     }
@@ -283,9 +367,9 @@ fn fetch(
     if got != entry.sha256 {
         let _ = fs::remove_file(part);
         return Err(Failure::Failed(format!(
-            "the archive of {} does not match the catalogue's checksum (SHA-256 {got}, \
-             expected {}); the download was deleted",
-            entry.id, entry.sha256
+            "{} does not match the catalogue's checksum (SHA-256 {got}, expected {}); \
+             the download was deleted",
+            entry.file, entry.sha256
         )));
     }
     Ok(())
@@ -362,6 +446,113 @@ mod tests {
         assert_eq!(content_range_start(Some("bytes 0-0/1")), Some(0));
         assert_eq!(content_range_start(Some("bytes */200")), None);
         assert_eq!(content_range_start(None), None);
+    }
+
+    /// Serve `body` over HTTP on 127.0.0.1 to each of `requests` requests (the whole of it,
+    /// whatever the range asked).
+    fn serve(body: &'static [u8], requests: usize) -> String {
+        use std::io::{BufRead, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(requests) {
+                let mut stream = stream.unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+                    line.clear();
+                }
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+        format!("http://{addr}/lexicon-xx.txt")
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "pisr-{name}-{}",
+            crate::token::random_hex(6).unwrap()
+        ))
+    }
+
+    #[test]
+    fn a_lexicon_is_fetched_checked_and_put_in_the_cache_root() {
+        const BODY: &[u8] = b"hello HH AH0 L OW1\n";
+        let root = scratch("lexicon");
+        let lexicon = Lexicon {
+            name: "lexicon-xx.txt".into(),
+            url: serve(BODY, 1),
+            size: BODY.len() as u64,
+            sha256: hex(&Sha256::digest(BODY)),
+        };
+        let stop = AtomicBool::new(false);
+        let mut events = Vec::new();
+        let path = super::lexicon(&lexicon, &root, true, &stop, &mut |e| events.push(e)).unwrap();
+        assert_eq!(path, root.join("lexicon-xx.txt"));
+        assert_eq!(fs::read(&path).unwrap(), BODY);
+        assert!(!cache::lexicon_part_path(&root, &lexicon).exists());
+        let total = BODY.len() as u64;
+        assert_eq!(
+            events.first(),
+            Some(&Event::LexiconProgress {
+                name: "lexicon-xx.txt".into(),
+                done: 0,
+                total
+            })
+        );
+        assert_eq!(
+            events.last(),
+            Some(&Event::LexiconProgress {
+                name: "lexicon-xx.txt".into(),
+                done: total,
+                total
+            })
+        );
+        // There already: nothing is fetched (the server is gone) and nothing reported.
+        events.clear();
+        let again = super::lexicon(&lexicon, &root, true, &stop, &mut |e| events.push(e));
+        assert_eq!(again, Ok(path));
+        assert!(events.is_empty());
+        // Plain HTTP only from a test catalogue.
+        let other = Lexicon {
+            name: "lexicon-yy.txt".into(),
+            ..lexicon.clone()
+        };
+        match super::lexicon(&other, &root, false, &stop, &mut |_| {}) {
+            Err(Failure::Failed(e)) => assert!(e.contains("plain HTTP"), "{e}"),
+            r => panic!("{r:?}"),
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_lexicon_that_does_not_match_its_checksum_is_deleted() {
+        const BODY: &[u8] = b"not the lexicon\n";
+        let root = scratch("lexicon-bad");
+        let lexicon = Lexicon {
+            name: "lexicon-xx.txt".into(),
+            url: serve(BODY, 1),
+            size: BODY.len() as u64,
+            sha256: "00".repeat(32),
+        };
+        let stop = AtomicBool::new(false);
+        match super::lexicon(&lexicon, &root, true, &stop, &mut |_| {}) {
+            Err(Failure::Failed(e)) => {
+                assert!(
+                    e.contains("the lexicon lexicon-xx.txt does not match"),
+                    "{e}"
+                )
+            }
+            r => panic!("{r:?}"),
+        }
+        assert!(!cache::lexicon_path(&root, &lexicon).exists());
+        assert!(!cache::lexicon_part_path(&root, &lexicon).exists());
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

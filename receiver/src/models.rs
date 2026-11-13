@@ -4,16 +4,21 @@
 //! - `list`: one line per catalogue entry:
 //!   `{"id","kind":"transcription"|"speech","name","languages":[..],"size",
 //!   "downloaded":bool,"partial":bytes,"path"}` (`size` is the archive's bytes, `partial` the
-//!   bytes of an interrupted download, `path` where the model is or will be).
+//!   bytes of an interrupted download, `path` where the model is or will be). A voice that needs
+//!   a shared lexicon (an English Piper voice) also has `"lexicon":{"name","size","downloaded"}`,
+//!   and is `downloaded` only when the lexicon is there too.
 //! - `download <id>`: `{"event":"progress","id","done","total"}` as bytes arrive, then
-//!   `{"event":"verifying"}`, `{"event":"unpacking"}` and `{"event":"done","path"}`; or
-//!   `{"event":"error","message"}` (exit 1) or `{"event":"stopped","done","total"}` (exit 1) when
-//!   stopped by SIGINT, SIGTERM or the closing of standard input, which leaves the part to resume.
+//!   `{"event":"verifying"}`, `{"event":"unpacking"}`; for a voice that needs a lexicon not yet
+//!   in the cache, `{"event":"progress","id","file":"<lexicon name>","done","total"}` as its
+//!   bytes arrive; then `{"event":"done","path"}`; or `{"event":"error","message"}` (exit 1)
+//!   or `{"event":"stopped","done","total"}` (exit 1, with `file` when stopped in the
+//!   lexicon) when stopped by SIGINT, SIGTERM or the closing of standard input, which leaves the
+//!   part to resume.
 //!   The extension cancels a download by closing its standard input, so a download stops at
 //!   once when standard input closes or is at its end (e.g. `< /dev/null`, or a script run
 //!   without a terminal). From a script, keep standard input open for the whole download:
 //!   `sleep 3600 | pi-speech-receiver models download <id>`.
-//! - `delete <id>`: `{"event":"deleted","id","freed":bytes}`.
+//! - `delete <id>`: `{"event":"deleted","id","freed":bytes}`. A shared lexicon stays.
 
 pub mod cache;
 pub mod catalog;
@@ -21,7 +26,7 @@ pub mod download;
 
 use crate::proc::{lock, start_thread};
 use crate::signals;
-use catalog::{Catalog, Entry, Kind};
+use catalog::{Catalog, Entry, Kind, Lexicon};
 use download::{Event, Failure};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -90,18 +95,27 @@ fn path_str(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
-/// A catalogue entry with its state in the cache `root`, as `list` prints it.
-pub fn list_line(entry: &Entry, root: &Path) -> Value {
-    json!({
+/// A catalogue entry, with the lexicon it needs if any, and its state in the cache `root`, as
+/// `list` prints it.
+pub fn list_line(entry: &Entry, lexicon: Option<&Lexicon>, root: &Path) -> Value {
+    let mut v = json!({
         "id": entry.id,
         "kind": entry.kind.as_str(),
         "name": entry.name,
         "languages": entry.languages,
         "size": entry.size,
-        "downloaded": cache::is_downloaded(root, entry),
+        "downloaded": cache::is_ready(root, entry, lexicon),
         "partial": cache::partial_bytes(root, entry),
         "path": path_str(&cache::model_path(root, entry)),
-    })
+    });
+    if let Some(l) = lexicon {
+        v["lexicon"] = json!({
+            "name": l.name,
+            "size": l.size,
+            "downloaded": cache::lexicon_path(root, l).is_file(),
+        });
+    }
+    v
 }
 
 fn find<'c>(catalog: &'c Catalog, id: &str) -> Result<&'c Entry, String> {
@@ -142,7 +156,7 @@ pub fn main(args: &[String]) -> ExitCode {
         Command::Help => ExitCode::SUCCESS,
         Command::List => {
             for entry in &catalog.entries {
-                print_line(&list_line(entry, &root));
+                print_line(&list_line(entry, catalog.lexicon(entry), &root));
             }
             ExitCode::SUCCESS
         }
@@ -164,31 +178,52 @@ pub fn main(args: &[String]) -> ExitCode {
                 Ok(e) => e.clone(),
                 Err(e) => return fail(Some(&id), &e),
             };
-            run_download(&entry, &root, catalog.allow_http)
+            let lexicon = catalog.lexicon(&entry).cloned();
+            run_download(&entry, lexicon.as_ref(), &root, catalog.allow_http)
         }
     }
 }
 
-fn run_download(entry: &Entry, root: &Path, allow_http: bool) -> ExitCode {
+/// Where a download is: the bytes done of the file being fetched, and that file when it is a
+/// lexicon (`None`: the archive).
+#[derive(Clone, Debug, Default)]
+struct At {
+    done: u64,
+    total: u64,
+    file: Option<String>,
+}
+
+/// The `stopped` line for a download that got to `at`.
+fn stopped_line(id: &str, at: &At) -> Value {
+    let mut v = json!({"event": "stopped", "id": id, "done": at.done, "total": at.total});
+    if let Some(file) = &at.file {
+        v["file"] = json!(file);
+    }
+    v
+}
+
+fn run_download(
+    entry: &Entry,
+    lexicon: Option<&Lexicon>,
+    root: &Path,
+    allow_http: bool,
+) -> ExitCode {
     let stop = Arc::new(AtomicBool::new(false));
-    let progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let stopped_line = {
-        let (id, total, progress) = (entry.id.clone(), entry.size, progress.clone());
-        move || {
-            json!({"event": "stopped", "id": id, "done": progress.load(Ordering::SeqCst),
-                "total": total})
-        }
-    };
+    let at = Arc::new(Mutex::new(At {
+        total: entry.size,
+        ..At::default()
+    }));
     let on_stop = {
-        let (stop, stopped_line) = (stop.clone(), stopped_line.clone());
+        let (stop, at, id) = (stop.clone(), at.clone(), entry.id.clone());
         Arc::new(move || {
             if stop.swap(true, Ordering::SeqCst) {
                 return;
             }
-            let stopped_line = stopped_line.clone();
+            let (at, id) = (at.clone(), id.clone());
             let _ = start_thread("stop-grace", move || {
                 std::thread::sleep(STOP_GRACE);
-                print_last(&stopped_line());
+                let now = lock(&at).clone();
+                print_last(&stopped_line(&id, &now));
                 std::process::exit(1);
             });
         })
@@ -218,23 +253,44 @@ fn run_download(entry: &Entry, root: &Path, allow_http: bool) -> ExitCode {
     let mut emit = |event: Event| {
         let line = match event {
             Event::Progress { done, total } => {
-                progress.store(done, Ordering::SeqCst);
+                *lock(&at) = At {
+                    done,
+                    total,
+                    file: None,
+                };
                 json!({"event": "progress", "id": id, "done": done, "total": total})
+            }
+            Event::LexiconProgress { name, done, total } => {
+                *lock(&at) = At {
+                    done,
+                    total,
+                    file: Some(name.clone()),
+                };
+                json!({"event": "progress", "id": id, "file": name, "done": done, "total": total})
             }
             Event::Verifying => json!({"event": "verifying", "id": id}),
             Event::Unpacking => json!({"event": "unpacking", "id": id}),
-            Event::Done { path } => {
-                print_last(&json!({"event": "done", "id": id, "path": path_str(&path)}));
-                return;
-            }
+            // Printed once the lexicon is there too.
+            Event::Done { .. } => return,
         };
         print_line(&line);
     };
-    match download::download(entry, root, allow_http, &stop, &mut emit) {
-        Ok(_) => ExitCode::SUCCESS,
+    let result =
+        download::download(entry, root, allow_http, &stop, &mut emit).and_then(
+            |path| match lexicon {
+                Some(l) => download::lexicon(l, root, allow_http, &stop, &mut emit).map(|_| path),
+                None => Ok(path),
+            },
+        );
+    match result {
+        Ok(path) => {
+            print_last(&json!({"event": "done", "id": id, "path": path_str(&path)}));
+            ExitCode::SUCCESS
+        }
         Err(Failure::Stopped { done }) => {
-            progress.store(done, Ordering::SeqCst);
-            print_last(&stopped_line());
+            let mut now = lock(&at).clone();
+            now.done = done;
+            print_last(&stopped_line(id, &now));
             ExitCode::from(1)
         }
         Err(Failure::Failed(e)) => fail(Some(id), &e),

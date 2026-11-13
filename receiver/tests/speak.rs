@@ -7,8 +7,9 @@
 //! PI_SPEECH_AUDIO_NULL=1 PI_SPEECH_TEST_MODELS=~/.cache/pi-speech/models cargo test --release --test speak -- --nocapture
 //! ```
 //!
-//! A Piper voice needs a lexicon (sherpa-onnx 2.0 no longer runs espeak-ng): put
-//! `lexicon-en-us.txt` from sherpa-onnx's `tts-models` release in that directory.
+//! A Piper voice needs a lexicon (sherpa-onnx 2.0 no longer runs espeak-ng): `models download` of
+//! an English Piper voice puts `lexicon-en-us.txt` from sherpa-onnx's `tts-models` release in the
+//! model cache; in another directory, put it there by hand.
 
 mod support;
 
@@ -140,7 +141,10 @@ fn a_catalogue_id_names_a_downloaded_speech_model() {
         r#"[{"id":"test-voice","kind":"speech","name":"V","languages":["en"],"size":1,
             "url":"http://127.0.0.1:1/v.tar.bz2","sha256":"00","dir":"test-voice-v1"},
            {"id":"test-model","kind":"transcription","name":"T","languages":["en"],"size":1,
-            "url":"http://127.0.0.1:1/t.tar.bz2","sha256":"00","dir":"test-model"}]"#,
+            "url":"http://127.0.0.1:1/t.tar.bz2","sha256":"00","dir":"test-model"},
+           {"id":"test-piper","kind":"speech","name":"P","languages":["en"],"size":1,
+            "url":"http://127.0.0.1:1/p.tar.bz2","sha256":"00","dir":"test-piper",
+            "lexicon":{"url":"http://127.0.0.1:1/lexicon-en-us.txt","size":1,"sha256":"00"}}]"#,
     )
     .unwrap();
     let speak = |id: &str| {
@@ -165,6 +169,17 @@ fn a_catalogue_id_names_a_downloaded_speech_model() {
     let e = error_of(&speak("test-voice"));
     assert!(e.contains("unrecognised voice model directory"), "{e}");
     assert!(e.contains("test-voice-v1"), "{e}");
+    // A voice that needs a lexicon is not ready without it.
+    std::fs::create_dir_all(cache.join("test-piper")).unwrap();
+    let e = error_of(&speak("test-piper"));
+    assert!(e.contains("needs the lexicon lexicon-en-us.txt"), "{e}");
+    assert!(
+        e.contains("`pi-speech-receiver models download test-piper`"),
+        "{e}"
+    );
+    std::fs::write(cache.join("lexicon-en-us.txt"), "x").unwrap();
+    let e = error_of(&speak("test-piper"));
+    assert!(e.contains("unrecognised voice model directory"), "{e}");
     // The built-in catalogue's ids.
     let o = run(
         command(&["kokoro-multi-lang-v1.1-int8"])

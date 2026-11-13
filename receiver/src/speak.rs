@@ -11,7 +11,8 @@
 //!   `{"event":"stopped"}`, exit 1.
 //! - `--list-voices`: one line per voice on standard output, `{"name","number"}`.
 //!
-//! A catalogue id (`models list`) names a downloaded speech model in the model cache.
+//! A catalogue id (`models list`) names a downloaded speech model in the model cache (with the
+//! lexicon it needs, for a Piper voice).
 
 use crate::engines::synthesize::{self, pcm16, voice_number, Synthesizer};
 use crate::models::cache;
@@ -132,6 +133,15 @@ pub fn resolve_voice_dir(arg: &str) -> Result<PathBuf, String> {
             "the model {arg} is not downloaded; download it with \
              `pi-speech-receiver models download {arg}`"
         ));
+    }
+    if let Some(l) = catalog.lexicon(entry) {
+        if !cache::is_ready(&root, entry, Some(l)) {
+            return Err(format!(
+                "the voice {arg} needs the lexicon {}, which is not in the model cache; \
+                 download it with `pi-speech-receiver models download {arg}`",
+                l.name
+            ));
+        }
     }
     Ok(cache::model_path(&root, entry))
 }

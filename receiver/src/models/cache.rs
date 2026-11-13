@@ -7,8 +7,10 @@
 //! Inside it, a model is the directory `<dir>` (complete: it is renamed into place only once
 //! unpacked); `<dir>.part` is a download in progress or interrupted; `.unpack-<dir>-*` is a
 //! directory being unpacked (left behind only by a hard kill, and removed by the next download).
+//! A shared lexicon (a Piper voice's) is the file `<name>` in the cache root, and `<name>.part`
+//! while it is being downloaded.
 
-use super::catalog::Entry;
+use super::catalog::{Entry, Lexicon};
 use std::ffi::OsString;
 use std::fs;
 use std::io;
@@ -82,6 +84,20 @@ pub fn is_downloaded(root: &Path, entry: &Entry) -> bool {
     model_path(root, entry).is_dir()
 }
 
+/// Where the shared `lexicon` is, or will be, in the cache `root`.
+pub fn lexicon_path(root: &Path, lexicon: &Lexicon) -> PathBuf {
+    root.join(&lexicon.name)
+}
+
+pub fn lexicon_part_path(root: &Path, lexicon: &Lexicon) -> PathBuf {
+    root.join(format!("{}.part", lexicon.name))
+}
+
+/// Whether `entry` can be used: it is downloaded, and so is the lexicon it needs, if any.
+pub fn is_ready(root: &Path, entry: &Entry, lexicon: Option<&Lexicon>) -> bool {
+    is_downloaded(root, entry) && lexicon.is_none_or(|l| lexicon_path(root, l).is_file())
+}
+
 /// The bytes of `entry`'s interrupted download, if any.
 pub fn partial_bytes(root: &Path, entry: &Entry) -> u64 {
     fs::metadata(part_path(root, entry)).map_or(0, |m| m.len())
@@ -129,7 +145,9 @@ pub fn remove(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Delete `entry`'s model, interrupted download and leftovers; returns the bytes freed.
+/// Delete `entry`'s model, interrupted download and leftovers; returns the bytes freed. A shared
+/// lexicon stays, even after the last voice that needs it: other voices (and voices put in the
+/// cache by hand) may use it, and the next download of such a voice finds it there.
 pub fn delete(root: &Path, entry: &Entry) -> Result<u64, String> {
     let mut paths = vec![model_path(root, entry), part_path(root, entry)];
     paths.extend(unpack_leftovers(root, entry));
@@ -157,6 +175,42 @@ mod tests {
 
     fn models(base: &str) -> PathBuf {
         Path::new(base).join("pi-speech").join("models")
+    }
+
+    #[test]
+    fn a_voice_that_needs_a_lexicon_is_ready_only_with_it() {
+        let root = std::env::temp_dir().join(format!(
+            "pisr-ready-{}",
+            crate::token::random_hex(6).unwrap()
+        ));
+        let entry = Entry {
+            id: "v".into(),
+            kind: super::super::catalog::Kind::Speech,
+            name: "V".into(),
+            languages: vec!["en".into()],
+            size: 1,
+            url: "https://x/v.tar.bz2".into(),
+            sha256: "00".into(),
+            dir: "v".into(),
+        };
+        let lexicon = Lexicon {
+            name: "lexicon-en-us.txt".into(),
+            url: "https://x/lexicon-en-us.txt".into(),
+            size: 1,
+            sha256: "00".into(),
+        };
+        assert!(!is_ready(&root, &entry, None));
+        fs::create_dir_all(root.join("v")).unwrap();
+        assert!(is_ready(&root, &entry, None));
+        assert!(!is_ready(&root, &entry, Some(&lexicon)));
+        fs::write(lexicon_part_path(&root, &lexicon), "x").unwrap();
+        assert!(!is_ready(&root, &entry, Some(&lexicon)));
+        fs::write(lexicon_path(&root, &lexicon), "x").unwrap();
+        assert!(is_ready(&root, &entry, Some(&lexicon)));
+        // Deleting the voice leaves the shared lexicon.
+        delete(&root, &entry).unwrap();
+        assert!(lexicon_path(&root, &lexicon).is_file());
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
