@@ -33,7 +33,7 @@ function wav(seconds: number, rate = 16000): Buffer {
 /** A node recorder: `<script> out.wav`; `body` runs in place of the recording. */
 function recorder(name: string, body: string): string {
   const p = join(dir, name);
-  writeFileSync(p, `#!/usr/bin/env node\nconst fs = require("node:fs");\nconst out = process.argv[2];\n${body}\n`);
+  writeFileSync(p, `#!${process.execPath}\nconst fs = require("node:fs");\nconst out = process.argv[2];\n${body}\n`);
   chmodSync(p, 0o755);
   return p;
 }

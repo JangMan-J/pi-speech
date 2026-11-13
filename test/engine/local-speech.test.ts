@@ -22,7 +22,7 @@ function fakeSpeak(): string {
   const pid = join(dir, "pid");
   writeFileSync(
     p,
-    `#!/usr/bin/env node
+    `#!${process.execPath}
 const fs = require("node:fs");
 const [, , cmd, id, ...rest] = process.argv;
 fs.writeFileSync(${JSON.stringify(pid)}, String(process.pid));

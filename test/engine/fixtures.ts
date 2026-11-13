@@ -219,7 +219,7 @@ export function fakeReceiver(dir: string): { path: string; log: string } {
   writeFileSync(state, JSON.stringify(["parakeet-v3"]));
   writeFileSync(
     path,
-    `#!/usr/bin/env node
+    `#!${process.execPath}
 const fs = require("node:fs");
 const [, , cmd, sub, id] = process.argv;
 fs.appendFileSync(${JSON.stringify(log)}, process.argv.slice(2).join(" ") + "\\n");

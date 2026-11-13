@@ -30,7 +30,7 @@ function fakeBinary(): string {
   const p = join(dir, "fake-receiver");
   writeFileSync(
     p,
-    `#!/usr/bin/env node
+    `#!${process.execPath}
 const [, , cmd, sub, id] = process.argv;
 const out = (v) => process.stdout.write(JSON.stringify(v) + "\\n");
 if (cmd === "transcribe") {
