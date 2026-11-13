@@ -88,17 +88,10 @@ check approved, under $0.02): only the summary is read, absent from the transcri
 reply done 5.4 s, summary speech starts 14.2 s (extra request + xAI), the Abridged summary lasted ~30 s (user did
 not answer whether Minimum ~15 s should be the default).
 
-Open at the Mac (one test at a time, announced with `say`, never the word "live" which `say` mispronounces):
-
-1. The Option+Z hint by a real keypress. The first try showed the hint fired (flag set) and then Pi was
-   SUSPENDED (zsh: suspended). A pty test sending the exact Ω bytes did NOT suspend Pi (notice shown, Ω kept), and
-   Pi's only native-modifier fallback is Shift+Enter; suspend is Ctrl+Z (app.suspend). Asked the user whether a
-   finger was on Control and whether to retry; no answer yet. Retry: `~/bracket/pi-hint.command` opened with
-   `env -i HOME=$HOME USER=$USER LOGNAME=$LOGNAME PATH=/usr/bin:/bin:/usr/sbin:/sbin /usr/bin/open -a Terminal`,
-   then close other Terminal windows (osascript by contents), user presses Option+Z once.
-2. Local speech by ear: Kokoro and an English Piper voice (download them there; keep stdin open:
-   `sleep 3600 | pi-speech-receiver models download <id>`), sentences that say their setting.
-3. Local transcription in Pi (Transcription source Local, Parakeet), dictated with `/speech --dictate`.
+Mac testing ended 2026-11-13 (user: the primitives are confirmed; no more Mac tests). Never checked on a real Mac:
+the Option+Z hint by a real keypress (the one try suspended Pi, probably Ctrl+Z; a pty test sending Ω shows the
+notice and keeps Ω), local speech (Kokoro, Piper) by ear, local transcription inside Pi. The Mac still holds the
+copied logins (`~/.pi/agent/auth.json`) and the test setup; remove them if the user asks.
 
 Learned there: macOS gives a process started over ssh no microphone (TCC); a Terminal.app first started by `open`
 over ssh inherits `SSH_CONNECTION` (start it with `env -i ... open`); quitting Terminal with a busy window stalls
@@ -106,7 +99,6 @@ on a dialog (kill the processes instead); stock Terminal sends Ω/ß for Option+
 
 ## Waiting on the user
 
-- Option+Z retry and the Control question (above).
 - Default read-aloud Length: Abridged ~30 s (now) or Minimum ~15 s.
 - Pairing limits and the second-session question (above).
 - Merging PR #5; the first release (version bump, bootstrap:npm 2FA).
