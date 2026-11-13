@@ -50,9 +50,11 @@ the Mac.
 
 ## Waiting on the user
 
-- Changing the Speak or Dictate key: Pi binds an extension's keys when it loads it, so a new key is saved at once
-  but works after `/reload` or the next start (the row shows `Alt+S · → Alt+D after /reload`). Slice 01 says to
-  stop unless the user accepts this. Asked through the operator; no answer yet.
+- Changing the Speak or Dictate key, user's answer (2026-11-13): acceptable, but better: when the user leaves the
+  Hotkeys screen after changing a key, the /speech command handler calls `await ctx.reload(); return;` (Pi's
+  extension API, docs/extensions.md "ctx.reload()"), silently, with no message. Drop the `→ Alt+D after /reload`
+  hint. Pi can't reload while the agent is running: in that case record the request and run it from
+  `agent_settled`. Not built yet.
 - The Mac is `moms-macbook` on Tailscale (`ssh moms-macbook`, user and key in `~/.ssh/config`). It was offline
   each time it was tried (04:20-05:30); when it is up, download the macOS artifact of the latest `portable-3` run
   (`gh run download`), copy it over and run the speed/pitch bracket there.
