@@ -24,7 +24,9 @@ Built and committed (`bdb4955`..`5f21dce`), `npm run check` and the receiver's f
    refuse PCM streams through an MP3 player. Checked live on the free `fish-audio/s2.1-pro-free:free`.
 3. OpenAI-compatible endpoints: WAV (sizes left open), raw PCM, MP3. Checked against a local server only.
 4. Chat audio (`openai/gpt-audio*`): audio plays only once the transcript said after it is still the start
-   of the text; a Stray stops playback, saves nothing, no second request.
+   of the text; a Stray stops playback, saves nothing, no second request. Measured live (one paid
+   `gpt-audio-mini` reading, approved): the transcript leads the audio by 0.3 to 1.6 s of speech, so the
+   check delays the first audio by 47 ms (first audio at about 1.0 s) and catches a Stray before it is heard.
 5. A Reading (texts over 280 characters) plays as one Stream on one player, pieces requested two at a time.
    Checked live with xAI through a logging player (22 s of audio over 1 s, one player).
 6. The bridge: protocol capability `stream` (`protocol/bridge.md`, "Playing a Stream"), the client, and
@@ -40,10 +42,6 @@ files, and no piece is asked for twice.
   was only run with Pi and the receiver both on the laptop; the SSH forward was not in the path.
 - **Decide**: a message stopped after its audio has fully arrived (about 1 s for xAI, while it plays for
   ten) is still saved in the history. Kept that way for now, as a Reading already did.
-- **Not measured, costs money**: whether a chat model's transcript leads or lags its audio. The gate is
-  safe either way (a Stray leaks at most about one word; "Sure!" before the text plays nothing), but if the
-  transcript lags, chat audio starts late. One reading with `openai/gpt-audio-mini` costs well under one
-  US cent; ask before running it.
 - `GLOSSARY.md` lists unresolved terms (piece/part/chunk, lowercase reading, Stream player, a burst as a
   Stream, vouch).
 - The receiver on the laptop must be rebuilt and restarted (0.2.0) for the bridge to stream.
