@@ -4,7 +4,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { createBridgeAudio } from "../../src/bridge/index";
+import { createBridgeAudio, probeBridge } from "../../src/bridge/index";
 
 const TOKEN = "t".repeat(40);
 
@@ -116,6 +116,54 @@ describe("health", () => {
   it("rejects something that is not a pi-speech-receiver", async () => {
     handler = (_r, res) => send(res, 200, { hello: 1 });
     expect((await createBridgeAudio({ url, token: TOKEN }).health()).ok).toBe(false);
+  });
+});
+
+describe("probe", () => {
+  it("returns the address, port and round trip of GET /v1/health", async () => {
+    handler = (_r, res) => setTimeout(() => send(res, 200, HEALTH), 30);
+    const p = await probeBridge({ url, token: TOKEN });
+    expect(p).toMatchObject({ ok: true, address: "127.0.0.1", port: Number(new URL(url).port), version: "0.4.0" });
+    if (p.ok) {
+      expect(Number.isInteger(p.ms)).toBe(true);
+      expect(p.ms).toBeGreaterThanOrEqual(25);
+      expect(p.ms).toBeLessThan(5000);
+    }
+    expect(seen.map((s) => s.url)).toEqual(["/v1/health"]);
+    expect(seen[0].headers.authorization).toBe(`Bearer ${TOKEN}`);
+  });
+
+  it("names where it looked when the receiver is unreachable, without the token", async () => {
+    const closed = url;
+    await new Promise((r) => server.close(r));
+    const p = await probeBridge(() => ({ url: closed, token: TOKEN }));
+    expect(p).toMatchObject({ ok: false, address: "127.0.0.1", port: Number(new URL(closed).port) });
+    if (!p.ok) {
+      expect(p.reason).toMatch(/not reachable/);
+      expect(p.reason).not.toContain(TOKEN);
+    }
+    server = createServer();
+  });
+
+  it("a wrong token is not a connection", async () => {
+    handler = (_r, res) => send(res, 401, { error: "unauthorized" });
+    const p = await probeBridge({ url, token: TOKEN });
+    expect(p).toMatchObject({ ok: false, reason: expect.stringMatching(/401/) });
+  });
+
+  it("an unusable configuration is reported, not thrown", async () => {
+    const p = await probeBridge(() => {
+      throw new Error("no bridge token: set PI_SPEECH_BRIDGE_TOKEN");
+    });
+    expect(p).toEqual({ ok: false, reason: "no bridge token: set PI_SPEECH_BRIDGE_TOKEN" });
+    const q = await probeBridge({ url: "http://192.0.2.1:47613", token: TOKEN });
+    expect(q).toMatchObject({ ok: false, reason: expect.stringMatching(/loopback/) });
+    expect(q).not.toHaveProperty("address");
+  });
+
+  it("gives an IPv6 address without brackets and the default port of a URL without one", async () => {
+    const p = await probeBridge({ url: "http://[::1]", token: TOKEN });
+    expect(p).toMatchObject({ address: "::1", port: 80 });
   });
 });
 

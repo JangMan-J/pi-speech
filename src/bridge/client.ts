@@ -321,3 +321,32 @@ export function createBridgeAudioFrom(getConfig: () => BridgeConfig): BridgeAudi
 export function createBridgeAudio(config: BridgeConfig): BridgeAudio {
   return createBridgeAudioFrom(() => config);
 }
+
+/**
+ * Evidence of the bridge connection from one `GET /v1/health`: the receiver's address and port as Pi reaches
+ * them (the forwarded end on This machine) and the round trip in whole milliseconds. Not ok when the
+ * configuration is unusable (no token, a non-loopback URL), the receiver cannot be reached, or it refuses (a
+ * wrong token, an incompatible receiver); `reason` says which, without the token.
+ */
+export type BridgeProbe =
+  | { ok: true; address: string; port: number; ms: number; version: string }
+  | { ok: false; address?: string; port?: number; reason: string };
+
+/** Probe the receiver once (see BridgeProbe). Never throws. */
+export async function probeBridge(config: BridgeConfig | (() => BridgeConfig)): Promise<BridgeProbe> {
+  const get = typeof config === "function" ? config : () => config;
+  let fixed: BridgeConfig;
+  let where: URL;
+  try {
+    fixed = get();
+    where = new URL(loopbackBase(fixed.url));
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+  }
+  const address = where.hostname.replace(/^\[(.*)\]$/, "$1");
+  const port = Number(where.port) || 80;
+  const started = performance.now();
+  const h = await createBridgeAudio(fixed).health();
+  const ms = Math.round(performance.now() - started);
+  return h.ok ? { ok: true, address, port, ms, version: h.version } : { ok: false, address, port, reason: h.reason };
+}
