@@ -366,6 +366,21 @@ fn sigterm_reaches_ssh_and_the_receiver_stops_after_it() {
 }
 
 #[test]
+fn the_shared_receiver_stops_when_its_state_directory_is_removed() {
+    let rig = Rig::new("ssh-gone");
+    let mut c = rig.command(&["ssh", "box"]);
+    let child = rig.start(&mut c);
+    let addr = rig.forwarded();
+    assert_eq!(health(addr, &rig.token()), 200);
+    // As when a test's scratch directory is removed: its leases go with it.
+    std::fs::remove_dir_all(rig.dir.join("xdg/pi-speech")).unwrap();
+    rig.release();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(unreachable(addr), "the shared receiver lingers");
+}
+
+#[test]
 fn sessions_share_one_receiver_and_closing_the_first_keeps_the_second_s_audio() {
     let rig = Rig::new("ssh-two");
     let player = rig.file("player");

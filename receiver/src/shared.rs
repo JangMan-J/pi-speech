@@ -337,9 +337,10 @@ fn serve_shared(dir: &Path) -> Result<(), String> {
     let _ = out.flush();
 
     let watch = || -> bool {
-        // Stop, under the start lock, once no session holds a lease.
+        // Stop, under the start lock, once no session holds a lease. A state directory
+        // that has gone (removed with its leases) holds none: stop rather than linger.
         let Ok(start) = open_lock(&dir.join(START)) else {
-            return false;
+            return !dir.is_dir();
         };
         if start.lock().is_err() || !live_leases(&dir.join(LEASES)).is_empty() {
             return false;

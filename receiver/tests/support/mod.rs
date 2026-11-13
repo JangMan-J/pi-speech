@@ -115,10 +115,30 @@ pub fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
 }
 
 /// An executable script. (On Windows only the file: these scripts are for Unix shells.)
+///
+/// On Unix the file is written by `cp`, never opened for writing by this process: a test on
+/// another thread that forks while this process holds the file open would keep a writer on
+/// it until its exec, and running the script meanwhile fails with "Text file busy".
 pub fn script(path: &Path, text: &str) {
-    std::fs::write(path, text).unwrap();
     #[cfg(unix)]
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    {
+        let mut draft = path.as_os_str().to_owned();
+        draft.push(".draft");
+        let draft = std::path::PathBuf::from(draft);
+        std::fs::write(&draft, text).unwrap();
+        std::fs::set_permissions(&draft, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_file(path);
+        let ok = std::process::Command::new("cp")
+            .arg(&draft)
+            .arg(path)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "cp {} failed", path.display());
+        let _ = std::fs::remove_file(&draft);
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, text).unwrap();
 }
 
 /// Extract `"key": "value"` from a flat JSON object.
