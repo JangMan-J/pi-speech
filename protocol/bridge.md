@@ -47,20 +47,22 @@ Every non-2xx response has the body `{"error": "<readable message>"}`.
 | 401    | Missing or wrong token.                                                              |
 | 408    | The request head did not arrive within 10 s.                                         |
 | 404    | Unknown endpoint, or unknown playback or recording id.                               |
-| 409    | A recording is already active, or a Stream's playback cannot take audio (see below). |
+| 409    | A recording or a model run is already active, or a Stream cannot take audio.         |
 | 413    | Body larger than the receiver's limit (default 64 MiB).                              |
-| 422    | The recording holds less than 0.1 s of audio.                                        |
+| 415    | `POST /v1/transcribe` with audio that is not WAV or MP3.                             |
+| 422    | The recording holds less than 0.1 s of audio, or a model run failed (see below).     |
 | 503    | The player or the microphone is not available; the message says why.                 |
 
 ## Endpoints
 
 ### `GET /v1/health`
 
-`200 {"protocol": 1, "name": "pi-speech-receiver", "version": "<semver>", "capabilities": ["play", "record", "stream"]}`
+`200 {"protocol": 1, "name": "pi-speech-receiver", "version": "<semver>", "capabilities": ["play", "record", "stream", "models"]}`
 
 A receiver that lists `stream` has the two endpoints under "Playing a Stream", the only
 way to play. A client checks for it: a receiver without it is too old, and the client
-says to update it rather than play any other way.
+says to update it rather than play any other way. A receiver that lists `models` has the
+endpoints under "Running local models".
 
 ### Playing a Stream
 
@@ -155,6 +157,45 @@ Stops the recording and returns it.
 ### `POST /v1/record/<id>/cancel`
 
 Stops the recording and deletes it. `200 {"id": "...", "state": "cancelled"}`.
+
+### Running local models
+
+The receiver runs local models (see "Subcommand notes: speak" and `transcribe`) for the
+client, so that a Pi on another host can use the models and CPU of the receiver's machine.
+Each endpoint runs the receiver's own executable (or the program named by
+`PI_SPEECH_RECEIVER_MODELS`) as `models list`, `speak <id> ...` or `transcribe <id> <file>`.
+A model id has only letters, digits, `.`, `_` and `-`, and does not start with `-` or `.`;
+anything else gets `400`. A failed run gets `422` with the model's own message (for example a
+model that is not downloaded, naming `pi-speech-receiver models download <id>`).
+
+One transcription or speech runs at a time: another `POST /v1/transcribe` or `POST /v1/speak`
+while one runs gets `409`. Listing models and voices is not a run.
+
+#### `GET /v1/models`
+
+`200 {"models": [...]}`: the objects `pi-speech-receiver models list` prints, one per model.
+
+#### `GET /v1/voices?model=<id>`
+
+`200 {"voices": [{"name": "af_maple", "number": 0}, ...]}`: the voices of a downloaded speech model.
+
+#### `POST /v1/transcribe?model=<id>`
+
+- Body: a WAV or MP3 file, with `Content-Type: audio/wav` or `audio/mpeg` (else `415`), at most
+  the body limit (`413`). The receiver keeps it in its private directory while the model runs
+  and deletes it after.
+- Response: `200 {"text": "<transcript>"}`.
+
+#### `POST /v1/speak`
+
+- Body: JSON `{"model": "<id>", "text": "...", "voice": "<name or number>", "speed": <0.25..4>}`
+  (`voice` and `speed` optional), at most 1 MiB.
+- Response, once the model has loaded: `200`, `Transfer-Encoding: chunked`, headers
+  `X-Pi-Speech-Format: pcm`, `X-Pi-Speech-Rate: <Hz>`, `X-Pi-Speech-Channels: 1`; body: raw
+  signed 16-bit little-endian PCM, sent as it is generated. The body ends with the last chunk
+  only when the speech is complete; a run that fails midway closes the connection without it.
+  A failure before any audio is `422`.
+- A client that closes the connection stops the run (noticed when the next audio is written).
 
 ## Receiver command line
 
@@ -279,6 +320,8 @@ Environment variables replace the built-in engine with other programs:
   its standard input and exits once the input has ended and played. It is run as
   `<player> s16le <rate> <channels>` for PCM and `<player> mp3` or `<player> wav` for
   the others.
+- `PI_SPEECH_RECEIVER_MODELS` names a program run for the model endpoints instead of the
+  receiver itself, with the same arguments (`models list`, `speak ...`, `transcribe ...`).
 - `PI_SPEECH_RECEIVER_RECORDER` names a recorder, run as `<recorder> <output.wav>`,
   which records mono 16-bit PCM WAV to that path, and finishes the file and exits when
   it receives SIGINT.

@@ -157,6 +157,13 @@ receiver when the submenu opens and every 2 s while it is open: `✓ Connected t
 `✗ Re-pair ›`, whose Enter says how to pair. Pairing runs on your own computer, not from Pi (see
 [The bridge](#the-bridge)).
 
+Under **DIRECTION**, while the bridge is in use, **Play audio on**, **Record audio on** and **Run models on**
+each choose This machine or the Remote machine (←→ or Enter; all Remote machine by default). Run models on is
+where a Local Speech or Transcription source runs its model: on the Remote machine the receiver there runs it,
+with the models downloaded there (`pi-speech-receiver models download <id>`); provider models are not affected.
+Without the bridge the rows show This machine and do not change. A choice that cannot work, such as recording
+on This machine over SSH with no microphone there, fails with a message that names the row to change.
+
 | Key             | In the dock                                                                                                     |
 | --------------- | --------------------------------------------------------------------------------------------------------------- |
 | `↑` `↓`         | Move row by row (they wrap)                                                                                     |
@@ -486,7 +493,8 @@ forward; the protocol is `protocol/bridge.md`.
 - `--bridge status` names the mode, why, the URL, and the receiver version.
 
 Nothing ever falls back to the other machine: with the bridge selected and the receiver down, a message is
-saved but not played, and the notification says why.
+saved but not played, and the notification says why. Play audio on, Record audio on and Run models on (in
+`/speech`, Bridge connection) choose, while the bridge is in use, which of these happen on This machine instead.
 
 `pi-speech-receiver` comes with the package; from a checkout, build it with `cargo build --release` in
 `receiver/` (Linux needs the ALSA library, `libasound2-dev` or `alsa-lib`, to build). It plays and records with
@@ -518,7 +526,8 @@ receiver, in the `Authorization` header.
 Every choice lives in one versioned file, `pi-speech/settings.json` in Pi's agent directory (`~/.pi/agent`,
 or `$PI_CODING_AGENT_DIR`): speech model, voice, transcription model, dictation language, the dictation output
 command, tools, bridge mode, the order of the model lists, voice-language overrides, the endpoints you added, and
-the Speech and Transcription sources with their local models, the keys of Speak and Dictate (only when changed, as `"hotkeys": { "speak": "alt+d", "dictate": "alt+z" }`; read
+the Speech and Transcription sources with their local models, Play audio on, Record audio on and Run models on
+(only when This machine), the keys of Speak and Dictate (only when changed, as `"hotkeys": { "speak": "alt+d", "dictate": "alt+z" }`; read
 when Pi loads the extension), and the read-aloud options Summarized by, Length and Truncate at. Settings persist
 across restarts, also with `--no-session`. What read-aloud reads (Read) is not saved: it starts Off.
 

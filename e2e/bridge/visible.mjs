@@ -1,6 +1,8 @@
 // Visible acceptance: the Pi side of the playback bridge, through real pi (RPC) and a real receiver.
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { editorEvents, recorderEnv, until } from '../lib/dict.mjs';
 import { check, command, errors, finish, notes, setup } from '../lib/lib.mjs';
 import { startReceiver } from '../lib/receiver.mjs';
 
@@ -62,5 +64,71 @@ try {
   await rcv.stop();
   ctx.cleanup();
   rcv.cleanup();
+}
+// DIRECTION: Play audio on, Record audio on and Run models on, with Local sources, a receiver whose models are a
+// stand-in, and a stand-in bundled binary on This machine. Each stand-in logs its runs and answers "<where> words".
+const mdir = fs.mkdtempSync(path.join(os.tmpdir(), 'e2e-models-'));
+function standIn(where) {
+  const file = path.join(mdir, `models-${where}`);
+  const log = path.join(mdir, `${where}.log`);
+  fs.writeFileSync(file, `#!${process.execPath}
+const fs = require('node:fs');
+const [, , cmd, sub] = process.argv;
+fs.appendFileSync(${JSON.stringify(log)}, process.argv.slice(2).join(' ') + '\\n');
+const out = (v) => process.stdout.write(JSON.stringify(v) + '\\n');
+if (cmd === 'models') {
+  out({ id: 'kokoro', kind: 'speech', name: 'Kokoro', languages: ['en'], size: 1, downloaded: true, partial: 0, path: '/m/k' });
+  out({ id: 'parakeet', kind: 'transcription', name: 'Parakeet', languages: ['en'], size: 1, downloaded: true, partial: 0, path: '/m/p' });
+} else if (cmd === 'transcribe') {
+  process.stdout.write('${where} words from ' + sub + '\\n');
+} else if (cmd === 'speak') {
+  if (process.argv.includes('--list-voices')) { out({ name: 'af_sol', number: 0 }); process.exit(0); }
+  process.stdin.resume();
+  process.stdin.on('end', () => {
+    process.stderr.write(JSON.stringify({ event: 'format', rate: 24000, channels: 1 }) + '\\n');
+    process.stdout.write(Buffer.alloc(9600, 3), () => process.stderr.write(JSON.stringify({ event: 'done' }) + '\\n'));
+  });
+}
+`, { mode: 0o755 });
+  return { file, runs: () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\n').filter(Boolean) : []) };
+}
+const remote = standIn('remote');
+const here = standIn('local');
+process.env.PI_SPEECH_RECEIVER_MODELS = remote.file;
+const rcv3 = await startReceiver();
+delete process.env.PI_SPEECH_RECEIVER_MODELS;
+const ctx3 = await setup({ env: { PI_SPEECH_BRIDGE_URL: rcv3.url, PI_SPEECH_BRIDGE_TOKEN: rcv3.token, PI_SPEECH_BINARY: here.file } });
+const rec = recorderEnv(ctx3);
+try {
+  for (const [playOn, recordOn, modelsOn] of [['remote', 'remote', 'remote'], ['this', 'this', 'this'], ['remote', 'this', 'remote'], ['this', 'remote', 'this']]) {
+    const at = `play ${playOn}, record ${recordOn}, models ${modelsOn}`;
+    fs.mkdirSync(path.join(ctx3.agentDir, 'pi-speech'), { recursive: true });
+    fs.writeFileSync(path.join(ctx3.agentDir, 'pi-speech', 'settings.json'), JSON.stringify({
+      version: 1, bridge: 'on', speechSource: 'local', localSpeechModel: 'kokoro', transcriptionSource: 'local',
+      localTranscriptionModel: 'parakeet', playOn, recordOn, modelsOn,
+    }));
+    const s = await ctx3.pi({ env: rec.env });
+    const before = { remotePlays: rcv3.starts('player').length, localPlays: ctx3.playerLog().length, remote: remote.runs().length, here: here.runs().length, mics: rec.starts().length };
+    let n = await command(s, '/speech Hello over the bridge.', 1500);
+    check(errors(n).length === 0, `${at}: speaking works`, notes(n));
+    const runner = modelsOn === 'remote' ? remote : here;
+    check(runner.runs().slice(modelsOn === 'remote' ? before.remote : before.here).some((l) => l.startsWith('speak kokoro')), `${at}: the speech model runs on ${modelsOn === 'remote' ? 'the Remote machine' : 'This machine'}`, [remote.runs(), here.runs()]);
+    const played = { remote: rcv3.starts('player').length - before.remotePlays, this: ctx3.playerLog().length - before.localPlays };
+    check(played[playOn] === 1 && played[playOn === 'remote' ? 'this' : 'remote'] === 0, `${at}: it plays on ${playOn === 'remote' ? 'the Remote machine' : 'This machine'} only`, played);
+    const from = s.uiRequests.length;
+    await command(s, '/speech --dictate', 800);
+    await command(s, '/speech --dictate', 300);
+    await until(() => editorEvents(s, from).length > 0, 8000);
+    const text = editorEvents(s, from)[0]?.text ?? '';
+    check(text.includes(`${modelsOn === 'remote' ? 'remote' : 'local'} words from parakeet`), `${at}: dictation is transcribed where the models run`, text);
+    check((rec.starts().length - before.mics === 1) === (recordOn === 'this'), `${at}: it records on ${recordOn === 'remote' ? 'the Remote machine' : 'This machine'}`, rec.starts());
+    await s.close();
+  }
+} finally {
+  await ctx3.close();
+  await rcv3.stop();
+  ctx3.cleanup();
+  rcv3.cleanup();
+  fs.rmSync(mdir, { recursive: true, force: true });
 }
 finish();

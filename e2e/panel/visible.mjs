@@ -209,6 +209,16 @@ try {
   await t.key('Right'); await sleep(1200);
   check(readSettings(ctx).bridge === 'on' || /unreachable|✗/.test(dock(t.lines()).join('\n')), 'Right cycles the mode (or says why it cannot)', dock(t.lines()).slice(0, 6));
   await t.key('Left'); await sleep(600);
+  // DIRECTION: without the bridge in use (auto, no SSH), every row is This machine and does not change
+  d = dock(t.lines());
+  const heading = d.indexOf('DIRECTION');
+  check(heading > 0 && d.indexOf(rowOf(d, 'Pairing')) === heading - 1, 'DIRECTION is a heading under Pairing', d);
+  check(['Play audio on', 'Record audio on', 'Run models on'].every((l, i) => new RegExp(`^ {4}${l}\\s+This machine · no bridge in use$`).test(d[heading + 1 + i] ?? '')), 'its three rows show This machine without the bridge', d.slice(heading, heading + 4));
+  check(await goTo(t, 'Play audio on'), 'the selection reaches Play audio on');
+  await t.key('Enter'); await sleep(300);
+  d = dock(t.lines());
+  check(/This machine/.test(rowOf(d, 'Play audio on') ?? '') && d.some((l) => /Without the bridge in use/.test(l)), 'Enter does not change it; the status line says why', d.slice(-5));
+  check(readSettings(ctx).playOn === undefined, 'nothing is saved');
   await t.key('Escape');
   check(isSelected(dock(t.lines()), 'Bridge connection'), 'Esc returns to the main view on its row');
 
