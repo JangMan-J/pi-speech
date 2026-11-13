@@ -10,11 +10,15 @@
 //!
 //! A stop (the `stop` flag) leaves the `.part` as it is, to be resumed by the next download.
 //!
+//! Two downloads of the same model may run at once (in other processes: two Pi sessions sharing
+//! one receiver), so from before step 1 until the model is in place or the download ends, a
+//! download holds `<dir>.lock` locked (the system's file lock, released when the process ends
+//! however it ends); another waits for it, then finds the model in place or resumes the part
+//! the first one left.
+//!
 //! A shared lexicon (see [`lexicon`]) is fetched the same way into `<name>.part` in the cache
 //! root, checked, and renamed to `<name>`. Downloads of different voices may need the same
-//! lexicon at the same time (in other processes), so a fetch holds `<name>.lock` locked (the
-//! system's file lock, released when the process ends however it ends); another waits for it,
-//! then finds the lexicon in place or resumes the part the first one left.
+//! lexicon at the same time, so a fetch holds `<name>.lock` locked in the same way.
 
 use super::cache;
 use super::catalog::{Entry, Lexicon};
@@ -94,10 +98,35 @@ pub fn download(
     }
     fs::create_dir_all(root)
         .map_err(|e| format!("cannot create the model cache {}: {e}", root.display()))?;
+    let part = cache::part_path(root, entry);
+    // Held until the model is in place, or the download has ended and left its part.
+    let (_lock, _) = lock(
+        &cache::model_lock_path(root, entry),
+        &part,
+        entry.size,
+        stop,
+        &mut |done| {
+            emit(Event::Progress {
+                done,
+                total: entry.size,
+            })
+        },
+    )?;
+    if target.is_dir() {
+        // Another download put it in place while this one waited.
+        emit(Event::Progress {
+            done: entry.size,
+            total: entry.size,
+        });
+        emit(Event::Done {
+            path: target.clone(),
+        });
+        return Ok(target);
+    }
+    // No other download is unpacking: these are a hard kill's.
     for leftover in cache::unpack_leftovers(root, entry) {
         let _ = cache::remove(&leftover);
     }
-    let part = cache::part_path(root, entry);
     let source = Source::archive(entry);
     fetch(&source, &part, allow_http, stop, &mut |done, total| {
         emit(Event::Progress { done, total })
@@ -123,7 +152,7 @@ pub fn download(
 
 /// Download the shared `lexicon` into the cache at `root` unless it is there; returns its path.
 /// Reports `Event::LexiconProgress` only while it fetches, or waits for another download's fetch
-/// of it (see [`lock_lexicon`]). Plain `http://` only when `allow_http`.
+/// of it (see [`lock`]). Plain `http://` only when `allow_http`.
 pub fn lexicon(
     lexicon: &Lexicon,
     root: &Path,
@@ -144,10 +173,28 @@ pub fn lexicon(
     fs::create_dir_all(root)
         .map_err(|e| format!("cannot create the model cache {}: {e}", root.display()))?;
     let part = cache::lexicon_part_path(root, lexicon);
+    let name = lexicon.name.clone();
+    let total = lexicon.size;
+    let mut progress = |done: u64| {
+        emit(Event::LexiconProgress {
+            name: name.clone(),
+            done,
+            total,
+        })
+    };
     // Held until the lexicon is in place, or the fetch has ended and left its part.
-    let _lock = lock_lexicon(lexicon, root, &part, stop, emit)?;
+    let (_lock, waited) = lock(
+        &cache::lexicon_lock_path(root, lexicon),
+        &part,
+        total,
+        stop,
+        &mut progress,
+    )?;
     if target.is_file() {
         // Another download fetched it while this one waited.
+        if waited {
+            progress(total);
+        }
         return Ok(target);
     }
     let source = Source {
@@ -157,13 +204,8 @@ pub fn lexicon(
         size: lexicon.size,
         sha256: &lexicon.sha256,
     };
-    let name = lexicon.name.clone();
-    fetch(&source, &part, allow_http, stop, &mut |done, total| {
-        emit(Event::LexiconProgress {
-            name: name.clone(),
-            done,
-            total,
-        })
+    fetch(&source, &part, allow_http, stop, &mut |done, _| {
+        progress(done)
     })?;
     match fs::rename(&part, &target) {
         Ok(()) => Ok(target),
@@ -177,35 +219,26 @@ pub fn lexicon(
     }
 }
 
-/// How often a download waiting for another's fetch of a lexicon looks again.
+/// How often a download waiting for another's fetch of the same file looks again.
 const LOCK_POLL: Duration = Duration::from_millis(50);
 
-/// Lock the `lexicon`'s lock file in `root`, waiting while another download holds it. While it
-/// waits it reports the other's progress (the bytes in `part`), and once the other has put the
-/// lexicon in place, the whole of it. A stop while waiting leaves everything as it is.
-fn lock_lexicon(
-    lexicon: &Lexicon,
-    root: &Path,
+/// Lock the lock file at `path` (a model's or a lexicon's), waiting while another download holds
+/// it. While it waits it reports the other's progress: the bytes in `part`, of `total`. A stop
+/// while waiting leaves everything as it is. Returns the locked file, and whether it waited.
+fn lock(
+    path: &Path,
     part: &Path,
+    total: u64,
     stop: &AtomicBool,
-    emit: &mut dyn FnMut(Event),
-) -> Result<File, Failure> {
-    let path = cache::lexicon_lock_path(root, lexicon);
+    progress: &mut dyn FnMut(u64),
+) -> Result<(File, bool), Failure> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(&path)
+        .open(path)
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-    let total = lexicon.size;
-    let mut progress = |done: u64| {
-        emit(Event::LexiconProgress {
-            name: lexicon.name.clone(),
-            done,
-            total,
-        })
-    };
     let mut waited = false;
     let mut last: Option<Instant> = None;
     loop {
@@ -230,10 +263,7 @@ fn lock_lexicon(
         waited = true;
         std::thread::sleep(LOCK_POLL);
     }
-    if waited && cache::lexicon_path(root, lexicon).is_file() {
-        progress(total);
-    }
-    Ok(file)
+    Ok((file, waited))
 }
 
 /// A file to fetch: an archive or a lexicon.
@@ -723,6 +753,129 @@ mod tests {
             fs::read(cache::lexicon_part_path(&root, &lexicon)).unwrap(),
             b"abcd"
         );
+        drop(held);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A `.tar.bz2` archive of the directory `dir` holding `data.bin` = `data`.
+    fn archive(dir: &str, data: &[u8]) -> Vec<u8> {
+        let bz = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
+        let mut tar = tar::Builder::new(bz);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, format!("{dir}/data.bin"), data)
+            .unwrap();
+        tar.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn model(url: String, size: u64, sha256: String) -> Entry {
+        Entry {
+            id: "m".into(),
+            kind: super::super::catalog::Kind::Speech,
+            name: "M".into(),
+            languages: vec!["en".into()],
+            size,
+            url,
+            sha256,
+            dir: "m-dir".into(),
+        }
+    }
+
+    #[test]
+    fn two_downloads_of_the_same_model_at_once_both_get_the_whole_checked_model() {
+        // Bytes that do not compress, so that the archive is about as large.
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let data: Vec<u8> = (0..320 * 1024)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        let body = archive("m-dir", &data);
+        let total = body.len() as u64;
+        assert!(total > 256 * 1024);
+        let root = scratch("model-twice");
+        let entry = model(
+            // A second request (there is none with the lock) would be the slower.
+            serve_slowly(
+                body.clone(),
+                &[Duration::from_millis(10), Duration::from_millis(100)],
+            ),
+            total,
+            hex(&Sha256::digest(&body)),
+        );
+        // Each returns what was in the model the moment it got it.
+        let run = || {
+            let (entry, root) = (entry.clone(), root.clone());
+            std::thread::spawn(move || {
+                let stop = AtomicBool::new(false);
+                let mut events = Vec::new();
+                let r = super::download(&entry, &root, true, &stop, &mut |e| events.push(e));
+                let got = r.as_ref().ok().map(|p| fs::read(p.join("data.bin")).ok());
+                (r, got, events)
+            })
+        };
+        let first = run();
+        // The second starts while the first is midway. Without the lock it would begin the
+        // shared part again (the server sends the whole file whatever the range asked) while
+        // the first goes on writing it and then unpacks it.
+        let part = cache::part_path(&root, &entry);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while fs::metadata(&part).map_or(0, |m| m.len()) < total / 2 {
+            assert!(Instant::now() < deadline, "the first fetch did not start");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let second = run();
+        let target = root.join("m-dir");
+        for run in [first, second] {
+            let (r, got, events) = run.join().unwrap();
+            assert_eq!(r, Ok(target.clone()));
+            assert!(got == Some(Some(data.clone())), "not the whole model");
+            assert!(
+                events.contains(&Event::Progress { done: total, total }),
+                "{events:?}"
+            );
+            assert_eq!(
+                events.last(),
+                Some(&Event::Done {
+                    path: target.clone()
+                })
+            );
+        }
+        assert!(!part.exists());
+        assert!(cache::unpack_leftovers(&root, &entry).is_empty());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_download_waiting_for_another_download_of_its_model_can_be_stopped() {
+        let root = scratch("model-wait");
+        let entry = model("http://127.0.0.1:1/m.tar.bz2".into(), 10, "00".repeat(32));
+        fs::create_dir_all(&root).unwrap();
+        // Another download is fetching it: it holds the lock and has 4 bytes in the part.
+        let held = File::create(cache::model_lock_path(&root, &entry)).unwrap();
+        held.lock().unwrap();
+        fs::write(cache::part_path(&root, &entry), b"abcd").unwrap();
+        let stop = AtomicBool::new(false);
+        let mut events = Vec::new();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(150));
+                stop.store(true, Ordering::SeqCst);
+            });
+            let r = super::download(&entry, &root, true, &stop, &mut |e| events.push(e));
+            assert_eq!(r, Err(Failure::Stopped { done: 4 }));
+        });
+        assert_eq!(
+            events.first(),
+            Some(&Event::Progress { done: 4, total: 10 })
+        );
+        // The other's part is left as it was.
+        assert_eq!(fs::read(cache::part_path(&root, &entry)).unwrap(), b"abcd");
         drop(held);
         fs::remove_dir_all(&root).unwrap();
     }

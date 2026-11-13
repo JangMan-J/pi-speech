@@ -7,10 +7,20 @@
 //! Inside it, a model is the directory `<dir>` (complete: it is renamed into place only once
 //! unpacked); `<dir>.part` is a download in progress or interrupted; `.unpack-<dir>-*` is a
 //! directory being unpacked (left behind only by a hard kill, and removed by the next download).
+//! `<dir>.lock` is an empty file that a download of the model holds locked (the system's file
+//! lock) from before it fetches `<dir>.part` until the model is in place or the download ends,
+//! so that two downloads of the same model (say from two Pi sessions sharing one receiver) never
+//! write the same part or unpack at once: the second waits, then finds the model in place or
+//! resumes the part.
 //! A shared lexicon (a Piper voice's) is the file `<name>` in the cache root, and `<name>.part`
-//! while it is being downloaded. `<name>.lock` is an empty file that a download of the lexicon
-//! holds locked while it fetches, so that two downloads of voices that share it never write the
-//! same `<name>.part` at once; it stays in the cache (deleting it could let two locks coexist).
+//! while it is being downloaded. `<name>.lock` is the same kind of lock for a download of the
+//! lexicon, so that two downloads of voices that share it never write the same `<name>.part` at
+//! once.
+//!
+//! The lock files stay in the cache, also after `delete` (deleting one could let two locks
+//! coexist: one on the deleted file, one on a new file of the same name). Nothing scans the
+//! cache directory for models (a model is found by its catalogue `dir`), so they are never
+//! taken for one.
 
 use super::catalog::{Entry, Lexicon};
 use std::ffi::OsString;
@@ -75,6 +85,12 @@ pub fn model_path(root: &Path, entry: &Entry) -> PathBuf {
 
 pub fn part_path(root: &Path, entry: &Entry) -> PathBuf {
     root.join(format!("{}.part", entry.dir))
+}
+
+/// The file a download of `entry` holds locked from before it fetches the archive until the
+/// model is in place or the download ends.
+pub fn model_lock_path(root: &Path, entry: &Entry) -> PathBuf {
+    root.join(format!("{}.lock", entry.dir))
 }
 
 pub fn unpack_prefix(entry: &Entry) -> String {
@@ -214,9 +230,12 @@ mod tests {
         assert!(!is_ready(&root, &entry, Some(&lexicon)));
         fs::write(lexicon_path(&root, &lexicon), "x").unwrap();
         assert!(is_ready(&root, &entry, Some(&lexicon)));
-        // Deleting the voice leaves the shared lexicon.
+        fs::write(model_lock_path(&root, &entry), "").unwrap();
+        // Deleting the voice leaves the shared lexicon, and its lock file.
         delete(&root, &entry).unwrap();
         assert!(lexicon_path(&root, &lexicon).is_file());
+        assert!(model_lock_path(&root, &entry).is_file());
+        assert!(!is_ready(&root, &entry, None));
         fs::remove_dir_all(&root).unwrap();
     }
 
