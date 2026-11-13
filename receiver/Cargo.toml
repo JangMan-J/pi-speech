@@ -18,6 +18,10 @@ path = "src/main.rs"
 # on macOS; WASAPI on Windows) and decoding.
 cpal = { version = "0.18.2", features = ["pulseaudio"] }
 symphonia = { version = "0.6.1", default-features = false, features = ["pcm", "wav", "mp3", "id3v1", "id3v2"] }
+# Local speech models run in-process: sherpa-onnx with ONNX Runtime linked statically from the
+# project's prebuilt archives (fetched by sherpa-onnx-sys's build script; on Windows the static-MT
+# archive, which matches this crate's +crt-static build).
+sherpa-onnx = { version = "2.0.1", default-features = false, features = ["static"] }
 # Random bytes (tokens, ids, file names) from the operating system, on every system.
 getrandom = "0.3"
 
