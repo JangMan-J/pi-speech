@@ -1,30 +1,13 @@
 /**
- * Draws the /speech panel: a pure function of the panel's view model (src/engine/panel.ts), the width, and a
- * style. Widths are measured on plain text and styles applied afterwards, so no line is ever wider than
- * `width`, and every state reads the same without colour (symbols and words carry it).
- *
- * The panel is a dock in the place of Pi's editor, so it stays small: one header line that is also the top
- * rule; then, in the main view, the sections SPEAK (Alt+S), LISTEN (Alt+Z) and SETTINGS, each a quiet heading
- * on its own line above its rows (in a submenu, its rows alone); one status line; and the key hints. The rows
- * share one label column, so their values line up. A value is only the current value (a model or a voice by
- * name: what it costs and offers is in its picker), followed by a note where something is wrong or a submenu
- * explains it, and by › on a row that opens a picker or a submenu.
- *
- * What gives way when the width shrinks, first to last: the headings; then, per row, the note, and only then
- * the value itself (cut with …).
+ * Draws the /speech panel inside the shared picker frame (src/pi/frame.ts): a pure function of the panel's
+ * view model (src/engine/panel.ts), the terminal width, and a style. Widths are measured on plain text and
+ * styles applied afterwards, so no line is ever wider than `termWidth`, and every state reads the same
+ * without colour (symbols and words carry it).
  */
 
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import type {
-  Hint,
-  InputView,
-  PanelRow,
-  PanelView,
-  PickerItem,
-  PickerView,
-  SpeakLine,
-  StatusTone,
-} from "../engine/panel";
+import type { Hint, PanelView, PickerItem, PickerView, StatusTone } from "../engine/panel";
+import { contentWidth, FRAME_ROWS, type FrameStyle, frameLines, type Measure, spread } from "./frame";
 
 export interface PanelStyle {
   accent(text: string): string;
@@ -35,7 +18,7 @@ export interface PanelStyle {
   warning(text: string): string;
   /** The text cursor in an input. */
   cursor(text: string): string;
-  /** The whole selected row, including its padding. */
+  /** The active tab, including its padding. */
   selected(text: string): string;
 }
 
@@ -53,30 +36,37 @@ export const PLAIN: PanelStyle = {
   selected: same,
 };
 
-/** The panel never draws wider than this. */
-export const MAX_WIDTH = 96;
 /** Below this only a one-line message is drawn. */
 export const MIN_WIDTH = 40;
-/** Picker rows shown at once. */
-export const PICKER_ROWS = 8;
+/** A model list's Price and Voices columns, about; one figure so the text is equally wide on every tab. */
+export const RIGHT_COLS_W = 24;
 
-const MARKER = "▸ ";
+const CURSOR = "▶ ";
 const NO_MARKER = "  ";
 const GAP = 2;
-/** The label column: one space after the longest label, and never narrower than this. */
+/** The label column: two spaces after the longest label, and never narrower than this when room allows. */
 const MIN_LABEL = 19;
 /** The mark at the end of a row whose Enter opens a list or a submenu. */
 const OPENS = " ›";
-/** Where the input under a row starts. */
-const INPUT_INDENT = "    ";
+/** An extra column is never wider than this, so one outlier value is cut rather than stretching the table. */
+const COL_CAP = 24;
+/** The separator between a value and its note: `value · note`. */
+const SEP = " · ";
 
 const width = (text: string) => visibleWidth(text);
+const frameMeasure: Measure = { width: visibleWidth, truncate: (text, w) => truncateToWidth(text, w, "…") };
 const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
+/** How many columns the panel's text uses in a terminal this wide. */
+export function panelContentWidth(termWidth: number): number {
+  return contentWidth(termWidth, RIGHT_COLS_W);
+}
+
 /** Plain text cut to `w` columns with …, on grapheme boundaries. */
-function cut(text: string, w: number): string {
+export function cutText(text: string, w: number): string {
   if (w <= 0) return "";
   if (width(text) <= w) return text;
+  if (w === 1) return "…";
   let out = "";
   let used = 0;
   for (const { segment } of graphemes.segment(text)) {
@@ -88,51 +78,61 @@ function cut(text: string, w: number): string {
   return `${out}…`;
 }
 
+/** Plain text word-wrapped to `w` columns without dropping words. */
+export function wrapText(text: string, w: number): string[] {
+  const room = Math.max(1, w);
+  const out: string[] = [];
+  for (const raw of text.split("\n")) {
+    let rest = raw.replace(/[ \t\r]+/g, " ").trim();
+    if (!rest) {
+      out.push("");
+      continue;
+    }
+    while (rest) {
+      if (width(rest) <= room) {
+        out.push(rest);
+        break;
+      }
+      let segs = "";
+      let used = 0;
+      let spaceAt = -1;
+      for (const { segment } of graphemes.segment(rest)) {
+        const sw = width(segment);
+        if (used + sw > room) break;
+        segs += segment;
+        used += sw;
+        if (segment === " ") spaceAt = segs.length - 1;
+      }
+      if (spaceAt > 0) {
+        out.push(segs.slice(0, spaceAt).trimEnd());
+        rest = rest.slice(spaceAt + 1).trimStart();
+      } else {
+        const chunk = segs || [...graphemes.segment(rest)][0]?.segment || rest[0];
+        out.push(chunk);
+        rest = rest.slice(chunk.length).trimStart();
+      }
+    }
+  }
+  return out;
+}
+
 /** Fit a ` · `-joined cell to `w` columns on whole tokens, dropping trailing ones; a lone long token is cut. */
 function fitColumn(cell: string, w: number): string {
   if (width(cell) <= w) return cell;
-  const parts = cell.split(" · ");
-  if (parts.length === 1) return cut(cell, w);
+  const parts = cell.split(SEP);
+  if (parts.length === 1) return cutText(cell, w);
   let out = parts[0];
-  if (width(out) > w) return cut(out, w);
+  if (width(out) > w) return cutText(out, w);
   for (let i = 1; i < parts.length; i++) {
-    const next = `${out} · ${parts[i]}`;
+    const next = `${out}${SEP}${parts[i]}`;
     if (width(next) > w) break;
     out = next;
   }
   return out;
 }
 
-/** A styled line cut to `w` columns (a safety net: lines are measured before they are styled). */
-const clip = (line: string, w: number) => (width(line) <= w ? line : truncateToWidth(line, w, "…"));
 const pad = (text: string, w: number) => text + " ".repeat(Math.max(0, w - width(text)));
 const spaces = (n: number) => " ".repeat(Math.max(0, n));
-
-/** `left` and `right` on one line of width `w`; the left side gives way. Both are styled after measuring. */
-/** Lines of the description under a model list. */
-const DETAIL_LINES = 3;
-
-/**
- * `text` in `max` lines at most: the first `first` cells wide, the others `rest`; broken at a space, the last
- * cut with … when the text goes on.
- */
-function wrapLines(text: string, first: number, rest: number, max: number): string[] {
-  let t = text.replace(/\s+/g, " ").trim();
-  const out: string[] = [];
-  while (t && out.length < max) {
-    const room = out.length ? rest : first;
-    if (out.length === max - 1 || width(t) <= room) {
-      out.push(cut(t, room));
-      break;
-    }
-    let at = room;
-    while (at > 0 && t[at] !== " ") at--;
-    if (at < room / 2) at = room; // no space near the end: break mid-word
-    out.push(t.slice(0, at).trimEnd());
-    t = t.slice(at).trimStart();
-  }
-  return out;
-}
 
 /** The live state: the recording dot in the error colour (as in the footer), speaking in the accent. */
 function stateStyle(state: string, s: PanelStyle): (t: string) => string {
@@ -158,27 +158,19 @@ function toneStyle(tone: StatusTone, s: PanelStyle): (t: string) => string {
 }
 
 /** The hints that fit in `w`: optional ones give way first (the last first), then the first ones; Esc stays. */
-/** The hint line; in a list, where the highlighted item is on its right: 44/54. */
-function hintsWith(view: PanelView, w: number, s: PanelStyle): string {
-  const p = view.picker;
-  const at =
-    p && !p.loading && p.items.length ? `${Math.min(p.selected, p.items.length - 1) + 1}/${p.items.length}` : "";
-  if (!at) return hintLine(view.hints, w, s);
-  const hints = hintLine(view.hints, w - width(at) - 2, s);
-  return hints + spaces(Math.max(2, w - width(hints) - width(at))) + s.dim(at);
-}
-
 function hintLine(hints: Hint[], w: number, s: PanelStyle): string {
-  const text = (hs: Hint[]) => hs.map((h) => (h.action ? `${h.key} ${h.action}` : h.key)).join(" · ");
+  if (!hints.length || w <= 0) return "";
+  const text = (hs: Hint[]) => hs.map((h) => (h.action ? `${h.key} ${h.action}` : h.key)).join(SEP);
   const kept = [...hints];
-  for (let i = kept.length - 1; i >= 0 && width(text(kept)) > w; i--) if (kept[i].optional) kept.splice(i, 1);
+  for (let i = kept.length - 1; i >= 0 && width(text(kept)) > w; i--) {
+    if (kept[i].optional) kept.splice(i, 1);
+  }
   while (kept.length > 1 && width(text(kept)) > w) kept.splice(0, 1);
-  return s.dim(cut(text(kept), w));
+  return s.dim(cutText(text(kept), w));
 }
 
 // ── Values and their notes ───────────────────────────────────────────────
 
-/** A value and what is said after it: a note (or its short form); all optional. */
 interface Entry {
   value: string;
   note?: string;
@@ -187,27 +179,16 @@ interface Entry {
   opens?: boolean;
 }
 
-/** A drawn value: the styled text and the plain columns it takes. */
-interface Drawn {
-  text: string;
-  width: number;
-}
-
-/** The separator between a value and its note: `value · note`. */
-const SEP = " · ";
-
 /**
  * One value drawn tight in `room` columns: `value · note ›`, the note in dim right after the value. When it does
  * not fit the note gives way to its short form, then goes; only then is the value itself cut with …. A row that
  * opens a list keeps its › at the end; an alert keeps its ✗ beside the value when its note is gone.
  */
-function drawEntry(e: Entry, room: number, s: PanelStyle, valueStyle: (t: string) => string): Drawn {
+function drawEntry(e: Entry, room: number, s: PanelStyle, valueStyle: (t: string) => string): string {
   const chev = e.opens ? OPENS : "";
   const chevW = width(chev);
   const chevStyled = chev ? s.dim(chev) : "";
-  // An alert's facts are drawn in the error colour so the eye finds them; everything else is dim.
   const factStyle = e.alert ? s.error : s.dim;
-  // Tails after the value, the richest first, each with the styled text that draws it.
   const tails: Array<{ plain: string; styled: string }> = [];
   const fact = (parts: string[]) => {
     const text = parts.length ? SEP + parts.join(SEP) : "";
@@ -219,71 +200,40 @@ function drawEntry(e: Entry, room: number, s: PanelStyle, valueStyle: (t: string
   fact([]);
   for (const t of tails) {
     if (width(e.value) + width(t.plain) + chevW <= room) {
-      return { text: valueStyle(e.value) + t.styled + chevStyled, width: width(e.value) + width(t.plain) + chevW };
+      return valueStyle(e.value) + t.styled + chevStyled;
     }
   }
-  // Even the value alone with its › does not fit: cut it, keep the › and an alert's ✗.
   const mark = e.alert ? " ✗" : "";
-  const v = cut(e.value, Math.max(0, room - chevW - width(mark)));
-  return { text: valueStyle(v) + (mark ? s.error(mark) : "") + chevStyled, width: width(v) + width(mark) + chevW };
-}
-
-// ── Lines ────────────────────────────────────────────────────────────────
-
-/** A line of the panel; an optional one gives way on a short terminal, the lowest `drop` first. */
-interface Line {
-  text: string;
-  drop?: number;
-}
-
-const keep = (text: string): Line => ({ text });
-const optional = (drop: number, text = ""): Line => ({ text, drop });
-
-/** The rows, their labels in one column and their values lined up after it. */
-function rowTexts(rows: PanelRow[], selected: number, w: number, s: PanelStyle): string[] {
-  const labelW = Math.max(MIN_LABEL, ...rows.map((r) => width(r.label) + 1));
-  const room = Math.max(0, w - MARKER.length - labelW);
-  return rows.map((r, i) => {
-    const on = i === selected;
-    const marker = on ? s.accent(MARKER) : NO_MARKER;
-    const labelStyle = on ? s.bold : s.dim;
-    // A submenu row has no value: its › stands right after the label.
-    if (r.value === undefined) {
-      const label = cut(r.label, w - MARKER.length - (r.opens ? width(OPENS) : 0));
-      const line = marker + labelStyle(label) + (r.opens ? s.dim(OPENS) : "");
-      return on ? s.selected(pad(line, w)) : line;
-    }
-    const label = labelStyle(pad(cut(r.label, labelW - 1), labelW));
-    const entry = drawEntry(
-      { value: r.value, note: r.note, short: r.short, alert: r.alert, opens: r.opens },
-      room,
-      s,
-      on ? s.bold : same,
-    );
-    const line = marker + label + entry.text;
-    return on ? s.selected(pad(line, w)) : line;
-  });
+  const v = cutText(e.value, Math.max(0, room - chevW - width(mark)));
+  return valueStyle(v) + (mark ? s.error(mark) : "") + chevStyled;
 }
 
 /** A text field of at most `room` columns: the text around the cursor, or the placeholder when empty. */
-function field(value: string, cursor: number, placeholder: string, room: number, s: PanelStyle) {
+export function renderField(
+  value: string,
+  cursor: number,
+  placeholder: string,
+  room: number,
+  s: PanelStyle,
+): { text: string; width: number } {
+  const maxRoom = Math.max(1, room);
   if (!value) {
-    const hint = cut(placeholder, room - 2);
+    const hint = placeholder ? cutText(placeholder, Math.max(0, maxRoom - 2)) : "";
     return { text: s.cursor(" ") + (hint ? ` ${s.dim(hint)}` : ""), width: 1 + (hint ? 1 + width(hint) : 0) };
   }
   const chars = [...value];
+  const clamped = Math.max(0, Math.min(cursor, chars.length));
   let start = 0;
-  // Scroll so the cursor stays in view (measured in columns, wide characters included).
-  while (start < cursor && width(chars.slice(start, cursor).join("")) + 1 > room) start++;
+  while (start < clamped && width(chars.slice(start, clamped).join("")) + 1 > maxRoom) start++;
   const parts: string[] = [];
   let used = 0;
   for (let i = start; i < chars.length; i++) {
     const cw = width(chars[i]);
-    if (used + cw > room) break;
+    if (used + cw > maxRoom) break;
     parts.push(chars[i]);
     used += cw;
   }
-  const at = cursor - start;
+  const at = clamped - start;
   const end = at >= parts.length;
   return {
     text: parts.slice(0, at).join("") + s.cursor(parts[at] ?? " ") + parts.slice(at + 1).join(""),
@@ -291,213 +241,286 @@ function field(value: string, cursor: number, placeholder: string, room: number,
   };
 }
 
-function inputLine(input: InputView, w: number, s: PanelStyle): string {
-  const label = input.label ? `${input.label}  ` : "";
-  const room = w - INPUT_INDENT.length - width(label);
-  if (room < 4) return INPUT_INDENT + cut(input.label, w - INPUT_INDENT.length);
-  return (
-    INPUT_INDENT +
-    (label ? s.bold(label) : "") +
-    // A password is shown as one dot a character.
-    field(input.secret ? "•".repeat([...input.value].length) : input.value, input.cursor, input.placeholder, room, s)
-      .text
+// ── Frame parts ──────────────────────────────────────────────────────────
+
+function renderTabs(view: PanelView, w: number, s: PanelStyle): string {
+  const tabs = view.tabs;
+  if (!tabs.length) return "";
+  const at = Math.max(
+    0,
+    tabs.findIndex((t) => t.id === view.tab),
   );
-}
-
-/**
- * The rows: in the main view each section under its heading (which carries its hotkey); in a submenu, the rows
- * alone. The headings give way first on a short terminal.
- */
-const BODY = "  ";
-/** The main view's Speak line: its marker when the cursor is on it, the label, then the message field. */
-function speakLine(speak: SpeakLine, w: number, s: PanelStyle): string {
-  const label = "Speak  ";
-  const mark = speak.focused ? s.accent(MARKER) : NO_MARKER;
-  const room = w - MARKER.length - width(label);
-  if (room < 4) return mark + cut(label.trim(), w - MARKER.length);
-  const text = speak.focused
-    ? field(speak.value, speak.cursor, speak.placeholder, room, s).text
-    : speak.value
-      ? cut(speak.value, room)
-      : // Where the focused field draws it, after its cursor cell.
-        s.dim(cut(`  ${speak.placeholder}`, room));
-  return mark + (speak.focused ? s.bold(label) : label) + text;
-}
-
-function homeLines(view: PanelView, w: number, s: PanelStyle): Line[] {
-  const cw = Math.max(0, w - BODY.length);
-  const drawn = rowTexts(view.rows, view.selected, cw, s);
-  const input = view.input;
-  const out: Line[] = [];
-  if (view.speak) out.push(keep(BODY + speakLine(view.speak, cw, s)));
-  let section: string | undefined;
-  view.rows.forEach((row, i) => {
-    const heading = row.section && view.headings?.[row.section];
-    if (heading && row.section !== section) out.push(optional(3, s.dim(cut(heading, w))));
-    section = row.section;
-    out.push(keep(BODY + drawn[i]));
-    if (input?.under === row.id) out.push(keep(BODY + inputLine(input, cw, s)));
-  });
-  return out;
-}
-
-/**
- * The items of a picker as an aligned table, so a long list reads down its columns: the name on the left,
- * the price right-aligned in its own column, then what the item offers (its features, or a voice's language).
- * The columns are sized from the whole list so they do not jump while it scrolls; the name gives way (cut
- * with …) before the price, and the offer is cut last.
- */
-/** An extra column is never wider than this, so one outlier value is cut rather than stretching the table. */
-const COL_CAP = 24;
-
-function pickerTable(
-  items: PickerItem[],
-  start: number,
-  end: number,
-  selected: number,
-  w: number,
-  s: PanelStyle,
-  keepColumns = false,
-): string[] {
-  const check = "✓ ";
-  const prefix = MARKER.length + check.length;
-  const room = Math.max(0, w - prefix);
-  const priceW = Math.max(0, ...items.map((it) => (it.price ? width(it.price) : 0)));
-  const priceCol = priceW ? GAP + priceW : 0;
-  // The aligned columns after the price (a model's language, then its voices); each as wide as its widest
-  // value, capped. A list without columns (voices, history) keeps its one free-text note instead.
-  const useCols = items.some((it) => it.cols !== undefined);
-  const colCount = useCols ? Math.max(0, ...items.map((it) => it.cols?.length ?? 0)) : 0;
-  // A column every row fills the same way (or leaves empty) carries nothing, so it is dropped (width 0).
-  const sameEverywhere = (c: number) => {
-    if (keepColumns) return false;
-    const first = items[0]?.cols?.[c] ?? "";
-    return items.length > 1 && items.every((it) => (it.cols?.[c] ?? "") === first);
+  const seg = (i: number) => ` ${tabs[i].label} `;
+  const fits = (lo: number, hi: number) => {
+    let used = 2 + (lo > 0 ? 3 : 0) + (hi < tabs.length - 1 ? 3 : 0);
+    for (let i = lo; i <= hi; i++) used += width(seg(i)) + (i > lo ? 1 : 0);
+    return used <= w;
   };
-  const colW = Array.from({ length: colCount }, (_, c) =>
-    sameEverywhere(c) ? 0 : Math.min(COL_CAP, Math.max(0, ...items.map((it) => width(it.cols?.[c] ?? "")))),
-  );
-  const hasNote = !useCols && items.some((it) => !!it.note);
-  const noteGap = hasNote ? GAP : 0;
-  const minNote = hasNote ? 6 : 0;
-  const nameMax = Math.max(1, ...items.map((it) => width(it.label)));
-  // The name gives way first; on a narrow panel whole columns go, from the right, so the rest stay aligned.
-  const extraWidth = (k: number) => colW.slice(0, k).reduce((e, cw) => e + (cw ? GAP + cw : 0), 0);
-  // Keep a column only while the name still has a usable width (its own, or at least 6 when it is long).
-  const nameFloor = Math.min(nameMax, 6);
-  let keptCols = colCount;
-  while (keptCols > 0 && room - priceCol - extraWidth(keptCols) - noteGap - minNote < nameFloor) keptCols--;
-  const extra = extraWidth(keptCols);
-  const nameW = Math.max(1, Math.min(nameMax, room - priceCol - extra - noteGap - minNote));
-  const noteW = Math.max(0, room - nameW - priceCol - extra - noteGap);
-  const lines: string[] = [];
-  for (let i = start; i < end; i++) {
-    const it = items[i];
-    const on = i === selected;
-    const strong = on ? s.bold : same;
-    const mark = (on ? s.accent(MARKER) : NO_MARKER) + (it.current ? s.success(check) : NO_MARKER);
-    const name = strong(pad(cut(it.label, nameW), nameW));
-    const price =
-      priceW && it.price ? spaces(GAP) + strong(spaces(priceW - width(it.price)) + it.price) : spaces(priceCol);
-    let cols = "";
-    for (let c = 0; c < keptCols; c++) {
-      if (!colW[c]) continue;
-      cols += spaces(GAP) + s.dim(pad(fitColumn(it.cols?.[c] ?? "", colW[c]), colW[c]));
+  let lo = 0;
+  let hi = tabs.length - 1;
+  while (hi > at && !fits(lo, hi)) hi--;
+  while (lo < at && !fits(lo, hi)) lo++;
+  while (hi + 1 < tabs.length && fits(lo, hi + 1)) hi++;
+  while (lo > 0 && fits(lo - 1, hi)) lo--;
+  const parts: string[] = [];
+  for (let i = lo; i <= hi; i++) {
+    parts.push(i === at ? s.selected(s.accent(s.bold(seg(i)))) : s.dim(seg(i)));
+  }
+  return `  ${lo > 0 ? s.dim("<< ") : ""}${parts.join(s.dim("│"))}${hi < tabs.length - 1 ? s.dim(" >>") : ""}`;
+}
+
+function renderInput(view: PanelView, w: number, s: PanelStyle): string {
+  const line = (label: string, text: string) => `  ${s.dim(`${label}: `)}${s.dim("> ")}${text}`;
+  const fitLabel = (raw: string) => cutText(raw, Math.max(1, w - 10));
+  const room = (label: string) => Math.max(2, w - 2 - width(`${label}: > `));
+  if (view.input) {
+    const input = view.input;
+    const rawLabel = input.label || view.rows[view.selected]?.label || "Value";
+    const label = fitLabel(rawLabel);
+    const value = input.secret ? "•".repeat([...input.value].length) : input.value;
+    return line(label, renderField(value, input.cursor, input.placeholder, room(label), s).text);
+  }
+  if (view.picker) {
+    const label = fitLabel("Search");
+    return line(label, renderField(view.picker.query, view.picker.cursor, "", room(label), s).text);
+  }
+  if (view.speak) {
+    const speak = view.speak;
+    const label = fitLabel("Speak");
+    const r = room(label);
+    const text = speak.focused
+      ? renderField(speak.value, speak.cursor, speak.placeholder, r, s).text
+      : speak.value
+        ? cutText(speak.value, r)
+        : s.dim(cutText(speak.placeholder, r));
+    return line(label, text);
+  }
+  return "";
+}
+
+/** First of FRAME_ROWS rows shown, keeping the selected row near the middle. */
+const windowStart = (selected: number, count: number) =>
+  Math.max(0, Math.min(Math.max(0, selected) - Math.floor(FRAME_ROWS / 2), count - FRAME_ROWS));
+
+function renderForm(view: PanelView, w: number, s: PanelStyle): { header: string; rows: string[] } {
+  const maxLabel = view.rows.length ? Math.max(...view.rows.map((r) => width(r.label) + 2)) : MIN_LABEL;
+  const labelW = Math.min(Math.max(8, w - 10), Math.max(MIN_LABEL, maxLabel));
+  const room = Math.max(0, w - CURSOR.length - labelW);
+  const header = `  ${s.accent(pad("Setting", labelW))}${s.accent("Value")}`;
+  const start = windowStart(view.selected, view.rows.length);
+  const rows = view.rows.slice(start, start + FRAME_ROWS).map((r, i) => {
+    const on = start + i === view.selected;
+    const mark = on ? s.accent(CURSOR) : NO_MARKER;
+    if (r.value === undefined) {
+      const trimmed = cutText(r.label, Math.max(0, w - CURSOR.length - (r.opens ? width(OPENS) : 0)));
+      return mark + (on ? s.accent(s.bold(trimmed)) : trimmed) + (r.opens ? s.dim(OPENS) : "");
     }
-    const note = hasNote && it.note && noteW > 0 ? spaces(GAP) + s.dim(cut(it.note, noteW)) : "";
-    const line = mark + name + price + cols + note;
-    lines.push(on ? s.selected(pad(line, w)) : line);
-  }
-  return lines;
+    const label = pad(cutText(r.label, labelW - 1), labelW);
+    const entry = drawEntry(
+      { value: r.value, note: r.note, short: r.short, alert: r.alert, opens: r.opens },
+      room,
+      s,
+      on ? s.bold : same,
+    );
+    return mark + (on ? s.accent(s.bold(label)) : s.dim(label)) + entry;
+  });
+  return { header, rows };
 }
 
-function pickerLines(p: PickerView, w: number, s: PanelStyle, rows: number): Line[] {
-  const label = "Find: ";
-  // A model list says how it is ordered on the right; where the highlighted item is, and how many there are,
-  // is at the bottom right.
-  const right = p.sort ? `Sort: ${p.sort}` : "";
-  const styledRight = p.sort ? `${s.dim("Sort:")} ${p.sort}` : "";
-  const room = w - width(label) - width(right) - 2;
-  const query = field(p.query, p.cursor, "", Math.max(1, room), s);
-  const gap = Math.max(1, w - width(label) - query.width - width(right));
-  const out: Line[] = [keep(s.dim(label) + query.text + spaces(gap) + styledRight)];
-  const height = Math.max(1, Math.min(rows, p.total || 1));
-  if (p.loading) out.push(keep(NO_MARKER + s.dim("loading…")));
-  else if (p.items.length === 0) out.push(keep(NO_MARKER + s.dim(p.empty)));
-  else {
+function renderPicker(p: PickerView, w: number, s: PanelStyle): { header: string; rows: string[] } {
+  if (p.loading) return { header: "", rows: [NO_MARKER + s.dim("loading…")] };
+  if (!p.items.length) return { header: "", rows: [NO_MARKER + s.dim(cutText(p.empty, Math.max(0, w - 2)))] };
+
+  const catalog = p.noun === "models" && !p.keepColumns;
+  const provider = (it: PickerItem) => (catalog && it.cols?.[0] ? `[${it.cols[0]}]` : "");
+  const rightOf = (it: PickerItem): string[] => {
+    const extra = catalog
+      ? it.cols
+        ? it.cols.slice(1)
+        : it.note
+          ? [it.note]
+          : []
+      : (it.cols ?? (it.note ? [it.note] : []));
+    return [it.price ?? "", ...extra];
+  };
+  const names = catalog
+    ? ["Price", "Voices"]
+    : p.keepColumns
+      ? ["Size", "State", "Languages"]
+      : p.noun === "voices"
+        ? ["", "Language"]
+        : ["Price", "Notes"];
+
+  const nRight = Math.max(1, ...p.items.map((it) => rightOf(it).length));
+  const rightW = Array.from({ length: nRight }, (_, c) => {
+    const first = rightOf(p.items[0])[c] ?? "";
+    const uniform =
+      c > 0 &&
+      !catalog &&
+      !p.keepColumns &&
+      p.items.length > 1 &&
+      p.items.every((it) => (rightOf(it)[c] ?? "") === first);
+    const dataMax = uniform ? 0 : Math.min(COL_CAP, Math.max(0, ...p.items.map((it) => width(rightOf(it)[c] ?? ""))));
+    const headName = names[c] ?? "";
+    return dataMax > 0 ? Math.max(dataMax, headName ? width(headName) + 2 : 0) : 0;
+  });
+
+  const rawProvW = Math.max(0, ...p.items.map((it) => width(provider(it))));
+  let provW = rawProvW > 0 ? Math.max(rawProvW, width("Provider ▲")) : 0;
+
+  const calcRightBlock = () => rightW.reduce((sum, cw) => sum + (cw ? GAP + cw : 0), 0);
+  const minName = 12;
+  for (let c = nRight - 1; c >= 1; c--) {
+    if (CURSOR.length + minName + (provW ? GAP + provW : 0) + calcRightBlock() <= w) break;
+    rightW[c] = 0;
+  }
+  if (provW > 0 && CURSOR.length + minName + GAP + provW + calcRightBlock() > w) {
+    provW = 0;
+  }
+  if (rightW[0] > 0 && CURSOR.length + minName + calcRightBlock() > w) {
+    const avail = w - CURSOR.length - minName - GAP;
+    rightW[0] = avail >= 6 ? avail : 0;
+  }
+
+  const provBlock = provW ? GAP + provW : 0;
+  const rightBlock = calcRightBlock();
+  const noun =
+    p.noun === "models" ? "Model" : p.noun === "voices" ? "Voice" : p.noun === "messages" ? "Message" : "Name";
+  const nameFloor = Math.max(width(noun) + 2, 8);
+  const nameFull = Math.max(nameFloor, ...p.items.map((it) => width(it.label) + 2));
+  const maxNameAvail = Math.max(4, w - CURSOR.length - provBlock - rightBlock);
+  const nameW = Math.min(maxNameAvail, Math.max(Math.min(minName, maxNameAvail), nameFull));
+  const leftW = CURSOR.length + nameW + provBlock;
+  const fill = Math.max(0, w - leftW - rightBlock);
+
+  const sortCol =
+    p.sort === "name"
+      ? "name"
+      : p.sort === "provider" && provW > 0
+        ? "Provider"
+        : p.sort === "price" && rightW[0] > 0 && names[0] === "Price"
+          ? "Price"
+          : "";
+  const sortRightPlain = p.sort && !sortCol ? `Sort: ${p.sort}` : "";
+  const sortRightStyled = p.sort && !sortCol ? `${s.dim("Sort:")} ${s.bold(s.accent(p.sort))}` : "";
+
+  const head = (text: string, on: boolean) =>
+    on ? s.bold(s.accent(text)) + s.bold(s.warning(" ▲")) : text ? s.accent(text) : "";
+  const headW = (text: string, on: boolean) => width(text) + (on ? 2 : 0);
+
+  const nameHeadW = headW(noun, sortCol === "name");
+  const provHeadW = headW("Provider", sortCol === "Provider");
+  const midFill =
+    sortRightPlain && fill >= width(sortRightPlain) + GAP
+      ? spaces(fill - width(sortRightPlain)) + sortRightStyled
+      : spaces(fill);
+
+  const header =
+    NO_MARKER +
+    head(noun, sortCol === "name") +
+    spaces(Math.max(0, nameW - nameHeadW)) +
+    (provW ? spaces(GAP) + head("Provider", sortCol === "Provider") + spaces(Math.max(0, provW - provHeadW)) : "") +
+    midFill +
+    rightW
+      .map((cw, c) => {
+        if (!cw) return "";
+        const label = cutText(names[c] ?? "", Math.max(0, cw - (sortCol === names[c] ? 2 : 0)));
+        const on = !!label && sortCol === names[c];
+        return spaces(Math.max(GAP, GAP + cw - headW(label, on))) + head(label, on);
+      })
+      .join("");
+
+  const start = windowStart(p.selected, p.items.length);
+  const rows = p.items.slice(start, start + FRAME_ROWS).map((it, i) => {
+    const on = start + i === p.selected;
+    const tone = on ? (t: string) => s.accent(s.bold(t)) : it.current ? s.success : same;
+    const dotW = it.current ? 2 : 0;
+    const name = cutText(it.label, Math.max(1, nameW - (dotW || 1)));
+    const dot = it.current ? s.success(s.bold(" ●")) : "";
+    const prov = provW ? cutText(provider(it), provW) : "";
+    const cells = rightOf(it);
+    const right = rightW
+      .map((cw, c) => {
+        if (!cw) return "";
+        const raw = cells[c] ?? "";
+        const fitted = c === 0 ? cutText(raw, cw) : fitColumn(raw, cw);
+        const cellStyle = c === 0 ? (on ? s.bold : same) : s.dim;
+        return spaces(GAP + cw - width(fitted)) + cellStyle(fitted);
+      })
+      .join("");
+    return (
+      (on ? s.accent(CURSOR) : NO_MARKER) +
+      tone(name) +
+      dot +
+      spaces(Math.max(0, nameW - width(name) - dotW)) +
+      (provW ? spaces(GAP) + (on ? s.accent : s.dim)(pad(prov, provW)) : "") +
+      spaces(fill) +
+      right
+    );
+  });
+
+  return { header, rows };
+}
+
+function renderStatus(view: PanelView, w: number, s: PanelStyle): string {
+  if (view.status) {
+    return `  ${toneStyle(view.status.tone, s)(cutText(view.status.text, Math.max(0, w - 2)))}`;
+  }
+  if (view.picker) {
+    const p = view.picker;
     const n = p.items.length;
-    const start = Math.max(0, Math.min(p.selected - Math.floor(height / 2), n - height));
-    const end = Math.min(n, start + height);
-    for (const line of pickerTable(p.items, start, end, p.selected, w, s, p.keepColumns)) out.push(keep(line));
+    const at = n > 0 ? Math.max(0, Math.min(p.selected, n - 1)) : -1;
+    const id = at >= 0 ? (p.items[at]?.id ?? "") : "";
+    const lead = `  (${at >= 0 ? at + 1 : 0}/${n})${id ? ` ${id}` : ""}`;
+    const detail = p.detail ? p.detail.replace(/\s+/g, " ").trim() : "";
+    return s.dim(cutText(detail ? `${lead}${SEP}${detail}` : lead, w));
   }
-  // A steady height: the panel does not jump while the list is filtered.
-  while (out.length < 1 + height) out.push(optional(1));
-  // Under a model list: what the catalog says about the highlighted model, three lines at most. All three are
-  // kept even when empty, so the panel does not jump.
-  if (p.detail !== undefined) {
-    const lines = wrapLines(p.detail, w, w, DETAIL_LINES);
-    for (let i = 0; i < DETAIL_LINES; i++) out.push(optional(5, lines[i] ? s.dim(lines[i]) : ""));
-  }
-  return out;
+  const n = view.rows.length;
+  const at = view.selected >= 0 && view.selected < n ? view.selected : -1;
+  const label = at >= 0 ? view.rows[at].label : "";
+  return s.dim(cutText(`  (${at >= 0 ? at + 1 : 0}/${n})${label ? ` ${label}` : ""}`, w));
 }
 
-/** The title, a rule to the right edge, and what speech is doing: `Speech › Voice ─────── ▶ speaking`. */
-function headerLine(view: PanelView, w: number, s: PanelStyle): string {
-  const sub = view.picker?.title ?? view.crumb;
-  const crumb = sub ? ` › ${sub}` : "";
-  const state = cut(view.state, Math.max(0, w - 8));
-  const taken = state ? width(state) + 1 : 0;
-  const title = cut(view.title + crumb, w - taken);
-  const a = title.slice(0, view.title.length);
-  const b = title.slice(a.length);
-  const fill = w - width(title) - taken - 1;
-  const rule = fill >= 3 ? ` ${s.dim("─".repeat(fill))}` : spaces(fill + 1);
-  return s.accent(s.bold(a)) + (b ? s.bold(b) : "") + rule + (state ? ` ${stateStyle(view.state, s)(state)}` : "");
+function renderKeys(view: PanelView, w: number, s: PanelStyle): string {
+  const left = `  ${hintLine(view.hints, Math.max(0, w - 2), s)}`;
+  const note = [
+    view.keys.speak ? `${view.keys.speak} speak` : "",
+    view.keys.dictate ? `${view.keys.dictate} dictate` : "",
+  ]
+    .filter(Boolean)
+    .join(SEP);
+  if (note) {
+    const both = spread(left, s.dim(note), w, frameMeasure);
+    if (both) return both;
+  }
+  return left;
 }
 
 /**
- * The panel as lines of at most `total` columns and `height` rows. On a short terminal the list shows fewer
- * rows, then blank lines, headings and the bottom rule give way; below that, one line asks for a bigger
- * terminal.
+ * The panel as 19 framed lines of at most `termWidth` columns, or one line when the terminal is narrower
+ * than MIN_WIDTH.
  */
-export function renderPanel(view: PanelView, total: number, s: PanelStyle = PLAIN, height = Infinity): string[] {
-  if (total < MIN_WIDTH) {
-    return [cut(`${view.title}: terminal too narrow · Esc`, Math.max(1, total))];
+export function renderPanel(view: PanelView, termWidth: number, s: PanelStyle = PLAIN): string[] {
+  if (termWidth < MIN_WIDTH) {
+    return [cutText(`${view.title}: terminal too narrow · Esc`, Math.max(1, termWidth))];
   }
-  const w = Math.min(total, MAX_WIDTH);
-
-  // Under the body: an input that belongs to no row, then one line for results (kept free, so the dock
-  // does not grow and shrink as they come and go).
-  const slot: Line[] = [];
-  const input = view.input;
-  if (input && !input.under) slot.push(keep(inputLine(input, w, s)));
-  // A blank line sets a change confirmation (green) apart from the fixed menu above it.
-  slot.push(optional(1));
-  slot.push(
-    view.status
-      ? keep(NO_MARKER + toneStyle(view.status.tone, s)(cut(view.status.text, w - NO_MARKER.length)))
-      : optional(1),
+  const w = panelContentWidth(termWidth);
+  const body = view.picker ? renderPicker(view.picker, w, s) : renderForm(view, w, s);
+  const frameStyle: FrameStyle = { accent: s.accent, bold: s.bold, border: s.dim };
+  return frameLines(
+    {
+      title: view.title,
+      badge: view.state ? stateStyle(view.state, s)(view.state) : undefined,
+      tabs: renderTabs(view, w, s),
+      input: renderInput(view, w, s),
+      header: body.header,
+      rows: body.rows,
+      status: renderStatus(view, w, s),
+      keys: renderKeys(view, w, s),
+    },
+    w,
+    termWidth,
+    frameStyle,
+    frameMeasure,
   );
-
-  const body: Line[] = [];
-  if (view.picker) {
-    // Header, filter, the slot and the hints stay; the rows get what is left.
-    const fixed = 3 + slot.filter((l) => l.drop === undefined).length;
-    body.push(...pickerLines(view.picker, w, s, Math.min(PICKER_ROWS, Math.max(3, height - fixed))));
-  } else {
-    body.push(...homeLines(view, w, s));
-  }
-
-  let lines: Line[] = [
-    keep(headerLine(view, w, s)),
-    ...body,
-    ...slot,
-    keep(BODY + hintsWith(view, w - BODY.length, s)),
-    optional(4, s.dim("─".repeat(w))),
-  ];
-  for (let level = 1; lines.length > height && level <= 5; level++) {
-    lines = lines.filter((l) => l.drop === undefined || l.drop > level);
-  }
-  if (lines.length > height) return [cut(`${view.title}: terminal too small · Esc`, w)];
-  return lines.map((l) => clip(l.text, w).replace(/ +$/, ""));
 }

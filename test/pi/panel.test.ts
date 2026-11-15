@@ -1,14 +1,18 @@
-import { join } from "node:path";
 import { stripVTControlCharacters } from "node:util";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { setKittyProtocolActive, visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { Engine } from "../../src/engine/engine";
-import { SettingsFile } from "../../src/engine/settings";
+import { PANEL_KEYS, type Panel, type PanelKey, type PanelView } from "../../src/engine/panel";
+import { Surface } from "../../src/engine/surface";
 import { registerPi } from "../../src/pi/adapter";
-import { KeyDecoder, panelStyle } from "../../src/pi/panel";
+import { KEYS } from "../../src/pi/frame";
+import { KeyDecoder, openPanel, panelStyle } from "../../src/pi/panel";
 import { fakeOpenRouter, makeEngine } from "../engine/fixtures";
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  setKittyProtocolActive(false);
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
 
 const theme = {
   fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
@@ -16,7 +20,14 @@ const theme = {
   inverse: (text: string) => `\x1b[7m${text}\x1b[27m`,
 };
 
-/** Pi with a terminal UI whose `custom` overlay can be drawn and typed into. */
+interface CustomCall {
+  component: any;
+  options: any;
+  closed: Promise<unknown>;
+  isDone: () => boolean;
+  renders: number;
+}
+
 function tuiPi() {
   const commands = new Map<string, any>();
   const shortcuts = new Map<string, any>();
@@ -30,14 +41,8 @@ function tuiPi() {
     setActiveTools: () => {},
     sendUserMessage: vi.fn(async () => {}),
   };
-  const notes: Array<{ message: string; type?: string }> = [];
-  const overlay: {
-    component?: any;
-    options?: any;
-    closed?: Promise<unknown>;
-    renders: number;
-    rows?: number;
-  } = { renders: 0 };
+  const customs: CustomCall[] = [];
+  let rows: number | undefined;
   const ctx: any = {
     mode: "tui",
     hasUI: true,
@@ -47,392 +52,338 @@ function tuiPi() {
     cwd: "/",
     modelRegistry: { getApiKeyForProvider: async () => undefined },
     ui: {
-      notify: (message: string, type?: string) => notes.push({ message, type }),
+      notify: vi.fn(),
       setStatus: () => {},
       select: vi.fn(async () => undefined),
       input: vi.fn(async () => undefined),
       pasteToEditor: vi.fn(),
       custom: vi.fn((factory: any, options: any) => {
-        overlay.options = options;
-        overlay.closed = new Promise<unknown>((resolve) => {
-          const tui = { requestRender: () => overlay.renders++, terminal: { rows: overlay.rows } };
-          overlay.component = factory(tui, theme, {}, (result: unknown) => resolve(result));
+        let settled = false;
+        const entry: CustomCall = {
+          component: undefined,
+          options,
+          closed: Promise.resolve(),
+          isDone: () => settled,
+          renders: 0,
+        };
+        entry.closed = new Promise<unknown>((resolve) => {
+          const tui = { requestRender: () => entry.renders++, terminal: { rows } };
+          entry.component = factory(tui, theme, {}, (result: unknown) => {
+            settled = true;
+            resolve(result);
+          });
         });
-        return overlay.closed;
+        customs.push(entry);
+        return entry.closed;
       }),
     },
   };
   const emit = async (e: string) => {
     for (const fn of handlers.get(e) ?? []) await fn({}, ctx);
   };
-  const screen = (width = 100) => overlay.component.render(width).join("\n");
-  return { pi, ctx, commands, shortcuts, emit, notes, overlay, screen };
+  return {
+    pi,
+    ctx,
+    commands,
+    shortcuts,
+    emit,
+    customs,
+    setRows: (r: number | undefined) => {
+      rows = r;
+    },
+    dock: () => customs[0]!,
+    overlays: () => customs.filter((c) => c.options?.overlay),
+  };
 }
 
-describe("the panel in Pi's terminal UI", () => {
-  it("/speech alone opens one dock in the editor's place instead of the menu; Esc closes it", async () => {
-    fakeOpenRouter();
-    const f = tuiPi();
-    const { engine } = makeEngine();
-    registerPi(f.pi, engine, {});
-    await f.emit("session_start");
-    const done = f.commands.get("speech").handler("", f.ctx);
-    expect(f.ctx.ui.custom).toHaveBeenCalledTimes(1);
-    // not an overlay: nothing floats over the conversation
-    expect(f.overlay.options).toBeUndefined();
-    expect(f.ctx.ui.select).not.toHaveBeenCalled();
-    expect(f.screen()).toMatch(/Speech[\s\S]*SPEAK \(Alt\+S\)[\s\S]*Bridge connection/);
-    f.overlay.component.handleInput("\x1b");
-    await done;
+describe("frame key alignment and KeyDecoder", () => {
+  it("matches PANEL_KEYS sort, detail, pageUp and pageDown to frame.ts KEYS", () => {
+    expect(PANEL_KEYS.sort).toEqual(KEYS.sort);
+    expect(PANEL_KEYS.detail).toEqual(KEYS.detail);
+    expect(PANEL_KEYS.pageUp).toEqual(KEYS.pageUp);
+    expect(PANEL_KEYS.pageDown).toEqual(KEYS.pageDown);
   });
 
-  it("Alt+S opens /speech with the cursor on its Speak line; Enter speaks, again and again", async () => {
-    const requests = fakeOpenRouter();
-    const f = tuiPi();
-    registerPi(f.pi, makeEngine().engine, { NO_COLOR: "1" });
-    await f.emit("session_start");
-    const done = f.shortcuts.get("alt+s").handler(f.ctx);
-    const screen = () => stripVTControlCharacters(f.screen());
-    expect(screen()).toMatch(/▸ Speak {2}/);
-    expect(screen()).toMatch(/Speech model/);
-    f.overlay.component.handleInput("first message");
-    f.overlay.component.handleInput("\r");
-    f.overlay.component.handleInput("second message");
-    f.overlay.component.handleInput("\r");
-    await vi.waitFor(() => expect(requests.filter((r) => r.body?.input)).toHaveLength(2));
-    expect(requests.filter((r) => r.body?.input).map((r) => r.body.input)).toEqual(["first message", "second message"]);
-    expect(screen()).toMatch(/▸ Speak {2}/);
-    f.overlay.component.handleInput("\x1b");
-    await done;
-  });
-
-  it("draws the agreed main view at 80, 100 and 160 columns, no line wider than the terminal", async () => {
-    fakeOpenRouter();
-    const f = tuiPi();
-    const { engine } = makeEngine();
-    registerPi(f.pi, engine, { NO_COLOR: "1" });
-    await f.emit("session_start");
-    await engine.speech.set("tts-model", "x-ai/grok-voice-tts-1.0");
-    await engine.speech.set("voice", "eve");
-    const done = f.commands.get("speech").handler("", f.ctx);
-    await vi.waitFor(() => expect(engine.speech.settings.voice).toBe("eve"));
-    const MOCKUP = [
-      "  ▸ Speak    type a message · Enter speaks it",
-      "SPEAK (Alt+S)",
-      "    Read aloud options   Off ›",
-      "    Speech source        Provider",
-      "    Speech model         x-ai/grok-voice-tts-1.0 ›",
-      "    Voice                eve ›",
-      "LISTEN (Alt+Z)",
-      "    Transcription source Provider",
-      "    Transcription model  openai/whisper-large-v3-turbo ›",
-      "    Dictation language   auto",
-      "    Dictation output     Pi ›",
-      "SETTINGS",
-      "    Hotkeys ›",
-      "    Bridge connection    not connected ›",
-      "    Spectrum OSD         Braille",
-    ];
-    for (const [width, w] of [
-      [80, 79],
-      [100, 96],
-      [160, 96],
-    ]) {
-      const raw: string[] = f.overlay.component.render(width);
-      expect(Math.max(...raw.map((l) => visibleWidth(l))), `width ${width}`).toBeLessThanOrEqual(width);
-      const lines = raw.map((l) => stripVTControlCharacters(l).trimEnd());
-      expect(lines[0]).toBe(` Speech ${"─".repeat(w - 7)}`);
-      expect(lines.slice(1, 16)).toEqual(MOCKUP.map((l) => ` ${l}`));
-      expect(lines.slice(16)).toEqual(["", "", "   Enter speak · ↓ settings · Esc close", ` ${"─".repeat(w)}`]);
-    }
-    f.overlay.component.handleInput("\x1b");
-    await done;
-  });
-
-  it("Hotkeys at 80, 100 and 160 columns as agreed; k sets a key, and leaving Hotkeys reloads Pi to bind it", async () => {
-    fakeOpenRouter();
-    const f = tuiPi();
-    const { engine, work } = makeEngine();
-    registerPi(f.pi, engine, { NO_COLOR: "1" });
-    await f.emit("session_start");
-    expect([...f.shortcuts.keys()].sort()).toEqual(["alt+s", "alt+z"]);
-    const done = f.commands.get("speech").handler("", f.ctx);
-    const c = f.overlay.component;
-    // From the Speak line, the first entry, down to Hotkeys.
-    for (let i = 0; i < 9; i++) c.handleInput("\x1b[B");
-    c.handleInput("\r");
-    const screen = (width: number) =>
-      f.overlay.component.render(width).map((l: string) => stripVTControlCharacters(l).trimEnd());
-    for (const width of [80, 100, 160]) {
-      const lines = screen(width);
-      expect(Math.max(...f.overlay.component.render(width).map((l: string) => visibleWidth(l)))).toBeLessThanOrEqual(
-        width,
-      );
-      expect(lines[0]).toMatch(/^ Speech › Hotkeys ─+$/);
-      expect(lines.slice(1, 4)).toEqual([
-        "   ▸ Speak…             Alt+S",
-        "     Dictate            Alt+Z",
-        "     Push-to-talk       off · hold to dictate (Kitty key-release)",
-      ]);
-      expect(lines[6]).toBe("   Enter run · k change key · Esc back");
-    }
-    // k, then the new key: Alt+D from a legacy terminal, as ESC d
-    c.handleInput("k");
-    expect(screen(100)[1]).toBe("   ▸ Speak…             press a key…");
-    c.handleInput("\x1bd");
-    expect(new SettingsFile(join(work, "agent", "pi-speech")).load().hotkeys).toEqual({
-      speak: "alt+d",
-      dictate: "alt+z",
-    });
-    expect(screen(100)[1]).toBe("   ▸ Speak…             Alt+D");
-    expect(screen(100).join("\n")).toContain("✓ Speak is Alt+D");
-    expect(screen(100).join("\n")).not.toMatch(/reload/);
-    expect(f.ctx.reload).not.toHaveBeenCalled();
-    // leaving Hotkeys closes the panel and reloads Pi silently: no message
-    c.handleInput("\x1b");
-    await done;
-    expect(f.ctx.reload).toHaveBeenCalledTimes(1);
-    expect(f.notes).toEqual([]);
-    expect(f.pi.sendUserMessage).not.toHaveBeenCalled();
-    // the reload loads the extension again: it binds Alt+D, and the panel takes it as the Speak key
-    const g = tuiPi();
-    const again = new Engine({ agentDir: join(work, "agent"), env: {}, home: join(work, "home") });
-    registerPi(g.pi, again, { NO_COLOR: "1" });
-    expect([...g.shortcuts.keys()].sort()).toEqual(["alt+d", "alt+z"]);
-    const reopened = g.commands.get("speech").handler("", g.ctx);
-    expect(stripVTControlCharacters(g.screen())).toContain("SPEAK (Alt+D)");
-    g.overlay.component.handleInput("\x1b[B"); // off the Speak line
-    g.overlay.component.handleInput("\x1bd"); // the Speak key, Alt+D now: back on it
-    expect(stripVTControlCharacters(g.screen())).toMatch(/▸ Speak {2}/);
-    g.overlay.component.handleInput("\x1b");
-    g.overlay.component.handleInput("\x1b");
-    await reopened;
-  });
-
-  it("leaving Hotkeys without a change reloads nothing", async () => {
-    fakeOpenRouter();
-    const f = tuiPi();
-    registerPi(f.pi, makeEngine().engine, { NO_COLOR: "1" });
-    await f.emit("session_start");
-    const done = f.commands.get("speech").handler("", f.ctx);
-    const c = f.overlay.component;
-    // From the Speak line, the first entry, down to Hotkeys.
-    for (let i = 0; i < 9; i++) c.handleInput("\x1b[B");
-    c.handleInput("\r");
-    c.handleInput("k");
-    c.handleInput("\x1b");
-    c.handleInput("\x1b");
-    expect(stripVTControlCharacters(f.screen())).toContain("SPEAK (Alt+S)");
-    c.handleInput("\x1b");
-    await done;
-    await f.emit("agent_settled");
-    expect(f.ctx.reload).not.toHaveBeenCalled();
-    expect(f.pi.sendUserMessage).not.toHaveBeenCalled();
-  });
-
-  it("while the agent runs, the reload for a changed key waits until the agent has settled", async () => {
-    fakeOpenRouter();
-    const f = tuiPi();
-    registerPi(f.pi, makeEngine().engine, { NO_COLOR: "1" });
-    await f.emit("session_start");
-    f.ctx.idle = false;
-    const done = f.commands.get("speech").handler("", f.ctx);
-    const c = f.overlay.component;
-    // From the Speak line, the first entry, down to Hotkeys.
-    for (let i = 0; i < 9; i++) c.handleInput("\x1b[B");
-    c.handleInput("\r");
-    c.handleInput("k");
-    c.handleInput("\x1bd");
-    c.handleInput("\x1b");
-    await done;
-    expect(f.ctx.reload).not.toHaveBeenCalled();
-    f.ctx.idle = true;
-    await f.emit("agent_settled");
-    // the request goes once, as the hidden /speech argument, which reloads from a command context
-    expect(f.pi.sendUserMessage).toHaveBeenCalledTimes(1);
-    expect(f.pi.sendUserMessage).toHaveBeenCalledWith("/speech --reload-hotkeys", { expandPromptTemplates: true });
-    await f.emit("agent_settled");
-    expect(f.pi.sendUserMessage).toHaveBeenCalledTimes(1);
-    await f.commands.get("speech").handler("--reload-hotkeys", f.ctx);
-    expect(f.ctx.reload).toHaveBeenCalledTimes(1);
-    expect(f.notes).toEqual([]);
-  });
-
-  it("draws a compact dock: one column of margin, the header as the top rule, three sections, no box", async () => {
-    fakeOpenRouter();
-    const f = tuiPi();
-    registerPi(f.pi, makeEngine().engine, { NO_COLOR: "1" });
-    await f.emit("session_start");
-    const done = f.commands.get("speech").handler("", f.ctx);
-    const lines: string[] = stripVTControlCharacters(f.overlay.component.render(120).join("\n")).split("\n");
-    expect(lines[0]).toMatch(/^ Speech ─+$/);
-    expect(lines[0]).toHaveLength(97);
-    expect(lines.filter((l) => /^ (SPEAK \(Alt\+S\)|LISTEN \(Alt\+Z\)|SETTINGS)$/.test(l))).toHaveLength(3);
-    expect(lines.join("\n")).not.toMatch(/[│╭╰]/);
-    expect(lines.length).toBeLessThanOrEqual(20);
-    f.overlay.component.handleInput("\x1b");
-    await done;
-  });
-
-  it("Tab sorts the model list from the keyboard, and typing filters it", async () => {
-    fakeOpenRouter();
-    const f = tuiPi();
-    const { engine } = makeEngine();
-    registerPi(f.pi, engine, { NO_COLOR: "1" });
-    await f.emit("session_start");
-    const done = f.commands.get("speech").handler("", f.ctx);
-    const c = f.overlay.component;
-    const screen = () => stripVTControlCharacters(f.screen(120));
-    c.handleInput("\x1b[B"); // off the Speak line: Read aloud options
-    c.handleInput("\x1b[B"); // down: Speech source
-    c.handleInput("\x1b[B"); // down: Speech model
-    c.handleInput("\r");
-    await vi.waitFor(() => expect(screen()).toMatch(/kokoro/));
-    expect(screen()).toMatch(/Find: +Sort: price/);
-    c.handleInput("\t");
-    expect(screen()).toMatch(/Sort: provider/);
-    expect(engine.speech.settings.modelSort).toBe("provider");
-    c.handleInput("gemini");
-    expect(screen()).toMatch(/Find: gemini +Sort: provider/);
-    expect(screen()).toMatch(/ 1\/1$/m);
-    expect(screen()).toMatch(/▸ ✓ google\/gemini-3\.8-flash-tts +~\$0\.03\/min {2}OpenRouter {2}2 voices/);
-    expect(screen()).toMatch(/Gemini 3\.8 Flash TTS is a text-to-speech model from Google\./);
-    c.handleInput("\x1b");
-    c.handleInput("\x1b");
-    await done;
-  });
-
-  it("draws with the theme, and without colour when NO_COLOR is set", async () => {
-    fakeOpenRouter();
-    const f = tuiPi();
-    registerPi(f.pi, makeEngine().engine, { NO_COLOR: "1" });
-    await f.emit("session_start");
-    const done = f.commands.get("speech").handler("", f.ctx);
-    const text = f.screen();
-    expect(text).not.toMatch(/<accent>|<dim>/);
-    expect(text).toContain("▸ \x1b[1mSpeak  ");
-    f.overlay.component.handleInput("\x1b[B"); // the first row
-    expect(f.screen()).toContain("\x1b[7m\x1b[1m▸ \x1b[1mRead aloud options");
-    f.overlay.component.handleInput("\x1b");
-    await done;
-    const coloured = panelStyle(theme, {});
-    expect(coloured.accent("x")).toBe("<accent>x</accent>");
-    // dim is the faint attribute, with colour and without
-    expect(coloured.dim("x")).toBe("\x1b[2mx\x1b[22m");
-    expect(coloured.selected("x")).toBe("\x1b[7m\x1b[1mx\x1b[22m\x1b[27m");
-    expect(panelStyle(theme, { NO_COLOR: "1" }).dim("x")).toBe("\x1b[2mx\x1b[22m");
-  });
-
-  it("keys change settings in place; engine notifications land in the panel, not in toasts", async () => {
-    fakeOpenRouter();
-    const f = tuiPi();
-    const { engine } = makeEngine();
-    registerPi(f.pi, engine, {});
-    await f.emit("session_start");
-    const done = f.commands.get("speech").handler("", f.ctx);
-    const c = f.overlay.component;
-    c.handleInput("\x1b[B"); // off the Speak line
-    c.handleInput("\r"); // Read aloud options
-    c.handleInput("\x1b[C"); // right: Read Summarized
-    expect(engine.readAloud.mode).toBe("summary");
-    expect(stripVTControlCharacters(f.screen())).toMatch(
-      /Read aloud options ─[\s\S]*Read\s+Summarized[\s\S]*Reads a spoken summary of the reply when the run ends\./,
-    );
-    c.handleInput("\x1b"); // back to the main view
-    expect(stripVTControlCharacters(f.screen())).toMatch(/Read aloud options\s+Summarized ›/);
-    c.handleInput("\x1b[A"); // up: the Speak line
-    c.handleInput("\x1b[A"); // up: on round to Spectrum OSD
-    c.handleInput("\x1b[A"); // up: Bridge connection
-    c.handleInput("\r");
-    // On this machine, Bridge connection is Remote machine (Connect) and DIRECTION.
-    expect(stripVTControlCharacters(f.screen())).toMatch(
-      /Bridge connection ─[\s\S]*Remote machine\s+not connected · Enter connects/,
-    );
-    engine.notify("Playback failed (local): boom", "error");
-    expect(f.notes).toEqual([]);
-    expect(f.screen()).toContain("✗ Playback failed (local): boom");
-    c.handleInput("\x1b"); // back to the main view
-    expect(f.screen()).toContain("SPEAK (Alt+S)");
-    c.handleInput("\x1b");
-    await done;
-    engine.notify("after the panel", "info");
-    expect(f.notes).toEqual([{ message: "after the panel", type: "info" }]);
-  });
-
-  it("never draws wider than it is given, and never throws while drawing", async () => {
-    fakeOpenRouter();
-    const f = tuiPi();
-    registerPi(f.pi, makeEngine().engine, {});
-    await f.emit("session_start");
-    const done = f.commands.get("speech").handler("", f.ctx);
-    for (const w of [1, 20, 39, 40, 55, 69, 70, 78, 120]) {
-      const lines: string[] = f.overlay.component.render(w);
-      expect(Math.max(...lines.map((l) => visibleWidth(l))), `width ${w}`).toBeLessThanOrEqual(w);
-    }
-    f.overlay.component.handleInput("\x1b");
-    await done;
-  });
-
-  it("fits a short terminal: never more lines than rows", async () => {
-    fakeOpenRouter();
-    const f = tuiPi();
-    f.overlay.rows = 17;
-    registerPi(f.pi, makeEngine().engine, {});
-    await f.emit("session_start");
-    const done = f.commands.get("speech").handler("", f.ctx);
-    const lines: string[] = f.overlay.component.render(100);
-    // Pi's footer keeps its rows
-    expect(lines.length).toBeLessThanOrEqual(14);
-    expect(lines.join("\n")).toMatch(/Speech[\s\S]*Spectrum OSD[\s\S]*Esc close/);
-    f.overlay.component.handleInput("\x1b");
-    await done;
-  });
-
-  it("in RPC mode /speech alone keeps the menu of dialogs", async () => {
-    fakeOpenRouter();
-    const f = tuiPi();
-    f.ctx.mode = "rpc";
-    registerPi(f.pi, makeEngine().engine, {});
-    await f.emit("session_start");
-    await f.commands.get("speech").handler("", f.ctx);
-    expect(f.ctx.ui.custom).not.toHaveBeenCalled();
-    expect(f.ctx.ui.select).toHaveBeenCalledWith("Speech", expect.arrayContaining(["Stop", "Replay last"]));
-  });
-});
-
-describe("decoding keys", () => {
-  it("names the keys the panel uses", () => {
+  it("decodes panel chords as { combo } and tab/backtab as named keys in legacy and Kitty encodings", () => {
     const d = new KeyDecoder();
+    // Legacy sequences
+    expect(d.decode("\x13")).toEqual([{ combo: "ctrl+s" }]);
+    expect(d.decode("\x04")).toEqual([{ combo: "ctrl+d" }]);
+    expect(d.decode("\x10")).toEqual([{ combo: "ctrl+p" }]);
+    expect(d.decode("\x0f")).toEqual([{ combo: "ctrl+o" }]);
+    expect(d.decode("\x0c")).toEqual([{ combo: "ctrl+l" }]);
+    expect(d.decode("\x0e")).toEqual([{ combo: "ctrl+n" }]);
+    expect(d.decode("\x14")).toEqual([{ combo: "ctrl+t" }]);
+    expect(d.decode("\x1b[5~")).toEqual([{ combo: "pageUp" }]);
+    expect(d.decode("\x1b[6~")).toEqual([{ combo: "pageDown" }]);
+    expect(d.decode("\x1b[1;2A")).toEqual([{ combo: "shift+up" }]);
+    expect(d.decode("\x1b[1;2B")).toEqual([{ combo: "shift+down" }]);
     expect(d.decode("\x1b[A")).toEqual([{ key: "up" }]);
-    expect(d.decode("\x1b[B")).toEqual([{ key: "down" }]);
-    expect(d.decode("\x1b[D")).toEqual([{ key: "left" }]);
-    expect(d.decode("\x1b[C")).toEqual([{ key: "right" }]);
-    expect(d.decode("\r")).toEqual([{ key: "enter" }]);
-    expect(d.decode("\x1b")).toEqual([{ key: "escape" }]);
     expect(d.decode("\t")).toEqual([{ key: "tab" }]);
-    expect(d.decode("\x7f")).toEqual([{ key: "backspace" }]);
-    expect(d.decode("\x1bz")).toEqual([{ key: "dictate", id: "alt+z" }]);
-    expect(d.decode("\x1bs")).toEqual([{ key: "speak", id: "alt+s" }]);
     expect(d.decode("\x1b[Z")).toEqual([{ key: "backtab", id: "shift+tab" }]);
-    expect(d.decode("\x1bOQ")).toEqual([{ key: "language" }]);
-    expect(d.decode("\x1b[12~")).toEqual([{ key: "language" }]);
+
+    // Kitty CSI-u / modified sequences
+    setKittyProtocolActive(true);
+    expect(d.decode("\x1b[115;5u")).toEqual([{ combo: "ctrl+s" }]);
+    expect(d.decode("\x1b[100;5u")).toEqual([{ combo: "ctrl+d" }]);
+    expect(d.decode("\x1b[112;5u")).toEqual([{ combo: "ctrl+p" }]);
+    expect(d.decode("\x1b[111;5u")).toEqual([{ combo: "ctrl+o" }]);
+    expect(d.decode("\x1b[5;1:1~")).toEqual([{ combo: "pageUp" }]);
+    expect(d.decode("\x1b[6;1:1~")).toEqual([{ combo: "pageDown" }]);
+    expect(d.decode("\x1b[1;2:1A")).toEqual([{ combo: "shift+up" }]);
+    expect(d.decode("\x1b[9u")).toEqual([{ key: "tab" }]);
+    expect(d.decode("\x1b[9;2u")).toEqual([{ key: "backtab", id: "shift+tab" }]);
+    expect(d.decode("\x1b[115;5:3u")).toEqual([]); // key release ignored
   });
 
-  it("passes typed text, drops other control input, and collects a bracketed paste", () => {
-    const d = new KeyDecoder();
-    expect(d.decode("s")).toEqual([{ text: "s" }]);
-    expect(d.decode("l")).toEqual([{ text: "l" }]);
-    expect(d.decode("é")).toEqual([{ text: "é" }]);
-    expect(d.decode("\x01")).toEqual([{ combo: "ctrl+a" }]);
-    expect(d.decode("\x1b[999~")).toEqual([]);
-    expect(d.decode("\x1b[200~hello ")).toEqual([]);
-    expect(d.decode("world\x1b[201~")).toEqual([{ text: "hello world", paste: true }]);
-  });
-  it("takes the Speak and Dictate keys Pi has bound, and passes any other modified key by its name", () => {
+  it("respects custom Speak/Dictate hotkeys and collects multi-chunk bracketed paste", () => {
     const d = new KeyDecoder({ speak: "alt+d", dictate: "ctrl+alt+x" });
     expect(d.decode("\x1bd")).toEqual([{ key: "speak", id: "alt+d" }]);
     expect(d.decode("\x1b\x18")).toEqual([{ key: "dictate", id: "ctrl+alt+x" }]);
-    expect(d.decode("\x1bs")).toEqual([{ combo: "alt+s" }]);
-    expect(d.decode("\x1bz")).toEqual([{ combo: "alt+z" }]);
+    expect(d.decode("\x1b[200~part ")).toEqual([]);
+    expect(d.decode("two\x1b[201~")).toEqual([{ text: "part two", paste: true }]);
+  });
+});
+
+describe("floating panes and dock in Pi's TUI", () => {
+  it("opens the login overlay when view().login is set and forwards typing, paste, Backspace, Enter and Esc", async () => {
+    fakeOpenRouter();
+    const f = tuiPi();
+    const { engine } = makeEngine();
+    const surface = new Surface(engine);
+    let tracked: Panel | undefined;
+    const panelClosed = openPanel(
+      f.ctx,
+      engine,
+      surface,
+      {
+        cwd: "/",
+        notify: () => {},
+        paste: () => {},
+        select: async () => undefined,
+        input: async () => undefined,
+        pick: async () => undefined,
+      },
+      { NO_COLOR: "1" },
+      (p) => {
+        tracked = p;
+      },
+    );
+    expect(tracked).toBeDefined();
+
+    let login: PanelView["login"];
+    let nextLogin: PanelView["login"];
+    let submitted: string | undefined;
+    let cancelled = false;
+    const baseView = tracked!.view.bind(tracked);
+    vi.spyOn(tracked!, "view").mockImplementation(() => ({ ...baseView(), login }));
+    vi.spyOn(tracked!, "handle").mockImplementation((k: PanelKey) => {
+      if (!login) {
+        if ("key" in k && k.key === "enter" && nextLogin) {
+          login = nextLogin;
+          nextLogin = undefined;
+        }
+        return;
+      }
+      if ("text" in k) {
+        login = { ...login, value: login.value + k.text, cursor: login.cursor + [...k.text].length };
+      } else if ("key" in k) {
+        if (k.key === "backspace") {
+          const chars = [...login.value];
+          chars.pop();
+          login = { ...login, value: chars.join(""), cursor: chars.length };
+        } else if (k.key === "enter") {
+          submitted = login.value;
+          login = undefined;
+        } else if (k.key === "escape") {
+          cancelled = true;
+          login = undefined;
+        }
+      }
+    });
+
+    // Trigger via the panel's changed callback (engine.onRemoteChange fires changed()).
+    login = { prompt: "Password for alice@box", secret: true, confirm: false, value: "", cursor: 0 };
+    engine.onRemoteChange();
+    expect(f.overlays()).toHaveLength(1);
+    const first = f.overlays()[0]!;
+    expect(first.options).toMatchObject({ overlay: true, overlayOptions: { anchor: "center" } });
+
+    const renderPlain = (c: CustomCall) => stripVTControlCharacters(c.component.render(56).join("\n"));
+    expect(renderPlain(first)).toContain("Password for alice@box");
+    expect(renderPlain(first)).toContain("Enter sign in · Esc cancel");
+
+    first.component.handleInput("s3");
+    expect(login?.value).toBe("s3");
+    expect(renderPlain(first)).toContain("> ••");
+    expect(renderPlain(first)).not.toContain("s3");
+
+    first.component.handleInput("\x1b[200~cr3tX\x1b[201~");
+    expect(login?.value).toBe("s3cr3tX");
+
+    first.component.handleInput("\x7f");
+    expect(login?.value).toBe("s3cr3t");
+
+    first.component.handleInput("\r");
+    expect(submitted).toBe("s3cr3t");
+    expect(login).toBeUndefined();
+    expect(first.isDone()).toBe(true);
+
+    // Esc cancels and closes a new login prompt triggered after a handled key on the dock.
+    nextLogin = { prompt: "Install receiver on box?", secret: false, confirm: true, value: "", cursor: 0 };
+    f.dock().component.handleInput("\r");
+    expect(f.overlays()).toHaveLength(2);
+    const second = f.overlays()[1]!;
+    expect(renderPlain(second)).toContain("Install receiver on box?");
+    expect(renderPlain(second)).toContain("Enter yes · Esc no");
+    second.component.handleInput("\x1b");
+    expect(cancelled).toBe(true);
+    expect(second.isDone()).toBe(true);
+
+    // Closing the panel while a login pane is open closes the login pane too.
+    login = { prompt: "Password again", secret: true, confirm: false, value: "", cursor: 0 };
+    engine.onRemoteChange();
+    const third = f.overlays()[2]!;
+    expect(third.isDone()).toBe(false);
+    f.dock().component.dispose();
+    await panelClosed;
+    expect(third.isDone()).toBe(true);
+  });
+
+  it("Ctrl+D opens a floating detail pane when picker.detail is non-empty, and passes through otherwise", async () => {
+    fakeOpenRouter();
+    const f = tuiPi();
+    const { engine } = makeEngine();
+    const surface = new Surface(engine);
+    let tracked: Panel | undefined;
+    const done = openPanel(
+      f.ctx,
+      engine,
+      surface,
+      {
+        cwd: "/",
+        notify: () => {},
+        paste: () => {},
+        select: async () => undefined,
+        input: async () => undefined,
+        pick: async () => undefined,
+      },
+      { NO_COLOR: "1" },
+      (p) => {
+        tracked = p;
+      },
+    );
+
+    const forwarded: PanelKey[] = [];
+    const baseView = tracked!.view.bind(tracked);
+    let withDetail = false;
+    vi.spyOn(tracked!, "view").mockImplementation(() => ({
+      ...baseView(),
+      picker: withDetail
+        ? {
+            title: "Speech model",
+            noun: "models",
+            query: "",
+            cursor: 0,
+            items: [{ id: "vendor/tts-1", label: "TTS One", current: true }],
+            selected: 0,
+            total: 1,
+            loading: false,
+            empty: "None",
+            detail: "Full model description that wraps cleanly across lines inside the detail overlay box.",
+          }
+        : undefined,
+    }));
+    vi.spyOn(tracked!, "handle").mockImplementation((k) => {
+      forwarded.push(k);
+    });
+
+    // No picker detail -> passed straight to engine.
+    f.dock().component.handleInput("\x04");
+    expect(forwarded).toEqual([{ combo: "ctrl+d" }]);
+    expect(f.overlays()).toHaveLength(0);
+
+    // Picker with detail -> opens floating detail pane; any key closes it.
+    withDetail = true;
+    f.dock().component.render(140);
+    f.dock().component.handleInput("\x04");
+    expect(forwarded).toHaveLength(1);
+    expect(f.overlays()).toHaveLength(1);
+    const pane = f.overlays()[0]!;
+    const rendered = stripVTControlCharacters(pane.component.render(60).join("\n"));
+    expect(rendered).toContain("TTS One");
+    expect(rendered).toContain("Full model description that wraps cleanly");
+    expect(rendered).toContain("overlay box.");
+    pane.component.handleInput(" ");
+    expect(pane.isDone()).toBe(true);
+
+    f.dock().component.dispose();
+    await done;
+  });
+
+  it("/speech opens the 19-line framed dock (even on a short terminal), speaks from Main, and catches draw errors", async () => {
+    const requests = fakeOpenRouter();
+    const f = tuiPi();
+    f.setRows(12);
+    const { engine } = makeEngine();
+    registerPi(f.pi, engine, { NO_COLOR: "1" });
+    await f.emit("session_start");
+
+    const done = f.commands.get("speech").handler("", f.ctx);
+    expect(f.dock().options).toBeUndefined();
+    const lines = f.dock().component.render(100);
+    expect(lines).toHaveLength(19);
+    expect(Math.max(...lines.map((l: string) => visibleWidth(l)))).toBeLessThanOrEqual(100);
+    expect(stripVTControlCharacters(lines.join("\n"))).toContain("Speak: >");
+
+    f.dock().component.handleInput("hello frame");
+    f.dock().component.handleInput("\r");
+    await vi.waitFor(() => expect(requests.filter((r) => r.body?.input)).toHaveLength(1));
+    expect(requests.find((r) => r.body?.input)?.body.input).toBe("hello frame");
+
+    expect(panelStyle(theme, {}).accent("x")).toBe("<accent>x</accent>");
+    expect(panelStyle(theme, { NO_COLOR: "1" }).accent("x")).toBe("x");
+
+    f.dock().component.handleInput("\x1b");
+    await done;
+  });
+
+  it("falls back to a one-line error if renderPanel throws, and keeps RPC mode on ctx.ui.select", async () => {
+    fakeOpenRouter();
+    const f = tuiPi();
+    const { engine } = makeEngine();
+    const surface = new Surface(engine);
+    let tracked: Panel | undefined;
+    const done = openPanel(
+      f.ctx,
+      engine,
+      surface,
+      {
+        cwd: "/",
+        notify: () => {},
+        paste: () => {},
+        select: async () => undefined,
+        input: async () => undefined,
+        pick: async () => undefined,
+      },
+      {},
+      (p) => {
+        tracked = p;
+      },
+    );
+    vi.spyOn(tracked!, "view").mockImplementation(() => {
+      throw new Error("boom");
+    });
+    expect(f.dock().component.render(80)).toEqual(["Speech: cannot draw the panel (boom) · Esc close"]);
+    f.dock().component.dispose();
+    await done;
+
+    const rpc = tuiPi();
+    rpc.ctx.mode = "rpc";
+    registerPi(rpc.pi, makeEngine().engine, {});
+    await rpc.emit("session_start");
+    await rpc.commands.get("speech").handler("", rpc.ctx);
+    expect(rpc.ctx.ui.custom).not.toHaveBeenCalled();
+    expect(rpc.ctx.ui.select).toHaveBeenCalled();
   });
 });
