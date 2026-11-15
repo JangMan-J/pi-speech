@@ -336,10 +336,9 @@ describe("the panel in Pi's terminal UI", () => {
     c.handleInput("\x1b[A"); // up: wraps to Spectrum OSD
     c.handleInput("\x1b[A"); // up: Bridge connection
     c.handleInput("\r");
-    c.handleInput("\x1b[C"); // right: Bridge on
-    await vi.waitFor(() => expect(engine.speech.settings.bridge).toBe("on"));
+    // On this machine, Bridge connection is Remote machine (Connect) and DIRECTION.
     expect(stripVTControlCharacters(f.screen())).toMatch(
-      /Bridge connection ─[\s\S]*Bridge\s+on · plays on the Remote machine/,
+      /Bridge connection ─[\s\S]*Remote machine\s+not connected · Enter connects/,
     );
     engine.notify("Playback failed (local): boom", "error");
     expect(f.notes).toEqual([]);

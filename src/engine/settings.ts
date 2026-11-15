@@ -134,6 +134,8 @@ export interface Settings {
   modelsOn: Machine;
   /** The receiver's address typed in Bridge connection's Pairing (`host:port`); unset: PI_SPEECH_BRIDGE_URL or the ssh forwards. */
   bridgeAddress?: string;
+  /** The Remote machine connected to over SSH (Connect), reconnected to at the start of a session. */
+  remoteHost?: string;
   /** macOS: the notice that Option+letter reached Pi as a character has been shown (once per install). */
   optionKeyHintShown?: boolean;
   /** Live audio spectrum OSD style above the editor. */
@@ -303,6 +305,8 @@ export class SettingsFile {
       if (isOsdStyle(raw.osdStyle)) s.osdStyle = raw.osdStyle;
       const address = str(raw.bridgeAddress);
       if (address) s.bridgeAddress = address;
+      const remoteHost = str(raw.remoteHost);
+      if (remoteHost) s.remoteHost = remoteHost;
       for (const d of DIRECTIONS) if (isMachine(raw[d])) s[d] = raw[d];
     } else if (raw) {
       // settings.json without a version
@@ -366,6 +370,7 @@ export class SettingsFile {
       ...(s.localTranscriptionModel ? { localTranscriptionModel: s.localTranscriptionModel } : {}),
       ...(s.optionKeyHintShown ? { optionKeyHintShown: true } : {}),
       ...(s.bridgeAddress ? { bridgeAddress: s.bridgeAddress } : {}),
+      ...(s.remoteHost ? { remoteHost: s.remoteHost } : {}),
       ...Object.fromEntries(DIRECTIONS.filter((d) => s[d] !== DEFAULT_SETTINGS[d]).map((d) => [d, s[d]])),
     };
     const tmp = `${this.file}.${process.pid}.tmp`;

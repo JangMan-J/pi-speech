@@ -97,9 +97,10 @@ export function saveBridgeToken(env: Env, token: string): string {
   return file;
 }
 
-export function bridgeConfig(env: Env, address?: string): BridgeConfig {
+/** The bridge's target and token; `token` (a Remote machine's over SSH, held in memory) before the configured one. */
+export function bridgeConfig(env: Env, address?: string, token?: string): BridgeConfig {
   const { from: _from, ...target } = bridgeTarget(env, address);
-  return { ...target, token: bridgeToken(env) };
+  return { ...target, token: token || bridgeToken(env) };
 }
 
 /** Read lazily so a token file written after Pi started is picked up. */

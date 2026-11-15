@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -596,7 +596,7 @@ describe("the panel view model: keys in the main view", () => {
 });
 
 describe("the panel view model: Bridge connection", () => {
-  it("is a submenu holding the bridge mode, which cycles auto, on, off in place and is saved", async () => {
+  it("on this machine it is Remote machine (Connect) and DIRECTION: no bridge mode or Pairing rows", async () => {
     const p = open();
     await p.panel.idle();
     await p.goTo("Bridge connection");
@@ -604,25 +604,29 @@ describe("the panel view model: Bridge connection", () => {
     const v = p.panel.view();
     expect(v).toMatchObject({ menu: "bridge", crumb: "Bridge connection", selected: 0 });
     expect(v.headings).toEqual({ direction: "DIRECTION" });
-    expect(p.row("Bridge")).toMatchObject({ value: "auto", note: "on over SSH · plays on This machine" });
-    expect(p.hint()).toBe("←→ auto · on · off · Esc back");
-    p.engine.routes.bridge.health = async () => ({ ok: false, reason: "connection refused" });
-    await p.press("right");
-    // an unreachable receiver keeps the mode, and says why
-    expect(p.row("Bridge")?.value).toBe("auto");
-    expect(p.panel.view().status).toMatchObject({
-      tone: "error",
-      text: expect.stringMatching(/^✗ .*connection refused/),
-    });
-    p.engine.routes.bridge.health = async () => ({ ok: true, version: "0.1.0" });
-    await p.press("right");
-    expect(p.row("Bridge")).toMatchObject({ value: "on", note: "plays on the Remote machine · ✓ 127.0.0.1:47613" });
-    await p.press("enter");
-    expect(p.row("Bridge")).toMatchObject({ value: "off", note: "plays on This machine" });
-    expect(settingsOf(p.work).bridge).toBe("off");
+    expect(v.rows.map((r) => r.label)).toEqual(["Remote machine", "Play audio on", "Record audio on", "Run models on"]);
+    expect(p.row("Remote machine")).toMatchObject({ value: "not connected", note: "Enter connects", opens: true });
+    expect(p.hint()).toBe("Enter connect · Esc back");
     await p.press("escape");
     expect(p.panel.view().menu).toBe("main");
     expect(p.selectedLabel()).toBe("Bridge connection");
+  });
+
+  it("over SSH it holds the bridge mode, which cycles auto, on, off in place and is saved", async () => {
+    const p = open({ SSH_CONNECTION: "1 2 3 4" });
+    await p.panel.idle();
+    await p.goTo("Bridge connection");
+    await p.press("enter");
+    expect(p.panel.view().rows.map((r) => r.label)).toEqual(BRIDGE_ROWS);
+    expect(p.row("Bridge")?.value).toBe("auto");
+    expect(p.hint()).toBe("←→ auto · on · off · Esc back");
+    await p.press("right");
+    expect(p.row("Bridge")?.value).toBe("on");
+    await p.press("enter");
+    expect(p.row("Bridge")?.value).toBe("off");
+    expect(settingsOf(p.work).bridge).toBe("off");
+    await p.press("escape");
+    expect(p.panel.view().menu).toBe("main");
     expect(p.close).not.toHaveBeenCalled();
   });
 
@@ -642,6 +646,132 @@ describe("the panel view model: Bridge connection", () => {
       note: "on over SSH · plays on the Remote machine · ✗ receiver unreachable",
       alert: true,
     });
+  });
+});
+
+describe("the panel view model: Remote machine's Connect, on this machine", () => {
+  it("Enter opens Connect; Tab steps through the Hosts of ~/.ssh/config", async () => {
+    const home = mkdtempSync(join(tmpdir(), "pi-speech-home-"));
+    mkdirSync(join(home, ".ssh"));
+    writeFileSync(join(home, ".ssh", "config"), "Host spider\n  HostName 100.64.0.9\nHost *.lan\nHost build lab\n");
+    const p = open({ HOME: home });
+    await p.goTo("Bridge connection");
+    await p.press("enter");
+    await p.goTo("Remote machine");
+    await p.press("enter");
+    expect(p.panel.view().input).toMatchObject({ label: "Connect to", value: "", under: "remoteMachine" });
+    expect(p.panel.view().status?.text).toBe("Your ssh Hosts: spider, build, lab");
+    expect(p.hint()).toBe("Enter connect · Tab your ssh Hosts · Esc back");
+    await p.press("tab");
+    expect(p.panel.view().input?.value).toBe("spider");
+    await p.press("tab", "tab", "tab");
+    expect(p.panel.view().input?.value).toBe("spider");
+  });
+
+  it("an SSH destination connects through the engine; its questions are asked here, a password as dots", async () => {
+    const p = open(
+      {},
+      {
+        before: (e) => {
+          e.connectRemote = async (dest, prompts) => {
+            prompts.progress(`… connecting to ${dest}`);
+            if (!(await prompts.confirm("spider has no pi-speech-receiver. Install it?"))) throw new Error("declined");
+            const pw = await prompts.password("me@spider");
+            if (pw !== "hunter2") throw new Error("wrong password");
+            e.speech.settings.remoteHost = dest;
+            e.remoteState = "connected";
+            e.onRemoteChange();
+            return {
+              dest,
+              address: "127.0.0.1:40000",
+              token: "t",
+              version: "0.3.0",
+              alive: () => true,
+              close: async () => {},
+            };
+          };
+        },
+      },
+    );
+    await p.goTo("Bridge connection");
+    await p.press("enter");
+    await p.press("enter"); // Remote machine: Connect
+    await p.type("spider");
+    p.panel.handle({ key: "enter" });
+    await vi.waitFor(() => expect(p.panel.view().status?.text).toBe("? spider has no pi-speech-receiver. Install it?"));
+    expect(p.hint()).toBe("Enter yes · Esc no");
+    // While a question waits the panel is not idle: keys go straight to it.
+    p.panel.handle({ text: "n" }); // typing does not answer
+    expect(p.panel.view().status?.text).toBe("? spider has no pi-speech-receiver. Install it?");
+    p.panel.handle({ key: "enter" });
+    await vi.waitFor(() =>
+      expect(p.panel.view().input).toMatchObject({ label: "Password for me@spider", secret: true }),
+    );
+    p.panel.handle({ text: "hunter2" });
+    expect(p.panel.view().input?.value).toBe("hunter2"); // the renderer draws it as dots
+    await p.press("enter");
+    expect(p.panel.view().status?.text).toMatch(/^✓ Connected to spider over SSH, receiver 0.3.0/);
+    expect(p.row("Remote machine")).toMatchObject({ value: "spider", note: expect.stringMatching(/^✓ over SSH/) });
+  });
+
+  it("Esc on a question or the password declines it, and the connection says why", async () => {
+    const p = open(
+      {},
+      {
+        before: (e) => {
+          e.connectRemote = async (_dest, prompts) => {
+            if (!(await prompts.confirm("Trust its key?")))
+              throw new Error("not connected: the host key was not trusted");
+            throw new Error("unreachable");
+          };
+        },
+      },
+    );
+    await p.goTo("Bridge connection");
+    await p.press("enter");
+    await p.press("enter");
+    await p.type("spider");
+    p.panel.handle({ key: "enter" });
+    await vi.waitFor(() => expect(p.panel.view().status?.text).toBe("? Trust its key?"));
+    await p.press("escape");
+    expect(p.panel.view().status?.text).toBe("✗ not connected: the host key was not trusted");
+  });
+
+  it("address:port pairs with a receiver there without SSH; paired, the bridge goes on with the audio here", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-speech-pair-"));
+    const tokenFile = join(dir, "bridge.token");
+    const token = "r".repeat(64);
+    const p = open({ PI_SPEECH_BRIDGE_TOKEN_FILE: tokenFile });
+    const inner = globalThis.fetch;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: RequestInit = {}) => {
+        if (!String(url).startsWith("http://100.64.0.2:47613/")) return inner(url, init);
+        const path = new URL(url).pathname;
+        const auth = (init.headers as Record<string, string>)?.Authorization;
+        if (path === "/v1/health") {
+          return auth === `Bearer ${token}`
+            ? Response.json({ protocol: 1, name: "pi-speech-receiver", version: "0.4.0", capabilities: ["stream"] })
+            : Response.json({ error: "unauthorized" }, { status: 401 });
+        }
+        const { code } = JSON.parse(String(init.body)) as { code?: string };
+        if (!code) return Response.json({ expires_in: 120, attempts: 5 }, { status: 202 });
+        return code === "123456"
+          ? Response.json({ token })
+          : Response.json({ error: "wrong pairing code", attempts_left: 4 }, { status: 403 });
+      }),
+    );
+    await p.goTo("Bridge connection");
+    await p.press("enter");
+    await p.press("enter");
+    await p.type("100.64.0.2:47613");
+    await p.press("enter");
+    expect(p.panel.view().input).toMatchObject({ label: "Code from 100.64.0.2:47613" });
+    await p.type("123456");
+    await p.press("enter");
+    await vi.waitFor(() => expect(p.panel.view().status?.text).toMatch(/Bridge on: models run there/));
+    expect(settingsOf(p.work)).toMatchObject({ bridge: "on", playOn: "this", recordOn: "this" });
+    expect(p.engine.speech.settings.modelsOn).toBe("remote");
   });
 });
 
@@ -679,7 +809,9 @@ describe("the panel view model: Bridge connection's DIRECTION", () => {
   });
 });
 
-describe("the panel view model: Bridge connection's Remote machine and Pairing", () => {
+describe("the panel view model: Bridge connection's Remote machine and Pairing (Pi over SSH)", () => {
+  // Over SSH the receiver is the user's own machine: the bridge mode and Pairing rows are there.
+  const SSH = { SSH_CONNECTION: "1 2 3 4" };
   const connected = async () => ({ ok: true, address: "127.0.0.1", port: 47613, ms: 52, version: "0.3.0" }) as const;
   const refused = async () =>
     ({
@@ -690,7 +822,7 @@ describe("the panel view model: Bridge connection's Remote machine and Pairing",
     }) as const;
 
   it("shows the bridge, the Remote machine's address (the ssh forward by default), and a connected receiver", async () => {
-    const p = open({}, { before: (e) => (e.probeBridge = connected) });
+    const p = open(SSH, { before: (e) => (e.probeBridge = connected) });
     await p.goTo("Bridge connection");
     await p.press("enter");
     expect(p.panel.view().rows.map((r) => r.label)).toEqual(BRIDGE_ROWS);
@@ -706,13 +838,16 @@ describe("the panel view model: Bridge connection's Remote machine and Pairing",
   });
 
   it("names the address PI_SPEECH_BRIDGE_URL gives", async () => {
-    const p = open({ PI_SPEECH_BRIDGE_URL: "http://localhost:5000" }, { before: (e) => (e.probeBridge = connected) });
+    const p = open(
+      { ...SSH, PI_SPEECH_BRIDGE_URL: "http://localhost:5000" },
+      { before: (e) => (e.probeBridge = connected) },
+    );
     await p.goTo("Remote machine");
     expect(p.row("Remote machine")).toMatchObject({ value: "localhost:5000", note: "from PI_SPEECH_BRIDGE_URL" });
   });
 
   it("an unreachable receiver is ✗ Re-pair, whose Enter opens the address field", async () => {
-    const p = open({}, { before: (e) => (e.probeBridge = refused) });
+    const p = open(SSH, { before: (e) => (e.probeBridge = refused) });
     await p.goTo("Pairing");
     expect(p.row("Pairing")).toMatchObject({ value: "✗ Re-pair", note: "receiver unreachable", opens: true });
     await p.press("enter");
@@ -724,7 +859,7 @@ describe("the panel view model: Bridge connection's Remote machine and Pairing",
     const dir = mkdtempSync(join(tmpdir(), "pi-speech-pair-"));
     const tokenFile = join(dir, "bridge.token");
     const token = "r".repeat(64);
-    const p = open({ PI_SPEECH_BRIDGE_TOKEN_FILE: tokenFile }, { before: (e) => (e.probeBridge = refused) });
+    const p = open({ ...SSH, PI_SPEECH_BRIDGE_TOKEN_FILE: tokenFile }, { before: (e) => (e.probeBridge = refused) });
     // The receiver at a Tailscale address: it shows 123456 on its own terminal; 999999 has expired.
     const asked: string[] = [];
     const inner = globalThis.fetch;
@@ -774,28 +909,22 @@ describe("the panel view model: Bridge connection's Remote machine and Pairing",
     expect(readFileSync(tokenFile, "utf8").trim()).toBe(token);
     expect(settingsOf(p.work).bridgeAddress).toBe("100.64.0.2:47613");
     expect(p.row("Remote machine")).toMatchObject({ value: "100.64.0.2:47613", note: "set in Pairing" });
-    // Paired from this machine (not over SSH) while the bridge was not in use: the bridge goes on, with the
-    // audio here and the models there.
-    await vi.waitFor(() => expect(p.panel.view().status?.text).toMatch(/Bridge on: models run there/));
-    expect(settingsOf(p.work)).toMatchObject({ bridge: "on", playOn: "this", recordOn: "this" });
-    expect(p.engine.speech.settings.modelsOn).toBe("remote");
+    // Over SSH pairing leaves the bridge mode and the directions as they are.
+    expect(settingsOf(p.work).bridge ?? "auto").toBe("auto");
   });
 
   it("Bridge on with no token of this machine goes to Pairing, saying to pair first", async () => {
-    const p = open(
-      {},
-      {
-        before: (e) => {
-          e.probeBridge = refused;
-          // As Routes.choose says it when no token file exists.
-          e.setBridge = async () => {
-            throw new Error(
-              "The bridge was not selected (audio stays local): no bridge token: set PI_SPEECH_BRIDGE_TOKEN, or put it in /x/bridge.token (ENOENT)",
-            );
-          };
-        },
+    const p = open(SSH, {
+      before: (e) => {
+        e.probeBridge = refused;
+        // As Routes.choose says it when no token file exists.
+        e.setBridge = async () => {
+          throw new Error(
+            "The bridge was not selected (audio stays local): no bridge token: set PI_SPEECH_BRIDGE_TOKEN, or put it in /x/bridge.token (ENOENT)",
+          );
+        };
       },
-    );
+    });
     await p.goTo("Bridge");
     await p.press("right");
     await vi.waitFor(() => expect(p.panel.view().input).toMatchObject({ label: "Address", under: "pairing" }));
@@ -808,17 +937,14 @@ describe("the panel view model: Bridge connection's Remote machine and Pairing",
   it("probes when it opens and again while it is open, and stops when it is left", async () => {
     let n = 0;
     let ok = false;
-    const p = open(
-      {},
-      {
-        pairingMs: 20,
-        before: (e) =>
-          (e.probeBridge = async () => {
-            n++;
-            return ok ? connected() : refused();
-          }),
-      },
-    );
+    const p = open(SSH, {
+      pairingMs: 20,
+      before: (e) =>
+        (e.probeBridge = async () => {
+          n++;
+          return ok ? connected() : refused();
+        }),
+    });
     await p.goTo("Bridge connection");
     await p.press("enter");
     expect(n).toBe(1);

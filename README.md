@@ -156,18 +156,31 @@ Or choose other keys here, or use `/speech --dictate`. When that character is ty
 pi-speech says so once (the character is still typed). On WSL, Pi itself binds Alt+Z to Undo: give Dictate
 another key there.
 
-**Bridge connection ›** holds the bridge mode, `auto` (the bridge when Pi runs over SSH), `on` or `off`,
-changed with ←→ or Enter, and says where audio plays: on This machine, or on the Remote machine with the
-receiver's state (`✓ 127.0.0.1:47613`, `✗ receiver unreachable`). **Remote machine** is the address in use and
-where it comes from: `set in Pairing`, `from PI_SPEECH_BRIDGE_URL`, or `ssh forward` (127.0.0.1:47613, or the
-spare forward 47614-47633 of your session when another session holds 47613). **Pairing** checks the receiver
-when the submenu opens and every 2 s while it is open (`✓ Connected to 127.0.0.1:47613 · 52 ms`, or
-`✗ Re-pair`), and its Enter opens a field for the receiver's address: empty for the ssh forward, or a Tailscale
-or LAN address (`100.64.0.2:47613`). Enter there connects when a token of This machine works; otherwise the
-receiver prints a 6-digit code on its own terminal (never to Pi), you type it into the panel, and the token it
-returns is saved as `~/.config/pi-speech/bridge.token` (or `PI_SPEECH_BRIDGE_TOKEN_FILE`) and the address in the
-settings. A code expires after 2 minutes and takes 5 wrong attempts; Enter on the address again asks for a new
-one. With `pi-speech-receiver ssh` the token is copied for you (see [The bridge](#the-bridge)).
+**Bridge connection ›** is where the Remote machine is chosen, and what runs there (DIRECTION).
+
+In a Pi session on this machine its first row is **Remote machine**: what it is connected to (`not connected`,
+`decent-spider · ✓ over SSH · 12 ms`). Enter opens **Connect to**: name the machine as you would ssh to it, a Host
+of `~/.ssh/config` (Tab steps through them) or `user@host`. Pi opens its own SSH connection to it (keys or the
+agent; otherwise it asks for the password in the panel, shown as dots and handed to ssh, never written down; a
+host key it does not know yet is shown, and trusted only when you say so). There it finds `pi-speech-receiver`,
+and when it is missing or too old offers to install the one for that machine's system in `~/.local/bin`; it
+starts that machine's shared receiver, and the receiver there runs for as long as the last Pi connected to it
+(it stops a moment after that Pi disconnects or exits). The bridge then goes on with the audio here and the
+models there (Play audio on and Record audio on This machine, Run models on Remote machine). The machine is
+remembered and reconnected to when a session starts (with keys or the agent; a password is asked for only when
+you press Enter). `x` on Remote machine disconnects and forgets it. Typed as `address:port` instead
+(`100.64.0.2:47613`), Connect pairs with a receiver already listening there without SSH
+(`pi-speech-receiver --listen <address>:47613 --network`): the receiver prints a 6-digit code on its own
+terminal (never to Pi), you type it into the panel, and the token it returns is saved as
+`~/.config/pi-speech/bridge.token` (or `PI_SPEECH_BRIDGE_TOKEN_FILE`); a code expires after 2 minutes and takes 5
+wrong attempts. Connect needs OpenSSH with ControlMaster (Linux, macOS); on Windows, pair by address.
+
+When Pi itself runs over SSH, the receiver is your own machine, reached through the forward of
+`pi-speech-receiver ssh` (see [The bridge](#the-bridge)), and the submenu holds the bridge mode, `auto` (the
+bridge when Pi runs over SSH), `on` or `off`, changed with ←→, Space or Enter; **Remote machine**, the address in
+use and where it comes from (`set in Pairing`, `from PI_SPEECH_BRIDGE_URL`, or `ssh forward`); and **Pairing**,
+which checks the receiver every 2 s while the submenu is open (`✓ Connected to 127.0.0.1:47613 · 52 ms`, or
+`✗ Re-pair`) and pairs by address as above.
 
 Under **DIRECTION**, while the bridge is in use, **Play audio on**, **Record audio on** and **Run models on**
 each choose This machine or the Remote machine (←→ or Enter; all Remote machine by default). Run models on is
@@ -175,12 +188,6 @@ where a Local Speech or Transcription source runs its model: on the Remote machi
 with the models downloaded there; provider models are not affected. The model lists then show the Remote
 machine's models, and download and delete them there (d, x, or Enter on one not downloaded), with progress.
 
-The Remote machine need not be where you sit. To run the models on another machine (a faster one, or a server)
-while Pi, your speakers and your microphone stay here: run `pi-speech-receiver --listen <its-address>:47613
---network` there (a Tailscale address), then in Bridge connection open Pairing (turning Bridge on with no token
-goes there too), type that address, and type the code its receiver shows on its terminal. Paired from a session
-on this machine, the bridge goes on with Play audio on and Record audio on set to This machine and Run models on
-to Remote machine; the DIRECTION rows change that.
 Without the bridge the rows show This machine and do not change. A choice that cannot work, such as recording
 on This machine over SSH with no microphone there, fails with a message that names the row to change.
 

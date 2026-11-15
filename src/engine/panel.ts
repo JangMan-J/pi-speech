@@ -30,6 +30,7 @@ import {
   TRUNCATE_SECONDS,
 } from "./read-aloud";
 import { ReadingFailed, readingFailedMessage } from "./reading";
+import { type RemotePrompts, sshConfigHosts } from "./remote";
 import {
   type BridgeMode,
   DIRECTIONS,
@@ -157,6 +158,8 @@ export interface InputView {
   placeholder: string;
   /** The row the input is drawn under; none: under the list. */
   under?: RowId;
+  /** A password: drawn as dots. */
+  secret?: boolean;
 }
 
 export type StatusTone = "success" | "error" | "warning" | "busy" | "info";
@@ -374,7 +377,20 @@ type Mode =
   /** Pairing's first step: the receiver's address. */
   | { kind: "input"; purpose: "pairAddress"; edit: LineEdit; back: Mode }
   /** Pairing's second step: the code the receiver at `address` shows on its terminal. */
-  | { kind: "input"; purpose: "pairCode"; address: string; edit: LineEdit; back: Mode };
+  | { kind: "input"; purpose: "pairCode"; address: string; edit: LineEdit; back: Mode }
+  /** Remote machine's Connect: an SSH destination, or host:port to pair with a receiver directly. */
+  | { kind: "input"; purpose: "connect"; edit: LineEdit; back: Mode; hosts: string[]; next: number }
+  /** A password Connect asks for; shown as dots. */
+  | {
+      kind: "input";
+      purpose: "secret";
+      label: string;
+      edit: LineEdit;
+      back: Mode;
+      resolve: (v: string | undefined) => void;
+    }
+  /** A yes-or-no question Connect asks (Enter yes, Esc no). */
+  | { kind: "input"; purpose: "confirm"; question: string; edit: LineEdit; back: Mode; resolve: (v: boolean) => void };
 
 type RowBase = Pick<PanelRow, "id" | "section" | "label" | "opens">;
 
@@ -415,6 +431,9 @@ const BRIDGE: RowBase[] = [
 const MACHINE_WORDS: Record<Machine, string> = { this: "This machine", remote: "Remote machine" };
 const isDirectionRow = (id: RowId): id is DirectionSetting => (DIRECTIONS as readonly RowId[]).includes(id);
 /** What the address field of Pairing takes. */
+const CONNECT_HINT = "a Host of ~/.ssh/config, or user@host · or address:port to pair with a receiver without SSH";
+const CONNECT_HOW =
+  "Connect: the machine to use, as you would ssh to it (a Host of ~/.ssh/config, or user@host); pi-speech-receiver is installed there if it is missing, once you agree. Or address:port pairs with a receiver already listening there (Tailscale or LAN)";
 /** Said when the bridge is turned on with no token of This machine that works. */
 const PAIR_FIRST =
   "Pair first: type the address of the receiver to use (its Tailscale or LAN address and port), then Enter; it shows a code on its own terminal";
@@ -654,6 +673,8 @@ export class Panel {
     return this.engine.downloads.current;
   }
   private unlistenDownloads?: () => void;
+  /** Answers a question Connect waits on, as declined, when the panel closes. */
+  private pendingPrompt?: () => void;
 
   constructor(
     private readonly engine: Engine,
@@ -678,11 +699,18 @@ export class Panel {
     const s = this.speech.settings;
     if (s.speechSource === "local" || s.transcriptionSource === "local") this.track(this.loadLocal());
     this.probe();
+    this.engine.onRemoteChange = this.remoteChanged;
     // A download goes on when this panel closes; any panel open follows it, and refreshes the lists at its end.
     this.unlistenDownloads = this.engine.downloads.listen(() => this.downloadChanged());
     const d = this.downloading;
     if (d) this.setStatus("busy", d.progress ? downloadLine(d.id, d.progress) : `… downloading ${d.id}`);
   }
+
+  /** The Remote machine's connection changed (connected, lost, reconnected at a session start): draw it again. */
+  private readonly remoteChanged = () => {
+    void this.probe();
+    this.changed();
+  };
 
   /** The engine's download moved on or ended: say so on the status line, and refresh the lists at its end. */
   private downloadChanged(): void {
@@ -709,6 +737,8 @@ export class Panel {
     this.disposed = true;
     this.unlisten?.();
     this.unlistenDownloads?.();
+    this.pendingPrompt?.();
+    if (this.engine.onRemoteChange === this.remoteChanged) this.engine.onRemoteChange = () => {};
     if (this.statusTimer) clearTimeout(this.statusTimer);
     this.stopPairing();
   }
@@ -760,7 +790,7 @@ export class Panel {
 
   view(): PanelView {
     const home = this.home();
-    const rows = (home.kind === "list" ? MAIN : MENUS[home.menu].rows).map((r) => this.row(r, home));
+    const rows = (home.kind === "list" ? MAIN : this.menuRows(home.menu)).map((r) => this.row(r, home));
     const view: PanelView = {
       title: "Speech",
       state: this.engine.indicator.live(),
@@ -825,7 +855,17 @@ export class Panel {
           view.input = input("Dictation output", OUTPUT_HINT, "output");
           break;
         case "pairAddress":
-          view.input = input("Address", ADDRESS_HINT, "pairing");
+          view.input = input("Address", ADDRESS_HINT, this.engine.routes.ssh ? "pairing" : "remoteMachine");
+          break;
+        case "connect":
+          view.input = input("Connect to", CONNECT_HINT, "remoteMachine");
+          break;
+        case "secret":
+          view.input = { ...input(m.label, "Enter signs in · Esc cancels", "remoteMachine"), secret: true };
+          break;
+        case "confirm":
+          view.input = input("", "Enter yes · Esc no", "remoteMachine");
+          view.status = { tone: "warning", text: `? ${m.question}` };
           break;
         case "pairCode":
           view.input = input(`Code from ${m.address}`, CODE_HINT, "pairing");
@@ -892,6 +932,7 @@ export class Panel {
         return { ...base, value: v, ...this.bridgeNote(mode) };
       }
       case "remoteMachine": {
+        if (!this.engine.routes.ssh) return { ...base, opens: true, ...this.remoteValue() };
         // The address in use: set in Pairing, from the environment, or the ssh forward (a spare one once found).
         const at = hostPort(this.engine.routes.url);
         const from = this.addressFrom();
@@ -1161,11 +1202,18 @@ export class Panel {
           ? "speak"
           : m.purpose === "transcribe"
             ? "transcribe"
-            : m.purpose === "pairAddress"
+            : m.purpose === "pairAddress" || m.purpose === "connect"
               ? "connect"
               : m.purpose === "pairCode"
                 ? "pair"
-                : "set";
+                : m.purpose === "secret"
+                  ? "sign in"
+                  : m.purpose === "confirm"
+                    ? "yes"
+                    : "set";
+      if (m.purpose === "confirm") return [{ key: "Enter", action }, esc("no")];
+      if (m.purpose === "connect" && m.hosts.length)
+        return [{ key: "Enter", action }, { key: "Tab", action: "your ssh Hosts" }, esc("back")];
       return [{ key: "Enter", action }, esc(m.purpose === "speak" && m.standalone ? "close" : "back")];
     }
     if (m.kind === "picker") {
@@ -1238,9 +1286,13 @@ export class Panel {
       ];
     }
     if (m.menu === "bridge") {
-      const id = BRIDGE[m.selected].id;
+      const id = this.menuRows("bridge")[m.selected].id;
       if (id === "bridgeMode") return [{ key: "←→", action: BRIDGE_MODES.join(" · ") }, back];
-      if (id === "remoteMachine") return [{ key: "Enter", action: "where it comes from" }, back];
+      if (id === "remoteMachine") {
+        if (this.engine.routes.ssh) return [{ key: "Enter", action: "where it comes from" }, back];
+        const x: Hint[] = this.engine.remoteHost ? [{ key: "x", action: "disconnect" }] : [];
+        return [{ key: "Enter", action: this.engine.remoteHost ? "reconnect" : "connect" }, ...x, back];
+      }
       if (isDirectionRow(id)) return [{ key: "←→", action: MACHINES.map((m) => MACHINE_WORDS[m]).join(" · ") }, back];
       return [{ key: "Enter", action: "address, pair" }, back];
     }
@@ -1304,8 +1356,16 @@ export class Panel {
       if (key === "enter") this.submit(m);
       else if (key === "escape") {
         if (m.purpose === "speak" && m.standalone) this.deps.close();
-        else this.mode = m.back;
-      } else m.edit.edit(key);
+        else {
+          this.mode = m.back;
+          if (m.purpose === "secret") m.resolve(undefined);
+          if (m.purpose === "confirm") m.resolve(false);
+        }
+      } else if (key === "tab" && m.purpose === "connect" && m.hosts.length) {
+        // Tab steps through the Hosts of ~/.ssh/config.
+        m.edit = new LineEdit(m.hosts[m.next % m.hosts.length]);
+        m.next++;
+      } else if (m.purpose !== "confirm") m.edit.edit(key);
       return;
     }
     if (m.kind === "picker") {
@@ -1339,7 +1399,7 @@ export class Panel {
       return;
     }
     if (m.kind === "menu") {
-      const rows = MENUS[m.menu].rows;
+      const rows = this.menuRows(m.menu);
       const id = rows[m.selected].id;
       if (key === "up" || key === "down")
         m.selected = (m.selected + (key === "up" ? rows.length - 1 : 1)) % rows.length;
@@ -1384,12 +1444,12 @@ export class Panel {
   private text(text: string, paste: boolean): void {
     const m = this.mode;
     if (m.kind === "input") {
-      m.edit.insert(text);
+      if (m.purpose !== "confirm") m.edit.insert(text);
       return;
     }
     // Space steps a value that changes in place, as Enter does.
     if (!paste && text === " " && (m.kind === "list" || m.kind === "menu")) {
-      const id = m.kind === "list" ? MAIN[this.selected].id : MENUS[m.menu].rows[m.selected].id;
+      const id = m.kind === "list" ? MAIN[this.selected].id : this.menuRows(m.menu)[m.selected].id;
       if (CYCLES.has(id)) {
         this.step(id, 1);
         return;
@@ -1419,6 +1479,15 @@ export class Panel {
       const id = HOTKEYS[m.selected].id;
       if (id === "speak" || id === "dictate" || id === "ptt") m.capture = id;
       else this.setStatus("info", "Only Speak, Dictate and Push-to-talk have keys of their own to change");
+      return;
+    }
+    if (
+      m.kind === "menu" &&
+      m.menu === "bridge" &&
+      ch === "x" &&
+      this.menuRows("bridge")[m.selected]?.id === "remoteMachine"
+    ) {
+      this.disconnect();
       return;
     }
     if (m.kind === "menu" && m.menu !== "hotkeys") return;
@@ -1541,7 +1610,9 @@ export class Panel {
         this.startPairing();
         return;
       case "remoteMachine":
-        this.setStatus("info", URL_FROM);
+        // Over SSH the receiver is the user's own machine, reached through the forward; else Connect.
+        if (this.engine.routes.ssh) this.setStatus("info", URL_FROM);
+        else this.openConnect();
         return;
       case "pairing":
         this.openPairing();
@@ -1851,6 +1922,20 @@ export class Panel {
   }
 
   private submit(m: Extract<Mode, { kind: "input" }>): void {
+    if (m.purpose === "secret") {
+      this.mode = m.back;
+      m.resolve(m.edit.value);
+      return;
+    }
+    if (m.purpose === "confirm") {
+      this.mode = m.back;
+      m.resolve(true);
+      return;
+    }
+    if (m.purpose === "connect") {
+      this.connect(m);
+      return;
+    }
     if (m.purpose === "output") {
       // Empty clears it back to Pi, so the empty guard below must not apply here.
       this.track(
@@ -1908,6 +1993,144 @@ export class Panel {
     );
   }
 
+  /**
+   * The rows of a submenu now. Bridge connection in a session on this machine: Remote machine connects (over SSH,
+   * or by pairing with an address), so the bridge mode and Pairing rows are not shown; over SSH the receiver is
+   * the user's own machine, and they are.
+   */
+  private menuRows(menu: MenuId): RowBase[] {
+    const rows = MENUS[menu as MenuMode["menu"]].rows;
+    if (menu !== "bridge" || this.engine.routes.ssh) return rows;
+    return rows.filter((r) => r.id !== "bridgeMode" && r.id !== "pairing");
+  }
+
+  /** Remote machine in a session on this machine: what it is connected to, and how that goes. */
+  private remoteValue(): Pick<PanelRow, "value" | "note" | "alert"> {
+    const e = this.engine;
+    const host = e.remoteHost;
+    switch (e.remoteState) {
+      case "connecting":
+        return { value: host ?? "…", note: "… connecting" };
+      case "connected": {
+        const p = this.pairing;
+        const ms = p && p !== "checking" && p.ok ? ` · ${p.ms} ms` : "";
+        return { value: host ?? "connected", note: `✓ over SSH${ms}` };
+      }
+      case "lost":
+      case "failed":
+        return { value: host ?? "not connected", note: `✗ ${e.remoteError ?? "not connected"}`, alert: true };
+    }
+    // Paired directly with an address (no SSH).
+    if (this.speech.settings.bridgeAddress && e.routes.route === "bridge") {
+      const p = this.pairingValue();
+      return { value: this.speech.settings.bridgeAddress, note: p.value };
+    }
+    return { value: host ?? "not connected", note: host ? "Enter reconnects" : "Enter connects" };
+  }
+
+  /** Remote machine's Connect field: the machine remembered, Tab for the Hosts of ~/.ssh/config. */
+  private openConnect(): void {
+    const hosts = sshConfigHosts(this.engine.env.HOME || undefined);
+    this.mode = {
+      kind: "input",
+      purpose: "connect",
+      edit: new LineEdit(this.engine.remoteHost ?? ""),
+      back: this.home(),
+      hosts,
+      next: 0,
+    };
+    this.setStatus("info", hosts.length ? `Your ssh Hosts: ${hosts.join(", ")}` : CONNECT_HOW);
+  }
+
+  /** Connect: host:port pairs with a receiver there directly; anything else is an SSH destination. */
+  private connect(m: Extract<Mode, { kind: "input"; purpose: "connect" }>): void {
+    const dest = m.edit.value.trim();
+    if (!dest) {
+      this.setStatus("info", CONNECT_HOW);
+      return;
+    }
+    if (/^[^@\s/]+:\d+$/.test(dest)) {
+      const pair: Extract<Mode, { kind: "input"; purpose: "pairAddress" }> = {
+        kind: "input",
+        purpose: "pairAddress",
+        edit: new LineEdit(dest),
+        back: m.back,
+      };
+      this.mode = pair;
+      this.connectTo(pair);
+      return;
+    }
+    this.mode = m.back;
+    this.setStatus("busy", `… connecting to ${dest}`);
+    this.track(
+      this.engine.connectRemote(dest, this.remotePrompts()).then(
+        (link) => {
+          const here = this.engine.routes.ssh
+            ? ""
+            : " · models run there, audio plays and records here (DIRECTION changes that)";
+          this.setStatus("success", `✓ Connected to ${link.dest} over SSH, receiver ${link.version}${here}`);
+          const s = this.speech.settings;
+          if (s.speechSource === "local" || s.transcriptionSource === "local") this.track(this.loadLocal(true));
+          if (s.speechSource === "local") this.track(this.loadVoices());
+          return this.probe();
+        },
+        (err) => this.setStatus("error", `✗ ${errorMessage(err)}`),
+      ),
+    );
+  }
+
+  /** x on Remote machine: close the connection and forget the machine; the bridge is no longer used. */
+  private disconnect(): void {
+    const host = this.engine.remoteHost;
+    if (!host) {
+      this.setStatus("info", "Not connected to a Remote machine");
+      return;
+    }
+    this.track(
+      this.engine.disconnectRemote().then(
+        () => {
+          this.setStatus("success", `✓ Disconnected from ${host}; audio and models are on This machine`);
+          return this.probe();
+        },
+        (err) => this.setStatus("error", `✗ ${errorMessage(err)}`),
+      ),
+    );
+  }
+
+  /** What Connect asks the user, in this panel: a password as dots, a question answered with Enter or Esc. */
+  private remotePrompts(): RemotePrompts {
+    const ask = <T>(make: (resolve: (v: T) => void, back: Mode) => Mode, none: T) =>
+      new Promise<T>((resolve) => {
+        if (this.disposed) return resolve(none);
+        this.pendingPrompt = () => resolve(none);
+        this.mode = make((v) => {
+          this.pendingPrompt = undefined;
+          resolve(v);
+        }, this.home());
+        this.changed();
+      });
+    return {
+      progress: (text) => this.setStatus("busy", text),
+      password: (who) =>
+        ask<string | undefined>(
+          (resolve, back) => ({
+            kind: "input",
+            purpose: "secret",
+            label: `Password for ${who}`,
+            edit: new LineEdit(),
+            back,
+            resolve,
+          }),
+          undefined,
+        ),
+      confirm: (question) =>
+        ask<boolean>(
+          (resolve, back) => ({ kind: "input", purpose: "confirm", question, edit: new LineEdit(), back, resolve }),
+          false,
+        ),
+    };
+  }
+
   /** Pairing's address field, filled with the address saved. */
   private openPairing(): void {
     const home = this.home();
@@ -1918,7 +2141,14 @@ export class Panel {
       back:
         home.kind === "menu"
           ? home
-          : { kind: "menu", menu: "bridge", selected: BRIDGE.findIndex((r) => r.id === "pairing") },
+          : {
+              kind: "menu",
+              menu: "bridge",
+              selected: Math.max(
+                0,
+                this.menuRows("bridge").findIndex((r) => r.id === "remoteMachine"),
+              ),
+            },
     };
   }
 

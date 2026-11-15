@@ -18,15 +18,17 @@ import {
   sendPairingCode,
 } from "../bridge/index";
 import type { AudioInput, AudioOutput } from "./audio";
+import { binaryFor } from "./binary";
 import { Dictation } from "./dictation";
 import { runDictationOutput } from "./dictation-output";
 import { Downloads } from "./downloads";
-import type { Env } from "./env";
+import { type Env, errorMessage } from "./env";
 import { Indicator } from "./indicator";
 import type { LocalModels } from "./local-models";
 import type { SpeechCatalog } from "./openrouter";
 import { Player } from "./player";
 import { type Notify, ReadAloud, type ReadAloudOptions, type ReadMode } from "./read-aloud";
+import { connectRemote, type RemoteLink, type RemotePrompts } from "./remote";
 import { DIRECTION_LABELS, type Notice, Routes } from "./routes";
 import { type BridgeMode, type DirectionSetting, type Machine, SettingsFile } from "./settings";
 import { Speech } from "./speech";
@@ -69,7 +71,7 @@ export class Engine {
 
   constructor(opts: EngineOptions) {
     this.env = opts.env;
-    this.probeBridge = () => probeBridge(() => bridgeConfig(opts.env, this.speech.settings.bridgeAddress));
+    this.probeBridge = () => probeBridge(() => bridgeConfig(opts.env, this.bridgeAddress(), this.linkToken()));
     const settingsFile = new SettingsFile(join(opts.agentDir, "pi-speech"));
     const mode = settingsFile.load().bridge;
     this.routes = new Routes({
@@ -79,7 +81,8 @@ export class Engine {
       localOutput: opts.localOutput,
       localInput: opts.localInput,
       directions: () => this.speech.settings,
-      address: () => this.speech.settings.bridgeAddress,
+      address: () => this.bridgeAddress(),
+      token: () => this.linkToken(),
     });
     this.indicator = new Indicator(() => ({
       dictation: this.dictation.indicator(),
@@ -132,6 +135,107 @@ export class Engine {
     );
   }
 
+  // ── The Remote machine over SSH (Connect) ──────────────────────────────
+
+  /** The SSH connection to the Remote machine, while there is one. */
+  private link?: RemoteLink;
+  /** What Connect is doing; `lost` and `failed` say why in `remoteError`. */
+  remoteState: "off" | "connecting" | "connected" | "lost" | "failed" = "off";
+  remoteError?: string;
+  /** Called on every change of the connection (the panel follows it). */
+  onRemoteChange: () => void = () => {};
+
+  /** Where the bridge reaches the receiver: the SSH forward while connected, else the address saved in Pairing. */
+  bridgeAddress(): string | undefined {
+    return this.link?.alive() ? this.link.address : this.speech.settings.bridgeAddress;
+  }
+
+  /** The token of the Remote machine's receiver while connected over SSH. */
+  private linkToken(): string | undefined {
+    return this.link?.alive() ? this.link.token : undefined;
+  }
+
+  /** The destination connected to (or to be reconnected to), if any. */
+  get remoteHost(): string | undefined {
+    return this.link?.dest ?? this.speech.settings.remoteHost;
+  }
+
+  private setRemote(state: Engine["remoteState"], error?: string): void {
+    this.remoteState = state;
+    this.remoteError = error;
+    this.onRemoteChange();
+  }
+
+  /**
+   * Connect to `dest` over SSH (see remote.ts) and use its receiver: the bridge goes on, with the audio here and
+   * the models there unless Pi runs over SSH. Remembered, and reconnected to at the next session start. Throws
+   * what failed.
+   */
+  async connectRemote(dest: string, prompts: RemotePrompts): Promise<RemoteLink> {
+    await this.disconnectRemote(false);
+    this.setRemote("connecting");
+    let link: RemoteLink;
+    try {
+      link = await connectRemote(dest, prompts, {
+        env: this.env as NodeJS.ProcessEnv,
+        binaryFor: (platform) => binaryFor(platform, this.env),
+      });
+    } catch (err) {
+      this.setRemote("failed", errorMessage(err));
+      throw err;
+    }
+    // The receiver's token stays in the link, in memory: never written down here.
+    this.link = link;
+    link.onLost = () => {
+      if (this.link !== link) return;
+      this.link = undefined;
+      this.setRemote("lost", `the connection to ${link.dest} ended`);
+      this.notify(
+        `Remote machine: the connection to ${link.dest} ended (Enter on Remote machine reconnects)`,
+        "warning",
+      );
+    };
+    this.speech.settings.remoteHost = link.dest;
+    this.speech.save();
+    try {
+      await this.setBridge("on");
+      if (!this.routes.ssh) {
+        this.setDirection("playOn", "this");
+        this.setDirection("recordOn", "this");
+        this.setDirection("modelsOn", "remote");
+      }
+    } catch (err) {
+      await this.disconnectRemote(false);
+      this.setRemote("failed", errorMessage(err));
+      throw err;
+    }
+    this.setRemote("connected");
+    return link;
+  }
+
+  /** Close the SSH connection; with `forget`, also forget the machine and stop using the bridge. */
+  async disconnectRemote(forget = true): Promise<void> {
+    const link = this.link;
+    this.link = undefined;
+    if (link) await link.close();
+    if (forget) {
+      delete this.speech.settings.remoteHost;
+      this.speech.save();
+      if (this.routes.mode === "on" && !this.routes.ssh) await this.setBridge("auto").catch(() => {});
+    }
+    this.setRemote("off");
+  }
+
+  /** At a session start: reconnect to the machine remembered, without asking anything (keys or agent only). */
+  private reconnect(): void {
+    const dest = this.speech.settings.remoteHost;
+    if (!dest || this.link || this.remoteState === "connecting" || this.routes.ssh) return;
+    const quiet: RemotePrompts = { password: async () => undefined, confirm: async () => false, progress: () => {} };
+    this.connectRemote(dest, quiet).catch(() => {
+      // remoteError says why; the panel offers Connect.
+    });
+  }
+
   /** A session starts: reload the settings, load the catalog, and turn read-aloud off. */
   start(): void {
     this.speech.start();
@@ -139,6 +243,7 @@ export class Engine {
     this.readAloud.mode = "off";
     this.announced = false;
     this.indicator.update();
+    this.reconnect();
   }
 
   /** The automatic bridge over SSH, announced once per session. */
@@ -270,9 +375,10 @@ export class Engine {
     ].join("\n");
   }
 
-  /** The session ends: stop playback everywhere and drop a recording in progress. */
+  /** The session ends: stop playback everywhere, drop a recording in progress, and give up the Remote machine's lease. */
   async shutdown(): Promise<void> {
     await this.dictation.cancel();
     await this.player.stop();
+    await this.disconnectRemote(false);
   }
 }

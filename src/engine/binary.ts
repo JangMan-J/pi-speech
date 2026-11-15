@@ -8,6 +8,7 @@
  *   3. In a checkout: `receiver/target/release`, then `receiver/target/debug`.
  */
 
+import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type Env, findExecutable } from "./env";
@@ -57,4 +58,18 @@ export function findBinary(env: Env, opts: BinaryOptions = {}): BinaryChoice {
     ok: false,
     reason: `the bundled ${BINARY_NAME} is not installed (set ${BINARY_ENV}, or build it with cargo build --release in receiver/)`,
   };
+}
+
+/**
+ * The bundled binary for a machine of system `target` (`linux-x64`, `darwin-arm64`, ...), to install there: this
+ * machine's own when it is the same system, else the package's copy for that system (a checkout's build runs here
+ * only); undefined when this install has none.
+ */
+export function binaryFor(target: string, env: Env, root = ROOT): string | undefined {
+  if (target === `${process.platform}-${process.arch}`) {
+    const b = findBinary(env, { root });
+    return b.ok ? b.path : undefined;
+  }
+  const p = join(root, "bin", target, BINARY_NAME);
+  return existsSync(p) ? p : undefined;
 }

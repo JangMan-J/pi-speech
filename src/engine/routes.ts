@@ -27,6 +27,8 @@ export interface RoutesOptions {
   directions?: () => Record<DirectionSetting, Machine>;
   /** The receiver's address saved in Bridge connection's Pairing, if any. */
   address?: () => string | undefined;
+  /** The receiver's token held in memory (a Remote machine over SSH), before the configured one. */
+  token?: () => string | undefined;
 }
 
 /** The rows of DIRECTION, as the panel and messages name them. */
@@ -60,7 +62,7 @@ export class Routes {
     this.mode = opts.mode;
     this.ssh = overSsh(opts.env);
     // The configuration is read per request, so a token file written after Pi started is picked up.
-    this.bridge = opts.bridge ?? createBridgeAudioFrom(() => bridgeConfig(this.env, this.address()));
+    this.bridge = opts.bridge ?? createBridgeAudioFrom(() => bridgeConfig(this.env, this.address(), opts.token?.()));
     this.localOutput = opts.localOutput ?? new LocalOutput(opts.env);
     this.localInput = opts.localInput ?? new LocalInput(opts.env);
   }

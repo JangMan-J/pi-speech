@@ -259,7 +259,11 @@ function inputLine(input: InputView, w: number, s: PanelStyle): string {
   const room = w - INPUT_INDENT.length - width(label);
   if (room < 4) return INPUT_INDENT + cut(input.label, w - INPUT_INDENT.length);
   return (
-    INPUT_INDENT + (label ? s.bold(label) : "") + field(input.value, input.cursor, input.placeholder, room, s).text
+    INPUT_INDENT +
+    (label ? s.bold(label) : "") +
+    // A password is shown as one dot a character.
+    field(input.secret ? "•".repeat([...input.value].length) : input.value, input.cursor, input.placeholder, room, s)
+      .text
   );
 }
 
