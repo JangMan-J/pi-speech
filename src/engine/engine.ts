@@ -20,6 +20,7 @@ import {
 import type { AudioInput, AudioOutput } from "./audio";
 import { Dictation } from "./dictation";
 import { runDictationOutput } from "./dictation-output";
+import { Downloads } from "./downloads";
 import type { Env } from "./env";
 import { Indicator } from "./indicator";
 import type { LocalModels } from "./local-models";
@@ -54,6 +55,8 @@ export class Engine {
   readonly speech: Speech;
   readonly dictation: Dictation;
   readonly readAloud: ReadAloud;
+  /** The on-device model download in progress; it outlives the settings panel that started it. */
+  readonly downloads: Downloads;
   readonly indicator: Indicator;
   /** Where notifications go; the adapter points it at the current session's UI. */
   notify: Notify = () => {};
@@ -117,6 +120,10 @@ export class Engine {
       output: (text) => runDictationOutput(this.speech.settings.dictationOutput ?? "", text, opts.env),
       onChange: () => this.indicator.update(),
     });
+    this.downloads = new Downloads(
+      () => this.speech.local,
+      (direction, id) => this.speech.setLocalModel(direction, id),
+    );
     this.readAloud = new ReadAloud(
       this.speech,
       (m, l) => this.notify(m, l),

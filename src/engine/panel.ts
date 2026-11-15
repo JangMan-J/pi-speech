@@ -646,7 +646,11 @@ export class Panel {
   /** A downloaded model that the next x deletes. */
   private deleting?: string;
   /** The download running, and how far it is. */
-  private downloading?: { id: string; progress?: DownloadProgress };
+  /** The engine's download in progress (it outlives this panel), as the lists and status line follow it. */
+  private get downloading() {
+    return this.engine.downloads.current;
+  }
+  private unlistenDownloads?: () => void;
 
   constructor(
     private readonly engine: Engine,
@@ -671,11 +675,37 @@ export class Panel {
     const s = this.speech.settings;
     if (s.speechSource === "local" || s.transcriptionSource === "local") this.track(this.loadLocal());
     this.probe();
+    // A download goes on when this panel closes; any panel open follows it, and refreshes the lists at its end.
+    this.unlistenDownloads = this.engine.downloads.listen(() => this.downloadChanged());
+    const d = this.downloading;
+    if (d) this.setStatus("busy", d.progress ? downloadLine(d.id, d.progress) : `… downloading ${d.id}`);
+  }
+
+  /** The engine's download moved on or ended: say so on the status line, and refresh the lists at its end. */
+  private downloadChanged(): void {
+    const d = this.downloading;
+    if (d) {
+      if (d.progress) this.setStatus("busy", downloadLine(d.id, d.progress));
+      this.changed();
+      return;
+    }
+    const end = this.engine.downloads.last;
+    if (!end) return;
+    if (end.status === "stopped") {
+      this.setStatus("info", `Download of ${end.id} stopped; the next download goes on from there`);
+    } else if (end.status === "failed") {
+      this.setStatus("error", `✗ Download of ${end.id} failed: ${end.error}`);
+    } else {
+      this.setStatus("success", end.summary ? `✓ ${end.id} downloaded · ${end.summary}` : `✓ ${end.id} downloaded`);
+      if (end.direction === "speech") this.track(this.loadVoices());
+    }
+    this.track(this.loadLocal(true));
   }
 
   dispose(): void {
     this.disposed = true;
     this.unlisten?.();
+    this.unlistenDownloads?.();
     if (this.statusTimer) clearTimeout(this.statusTimer);
     this.stopPairing();
   }
@@ -999,7 +1029,7 @@ export class Panel {
           d?.id === m.id
             ? d.progress?.phase === "progress" && d.progress.total
               ? `downloading ${Math.floor((d.progress.done / d.progress.total) * 100)}%`
-              : "downloading"
+              : (d.progress?.phase ?? "downloading")
             : m.downloaded
               ? "downloaded"
               : m.partial
@@ -1711,6 +1741,10 @@ export class Panel {
     const model = this.localModels?.find((x) => x.id === id);
     if (!model) return;
     this.deleting = undefined;
+    if (this.downloading?.id === id) {
+      this.setStatus("info", `${id} is still downloading; it can be chosen once it is done`);
+      return;
+    }
     if (model.downloaded) {
       this.offer = undefined;
       this.mode = m.back;
@@ -1771,57 +1805,27 @@ export class Panel {
 
   /**
    * Download an on-device model with its progress on the status line; when it was chosen from a model list,
-   * it becomes that direction's model once downloaded.
+   * it becomes that direction's model once downloaded. The engine runs it, so it goes on (and the choice is
+   * made) when this panel closes.
    */
   private startDownload(
     model: LocalModel,
     chosen?: { direction: Direction; picker: Extract<Mode, { kind: "picker" }> },
   ): void {
     this.offer = undefined;
-    if (this.downloading) {
-      this.setStatus("info", `${this.downloading.id} is downloading; one download at a time`);
-      return;
-    }
-    const id = model.id;
-    const state: { id: string; progress?: DownloadProgress } = { id };
-    let result: Promise<unknown>;
+    let end: Promise<{ status: string }>;
     try {
-      result = this.speech.local.download(id, {
-        onProgress: (p) => {
-          state.progress = p;
-          if (this.downloading === state) this.setStatus("busy", downloadLine(id, p));
-          this.changed();
-        },
-      }).result;
+      end = this.engine.downloads.start(model, chosen?.direction);
     } catch (err) {
-      this.setStatus("error", `✗ ${errorMessage(err)}`);
+      this.setStatus("info", errorMessage(err));
       return;
     }
-    this.downloading = state;
-    this.setStatus("busy", `… downloading ${id} (${formatSize(model.size)})`);
+    this.setStatus("busy", `… downloading ${model.id} (${formatSize(model.size)})`);
+    // The status line and the lists follow the engine's download (downloadChanged); here only the list closes.
     this.track(
-      result
-        .then(async (r) => {
-          this.downloading = undefined;
-          const done = r as { status: string; done?: number; total?: number };
-          if (done.status === "stopped") {
-            this.setStatus("info", `Download of ${id} stopped; the next download goes on from there`);
-            return;
-          }
-          await this.loadLocal(true).catch(() => {});
-          if (!chosen) {
-            this.setStatus("success", `✓ ${id} downloaded`);
-            return;
-          }
-          const summary = this.speech.setLocalModel(chosen.direction, id);
-          if (this.mode === chosen.picker) this.mode = chosen.picker.back;
-          if (chosen.direction === "speech") this.track(this.loadVoices());
-          this.setStatus("success", `✓ ${id} downloaded · ${summary}`);
-        })
-        .catch((err) => {
-          this.downloading = undefined;
-          this.setStatus("error", `✗ Download of ${id} failed: ${errorMessage(err)}`);
-        }),
+      end.then((e) => {
+        if (e.status === "done" && chosen && this.mode === chosen.picker) this.mode = chosen.picker.back;
+      }),
     );
   }
 

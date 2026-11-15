@@ -1,6 +1,6 @@
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Engine } from "../../src/engine/engine";
 import { matchItems, Panel, type PanelKey, type PanelView } from "../../src/engine/panel";
@@ -1504,6 +1504,41 @@ describe.skipIf(!STAND_IN_BINARY)("the panel view model: Local sources", () => {
     );
     expect(p.row("Transcription model")?.value).toBe("whisper-small");
     expect(p.calls()).toContain("models download whisper-small");
+  });
+
+  it("a download outlives the panel that started it: a panel opened meanwhile follows it and sees the end", async () => {
+    const p = local();
+    const gate = join(dirname(p.bin.path), "unpack.gate");
+    writeFileSync(gate, "");
+    p.engine.speech.setSource("transcription", "local");
+    await p.goTo("Transcription model");
+    await p.press("enter");
+    p.panel.handle({ key: "down" });
+    p.panel.handle({ key: "enter" });
+    p.panel.handle({ key: "enter" });
+    await vi.waitFor(() => expect(p.engine.downloads.current?.progress?.phase).toBe("unpacking"));
+    p.panel.dispose(); // closed while it unpacks
+
+    const changed = vi.fn();
+    const again = new Panel(p.engine, new Surface(p.engine), { ui: p.ui, close: vi.fn(), changed });
+    again.open();
+    expect(again.view().status?.text).toBe("… unpacking whisper-small");
+    const label = () => again.view().rows[again.view().selected].label;
+    for (let i = 0; i < 20 && label() !== "Transcription model"; i++) again.handle({ key: "down" });
+    again.handle({ key: "enter" });
+    await again.idle();
+    const item = () => again.view().picker?.items.find((i) => i.id === "whisper-small");
+    expect(item()?.cols?.[0]).toBe("unpacking");
+    again.handle({ key: "down" });
+    again.handle({ key: "enter" });
+    expect(again.view().status?.text).toBe("whisper-small is still downloading; it can be chosen once it is done");
+    expect(p.calls().filter((c) => c === "models download whisper-small")).toHaveLength(1);
+
+    rmSync(gate);
+    await vi.waitFor(() => expect(item()?.cols?.[0]).toBe("downloaded"));
+    expect(again.view().status?.text).toBe("✓ whisper-small downloaded · Transcription model: whisper-small (local)");
+    expect(settingsOf(p.work).localTranscriptionModel).toBe("whisper-small");
+    expect(changed).toHaveBeenCalled();
   });
 
   it("in the list d downloads and x (twice) deletes the highlighted model", async () => {

@@ -207,6 +207,7 @@ export const STAND_IN_BINARY = process.platform !== "win32";
  * A stand-in for the receiver binary's `models`, `transcribe` and `speak` commands, in `dir`: two transcription
  * models (parakeet-v3 downloaded, whisper-small not) and one speech model (kokoro, not downloaded). Downloads and
  * deletes change what `models list` says; `transcribe` answers `local words from <id>` for a downloaded model.
+ * `models download` stays unpacking while `unpack.gate` exists in `dir`.
  * `speak` of a downloaded model writes the format line at 24000 Hz, then 4800 bytes of PCM (value 1) per
  * sentence of its input, then done; with a text holding "hold" it stops after the first sentence's audio and
  * waits to be killed; `speak <id> --list-voices` names three voices (af_alloy, af_sol, bm_lewis), and `--voice` must
@@ -280,9 +281,15 @@ if (cmd === "models" && sub === "download") {
   for (const done of [0, m.size / 2, m.size]) out({ event: "progress", id, done, total: m.size });
   out({ event: "verifying", id });
   out({ event: "unpacking", id });
-  fs.writeFileSync(state, JSON.stringify([...have, id]));
-  out({ event: "done", id, path: "/cache/" + id });
-  process.exit(0);
+  // While unpack.gate exists, it stays unpacking.
+  const gate = ${JSON.stringify(join(dir, "unpack.gate"))};
+  const finish = () => {
+    if (fs.existsSync(gate)) return setTimeout(finish, 20);
+    fs.writeFileSync(state, JSON.stringify([...JSON.parse(fs.readFileSync(state, "utf8")), id]));
+    out({ event: "done", id, path: "/cache/" + id });
+    process.exit(0);
+  };
+  return finish();
 }
 if (cmd === "models" && sub === "delete") {
   fs.writeFileSync(state, JSON.stringify(have.filter((x) => x !== id)));
