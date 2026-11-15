@@ -76,7 +76,7 @@ export type SettingName =
   | "dictation-output"
   | "tts-source"
   | "stt-source"
-  | "stt-device";
+  | "device";
 export const SETTING_NAMES: SettingName[] = [
   "tts-model",
   "voice",
@@ -86,7 +86,7 @@ export const SETTING_NAMES: SettingName[] = [
   "dictation-output",
   "tts-source",
   "stt-source",
-  "stt-device",
+  "device",
 ];
 
 /** What speaking says while the Speech source is Local and no local speech model is chosen. */
@@ -208,6 +208,7 @@ export class Speech {
       () => this.local.binary(),
       () => childEnv(opts.env),
       () => this.local.remote(),
+      () => this.local.deviceEnvironment(),
     );
     this.settings = this.store.load();
     this.local.setDevice(this.settings.localDevice);
@@ -594,17 +595,14 @@ export class Speech {
           throw new Error(`${name} must be provider or local, not ${value || "empty"}`);
         return this.setSource(name === "tts-source" ? "speech" : "transcription", value as Source);
       }
-      case "stt-device": {
-        if (value !== "cpu" && value !== "gpu")
-          throw new Error(`stt-device must be cpu or gpu, not ${value || "empty"}`);
+      case "device": {
+        if (value !== "cpu" && value !== "gpu") throw new Error(`device must be cpu or gpu, not ${value || "empty"}`);
         s.localDevice = value;
         this.local.setDevice(value);
         this.save();
-        if (value === "cpu") return "Transcription device: CPU";
+        if (value === "cpu") return "Local models run on: CPU";
         const gpu = await this.local.gpu().catch((e) => ({ usable: false, why: errorMessage(e) }));
-        return gpu.usable
-          ? "Transcription device: GPU"
-          : `Transcription device: GPU (on the CPU until then: ${gpu.why})`;
+        return gpu.usable ? "Local models run on: GPU" : `Local models run on: GPU (on the CPU until then: ${gpu.why})`;
       }
       case "dictation-output": {
         const cmd = value.trim();

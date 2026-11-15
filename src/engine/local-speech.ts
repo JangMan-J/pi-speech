@@ -466,6 +466,8 @@ export class LocalSpeechProvider implements SpeechProvider {
 
   /** The running `speak --serve`, which keeps the last voice model loaded between utterances. */
   private readonly worker: SpeechWorker;
+  /** What the worker runs with for the chosen device (the GPU runtime's), as it was started. */
+  private deviceEnv: NodeJS.ProcessEnv = {};
 
   constructor(
     /** The binary's path; throws why there is none. */
@@ -473,8 +475,19 @@ export class LocalSpeechProvider implements SpeechProvider {
     private readonly env: () => NodeJS.ProcessEnv = () => process.env,
     /** The Remote machine's models when they run there (Run models on), else undefined. */
     private readonly remote: () => BridgeModels | undefined = () => undefined,
+    /** What the chosen device (CPU or GPU) needs in the environment. */
+    private readonly device: () => Promise<NodeJS.ProcessEnv> = async () => ({}),
   ) {
-    this.worker = new SpeechWorker(binary, env);
+    this.worker = new SpeechWorker(binary, () => ({ ...env(), ...this.deviceEnv }));
+  }
+
+  /** Start the worker with what the chosen device needs; restart it when that changed. */
+  private async applyDevice(): Promise<void> {
+    const env = await this.device().catch(() => ({}));
+    if (JSON.stringify(env) !== JSON.stringify(this.deviceEnv)) {
+      this.worker.close();
+      this.deviceEnv = env;
+    }
   }
 
   /** Load voice model `id` now, on This machine, so the next utterance does not wait for it. */
@@ -485,7 +498,7 @@ export class LocalSpeechProvider implements SpeechProvider {
     } catch {
       return;
     }
-    this.worker.load(id);
+    void this.applyDevice().then(() => this.worker.load(id));
   }
 
   /** End the speech worker, giving back the memory of the voice model it holds. */
@@ -506,6 +519,7 @@ export class LocalSpeechProvider implements SpeechProvider {
     const remote = this.remote();
     if (remote) return remote.speak(req.model, req.text, { voice: req.voice, signal: req.signal });
     this.binary();
+    await this.applyDevice();
     const lang = req.language && req.language !== "auto" ? req.language : undefined;
     return this.worker.speak(req.model, req.text, { voice: req.voice, signal: req.signal, lang });
   }

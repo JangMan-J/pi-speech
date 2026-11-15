@@ -46,7 +46,8 @@ if (id === "--serve") {
   require("node:readline").createInterface({ input: process.stdin }).on("line", (line) => {
     const r = JSON.parse(line);
     if (r.cancel !== undefined) return;
-    fs.writeFileSync(${JSON.stringify(log)}, JSON.stringify({ args: [cmd, r.model], text: r.text, request: r }));
+    fs.writeFileSync(${JSON.stringify(log)}, JSON.stringify({ args: [cmd, r.model], text: r.text, request: r,
+      provider: process.env.PI_SPEECH_PROVIDER ?? null, pid: process.pid }));
     if (r.model === "missing") return json({ id: r.id, event: "error", message: "the model missing is not downloaded" });
     json({ id: r.id, event: "format", rate: 22050, channels: 1 });
     frame("A", Buffer.from([1, 2, 3, 4]));
@@ -197,6 +198,26 @@ describe.skipIf(!STAND_IN_BINARY)("LocalSpeechProvider", () => {
     await expect(provider.synthesize({ text: "Hi.", model: "missing", voice: "", language: "auto" })).rejects.toThrow(
       /not downloaded/,
     );
+    provider.close();
+  });
+
+  it("runs the worker with what the chosen device needs, and restarts it when that changes", async () => {
+    const bin = fakeSpeak();
+    let device: NodeJS.ProcessEnv = { PI_SPEECH_PROVIDER: "cuda" };
+    const provider = new LocalSpeechProvider(
+      () => bin,
+      () => process.env,
+      () => undefined,
+      async () => device,
+    );
+    const logged = () => JSON.parse(readFileSync(join(dir, "log.json"), "utf8"));
+    await provider.synthesize({ text: "Hi.", model: "ok", voice: "", language: "auto" });
+    const gpu = logged();
+    expect(gpu.provider).toBe("cuda");
+    device = {};
+    await provider.synthesize({ text: "Hi.", model: "ok", voice: "", language: "auto" });
+    expect(logged().provider).toBeNull();
+    expect(logged().pid).not.toBe(gpu.pid);
     provider.close();
   });
 

@@ -528,7 +528,17 @@ pub struct Synthesizer {
 }
 
 impl Synthesizer {
+    /// Load `model`, where [`crate::engines::recognize::PROVIDER_ENV`] says (`cuda` on a build
+    /// linked with the GPU libraries), else on the CPU; a model the GPU refuses runs on the CPU.
     pub fn load(model: &VoiceModel) -> Result<Synthesizer, String> {
+        let wanted = crate::engines::recognize::provider();
+        match Self::load_on(model, &wanted) {
+            Err(_) if wanted != "cpu" => Self::load_on(model, "cpu"),
+            r => r,
+        }
+    }
+
+    fn load_on(model: &VoiceModel, provider: &str) -> Result<Synthesizer, String> {
         let mut config = OfflineTtsConfig {
             // One sentence at a time: each comes out as soon as it is generated.
             max_num_sentences: 1,
@@ -536,7 +546,7 @@ impl Synthesizer {
         };
         let m = &mut config.model;
         m.num_threads = threads();
-        m.provider = Some("cpu".into());
+        m.provider = Some(provider.into());
         let opt = |p: &Option<PathBuf>| p.as_deref().map(path).transpose();
         match model {
             VoiceModel::Kokoro {

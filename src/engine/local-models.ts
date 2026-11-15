@@ -404,7 +404,7 @@ export class LocalModels {
 
   /** The running `transcribe --serve`, which keeps the last model loaded between transcriptions. */
   private readonly worker: TranscribeWorker;
-  /** Where transcription runs; see `setDevice`. */
+  /** Where local models run; see `setDevice`. */
   private device: "cpu" | "gpu" = "cpu";
   /** What the worker runs with beyond the usual environment (the GPU runtime's), as it was started. */
   private deviceEnv: NodeJS.ProcessEnv = {};
@@ -421,7 +421,7 @@ export class LocalModels {
     );
   }
 
-  /** Run on-device transcription on the CPU or an NVIDIA GPU from the next transcription on. */
+  /** Run on-device models (transcription and speech) on the CPU or an NVIDIA GPU from their next run on. */
   setDevice(device: "cpu" | "gpu"): void {
     if (device === this.device) return;
     this.device = device;
@@ -439,16 +439,21 @@ export class LocalModels {
     return info;
   }
 
+  /**
+   * What a model process needs in its environment, beyond the usual, to run on the chosen device: on a usable GPU,
+   * the GPU runtime first on the library path and the CUDA provider; else nothing (the CPU).
+   */
+  async deviceEnvironment(): Promise<NodeJS.ProcessEnv> {
+    if (this.device !== "gpu") return {};
+    const info = await this.gpu().catch(() => undefined);
+    if (!info?.usable || !info.lib) return {};
+    const prior = this.childEnv.LD_LIBRARY_PATH;
+    return { LD_LIBRARY_PATH: prior ? `${info.lib}:${prior}` : info.lib, PI_SPEECH_PROVIDER: "cuda" };
+  }
+
   /** The environment the chosen device needs; restarts the worker when it changes. GPU unusable: the CPU. */
   private async applyDevice(): Promise<void> {
-    let env: NodeJS.ProcessEnv = {};
-    if (this.device === "gpu") {
-      const info = await this.gpu().catch(() => undefined);
-      if (info?.usable && info.lib) {
-        const prior = this.childEnv.LD_LIBRARY_PATH;
-        env = { LD_LIBRARY_PATH: prior ? `${info.lib}:${prior}` : info.lib, PI_SPEECH_PROVIDER: "cuda" };
-      }
-    }
+    const env = await this.deviceEnvironment();
     if (JSON.stringify(env) !== JSON.stringify(this.deviceEnv)) {
       this.worker.close();
       this.deviceEnv = env;

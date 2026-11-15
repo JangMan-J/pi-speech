@@ -51,7 +51,7 @@ fn path(p: &Path) -> Result<String, String> {
 /// default), or `cuda`, `coreml`, `directml` on a build that has it.
 pub const PROVIDER_ENV: &str = "PI_SPEECH_PROVIDER";
 
-fn provider() -> String {
+pub(crate) fn provider() -> String {
     std::env::var(PROVIDER_ENV)
         .ok()
         .map(|p| p.trim().to_ascii_lowercase())

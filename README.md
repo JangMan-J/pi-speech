@@ -96,12 +96,12 @@ starts, so the wait after speaking is only the transcription itself: Parakeet 0.
 running `pi-speech-receiver speak --serve`: the first utterance waits for the voice model (about 2 s), the next
 ones do not (a Piper voice starts in about 60 ms), and stopping one keeps the model.
 
-**GPU (Linux x64, NVIDIA).** Local transcription can run on an NVIDIA GPU: `/speech --set stt-device gpu`
+**GPU (Linux x64, NVIDIA).** Local models (transcription and speech) can run on an NVIDIA GPU: `/speech --set device gpu`
 (back with `cpu`). It needs the NVIDIA driver, CUDA 13 or 12 and cuDNN 9 installed on the system (pi-speech
 does not ship them), and the GPU runtime, downloaded like a model: `gpu-runtime-cuda13` (255 MB) or
 `gpu-runtime-cuda12` (394 MB), sherpa-onnx's ONNX Runtime with its CUDA provider. `pi-speech-receiver gpu`
-says what the system has, which runtime fits, and what is missing; until all of it is there, transcription
-runs on the CPU. The same receiver runs on the CPU without any of it: on Linux x64 it carries sherpa-onnx's
+says what the system has, which runtime fits, and what is missing; until all of it is there, the models run
+on the CPU. The same receiver runs on the CPU without any of it: on Linux x64 it carries sherpa-onnx's
 and ONNX Runtime's shared libraries beside it (39 MB in all), and the GPU runtime only adds the CUDA provider.
 
 The GPU pays off with the full-precision models (`… (fp32, for GPU)`, `… (fp16, for GPU)`, Canary 1B v2);
@@ -116,6 +116,19 @@ i9-14900HX, with the model loaded, for 8 and 25 seconds of speech:
 | `canary-1b-v2` (3.4 GB)               | 2.7 s, 10 s   | 0.34 s, 1.05 s |
 | `canary-180m-flash-fp32` (717 MB)     | 1.3 s, 5.3 s  | 0.19 s, 0.68 s |
 | `parakeet-tdt-0.6b-v3-int8`           | 0.8 s, 2.0 s  | 0.8 s, 2.0 s   |
+
+For speech, the GPU speeds up the larger voice models; the small ones are already fast on the CPU, and
+Pocket TTS is slower on the GPU. Two sentences (about 9 seconds of speech), first audio and all of it:
+
+| Voice model                   | CPU            | GPU            |
+| ----------------------------- | -------------- | -------------- |
+| `kokoro-multi-lang-v1.1`      | 1.2 s, 4.1 s   | 0.18 s, 0.7 s  |
+| `supertonic-3-int8`           | 1.3 s, 2.7 s   | 0.26 s, 0.53 s |
+| `piper-en_US-lessac-medium`   | 0.22 s, 0.43 s | 0.20 s, 0.40 s |
+| `kokoro-multi-lang-v1.1-int8` | 3.5 s, 11.6 s  | 3.2 s, 10.7 s  |
+| `pocket-tts-int8`             | 1.5 s, 3.1 s   | 1.7 s, 4.1 s   |
+
+Kokoro's int8 build is the slower one on the CPU as well; the full one (365 MB) is the one to pick.
 
 Some of these are published as separate files on Hugging Face rather than one archive; the catalogue names
 each file with its size and SHA-256 at a fixed commit, and a download fetches and checks them one by one (and

@@ -863,10 +863,22 @@ const BUILTIN: &[Builtin] = &[
         sha256: "0b4a0a2630d6dccbf15ffc14ff2b6b446872bfdf7509d0ad602fe78bd8efc29d",
         lexicon: None,
     },
+    // Kokoro's fp32 build is the faster one, on the CPU as well: two sentences in 4.1 s on 8 CPU
+    // threads (0.7 s on an RTX 4090 Laptop), against 11.6 s for the int8 one (no faster on a GPU).
+    Builtin {
+        id: "kokoro-multi-lang-v1.1",
+        kind: Kind::Speech,
+        name: "Kokoro multi-lang v1.1",
+        languages: "en zh",
+        size: 364_855_331,
+        path: "tts-models/kokoro-multi-lang-v1_1.tar.bz2",
+        sha256: "b78e1ac42b852e839cceaafbe88f66806bf5860992d1d7b9a3f2ad1198427aed",
+        lexicon: None,
+    },
     Builtin {
         id: "kokoro-multi-lang-v1.1-int8",
         kind: Kind::Speech,
-        name: "Kokoro multi-lang v1.1 (int8)",
+        name: "Kokoro multi-lang v1.1 (int8: smaller, slower)",
         languages: "en zh",
         size: 147_052_523,
         path: "tts-models/kokoro-int8-multi-lang-v1_1.tar.bz2",
@@ -1015,7 +1027,7 @@ mod tests {
         }
         let kinds = |k| c.entries.iter().filter(|e| e.kind == k).count();
         assert_eq!(kinds(Kind::Transcription), 30);
-        assert_eq!(kinds(Kind::Speech), 8);
+        assert_eq!(kinds(Kind::Speech), 9);
         // Every Piper and Kitten voice names the English lexicon; Kokoro carries its own, and
         // Supertonic and Pocket TTS need none.
         for e in c.entries.iter().filter(|e| e.kind == Kind::Speech) {

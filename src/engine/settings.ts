@@ -127,7 +127,7 @@ export interface Settings {
   localSpeechVoice?: string;
   /** The on-device transcription model. */
   localTranscriptionModel?: string;
-  /** Where on-device transcription runs on This machine: the CPU, or an NVIDIA GPU (with the GPU runtime downloaded). */
+  /** Where on-device models (transcription and speech) run on This machine: the CPU, or an NVIDIA GPU (with the GPU runtime downloaded). */
   localDevice: Device;
   /** With the bridge in use: where audio plays. */
   playOn: Machine;
