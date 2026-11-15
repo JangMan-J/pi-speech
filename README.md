@@ -30,41 +30,49 @@ engine; `PI_SPEECH_BINARY` names another). Without the binary it uses one of `pa
 
 ## `/speech`
 
-**`/speech`** (or the Speak key, Alt+S) opens the dock: a compact panel in the place of Pi's editor (nothing
-floats over the conversation). Its first entry is the **Speak** line, where the cursor starts: type a message
-and press Enter to speak it. Below it are the settings, under three headings: SPEAK and LISTEN carry the Speak
-key and the key that dictates, as Pi has them bound; SETTINGS holds the submenus. A row
+**`/speech`** (or the Speak key, Alt+S) opens the dock: a compact panel in the place of Pi's editor, drawn in
+the frame shared with pi-picks and pi-hashline. It is always 19 lines: a title line, with what speech is doing
+on its right (`▶ speaking`, `● REC 0:03`, `… transcribing`); a tab line; the text field; a column header; 10
+rows; one status line; and the key bar, with rules around them. The tabs are **Main**, **Read aloud**,
+**Speech model**, **Voice**, **Transcription model**, **Dictation output**, **Hotkeys** and **Bridge**, in
+that order. Tab and Shift+Tab switch tabs. Esc on a tab returns to Main; Esc on Main closes the panel.
+
+Main's text field is the **Speak** line: typing anywhere on Main types the message, and Enter in it speaks the
+message. Its
+10 rows are **Read aloud options**, **Speech source**, **Speech model**, **Voice**, **Transcription source**,
+**Transcription model**, **Dictation language**, **Dictation output**, **Bridge connection** and **Spectrum
+OSD**. The Speak and Dictate keys (Alt+S and Alt+Z unless changed) are shown on the right of the key bar. A row
 shows only its current value: a model or a voice by its name (its price, features and languages are in its
-picker). The header is also the top rule, and shows what speech is doing (`▶ speaking`, `● REC 0:03`,
-`… transcribing`) while it happens.
+tab).
 
 ```
-Speech ──────────────────────────────────────────────────────────────── ▶ speaking
-  ▸ Speak    type a message · Enter speaks it
-SPEAK (Alt+S)
-    Read aloud options   Off ›
-    Speech source        Provider
-    Speech model         x-ai/grok-voice-tts-1.0 ›
-    Voice                eve ›
-LISTEN (Alt+Z)
-    Transcription source Provider
-    Transcription model  openai/whisper-large-v3-turbo ›
-    Dictation language   auto
-    Dictation output     Pi ›
-SETTINGS
-    Hotkeys ›
-    Bridge connection    decent-spider · ✓ over SSH ›
-
+─ Speech ──────────────────────────────────────────────────────────── ▶ speaking ─
+  Main │ Read aloud │ Speech model │ Voice │ … │ Hotkeys │ Bridge
+────────────────────────────────────────────────────────────────────────────────
+  Speak: type a message · Enter speaks it
+  Setting              Value
+▸ Read aloud options   Off ›
+  Speech source        Provider
+  Speech model         x-ai/grok-voice-tts-1.0 ›
+  Voice                eve ›
+  Transcription source Provider
+  Transcription model  openai/whisper-large-v3-turbo ›
+  Dictation language   auto
+  Dictation output     Pi ›
+  Bridge connection    decent-spider · ✓ over SSH ›
+  Spectrum OSD         Off
   ✓ Voice: eve
-  Enter speak · ↓ settings · Esc close
+────────────────────────────────────────────────────────────────────────────────
+  Enter open · Ctrl+O replay · Esc close          Speak Alt+S · Dictate Alt+Z
+────────────────────────────────────────────────────────────────────────────────
 ```
 
-Values change in place with Enter or ←→ and are saved at once; a row ending in `›` opens a picker (models,
-voices), a field (Dictation output) or a submenu.
+Values on rows without their own tab change in place with Enter or ←→ and are saved at once. Enter on a Main
+row that has its own tab goes to that tab.
 
 **Speech source** and **Transcription source** each switch between Provider (a speech service over the
 network) and Local (a model on This machine), on their own, so provider speech can go with local transcription
-or the other way round. With Local, the model row of that direction holds the on-device model, and its picker
+or the other way round. With Local, the model row of that direction holds the on-device model, and its tab
 lists the models of the bundled `pi-speech-receiver` with their size and whether they are downloaded:
 
 ```
@@ -75,13 +83,13 @@ Find:
     sense-voice-int8           163 MB  not downloaded  5 langs
 Runs on This machine, with no network request once downloaded.
 
-  Enter pick · d download · x delete · Esc back                              1/25
+  Enter pick · Ctrl+O download · Ctrl+T delete · Esc Main                     1/25
 ```
 
 Enter picks a downloaded model. On one that is not downloaded, Enter says its size and Enter again downloads it,
-with its progress on the status line, and then picks it. `d` downloads the highlighted model, `x` twice
-deletes it. A stopped download goes on from where it stopped the next time. Models are kept in the per-user
-model cache (`~/.cache/pi-speech/models` on Linux, or `PI_SPEECH_MODELS_DIR`).
+with its progress on the status line, and then picks it. Ctrl+O downloads the highlighted model, Ctrl+T twice
+deletes it. Letters type into the filter. A stopped download goes on from where it stopped the next time.
+Models are kept in the per-user model cache (`~/.cache/pi-speech/models` on Linux, or `PI_SPEECH_MODELS_DIR`).
 
 Local transcription (dictation, Transcribe file…, `--transcribe`, `speech_transcribe`) runs
 `pi-speech-receiver transcribe <model> <audio>` on This machine, with no network request; it reads WAV and MP3.
@@ -166,7 +174,7 @@ pi-speech-receiver: it plays as it is generated, sentence by sentence, and is sa
 provider speech; nothing goes over the network. The Voice row then opens the local model's voices (Kokoro v1.1
 has 103, a Piper voice one, Kitten 8 (Jasper, Bella, Bruno, Luna, Hugo, Rosie, Leo, Kiki), Supertonic 10 (F1 to
 F5, M1 to M5), Pocket TTS 3 (bria, loona, sample_fr_hibiki_crepes: short recordings whose voice it copies);
-`Tab` samples the highlighted one), and `/speech --set voice <name>` sets it; `default` is the model's first
+Ctrl+P samples the highlighted one), and `/speech --set voice <name>` sets it; `default` is the model's first
 voice, and choosing another local model goes back to it. A Piper or Kitten voice speaks through sherpa-onnx's
 English lexicon (`lexicon-en-us.txt`, 6.3 MB), which its download fetches into the model cache with it;
 deleting the voice leaves the lexicon for the others. Supertonic 3 reads 31 languages but is told which one;
@@ -177,8 +185,8 @@ Until a model is chosen, the Speech model row shows `✗ choose a model` and spe
 `Choose a local speech model first: /speech, Speech model`. Something unavailable shows `✗` and the reason beside the value (`✗ xAI: no login`,
 `✗ models unavailable`).
 
-**Read aloud options ›** says what is read aloud once a run ends, and how; one line under the rows says what
-the highlighted one does:
+The **Read aloud** tab (Read aloud options on Main) says what is read aloud once a run ends, and how; one line
+under the rows says what the highlighted one does:
 
 ```
 Speech › Read aloud options ──────────────────────────────────────────────────────
@@ -188,7 +196,7 @@ Speech › Read aloud options ────────────────�
     Truncate at        Off
 
   Reads a spoken summary of the reply when the run ends.
-  ←→ Off · Summarized · Streaming · Esc back
+  ←→ Off · Summarized · Streaming · Esc Main
 ```
 
 - **Read**: Off; Summarized (a spoken summary of the reply, read when the run ends); Streaming (a spoken summary
@@ -211,8 +219,8 @@ Speech › Read aloud options ────────────────�
 
 Read, Length and Truncate at change in place with Enter, Space or ←→; Summarized by opens its picker.
 
-**Hotkeys ›** holds the actions with keys of their own, which work anywhere in Pi; Enter runs the highlighted
-one:
+The **Hotkeys** tab has no text field. It holds the actions with keys of their own, which work anywhere in Pi;
+Enter runs the highlighted one:
 
 ```
 Speech › Hotkeys ─────────────────────────────────────────────────────────────────
@@ -220,15 +228,16 @@ Speech › Hotkeys ────────────────────�
     Dictate            Alt+Z
     Push-to-talk       off · hold to dictate (Kitty key-release)
 
-  Enter run · k change key · Esc back
+  Enter run · k change key · r replay · h history · s stop · t transcribe · Esc Main
 ```
 
-`k` on Speak… or Dictate waits for a new key: Alt with a letter or a digit (Ctrl and Shift may be added, as
-in Ctrl+Alt+D). The key is saved in the settings file at once and the status line confirms it
+Speak and Dictate stay bound to Alt+S and Alt+Z by default, and Push-to-talk is off by default. `k` on the
+highlighted key waits for a new one: on Speak… or Dictate, Alt with a letter or a digit (Ctrl and Shift may be
+added, as in Ctrl+Alt+D). The key is saved in the settings file at once and the status line confirms it
 (`✓ Speak is Alt+D`). Pi binds an extension's keys when it loads the extension, so leaving Hotkeys with Esc
-after a change closes the dock and reloads Pi silently: the new key works at once. If the agent is running,
-the reload waits until it has finished. `r`, `h`, `s` and `t` also work in the main view (except on a
-model or voice row, where typing searches).
+after a change returns to Main and reloads Pi silently: the new key works at once. If the agent is running,
+the reload waits until it has finished. `r`, `h`, `s` and `t` replay the last message, open the spoken
+history, stop and transcribe a file.
 
 On macOS, Terminal.app sends a character for Option with a letter (`Ω` for Option+Z, `ß` for Option+S)
 unless "Use Option as Meta key" is on, so Alt+Z and Alt+S never reach Pi as keys. Turn it on in Terminal >
@@ -237,13 +246,15 @@ Or choose other keys here, or use `/speech --dictate`. When that character is ty
 pi-speech says so once (the character is still typed). On WSL, Pi itself binds Alt+Z to Undo: give Dictate
 another key there.
 
-**Bridge connection ›** is where the Remote machine is chosen, and what runs there (DIRECTION).
+The **Bridge** tab (Bridge connection on Main) is where the Remote machine is chosen, and what runs there
+(DIRECTION).
 
 In a Pi session on this machine its first row is **Remote machine**: what it is connected to (`not connected`,
-`decent-spider · ✓ over SSH · 12 ms`). Enter opens **Connect to**: name the machine as you would ssh to it, a Host
-of `~/.ssh/config` (Tab steps through them) or `user@host`. Pi opens its own SSH connection to it (keys or the
-agent; otherwise it asks for the password in the panel, shown as dots and handed to ssh, never written down; a
-host key it does not know yet is shown, and trusted only when you say so). There it finds `pi-speech-receiver`,
+`decent-spider · ✓ over SSH · 12 ms`). Enter opens the **Connect** field: name the machine as you would ssh to
+it, a Host of `~/.ssh/config` (↑ and ↓ step through them) or `user@host`. Pi opens its own SSH connection to it
+(keys or the agent; otherwise it asks for the password in a floating pane over the panel, shown as dots and
+handed to ssh, never written down). A password or yes/no question from the SSH login, including one about a
+host key it does not know yet, appears in that pane. There it finds `pi-speech-receiver`,
 and when it is missing or too old offers to install the one for that machine's system in `~/.local/bin`; it
 starts that machine's shared receiver, and the receiver there runs for as long as the last Pi connected to it
 (it stops a moment after that Pi disconnects or exits). The bridge then goes on with the audio here and the
@@ -257,44 +268,54 @@ terminal (never to Pi), you type it into the panel, and the token it returns is 
 wrong attempts. Connect needs OpenSSH with ControlMaster (Linux, macOS); on Windows, pair by address.
 
 When Pi itself runs over SSH, the receiver is your own machine, reached through the forward of
-`pi-speech-receiver ssh` (see [The bridge](#the-bridge)), and the submenu holds the bridge mode, `auto` (the
+`pi-speech-receiver ssh` (see [The bridge](#the-bridge)), and the tab holds the bridge mode, `auto` (the
 bridge when Pi runs over SSH), `on` or `off`, changed with ←→, Space or Enter; **Remote machine**, the address in
 use and where it comes from (`set in Pairing`, `from PI_SPEECH_BRIDGE_URL`, or `ssh forward`); and **Pairing**,
-which checks the receiver every 2 s while the submenu is open (`✓ Connected to 127.0.0.1:47613 · 52 ms`, or
+which checks the receiver every 2 s while the tab is open (`✓ Connected to 127.0.0.1:47613 · 52 ms`, or
 `✗ Re-pair`) and pairs by address as above.
 
 Under **DIRECTION**, while the bridge is in use, **Play audio on**, **Record audio on** and **Run models on**
 each choose This machine or the Remote machine (←→ or Enter; all Remote machine by default). Run models on is
 where a Local Speech or Transcription source runs its model: on the Remote machine the receiver there runs it,
 with the models downloaded there; provider models are not affected. The model lists then show the Remote
-machine's models, and download and delete them there (d, x, or Enter on one not downloaded), with progress.
+machine's models, and download and delete them there (Ctrl+O downloads, Ctrl+T twice deletes, or Enter on one
+not downloaded), with progress.
 
 Without the bridge the rows show This machine and do not change. A choice that cannot work, such as recording
 on This machine over SSH with no microphone there, fails with a message that names the row to change.
 
-| Key             | In the dock                                                                                                     |
-| --------------- | --------------------------------------------------------------------------------------------------------------- |
-| `↑` `↓`         | Move row by row (they wrap)                                                                                     |
-| `←` `→`         | Change the value in place (the read-aloud options, the bridge mode); saved at once                              |
-| `Enter`         | Change the value in place; open the picker, field or submenu of a row ending in `›`; in Hotkeys, run the action |
-| `k`             | In Hotkeys, on Speak… or Dictate: set a new key (bound when you leave Hotkeys, which reloads Pi)                |
-| `r` `h` `s` `t` | Replay last, History…, Stop, Transcribe file…: on the main view's rows (shown on its hint line)                 |
-| Speak key       | The Speak line (Alt+S unless changed): opens the dock on it from anywhere in Pi, and goes back to it inside     |
-| Dictate key     | Dictate (Alt+Z unless changed): closes the dock and starts (or stops) dictation                                 |
-| `Tab`           | On Voice, play a sample of the current voice                                                                    |
-| `F2`            | On Voice, set its language (`ja`, `pt-BR`, …, or `auto` to remove the override)                                 |
-| any character   | On Speech model, Voice, Transcription model: open the list with it typed                                        |
-| `Esc`           | Back one level; from the main view, close the dock                                                              |
+| Key                         | In the panel                                                                                          |
+| --------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `↑` `↓`                     | Move row by row (they wrap); in Connect, step through the Hosts of `~/.ssh/config`                  |
+| `←` `→`                     | Change the value in place (the read-aloud options, the bridge mode); saved at once                  |
+| `Enter`                     | Speak the message; change a value; open a Main row's own tab; in Hotkeys, run the action            |
+| `Tab` / `Shift+Tab`         | Next / previous tab                                                                                   |
+| `Ctrl+O`                    | On Main, replay the last message; in an on-device model list, download the highlighted model         |
+| `Ctrl+L`                    | On Main, open the spoken history                                                                      |
+| `Ctrl+N`                    | On Main, stop                                                                                         |
+| `Ctrl+T`                    | On Main, transcribe a file; in an on-device model list, delete the highlighted model (press twice)   |
+| `Ctrl+P`                    | On Voice, sample the current voice; in the voice list, sample the highlighted voice                  |
+| `Ctrl+S`                    | In a model list, change the sort order                                                                |
+| `Ctrl+D`                    | In a model list, open the highlighted model's full description                                      |
+| `Shift+↑` `Shift+↓`         | In a model list, move 10 rows (PageUp and PageDown do the same)                                     |
+| `k`                         | In Hotkeys, change the highlighted key (bound when you leave Hotkeys, which reloads Pi)              |
+| `r` `h` `s` `t`             | In Hotkeys: replay last, history, stop, transcribe a file                                           |
+| `x`                         | On Bridge's Remote machine, disconnect and forget it                                                 |
+| Speak key                   | The Speak line (Alt+S unless changed): opens the panel on it from anywhere in Pi, and goes back to it inside |
+| Dictate key                 | Dictate (Alt+Z unless changed): closes the panel and starts (or stops) dictation                     |
+| `F2`                        | On Voice, set its language (`ja`, `pt-BR`, …, or `auto` to remove the override)                     |
+| any character               | On Main, type the Speak message; in a model list, type into the filter                              |
+| `Esc`                       | Return to Main; on Main, close the panel                                                             |
 
-On the **Speak** line, type a message and press Enter: it is spoken, the line clears, and it stays ready for the
-next message; a new message replaces the audio that is playing. ↓ moves on to the settings (a half-typed
-message is kept), ↑ from the first row comes back, and Esc closes the dock. When the speech model takes inline
-delivery tags, the line says so (`[tags] direct this model`). The main view's own keys are on its hint line:
-`r` replays the last message, `h` opens **History**, `s` stops, `t` transcribes a file. History lists
-the spoken messages still on disk, the newest first; Enter replays one from its file, without a new request,
-and the list stays open. Transcribe asks for an audio file; its transcript goes into the editor and
-the dock closes. The agent tools (`speech_synthesize`, `speech_transcribe`) are turned on and off with
-`/speech --set tools on|off`.
+On Main's **Speak** line, type a message and press Enter: it is spoken, the line clears, and it stays ready for
+the next message; a new message replaces the audio that is playing. Typing anywhere on Main goes to this line.
+↓ moves on to the rows (a half-typed message is kept), ↑ from the first row comes back, and Esc closes the
+panel. When the speech model takes inline delivery tags, the line says so (`[tags] direct this model`). Main's
+own keys are Ctrl chords: Ctrl+O replays the last message, Ctrl+L opens **History**, Ctrl+N stops and Ctrl+T
+transcribes a file. History lists the spoken messages still on disk, the newest first; Enter replays one from
+its file, without a new request, and the list stays open. Transcribe asks for an audio file; its transcript
+goes into the editor and the panel closes. The agent tools (`speech_synthesize`, `speech_transcribe`) are turned
+on and off with `/speech --set tools on|off`.
 **Dictation language** is the language you speak (`ja`, `pt-BR`, or `auto`): it goes with every dictation and
 transcribed file until you change it. **Dictation output** chooses where a finished transcript lands: _Pi_
 (the default) inserts it into Pi's input box, or _User-defined_ hands it to a command you supply — `%s` stands
@@ -305,7 +326,7 @@ text falls back into Pi's input box so it is never lost.
 
 ### Choosing a model
 
-Enter on Speech model or Transcription model opens the model browser:
+Enter on Speech model or Transcription model opens the model browser on its tab:
 
 ```
 Speech › Speech model ────────────────────────────────────────────────────────────────────
@@ -313,19 +334,19 @@ Find: eleven                                                           Sort: pro
 ▸ ✓ elevenlabs/eleven-v4-turbo  ~$0.032/min  OpenRouter  21 voices
     elevenlabs/eleven-v3        ~$0.064/min  OpenRouter  21 voices
     elevenlabs/eleven-v4        ~$0.064/min  OpenRouter  21 voices
-Eleven v4 Turbo is a low-latency text-to-speech model from ElevenLabs. It keeps Eleven
-v4's audio tags and 90+ languages at about half the latency of Eleven v4, for interactive
-use.
-Enter pick · Tab sort · type to filter · Esc back                                    1/3
+elevenlabs/eleven-v4-turbo · Low-latency Eleven v4 Turbo, with audio tags and 90+ languages.
+Enter pick · Ctrl+S sort · Ctrl+D details · type to filter · Esc Main                 1/3
 ```
 
-- **Tab** changes the order: `price` (cheapest first, the start), `provider` (the models of one maker
+- **Ctrl+S** changes the order: `price` (cheapest first, the start), `provider` (the models of one maker
   together), `newest`, `name`. The order is saved and holds for both model lists.
 - A row is the model, its price, who serves it (OpenRouter, OpenAI, xAI, or an endpoint of yours) and, for a
   speech model, how many voices it has. A transcription model's row is its price and who serves it.
 - **Typing** searches the names, ids and features of what is shown (`tags`, `fast`, `eleven`).
-- The order is on the right of `Find:` (`Sort: price`). The three lines under the list are what the catalog
-  says about the highlighted model; where it is in the list is at the right of the bottom line (`1/56`).
+- **Shift+↑**, **Shift+↓**, **PageUp** and **PageDown** move 10 rows.
+- The order is on the right of `Find:` (`Sort: price`). The status line shows the highlighted model's id and
+  its description. **Ctrl+D** opens the full description in a floating pane; any key closes it. Where the
+  highlighted model is in the list is at the right of the key bar (`1/56`).
 
 The features (not shown in the rows: type one to find the models that offer it) are read from
 OpenRouter's catalog entry of each model: its (short) description, its id and its
@@ -347,20 +368,21 @@ price. A feature that is not shown is not stated there; it is not known to be mi
 pi-speech sends plain text and receives plain text: `timestamps`, `speakers` and `translate` tell models
 apart, they do not change what dictation inserts.
 
-The voice list keeps the provider's order; `Tab` samples the highlighted voice without choosing it and `F2`
-sets its language. In every list `16/39` at the right of the bottom line says where the highlighted item is (of those the
-search leaves), the current choice is marked `✓`, the selection `▸`. Samples follow the `--sample`
+The voice list keeps the provider's order; Ctrl+P samples the highlighted voice without choosing it and `F2`
+sets its language. In every list `16/39` at the right of the key bar says where the highlighted item is (of
+those the search leaves), the current choice is marked `✓`, the selection `▸`. Samples follow the `--sample`
 rules.
 
-Results, refusals and errors appear in one line under the rows (`✓ Voice: Kore`, `✗ No xAI login in Pi: …`),
-not as notifications; the line is always there, so the dock does not move when they come and go. The hint line
-follows the row and the state, `Esc` always last.
+Results, refusals and errors appear in the status line under the rows (`✓ Voice: Kore`,
+`✗ No xAI login in Pi: …`), not as notifications; the line is always there, so the panel does not move when
+they come and go. The key bar follows the tab and the state, with the Speak and Dictate keys on its right on
+Main.
 
 The dock is at most 96 columns wide. As it narrows, a note beside a value gives way to its short form, then
-goes; values are shortened with `…` last (an alert keeps its `✗` next to the value). On a short terminal the
-headings give way. Below 40 columns the dock shows one line asking for a wider terminal. The title is in the
-accent colour, headings, labels, notes and hints dim, values normal, and the selection is reversed and bold;
-with `NO_COLOR` set no colour is added, but bold, reverse video and dim remain.
+goes; values are shortened with `…` last (an alert keeps its `✗` next to the value). Below 40 columns the dock
+asks for a wider terminal. The title is in the accent colour, tabs, labels, notes and hints
+dim, values normal, and the selection is reversed and bold; with `NO_COLOR` set no colour is added, but bold,
+reverse video and dim remain.
 
 Without a terminal UI (RPC mode), `/speech` opens a menu of dialogs instead: Speak text…, Stop, Replay last,
 Dictate (Alt+Z), Sample a voice…, Read-aloud, Audio, Speech model…, Voice…, Voice language…, Transcription
