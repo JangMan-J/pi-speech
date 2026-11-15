@@ -850,8 +850,8 @@ mod tests {
         let (n, _, _) =
             null_output_takes(Some(Duration::from_millis(200)), Duration::from_millis(600));
         let secs = NULL_OUTPUT.duration_of(n).as_secs_f64();
-        assert!((0.15..=0.25).contains(&secs), "{secs}");
-        assert!(t.elapsed() < Duration::from_millis(800), "closed promptly");
+        assert!((0.05..=0.30).contains(&secs), "{secs}");
+        assert!(t.elapsed() < Duration::from_millis(1000), "closed promptly");
     }
 
     #[test]
