@@ -45,6 +45,22 @@ fn wait_within(child: &mut Child, limit: Duration) -> Option<ExitStatus> {
         status = child.try_wait().unwrap();
         status.is_some()
     });
+    if status.is_none() {
+        // Diagnostic: where is it stuck?
+        let pid = child.id().to_string();
+        for cmd in [vec!["sample", &pid, "3"], vec!["ps", "-M", "-p", &pid]] {
+            if let Ok(o) = std::process::Command::new(cmd[0]).args(&cmd[1..]).output() {
+                eprintln!(
+                    "=== {cmd:?}\n{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                );
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        eprintln!("=== child stderr\n{}", stderr_of(child));
+    }
     status
 }
 
