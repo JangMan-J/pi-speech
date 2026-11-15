@@ -15,8 +15,8 @@ import {
 import { Type } from "typebox";
 import type { Engine } from "../engine/engine";
 import { errorMessage } from "../engine/env";
-import { indicatorText, STATUS_KEY } from "../engine/indicator";
-import { renderOsd } from "../engine/osd";
+import { STATUS_KEY, statusLine } from "../engine/indicator";
+import { centre, OSD_COLUMNS, renderOsd } from "../engine/osd";
 import type { Panel } from "../engine/panel";
 import { type Hotkeys, keyLabel } from "../engine/settings";
 import type { SpeechResult } from "../engine/speech";
@@ -118,14 +118,6 @@ function surfaceUi(ctx: ExtensionContext): SurfaceUi {
     pick: (title, options, current) =>
       hasTerminal(ctx) ? pick(ctx, title, options, current) : ctx.ui.select(title, options),
   };
-}
-
-/** The recording dot in the theme's error colour (red); every other status text stays plain. */
-export function tintRecordingDot(
-  text: string | undefined,
-  theme: { fg(color: "error", text: string): string },
-): string | undefined {
-  return text?.startsWith("●") ? theme.fg("error", "●") + text.slice(1) : text;
 }
 
 /** The user's Pi models as `provider/id`: the scoped ones when the session has them, else every available one. */
@@ -231,7 +223,9 @@ export function registerPi(
   /** The latest context: its model registry has the user's Pi models. */
   let latest: ExtensionContext | undefined;
 
-  let osdShown = false;
+  /** The OSD widget while it is up, and the TUI that draws it (to ask for a frame when the bands change). */
+  let osdTui: { requestRender(): void } | undefined;
+  let osdUp = false;
   let lastBands: number[] = [];
   let levelsTimer: ReturnType<typeof setInterval> | undefined;
   let levelsInflight = false;
@@ -247,44 +241,52 @@ export function registerPi(
     levelsInflight = false;
   };
 
-  /** The OSD is on and this UI can draw it: then it alone shows recording and playback. */
-  const osdOn = () => engine.speech.settings.osdStyle !== "off" && typeof ui?.setWidget === "function";
-  engine.indicator.shownElsewhere = osdOn;
+  /** The footer always shows what speech does; the OSD is the graph only, and the panel's header stays quiet. */
+  engine.indicator.shownElsewhere = () => !!latest && hasTerminal(latest);
 
+  const hideOsd = () => {
+    stopLevels();
+    lastBands = [];
+    if (osdUp) ui?.setWidget?.(OSD_KEY, undefined);
+    osdUp = false;
+    osdTui = undefined;
+  };
+
+  /** The OSD's lines now, centred in `width`: red while recording, the accent while playing. */
+  const osdLines = (width: number): string[] => {
+    const style = engine.speech.settings.osdStyle;
+    if (style === "off") return [];
+    const d = engine.dictation.state;
+    const mode = d === "starting" || d === "recording" ? "recording" : "playing";
+    const tinted = latest ? hasTerminal(latest) && !env.NO_COLOR : false;
+    const theme = ui?.theme;
+    const tint =
+      tinted && theme
+        ? { dot: (t: string) => theme.fg("error", t), accent: (t: string) => theme.fg("accent", t) }
+        : undefined;
+    return centre(renderOsd({ style, mode, bands: lastBands, tint }), OSD_COLUMNS[style], width);
+  };
+
+  /** Show the OSD while recording or playing (when it is on and this UI can draw widgets), else remove it. */
   const updateOsd = () => {
     if (!ui || typeof ui.setWidget !== "function") return;
-    const style = engine.speech.settings.osdStyle;
-    const dState = engine.dictation.state;
-    const recording = dState === "starting" || dState === "recording";
-    const playing = engine.player.playing;
-    if (style === "off" || (!recording && !playing)) {
-      stopLevels();
-      lastBands = [];
-      if (osdShown) {
-        osdShown = false;
-        ui.setWidget(OSD_KEY, undefined);
-      }
+    const d = engine.dictation.state;
+    const live = d === "starting" || d === "recording" || engine.player.playing;
+    if (engine.speech.settings.osdStyle === "off" || !live) {
+      hideOsd();
       return;
     }
-    const mode = recording ? "recording" : "playing";
-    const label = recording ? (engine.dictation.indicator() ?? "● REC 0:00") : "▶ speaking";
-    const tinted = latest ? hasTerminal(latest) && !env.NO_COLOR : false;
-    const theme = ui.theme;
-    const lines = renderOsd({
-      style,
-      mode,
-      label,
-      bands: lastBands,
-      tint:
-        tinted && theme
-          ? {
-              dot: (t) => theme.fg("error", t),
-              accent: (t) => theme.fg("accent", t),
-            }
-          : undefined,
-    });
-    osdShown = lines.length > 0;
-    ui.setWidget(OSD_KEY, lines.length ? lines : undefined, { placement: "aboveEditor" });
+    if (!osdUp) {
+      osdUp = true;
+      ui.setWidget(
+        OSD_KEY,
+        (tui) => {
+          osdTui = tui;
+          return { render: (width: number) => osdLines(width), invalidate: () => {} };
+        },
+        { placement: "aboveEditor" },
+      );
+    } else osdTui?.requestRender();
     if (!levelsTimer) {
       levelsTimer = setInterval(() => {
         if (levelsInflight) return;
@@ -321,11 +323,8 @@ export function registerPi(
     ui = ctx.ui;
     const current = ctx.ui;
     const tinted = hasTerminal(ctx) && !env.NO_COLOR;
-    engine.indicator.attach((text) => {
-      // Recording and playback show in one place: the OSD when it is on, else the open panel's header, else here.
-      const shown = osdOn() || panel ? indicatorText({ playing: false, route: engine.routes.route }) : text;
-      current.setStatus(STATUS_KEY, tinted ? tintRecordingDot(shown, current.theme) : shown);
-    });
+    // Always there, in its own colours: footer extensions place it by its key (zentui: colorModes "original").
+    engine.indicator.attach(() => current.setStatus(STATUS_KEY, statusLine(engine.indicator.state(), tinted)));
     updateOsd();
   };
   engine.notify = (message, level) => {
@@ -359,9 +358,7 @@ export function registerPi(
   pi.on("session_shutdown", async () => {
     stopPtt?.();
     stopPtt = undefined;
-    stopLevels();
-    if (osdShown && ui && typeof ui.setWidget === "function") ui.setWidget(OSD_KEY, undefined);
-    osdShown = false;
+    hideOsd();
     await engine.shutdown();
   });
 

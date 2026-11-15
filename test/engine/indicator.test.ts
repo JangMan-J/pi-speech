@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { Indicator, type IndicatorState, indicatorText } from "../../src/engine/indicator";
+import { Indicator, type IndicatorState, indicatorText, MIC, statusLine } from "../../src/engine/indicator";
 
 describe("the status indicator", () => {
   it("is empty when idle on the local route and names the bridge when idle there", () => {
@@ -42,5 +42,24 @@ describe("the status indicator", () => {
     expect(ind.live()).toBe("● REC 0:03");
     ind.shownElsewhere = () => true;
     expect(ind.live()).toBe("");
+  });
+});
+
+describe("the footer status", () => {
+  it("is always there: a dim microphone while idle, with bridge on the bridge", () => {
+    expect(statusLine({ playing: false, route: "local" }, false)).toBe(MIC);
+    expect(statusLine({ playing: false, route: "bridge" }, false)).toBe(`${MIC} bridge`);
+    expect(statusLine({ playing: false, route: "local" }, true)).toBe(`\x1b[38;5;240m${MIC}\x1b[0m`);
+  });
+
+  it("shows the recording dot and timer in red, transcribing in yellow, speaking in the accent", () => {
+    expect(statusLine({ dictation: "● REC 0:08", playing: false, route: "local" }, true)).toBe(
+      "\x1b[38;5;203m● REC 0:08\x1b[0m",
+    );
+    expect(statusLine({ dictation: "… transcribing", playing: true, route: "local" }, true)).toBe(
+      "\x1b[38;5;214m… transcribing\x1b[0m",
+    );
+    expect(statusLine({ playing: true, route: "local" }, true)).toBe("\x1b[38;5;45m▶ speaking\x1b[0m");
+    expect(statusLine({ dictation: "● REC 0:08", playing: false, route: "local" }, false)).toBe("● REC 0:08");
   });
 });

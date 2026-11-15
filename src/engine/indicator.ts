@@ -22,6 +22,23 @@ export function indicatorText(s: IndicatorState): string | undefined {
   return s.route === "bridge" ? "speech: bridge" : undefined;
 }
 
+/** A Nerd Font microphone: the footer's mark while speech is idle. */
+export const MIC = "\uf130";
+const ANSI = { idle: 240, recording: 203, transcribing: 214, speaking: 45 } as const;
+const ansi = (code: number, text: string) => `\x1b[38;5;${code}m${text}\x1b[0m`;
+
+/**
+ * The footer status: always there, so a footer extension (zentui, pi-statusline) places it once under its key,
+ * like pi-bgtasks and pi-webtasks. A dim microphone while idle (with `bridge` while the bridge is in use), red
+ * `● REC 0:03` while recording, yellow `… transcribing`, the accent `▶ speaking`. Without colour: the words only.
+ */
+export function statusLine(s: IndicatorState, color: boolean): string {
+  const paint = (code: number, text: string) => (color ? ansi(code, text) : text);
+  if (s.dictation) return paint(s.dictation.startsWith("●") ? ANSI.recording : ANSI.transcribing, s.dictation);
+  if (s.playing) return paint(ANSI.speaking, "▶ speaking");
+  return paint(ANSI.idle, s.route === "bridge" ? `${MIC} bridge` : MIC);
+}
+
 /** What speech is doing, as the status shows it, and empty when nothing happens: the settings panel's header. */
 export function liveState(s: IndicatorState): string {
   return s.dictation ?? (s.playing ? "▶ speaking" : "");
@@ -29,6 +46,11 @@ export function liveState(s: IndicatorState): string {
 
 /** Pushes the status text to a sink, only when it changes. */
 export class Indicator {
+  /** The state now. */
+  state(): IndicatorState {
+    return this.read();
+  }
+
   private last: string | undefined | null = null;
   private readonly listeners = new Set<() => void>();
   /**

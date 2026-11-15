@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { setKittyProtocolActive } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { MIC } from "../../src/engine/indicator";
 import { GUIDELINE_PREFIX } from "../../src/engine/read-aloud";
 import { macOptionCharacter, optionKeyNotice, piModels, registerPi, summarizeWith } from "../../src/pi/adapter";
 import { fakeOpenRouter, makeEngine } from "../engine/fixtures";
@@ -70,18 +71,25 @@ describe("the Pi adapter", () => {
     expect(new Set(f.statuses.map(([k]) => k))).toEqual(new Set(["pi-speech"]));
   });
 
-  it("with the OSD on, recording and playback show in the OSD only, not in the footer", async () => {
+  it("the footer always shows what speech does; the OSD is a centred graph above the editor", async () => {
     fakeOpenRouter();
     const f = fakePi();
-    const widgets: Array<[string, unknown]> = [];
-    f.ctx.ui.setWidget = (k: string, lines: unknown) => widgets.push([k, lines]);
+    const widgets: Array<[string, unknown, unknown]> = [];
+    f.ctx.ui.setWidget = (k: string, content: unknown, opts: unknown) => widgets.push([k, content, opts]);
     const { engine } = makeEngine();
     registerPi(f.pi, engine);
     await f.emit("session_start");
+    expect(f.statuses.at(-1)).toEqual(["pi-speech", MIC]);
     engine.speech.settings.osdStyle = "braille";
     await f.commands.get("speech").handler("hello there", f.ctx);
-    expect(f.statuses.at(-1)).toEqual(["pi-speech", undefined]);
-    expect(widgets.some(([k, lines]) => k === "pi-speech-osd" && Array.isArray(lines) && lines.length > 0)).toBe(true);
+    expect(f.statuses.at(-1)).toEqual(["pi-speech", "▶ speaking"]);
+    const osd = widgets.find(([k, c]) => k === "pi-speech-osd" && typeof c === "function");
+    if (!osd) throw new Error("no OSD widget");
+    expect(osd[2]).toEqual({ placement: "aboveEditor" });
+    const widget = (osd[1] as (tui: unknown) => { render(width: number): string[] })({ requestRender() {} });
+    const lines = widget.render(60);
+    expect(lines).toHaveLength(3);
+    expect(lines[0].startsWith(" ".repeat(20))).toBe(true);
   });
 
   it("--type inserts literal text into the editor without speaking or submitting it", async () => {
@@ -318,7 +326,8 @@ describe("the Pi adapter", () => {
       expect(listeners[0]("\x1b[19;1:1~")).toEqual({ consume: true });
       await vi.waitFor(() => expect(engine.dictation.state).toBe("recording"));
       expect(widgets.at(-1)?.[0]).toBe("pi-speech-osd");
-      expect(widgets.at(-1)?.[1]).toHaveLength(2);
+      const osd = widgets.at(-1)?.[1] as unknown as (tui: unknown) => { render(width: number): string[] };
+      expect(osd({ requestRender() {} }).render(80)).toHaveLength(3);
       expect(widgets.at(-1)?.[2]).toEqual({ placement: "aboveEditor" });
 
       // Repeat F8 while held is consumed without stopping
