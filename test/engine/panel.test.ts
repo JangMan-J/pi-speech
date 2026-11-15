@@ -1070,7 +1070,17 @@ describe("the panel view model: Hotkeys", () => {
     expect(p.close).not.toHaveBeenCalled();
     expect(p.notes).toEqual([]);
   });
-  it("s stops and leaves the panel open; r with nothing to replay is refused in the panel", async () => {
+  it("s on Hotkeys does not stop active speech", async () => {
+    const p = open();
+    await p.engine.speech.speak("still speaking");
+    await p.goTo("Hotkeys");
+    const stop = vi.spyOn(p.engine.player, "stop");
+    await p.type("s");
+    expect(stop).not.toHaveBeenCalled();
+    await p.press("escape", { combo: "ctrl+n" });
+    expect(stop).toHaveBeenCalled();
+  });
+  it("Ctrl+N stops and leaves the panel open; Ctrl+O with nothing to replay is refused", async () => {
     const p = open();
     await p.press({ combo: "ctrl+n" });
     expect(p.close).not.toHaveBeenCalled();
@@ -1084,7 +1094,7 @@ describe("the panel view model: Hotkeys", () => {
     await p.press("speak");
     await p.type("words");
     await p.press("enter");
-    await p.press("down"); // to the rows, where s stops
+    await p.press("down"); // to the rows, where Ctrl+N also stops
     await p.press({ combo: "ctrl+n" });
     expect(p.panel.view().status?.text).toBe("✓ Stopped");
     await new Promise((r) => setTimeout(r, 10));
@@ -1129,7 +1139,7 @@ describe("the panel view model: Hotkeys", () => {
     expect(p.panel.view().speak?.value).toBe("hello hello world");
   });
 
-  it("h opens the history; Esc returns to the main view", async () => {
+  it("Ctrl+L opens the history; Esc returns to the main view", async () => {
     const p = open();
     await p.engine.speech.speak("first words");
     await p.press({ combo: "ctrl+l" });
@@ -1138,7 +1148,7 @@ describe("the panel view model: Hotkeys", () => {
     expect(p.panel.view().menu).toBe("main");
     expect(p.panel.view().picker).toBeUndefined();
   });
-  it("t asks for the path of an audio file to transcribe; Esc returns to the main view", async () => {
+  it("Ctrl+T asks for the path of an audio file to transcribe; Esc returns to the main view", async () => {
     const p = open();
     await p.press({ combo: "ctrl+t" });
     expect(p.panel.view().input).toMatchObject({ label: "Audio file" });
@@ -1762,10 +1772,9 @@ describe("tab navigation", () => {
     expect(p.panel.view().speak).toMatchObject({ focused: true, value: "rhst" });
     expect(p.panel.view().picker).toBeUndefined();
   });
-  it("keeps bare r in Hotkeys", async () => {
+  it("uses Ctrl+O on Main for replay", async () => {
     const p = open();
-    await p.goTo("Hotkeys");
-    await p.type("r");
+    await p.press({ combo: "ctrl+o" });
     expect(p.panel.view().status?.text).toMatch(/nothing|no message/i);
   });
 });

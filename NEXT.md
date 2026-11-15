@@ -1,5 +1,15 @@
 # NEXT
 
+## Shared /speech frame (not released)
+
+The port is on `port/shared-frame`. Open for the user:
+
+- Keep bare `k` (Hotkeys, change key) and `x` (Bridge, disconnect), or follow the suite rule that letters type into the text field?
+- Short terminals cut the 19-line frame at the bottom; pi-picks and pi-hashline do the same.
+- Add the rule that a tool binds no key by default unless used outside its menu to `frame.ts`? It must stay identical across pi-picks, pi-hashline and pi-speech: a suite-wide edit.
+- Ctrl+P for voice sampling was proposed, not confirmed.
+- `e2e/redesign` has three Read aloud failures that also fail at 0.2.2 (`36a8302`): pre-existing.
+
 Handoff written 2026-11-13 on `decent-spider` (Pi runs here now; the laptop is `agent-jail`, reachable with
 `ssh agent-jail`). Read this, then `GLOSSARY.md`, then the pad of the thread you take up (`.pad/<thread>/`,
 gitignored, on this machine and on agent-jail). `VECTORS/` is retired: write no new vectors; handoff state lives here.

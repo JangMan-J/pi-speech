@@ -106,7 +106,7 @@ export const TABS: ReadonlyArray<{ id: TabId; label: string }> = [
  * The panel's keys, as pi-tui key ids. sort, detail, pageUp and pageDown are KEYS of src/pi/frame.ts, written out
  * because the engine imports nothing of Pi (test/pi checks they match); the rest are the panel's own.
  * Typing goes to the text field, so on a tab that has one these are Ctrl chords. Hotkeys and Bridge have no text
- * field and keep their bare letters (k, r, h, s, t; x).
+ * field and keep their bare letters (k; x).
  */
 export const PANEL_KEYS = {
   /** A model list's next order. */
@@ -531,10 +531,8 @@ const CYCLES: ReadonlySet<RowId> = new Set<RowId>([
   "modelsOn",
 ]);
 
-/** The keys of the actions that only work inside the panel. */
-const LETTERS: Partial<Record<RowId, string>> = { replay: "r", history: "h", stop: "s", transcribe: "t" };
-/** What each of those keys does, on the main view's hint line. */
-const LETTER_WORDS: Partial<Record<RowId, string>> = {
+/** Actions available through Ctrl chords on Main. */
+const ACTION_WORDS: Partial<Record<RowId, string>> = {
   replay: "replay",
   history: "history",
   stop: "stop",
@@ -1042,10 +1040,8 @@ export class Panel {
         if (this.engine.routes.route !== "bridge")
           return { ...base, value: MACHINE_WORDS.this, note: "no bridge in use" };
         return { ...base, value: value(MACHINE_WORDS[s[base.id]]) };
-      default: {
-        const letter = LETTERS[base.id];
-        return letter ? { ...base, value: letter } : { ...base };
-      }
+      default:
+        return { ...base };
     }
   }
 
@@ -1346,9 +1342,9 @@ export class Panel {
     const home = this.home();
     if (home.kind === "menu") return this.menuHints(home);
     // The panel's own keys, on every row of the main view; given up first when the line is narrow.
-    const letters: Hint[] = (Object.entries(LETTERS) as Array<[RowId, string]>).map(([id]) => ({
+    const letters: Hint[] = (Object.entries(ACTION_WORDS) as Array<[RowId, string]>).map(([id]) => ({
       key: keyLabel(PANEL_KEYS[id as "replay"][0]),
-      action: LETTER_WORDS[id] ?? id,
+      action: ACTION_WORDS[id] ?? id,
       optional: true,
     }));
     const close = esc("close");
@@ -1628,10 +1624,6 @@ export class Panel {
       this.disconnect();
       return;
     }
-    if (m.kind === "menu" && m.menu !== "hotkeys") return;
-    // The keys of the actions, in the main view and in Hotkeys.
-    const action = (Object.keys(LETTERS) as RowId[]).find((id) => LETTERS[id] === ch);
-    if (action) this.activate(action);
   }
 
   /** Clear the Push-to-talk hotkey back to off. */

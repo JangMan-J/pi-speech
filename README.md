@@ -46,25 +46,25 @@ shows only its current value: a model or a voice by its name (its price, feature
 tab).
 
 ```
-─ Speech ──────────────────────────────────────────────────────────── ▶ speaking ─
-  Main │ Read aloud │ Speech model │ Voice │ … │ Hotkeys │ Bridge
-────────────────────────────────────────────────────────────────────────────────
-  Speak: type a message · Enter speaks it
-  Setting              Value
-▸ Read aloud options   Off ›
-  Speech source        Provider
-  Speech model         x-ai/grok-voice-tts-1.0 ›
-  Voice                eve ›
-  Transcription source Provider
-  Transcription model  openai/whisper-large-v3-turbo ›
-  Dictation language   auto
-  Dictation output     Pi ›
-  Bridge connection    decent-spider · ✓ over SSH ›
-  Spectrum OSD         Off
-  ✓ Voice: eve
-────────────────────────────────────────────────────────────────────────────────
-  Enter open · Ctrl+O replay · Esc close          Speak Alt+S · Dictate Alt+Z
-────────────────────────────────────────────────────────────────────────────────
+─ Speech ───────────────────────────────────────────────────────────────────────────────────────
+   Main │ Read aloud │ Speech model │ Voice │ Transcription model │ Dictation output  >>
+────────────────────────────────────────────────────────────────────────────────────────────────
+  Speak: >   type a message · Enter speaks · [tags] direct this model
+  Setting               Value
+  Read aloud options    Off ›
+  Speech source         Provider
+  Speech model          google/gemini-3.8-flash-tts ›
+  Voice                 Kore ›
+  Transcription source  Provider
+  Transcription model   openai/whisper-large-v3-turbo ›
+  Dictation language    auto
+  Dictation output      Pi ›
+  Bridge connection     not connected ›
+  Spectrum OSD          Braille
+  (0/10)
+────────────────────────────────────────────────────────────────────────────────────────────────
+  Enter speak · Ctrl+O replay · Ctrl+L history · Esc close         Alt+S speak · Alt+Z dictate
+────────────────────────────────────────────────────────────────────────────────────────────────
 ```
 
 Values on rows without their own tab change in place with Enter or ←→ and are saved at once. Enter on a Main
@@ -76,14 +76,25 @@ or the other way round. With Local, the model row of that direction holds the on
 lists the models of the bundled `pi-speech-receiver` with their size and whether they are downloaded:
 
 ```
-Speech › Transcription model ─────────────────────────────────────────────────────
-Find:
-▸ ✓ parakeet-tdt-0.6b-v3-int8  487 MB  downloaded      25 langs
-    whisper-small              639 MB  not downloaded  99 langs
-    sense-voice-int8           163 MB  not downloaded  5 langs
-Runs on This machine, with no network request once downloaded.
+─ Speech ───────────────────────────────────────────────────────────────────────────────────────
+   Main │ Read aloud │ Speech model │ Voice │ Transcription model │ Dictation output  >>
+────────────────────────────────────────────────────────────────────────────────────────────────
+  Search: >
+  Model                                  Size       State           Languages
+▶ parakeet-tdt-0.6b-v3-int8 ●              487 MB     downloaded      25 langs
+  whisper-small                          639 MB     not downloaded  99 langs
+  sense-voice-int8                        163 MB     not downloaded  5 langs
 
-  Enter pick · Ctrl+O download · Ctrl+T delete · Esc Main                     1/25
+
+
+
+
+
+
+  (1/25) Runs on This machine, with no network request once downloaded.
+────────────────────────────────────────────────────────────────────────────────────────────────
+  Enter pick · Ctrl+O download · Ctrl+T delete · Esc back          Alt+S speak · Alt+Z dictate
+────────────────────────────────────────────────────────────────────────────────────────────────
 ```
 
 Enter picks a downloaded model. On one that is not downloaded, Enter says its size and Enter again downloads it,
@@ -189,14 +200,25 @@ The **Read aloud** tab (Read aloud options on Main) says what is read aloud once
 under the rows says what the highlighted one does:
 
 ```
-Speech › Read aloud options ──────────────────────────────────────────────────────
-  ▸ Read               Summarized
-    Summarized by      Same model ›
-    Length             Minimum ~15 s
-    Truncate at        Off
+─ Speech ───────────────────────────────────────────────────────────────────────────────────────
+   Main │ Read aloud │ Speech model │ Voice │ Transcription model │ Dictation output  >>
+────────────────────────────────────────────────────────────────────────────────────────────────
 
-  Reads a spoken summary of the reply when the run ends.
-  ←→ Off · Summarized · Streaming · Esc Main
+  Setting            Value
+▶ Read               Off
+  Summarized by      Same model ›
+  Length             Minimum ~15 s
+  Truncate at        Off
+
+
+
+
+
+
+  Off: nothing is read aloud.
+────────────────────────────────────────────────────────────────────────────────────────────────
+  ←→ Off · Summarized · Streaming · Tab tabs · Esc Main            Alt+S speak · Alt+Z dictate
+────────────────────────────────────────────────────────────────────────────────────────────────
 ```
 
 - **Read**: Off; Summarized (a spoken summary of the reply, read when the run ends); Streaming (a spoken summary
@@ -223,12 +245,25 @@ The **Hotkeys** tab has no text field. It holds the actions with keys of their o
 Enter runs the highlighted one:
 
 ```
-Speech › Hotkeys ─────────────────────────────────────────────────────────────────
-  ▸ Speak…             Alt+S
-    Dictate            Alt+Z
-    Push-to-talk       off · hold to dictate (Kitty key-release)
+─ Speech ───────────────────────────────────────────────────────────────────────────────────────
+  <<  Read aloud │ Speech model │ Voice │ Transcription model │ Dictation output │ Hotkeys  >>
+────────────────────────────────────────────────────────────────────────────────────────────────
 
-  Enter run · k change key · r replay · h history · s stop · t transcribe · Esc Main
+  Setting            Value
+▶ Speak…             Alt+S
+  Dictate            Alt+Z
+  Push-to-talk       off · hold to dictate (Kitty key-release)
+
+
+
+
+
+
+
+  (1/3) Speak…
+────────────────────────────────────────────────────────────────────────────────────────────────
+  Enter run · k change key · Tab tabs · Esc Main                   Alt+S speak · Alt+Z dictate
+────────────────────────────────────────────────────────────────────────────────────────────────
 ```
 
 Speak and Dictate stay bound to Alt+S and Alt+Z by default, and Push-to-talk is off by default. `k` on the
@@ -236,8 +271,8 @@ highlighted key waits for a new one: on Speak… or Dictate, Alt with a letter o
 added, as in Ctrl+Alt+D). The key is saved in the settings file at once and the status line confirms it
 (`✓ Speak is Alt+D`). Pi binds an extension's keys when it loads the extension, so leaving Hotkeys with Esc
 after a change returns to Main and reloads Pi silently: the new key works at once. If the agent is running,
-the reload waits until it has finished. `r`, `h`, `s` and `t` replay the last message, open the spoken
-history, stop and transcribe a file.
+the reload waits until it has finished. Replay, history, stop and transcribe use Ctrl+O, Ctrl+L, Ctrl+N
+and Ctrl+T on Main, not bare letters on Hotkeys.
 
 On macOS, Terminal.app sends a character for Option with a letter (`Ω` for Option+Z, `ß` for Option+S)
 unless "Use Option as Meta key" is on, so Alt+Z and Alt+S never reach Pi as keys. Turn it on in Terminal >
@@ -299,7 +334,6 @@ on This machine over SSH with no microphone there, fails with a message that nam
 | `Ctrl+D`            | In a model list, open the highlighted model's full description                                               |
 | `Shift+↑` `Shift+↓` | In a model list, move 10 rows (PageUp and PageDown do the same)                                              |
 | `k`                 | In Hotkeys, change the highlighted key (bound when you leave Hotkeys, which reloads Pi)                      |
-| `r` `h` `s` `t`     | In Hotkeys: replay last, history, stop, transcribe a file                                                    |
 | `x`                 | On Bridge's Remote machine, disconnect and forget it                                                         |
 | Speak key           | The Speak line (Alt+S unless changed): opens the panel on it from anywhere in Pi, and goes back to it inside |
 | Dictate key         | Dictate (Alt+Z unless changed): closes the panel and starts (or stops) dictation                             |
@@ -311,7 +345,8 @@ On Main's **Speak** line, type a message and press Enter: it is spoken, the line
 the next message; a new message replaces the audio that is playing. Typing anywhere on Main goes to this line.
 ↓ moves on to the rows (a half-typed message is kept), ↑ from the first row comes back, and Esc closes the
 panel. When the speech model takes inline delivery tags, the line says so (`[tags] direct this model`). Main's
-own keys are Ctrl chords: Ctrl+O replays the last message, Ctrl+L opens **History**, Ctrl+N stops and Ctrl+T
+key bar is `Enter speak · Ctrl+O replay · Ctrl+L history · Ctrl+N stop · Ctrl+T transcribe · Esc close`
+(optional hints drop when narrow). Its own keys are Ctrl chords: Ctrl+O replays the last message, Ctrl+L opens **History**, Ctrl+N stops and Ctrl+T
 transcribes a file. History lists the spoken messages still on disk, the newest first; Enter replays one from
 its file, without a new request, and the list stays open. Transcribe asks for an audio file; its transcript
 goes into the editor and the panel closes. The agent tools (`speech_synthesize`, `speech_transcribe`) are turned
@@ -329,13 +364,25 @@ text falls back into Pi's input box so it is never lost.
 Enter on Speech model or Transcription model opens the model browser on its tab:
 
 ```
-Speech › Speech model ────────────────────────────────────────────────────────────────────
-Find: eleven                                                           Sort: provider
-▸ ✓ elevenlabs/eleven-v4-turbo  ~$0.032/min  OpenRouter  21 voices
-    elevenlabs/eleven-v3        ~$0.064/min  OpenRouter  21 voices
-    elevenlabs/eleven-v4        ~$0.064/min  OpenRouter  21 voices
-elevenlabs/eleven-v4-turbo · Low-latency Eleven v4 Turbo, with audio tags and 90+ languages.
-Enter pick · Ctrl+S sort · Ctrl+D details · type to filter · Esc Main                 1/3
+─ Speech ───────────────────────────────────────────────────────────────────────────────────────
+   Main │ Read aloud │ Speech model │ Voice │ Transcription model │ Dictation output  >>
+────────────────────────────────────────────────────────────────────────────────────────────────
+  Search: >
+  Model                          Provider                                      Price ▲    Voices
+▶ hexgrad/kokoro-82m             [OpenRouter]                              ~$0.001/min  2 voices
+  x-ai/grok-voice-tts-1.0        [OpenRouter]                               ~$0.01/min  2 voices
+  google/gemini-3.8-flash-tts ●  [OpenRouter]                               ~$0.03/min  2 voices
+
+
+
+
+
+
+
+  (1/3) hexgrad/kokoro-82m · Kokoro 82M is a lightweight text-to-speech model across 8 language…
+────────────────────────────────────────────────────────────────────────────────────────────────
+  Enter pick · Ctrl+S sort · type to filter · Tab tabs · Esc back  Alt+S speak · Alt+Z dictate
+────────────────────────────────────────────────────────────────────────────────────────────────
 ```
 
 - **Ctrl+S** changes the order: `price` (cheapest first, the start), `provider` (the models of one maker
@@ -344,9 +391,9 @@ Enter pick · Ctrl+S sort · Ctrl+D details · type to filter · Esc Main       
   speech model, how many voices it has. A transcription model's row is its price and who serves it.
 - **Typing** searches the names, ids and features of what is shown (`tags`, `fast`, `eleven`).
 - **Shift+↑**, **Shift+↓**, **PageUp** and **PageDown** move 10 rows.
-- The order is on the right of `Find:` (`Sort: price`). The status line shows the highlighted model's id and
-  its description. **Ctrl+D** opens the full description in a floating pane; any key closes it. Where the
-  highlighted model is in the list is at the right of the key bar (`1/56`).
+- The sorted column is marked with an arrow in the header. The status line shows the highlighted model's id and
+  its description. **Ctrl+D** opens the full description in a floating pane; any key closes it. The highlighted
+  model's position appears at the start of the status line (`1/56`).
 
 The features (not shown in the rows: type one to find the models that offer it) are read from
 OpenRouter's catalog entry of each model: its (short) description, its id and its
@@ -369,14 +416,14 @@ pi-speech sends plain text and receives plain text: `timestamps`, `speakers` and
 apart, they do not change what dictation inserts.
 
 The voice list keeps the provider's order; Ctrl+P samples the highlighted voice without choosing it and `F2`
-sets its language. In every list `16/39` at the right of the key bar says where the highlighted item is (of
-those the search leaves), the current choice is marked `✓`, the selection `▸`. Samples follow the `--sample`
+sets its language. In every list `(16/39)` at the start of the status line says where the highlighted item is (of
+those the search leaves), the current choice is marked `●`, the selection `▶`. Samples follow the `--sample`
 rules.
 
 Results, refusals and errors appear in the status line under the rows (`✓ Voice: Kore`,
 `✗ No xAI login in Pi: …`), not as notifications; the line is always there, so the panel does not move when
 they come and go. The key bar follows the tab and the state, with the Speak and Dictate keys on its right on
-Main.
+every tab.
 
 The dock is at most 96 columns wide. As it narrows, a note beside a value gives way to its short form, then
 goes; values are shortened with `…` last (an alert keeps its `✗` next to the value). Below 40 columns the dock
