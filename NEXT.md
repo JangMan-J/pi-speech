@@ -4,6 +4,56 @@ Handoff written 2026-11-13 on `decent-spider` (Pi runs here now; the laptop is `
 `ssh agent-jail`). Read this, then `GLOSSARY.md`, then the pad of the thread you take up (`.pad/<thread>/`,
 gitignored, on this machine and on agent-jail). `VECTORS/` is retired: write no new vectors; handoff state lives here.
 
+## TODO: a full GPU receiver per OS, downloaded on demand (user's direction, 2026-11-15; after the new UI)
+
+The user wants 0.2.2 ported into the new UI first (another agent owns the UI). Then replace 0.2.2's interim GPU
+design with this.
+
+**Decision (user):** build a GPU receiver for every OS that has a GPU path, publish each on the GitHub release,
+and have the extension download it. The GPU receiver does all the duties of the CPU one (play, record, bridge,
+lease, models, transcribe, speak): "no mish mash". When it is installed and `device` is `gpu`, the extension uses
+it for everything instead of the bundled receiver.
+
+**What 0.2.2 shipped instead (to undo):** the Linux x64 receiver in the npm package links sherpa-onnx's shared
+libraries (`shared` feature, `receiver/build.rs` `$ORIGIN` rpath, `npm/platforms.mjs` `LIBRARIES`, publish.yml's
+`GPU_BUNDLE`), and the GPU runtime is a catalogue entry (`Kind::Runtime`, `gpu-runtime-cuda13|12`) put first on
+`LD_LIBRARY_PATH` by the engine (`LocalModels.deviceEnvironment`, `PI_SPEECH_PROVIDER=cuda`). Remote installs
+copy the libraries to `~/.local/lib/pi-speech-receiver/`.
+
+**Plan:**
+1. Package: static CPU receivers on every target again (drop `LIBRARIES`, the shared Linux build in publish.yml,
+   the remote install's library copy can stay generic).
+2. Release job: per GPU target, build the receiver with `--no-default-features --features shared` against the
+   GPU bundle; archive the binary, its libraries (CUDA provider included) and, on Windows, the Visual C++ runtime
+   DLLs (app-local is allowed by Microsoft's redistribution terms; the bundle's DLLs need them, a fresh Windows
+   has none). Upload the archives to the GitHub release; write each one's URL, size and SHA-256 into a file in
+   the npm package (e.g. `bin/gpu.json`), so the extension checks what it downloads.
+3. The GPU build defaults `PI_SPEECH_PROVIDER` to `cuda` (keep the per-model CPU fallback: Moonshine's `.ort`
+   files do not load under CUDA). Drop `Kind::Runtime`, `GPU_RUNTIMES` and the library-path swap.
+4. Extension: the CPU receiver's `gpu` probe picks the archive (driver, CUDA 13 or 12, cuDNN 9); download into
+   the cache (resumable, checked, like models); `findBinary` returns the GPU receiver when `device` is `gpu` and
+   it is installed and its version matches the extension's; restart the workers on a switch.
+5. Remote machines: the install can offer the GPU receiver too (not wired in 0.2.2: remote runs are CPU).
+
+**Targets (sherpa-onnx v2.0.1 release assets):**
+- linux-x64: `cuda-12.x-cudnn-9.x` (375 MB) and `cuda-13.x-cudnn-9.x` (242 MB) `…-linux-x64-gpu.tar.bz2`. Built,
+  run and measured on agent-jail (RTX 4090 Laptop, CUDA 13.4, cuDNN 9.28).
+- win32-x64: `cuda-12.x` (569 MB) and `cuda-13.x` (458 MB) `…-win-x64-cuda.tar.bz2`. Unchecked: whether the bundle
+  ships the VC runtime DLLs, and which DLLs its files import.
+- linux-arm64: only Jetson builds (`linux-aarch64-shared-gpu-onnxruntime-1.11/1.16/1.18`, old ONNX Runtime,
+  JetPack-specific). Unchecked which JetPack each is for.
+- macOS: only shared CPU libraries; the static ones disable Core ML. Unchecked whether the shared
+  `libonnxruntime.dylib` has the Core ML provider, and whether Core ML speeds these models up.
+
+**Measured (README "GPU" section has the tables):** a GPU pays off with full-precision models only (Parakeet v3
+fp32: 0.17 s for 25 s of speech, warm, against 2.0 s for int8 on 8 CPU threads; Kokoro fp32 speech 6x, Supertonic
+5x; int8 models, Piper, Kitten: no gain; Pocket TTS slower). Throwaway rigs: `.probe/bench.sh`,
+`.probe/tts_bench.py`, `.probe/gpu-e2e.ts`, `.probe/speak-gpu-e2e.ts` (gitignored, on agent-jail).
+
+**Also open:** the Windows VM checks below; one flaky run of
+`models::download::tests::a_lock_file_is_removed_when_unlocked_and_a_waiter_on_it_locks_the_new_one` (passed on
+every rerun).
+
 ## Where the code is
 
 - Branch `portable-3` (checked out), draft PR #5 against GitHub `main` (`7b04463`); nothing is released (npm has
