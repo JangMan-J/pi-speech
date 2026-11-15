@@ -1129,7 +1129,7 @@ export class Panel {
       view.keepColumns = true;
       view.detail =
         this.engine.routes.modelsRoute === "bridge"
-          ? "Runs on the Remote machine (Run models on); download there with pi-speech-receiver models download <id>."
+          ? "Runs, downloads and deletes on the Remote machine (Run models on)."
           : "Runs on This machine, with no network request once downloaded.";
       if (p.ids?.length === 0) view.empty = "No local models of this kind";
     } else if (isModelRow(p.row)) {

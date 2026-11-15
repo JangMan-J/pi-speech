@@ -195,56 +195,81 @@ export function downloadModel(binary: string, id: string, options: DownloadOptio
   else options.signal?.addEventListener("abort", onAbort, { once: true });
 
   const result = (async (): Promise<DownloadResult> => {
-    let delivered: Promise<void> = Promise.resolve();
-    let callbackError: unknown;
-    const deliver = (p: DownloadProgress) => {
-      const cb = options.onProgress;
-      if (!cb) return;
-      delivered = delivered.then(async () => {
-        if (callbackError !== undefined) return;
-        try {
-          await cb(p);
-        } catch (e) {
-          callbackError = e;
-        }
-      });
-    };
-    let last: Record<string, unknown> | undefined;
-    let done = 0;
-    let total = 0;
     try {
-      for await (const line of r.lines) {
-        const v = parse(line);
-        if (!v) continue;
-        if (v.event === "progress" && typeof v.done === "number" && typeof v.total === "number") {
-          done = v.done;
-          total = v.total;
-          const file = typeof v.file === "string" && v.file ? v.file : undefined;
-          deliver({ phase: "progress", done, total, ...(file ? { file } : {}) });
-        } else if (v.event === "verifying" || v.event === "unpacking") {
-          deliver({ phase: v.event });
-        } else if (v.event === "done" || v.event === "stopped" || v.event === "error") {
-          last = v;
-        }
-      }
+      const followed = await followDownload(r.lines, options.onProgress);
       const { code, stderr } = await r.exited;
-      await delivered;
-      if (callbackError !== undefined) throw callbackError;
-      if (last?.event === "done" && typeof last.path === "string" && code === 0) {
-        return { status: "done", path: last.path };
-      }
-      if (last?.event === "stopped" || (stopping && last?.event !== "error")) {
-        const kept = typeof last?.done === "number" ? last.done : done;
-        const of = typeof last?.total === "number" ? last.total : total;
-        return { status: "stopped", done: kept, total: of };
-      }
-      throw failure(stderr, code, last?.message);
+      return downloadResult(followed, stopping, code === 0, () => failure(stderr, code, followed.last?.message));
     } finally {
       if (killTimer) clearTimeout(killTimer);
       options.signal?.removeEventListener("abort", onAbort);
     }
   })();
   return { result, cancel };
+}
+
+/** What a download's event lines said: how it ended, and how far it got. */
+export interface FollowedDownload {
+  last?: Record<string, unknown>;
+  done: number;
+  total: number;
+}
+
+/**
+ * Follow a download's event lines (`models download` prints them, and the receiver streams the same for the
+ * Remote machine's), passing its progress on in order; resolves once the lines end and every callback has.
+ */
+export async function followDownload(
+  lines: AsyncIterable<string>,
+  onProgress?: (p: DownloadProgress) => void | Promise<void>,
+): Promise<FollowedDownload> {
+  let delivered: Promise<void> = Promise.resolve();
+  let callbackError: unknown;
+  const deliver = (p: DownloadProgress) => {
+    if (!onProgress) return;
+    delivered = delivered.then(async () => {
+      if (callbackError !== undefined) return;
+      try {
+        await onProgress(p);
+      } catch (e) {
+        callbackError = e;
+      }
+    });
+  };
+  const out: FollowedDownload = { done: 0, total: 0 };
+  for await (const line of lines) {
+    const v = parse(line);
+    if (!v) continue;
+    if (v.event === "progress" && typeof v.done === "number" && typeof v.total === "number") {
+      out.done = v.done;
+      out.total = v.total;
+      const file = typeof v.file === "string" && v.file ? v.file : undefined;
+      deliver({ phase: "progress", done: out.done, total: out.total, ...(file ? { file } : {}) });
+    } else if (v.event === "verifying" || v.event === "unpacking") {
+      deliver({ phase: v.event });
+    } else if (v.event === "done" || v.event === "stopped" || v.event === "error") {
+      out.last = v;
+    }
+  }
+  await delivered;
+  if (callbackError !== undefined) throw callbackError;
+  return out;
+}
+
+/** How a followed download ended: done, stopped (asked to, or it said so), else the error `fail` makes. */
+export function downloadResult(
+  f: FollowedDownload,
+  stopping: boolean,
+  exitedOk: boolean,
+  fail: () => Error,
+): DownloadResult {
+  const last = f.last;
+  if (last?.event === "done" && typeof last.path === "string" && exitedOk) return { status: "done", path: last.path };
+  if (last?.event === "stopped" || (stopping && last?.event !== "error")) {
+    const kept = typeof last?.done === "number" ? last.done : f.done;
+    const of = typeof last?.total === "number" ? last.total : f.total;
+    return { status: "stopped", done: kept, total: of };
+  }
+  throw fail();
 }
 
 /** The audio a local model transcribes, by file extension. */
@@ -353,13 +378,23 @@ export class LocalModels {
     return kind ? all.filter((m) => m.kind === kind) : all;
   }
 
+  /** Download a model: into this machine's cache, or the Remote machine's while its models are the ones used. */
   download(id: string, options: Omit<DownloadOptions, "env"> = {}): Download {
-    if (this.remote()) throw new LocalModelsError(remoteOnly("download", id));
+    const remote = this.remote();
+    if (remote) {
+      if (!remote.download) throw new LocalModelsError(remoteOnly("download", id));
+      return remote.download(id, options);
+    }
     return downloadModel(this.binary(), id, { ...options, env: this.childEnv });
   }
 
+  /** Delete a model, here or on the Remote machine as `download`; resolves to the bytes freed. */
   delete(id: string): Promise<number> {
-    if (this.remote()) return Promise.reject(new LocalModelsError(remoteOnly("delete", id)));
+    const remote = this.remote();
+    if (remote) {
+      if (!remote.delete) return Promise.reject(new LocalModelsError(remoteOnly("delete", id)));
+      return remote.delete(id);
+    }
     return deleteModel(this.binary(), id, this.childEnv);
   }
 

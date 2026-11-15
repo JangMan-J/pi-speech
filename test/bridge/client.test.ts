@@ -3,7 +3,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createBridgeAudio, probeBridge } from "../../src/bridge/index";
 
 const TOKEN = "t".repeat(40);
@@ -651,6 +651,73 @@ describe("local models on the Remote machine", () => {
     expect(req.url).toBe("/v1/transcribe?model=parakeet-v3");
     expect(req.headers["content-type"]).toBe("audio/mpeg");
     expect(req.body.toString()).toBe("RIFF....");
+  });
+
+  it("download streams the progress there as the local download gives it, and ends done", async () => {
+    let next!: () => void;
+    handler = (r, res) => {
+      if (r.url === "/v1/health") return send(res, 200, MODELS_HEALTH);
+      res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+      res.write(`${JSON.stringify({ event: "progress", id: "whisper", done: 5, total: 10 })}\n`);
+      next = () => {
+        res.write(`{"event":"progress","id":"whisper","done":10,"total":10}\n{"event":"unpack`);
+        res.end(`ing","id":"whisper"}\n{"event":"done","id":"whisper","path":"/cache/whisper"}\n`);
+      };
+    };
+    const progress: unknown[] = [];
+    const d = models().download!("whisper", { onProgress: (p) => void progress.push(p) });
+    await vi.waitFor(() => expect(progress).toHaveLength(1));
+    next();
+    expect(await d.result).toEqual({ status: "done", path: "/cache/whisper" });
+    expect(progress).toEqual([
+      { phase: "progress", done: 5, total: 10 },
+      { phase: "progress", done: 10, total: 10 },
+      { phase: "unpacking" },
+    ]);
+    expect(seen.at(-1)).toMatchObject({ method: "POST", url: "/v1/models/download?model=whisper" });
+  });
+
+  it("a cancelled download is stopped; a failed one says why there; one from an old receiver says to update", async () => {
+    handler = (r, res) => {
+      if (r.url === "/v1/health") return send(res, 200, MODELS_HEALTH);
+      res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+      res.write(`${JSON.stringify({ event: "progress", id: "whisper", done: 1, total: 10 })}\n`);
+    };
+    const progress: unknown[] = [];
+    const d = models().download!("whisper", { onProgress: (p) => void progress.push(p) });
+    await vi.waitFor(() => expect(progress).toHaveLength(1));
+    d.cancel();
+    expect(await d.result).toMatchObject({ status: "stopped" });
+
+    handler = (r, res) => {
+      if (r.url === "/v1/health") return send(res, 200, MODELS_HEALTH);
+      res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+      res.end(`${JSON.stringify({ event: "error", id: "x", message: "no model named x" })}\n`);
+    };
+    await expect(models().download!("x").result).rejects.toThrow("on the Remote machine: no model named x");
+
+    handler = (r, res) => {
+      if (r.url === "/v1/health") return send(res, 200, MODELS_HEALTH);
+      send(res, 409, { error: "a model is downloading on this machine; one at a time" });
+    };
+    await expect(models().download!("x").result).rejects.toThrow(
+      "on the Remote machine: a model is downloading on this machine; one at a time",
+    );
+
+    handler = (r, res) => {
+      if (r.url === "/v1/health") return send(res, 200, MODELS_HEALTH);
+      send(res, 404, { error: "not found" });
+    };
+    await expect(models().download!("x").result).rejects.toThrow(/from before model downloads: update it/);
+  });
+
+  it("delete says what it freed there", async () => {
+    handler = (r, res) => {
+      if (r.url === "/v1/health") return send(res, 200, MODELS_HEALTH);
+      send(res, 200, { id: "whisper", freed: 4096 });
+    };
+    expect(await models().delete!("whisper")).toBe(4096);
+    expect(seen.at(-1)).toMatchObject({ method: "POST", url: "/v1/models/delete?model=whisper" });
   });
 
   it("says plainly what failed: the model's words there, a run already going, a receiver too old", async () => {

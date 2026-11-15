@@ -20,6 +20,13 @@ import type {
   Recording,
   StreamOptions,
 } from "../engine/audio";
+import {
+  type Download,
+  type DownloadProgress,
+  type DownloadResult,
+  downloadResult,
+  followDownload,
+} from "../engine/local-models";
 import type { AudioStream, StreamFormat } from "../engine/provider";
 
 export interface BridgeConfig {
@@ -54,6 +61,16 @@ export interface BridgeModels {
   list(): Promise<Record<string, unknown>[]>;
   voices(id: string, signal?: AbortSignal): Promise<BridgeVoice[]>;
   transcribe(id: string, audio: Buffer, format: "wav" | "mp3", signal?: AbortSignal): Promise<string>;
+  /**
+   * Download a model into the Remote machine's cache, its progress as the local download gives it; cancelling
+   * stops it there, keeping what arrived. Absent in stand-ins that cannot.
+   */
+  download?(
+    id: string,
+    options?: { onProgress?: (p: DownloadProgress) => void | Promise<void>; signal?: AbortSignal },
+  ): Download;
+  /** Delete a model on the Remote machine; resolves to the bytes freed. */
+  delete?(id: string): Promise<number>;
   /** Resolves once the model has loaded there; the chunks are the PCM as it is generated. */
   speak(
     id: string,
@@ -540,7 +557,115 @@ export function createBridgeAudioFrom(getConfig: () => BridgeConfig, opts: { cli
     return before.then(() => release);
   }
 
+  /** The lines of a streamed body, as they arrive. */
+  async function* bodyLines(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+    const decoder = new TextDecoder();
+    let rest = "";
+    const reader = body.getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        rest += decoder.decode(value, { stream: true });
+        let nl = rest.indexOf("\n");
+        while (nl >= 0) {
+          yield rest.slice(0, nl);
+          rest = rest.slice(nl + 1);
+          nl = rest.indexOf("\n");
+        }
+      }
+      if (rest) yield rest;
+    } finally {
+      reader.cancel().catch(() => {});
+    }
+  }
+
   const models: BridgeModels = {
+    download(id, options = {}) {
+      const ending = new AbortController();
+      let stopping = false;
+      const cancel = () => {
+        stopping = true;
+        ending.abort();
+      };
+      if (options.signal?.aborted) cancel();
+      else options.signal?.addEventListener("abort", cancel, { once: true });
+      const stopped = (): DownloadResult => ({ status: "stopped", done: 0, total: 0 });
+      const result = (async (): Promise<DownloadResult> => {
+        await requireModels();
+        const { base: at, token, scrub } = await target();
+        let res: Response;
+        try {
+          res = await fetch(`${at}/v1/models/download?model=${encodeURIComponent(id)}`, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${token}`, [CLIENT_HEADER]: clientId },
+            redirect: "error",
+            signal: ending.signal,
+          });
+        } catch (err) {
+          if (stopping) return stopped();
+          lost(at);
+          throw new Error(scrub(`the playback receiver is not reachable at ${displayUrl(at)}: ${describeError(err)}`));
+        }
+        if (!res.ok || !res.body) {
+          if (res.status === 404) {
+            throw new Error(
+              `the receiver on the Remote machine is from before model downloads: update it, or run pi-speech-receiver models download ${id} there`,
+            );
+          }
+          let detail = res.statusText || "the download failed";
+          try {
+            const parsed = (await res.json()) as { error?: unknown };
+            if (typeof parsed.error === "string" && parsed.error) detail = parsed.error;
+          } catch {
+            /* keep the status text */
+          }
+          if (res.status === 409) throw new Error(`on the Remote machine: ${scrub(detail)}`);
+          throw modelError(
+            new ReceiverError(`the playback receiver answered ${res.status}: ${detail}`, res.status, scrub(detail)),
+          );
+        }
+        let followed: Awaited<ReturnType<typeof followDownload>>;
+        try {
+          followed = await followDownload(bodyLines(res.body), options.onProgress);
+        } catch (err) {
+          if (stopping) return stopped();
+          throw err;
+        }
+        const message = followed.last?.message;
+        return downloadResult(
+          followed,
+          stopping,
+          true,
+          () =>
+            new Error(
+              `on the Remote machine: ${typeof message === "string" && message ? scrub(message) : "the download failed"}`,
+            ),
+        );
+      })();
+      return { result, cancel };
+    },
+
+    async delete(id) {
+      try {
+        await requireModels();
+        const r = await json<{ freed?: unknown }>(
+          await call("POST", `/v1/models/delete?model=${encodeURIComponent(id)}`, { timeoutMs: MODELS_TIMEOUT_MS }),
+        );
+        return typeof r.freed === "number" ? r.freed : 0;
+      } catch (err) {
+        if (err instanceof ReceiverError && err.status === 404) {
+          throw new Error(
+            `the receiver on the Remote machine is from before model deletes: update it, or run pi-speech-receiver models delete ${id} there`,
+          );
+        }
+        if (err instanceof ReceiverError && err.status === 409 && err.detail) {
+          throw new Error(`on the Remote machine: ${err.detail}`);
+        }
+        throw modelError(err);
+      }
+    },
+
     async list() {
       try {
         await requireModels();

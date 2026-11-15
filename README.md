@@ -172,7 +172,13 @@ one. With `pi-speech-receiver ssh` the token is copied for you (see [The bridge]
 Under **DIRECTION**, while the bridge is in use, **Play audio on**, **Record audio on** and **Run models on**
 each choose This machine or the Remote machine (←→ or Enter; all Remote machine by default). Run models on is
 where a Local Speech or Transcription source runs its model: on the Remote machine the receiver there runs it,
-with the models downloaded there (`pi-speech-receiver models download <id>`); provider models are not affected.
+with the models downloaded there; provider models are not affected. The model lists then show the Remote
+machine's models, and download and delete them there (d, x, or Enter on one not downloaded), with progress.
+
+The Remote machine need not be where you sit. To run the models on another machine (a faster one, or a server)
+while Pi, your speakers and your microphone stay here: run `pi-speech-receiver --listen <its-address>:47613
+--network` there (a Tailscale address), set Bridge to on and pair with that address under Bridge connection,
+then set Play audio on and Record audio on to This machine and Run models on to Remote machine.
 Without the bridge the rows show This machine and do not change. A choice that cannot work, such as recording
 on This machine over SSH with no microphone there, fails with a message that names the row to change.
 
