@@ -153,7 +153,7 @@ describe("the panel view model: the main view", () => {
       "Dictation language": "auto",
       "Dictation output": "Pi",
       Hotkeys: undefined,
-      "Bridge connection": undefined,
+      "Bridge connection": "not connected",
       "Spectrum OSD": "Braille",
     });
   });
@@ -659,6 +659,27 @@ describe("the panel view model: Bridge connection", () => {
 });
 
 describe("the panel view model: Remote machine's Connect, on this machine", () => {
+  it("the main view's Bridge connection row says what the bridge is connected to", async () => {
+    const p = open();
+    await p.panel.idle();
+    expect(p.row("Bridge connection")).toMatchObject({ value: "not connected", opens: true });
+    p.engine.speech.settings.remoteHost = "spider";
+    p.engine.remoteState = "connecting";
+    expect(p.row("Bridge connection")).toMatchObject({ value: "spider", note: "… connecting" });
+    p.engine.remoteState = "connected";
+    expect(p.row("Bridge connection")).toMatchObject({ value: "spider", note: expect.stringMatching(/^✓ over SSH/) });
+    p.engine.remoteState = "lost";
+    p.engine.remoteError = "the connection to spider ended";
+    expect(p.row("Bridge connection")).toMatchObject({
+      value: "spider",
+      note: "✗ the connection to spider ended",
+      alert: true,
+    });
+    const ssh = open({ SSH_CONNECTION: "1 2 3 4" });
+    await ssh.panel.idle();
+    expect(ssh.row("Bridge connection")).toMatchObject({ value: "ssh forward", note: "✓" });
+  });
+
   it("Enter opens Connect; Tab steps through the Hosts of ~/.ssh/config", async () => {
     const home = mkdtempSync(join(tmpdir(), "pi-speech-home-"));
     mkdirSync(join(home, ".ssh"));

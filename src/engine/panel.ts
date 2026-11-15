@@ -913,6 +913,8 @@ export class Panel {
         const v = value(s.voice);
         return { ...base, value: v, ...this.voiceAlert() };
       }
+      case "bridge":
+        return { ...base, ...this.connectionValue() };
       case "readAloud":
       case "readMode":
         return { ...base, value: READ_WORDS[this.engine.readAloud.mode] };
@@ -2061,6 +2063,29 @@ export class Panel {
       return { value: this.speech.settings.bridgeAddress, note: p.value };
     }
     return { value: host ?? "not connected", note: host ? "Enter reconnects" : "Enter connects" };
+  }
+
+  /**
+   * Bridge connection on the main view: what the bridge is connected to, and whether its receiver answers. On
+   * this machine the Remote machine (over SSH, or paired by address); over SSH the forward to the user's own.
+   */
+  private connectionValue(): Pick<PanelRow, "value" | "note" | "alert"> {
+    const routes = this.engine.routes;
+    const r = this.receiver;
+    const answers = (): Pick<PanelRow, "note" | "alert"> =>
+      !r || r === "checking"
+        ? { note: "… checking" }
+        : r.ok
+          ? { note: "✓" }
+          : { note: "✗ receiver unreachable", alert: true };
+    if (!routes.ssh) {
+      if (this.engine.remoteState !== "off") return this.remoteValue();
+      if (routes.route === "bridge")
+        return { value: this.speech.settings.bridgeAddress ?? hostPort(routes.url) ?? "bridge", ...answers() };
+      return { value: this.engine.remoteHost ?? "not connected" };
+    }
+    if (routes.route !== "bridge") return { value: "off", note: "audio and models on this host" };
+    return { value: "ssh forward", ...answers() };
   }
 
   /** Remote machine's Connect field: the machine remembered, Tab for the Hosts of ~/.ssh/config. */

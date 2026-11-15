@@ -130,7 +130,7 @@ describe("the panel in Pi's terminal UI", () => {
       "    Dictation output     Pi ›",
       "SETTINGS",
       "    Hotkeys ›",
-      "    Bridge connection ›",
+      "    Bridge connection    not connected ›",
       "    Spectrum OSD         Braille",
     ];
     for (const [width, w] of [

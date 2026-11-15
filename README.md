@@ -53,7 +53,7 @@ LISTEN (Alt+Z)
     Dictation output     Pi ›
 SETTINGS
     Hotkeys ›
-    Bridge connection ›
+    Bridge connection    decent-spider · ✓ over SSH ›
 
   ✓ Voice: eve
   Enter speak · ↓ settings · Esc close
