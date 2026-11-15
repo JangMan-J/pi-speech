@@ -7,6 +7,7 @@ pub mod device;
 pub mod play;
 pub mod record;
 pub mod ring;
+pub mod spectrum;
 
 use std::process::ExitCode;
 

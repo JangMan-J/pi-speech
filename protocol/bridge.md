@@ -193,6 +193,12 @@ Stops the recording and returns it.
 
 Stops the recording and deletes it. `200 {"id": "...", "state": "cancelled"}`.
 
+### `GET /v1/levels`
+
+Returns live 12-band speech spectrum levels (`0..=100` integers) while the built-in
+engine is recording or playing for the requesting `X-Pi-Speech-Client`.
+`200 {"recording": [...], "playing": [...]}` (each field is omitted when inactive; `{}` when idle).
+
 ### Running local models
 
 The receiver runs local models (see "Subcommand notes: speak" and `transcribe`) for the

@@ -129,6 +129,7 @@ describe("the panel in Pi's terminal UI", () => {
       "SETTINGS",
       "    Hotkeys ›",
       "    Bridge connection ›",
+      "    Spectrum OSD         Braille",
     ];
     for (const [width, w] of [
       [80, 79],
@@ -139,8 +140,8 @@ describe("the panel in Pi's terminal UI", () => {
       expect(Math.max(...raw.map((l) => visibleWidth(l))), `width ${width}`).toBeLessThanOrEqual(width);
       const lines = raw.map((l) => stripVTControlCharacters(l).trimEnd());
       expect(lines[0]).toBe(` Speech ${"─".repeat(w - 7)}`);
-      expect(lines.slice(1, 14)).toEqual(MOCKUP.map((l) => ` ${l}`));
-      expect(lines.slice(14)).toEqual(["", "", "   Enter what is read and how · Esc close", ` ${"─".repeat(w)}`]);
+      expect(lines.slice(1, 15)).toEqual(MOCKUP.map((l) => ` ${l}`));
+      expect(lines.slice(15)).toEqual(["", "", "   Enter what is read and how · Esc close", ` ${"─".repeat(w)}`]);
     }
     f.overlay.component.handleInput("\x1b");
     await done;
@@ -165,15 +166,16 @@ describe("the panel in Pi's terminal UI", () => {
         width,
       );
       expect(lines[0]).toMatch(/^ Speech › Hotkeys ─+$/);
-      expect(lines.slice(1, 7)).toEqual([
+      expect(lines.slice(1, 8)).toEqual([
         "   ▸ Speak…             Alt+S",
         "     Dictate            Alt+Z",
+        "     Push-to-talk       off · hold to dictate (Kitty key-release)",
         "     Replay last        r",
         "     History…           h",
         "     Stop               s",
         "     Transcribe file…   t",
       ]);
-      expect(lines[9]).toBe("   Enter run · k change key · Esc back");
+      expect(lines[10]).toBe("   Enter run · k change key · Esc back");
     }
     // k, then the new key: Alt+D from a legacy terminal, as ESC d
     c.handleInput("k");
@@ -324,14 +326,15 @@ describe("the panel in Pi's terminal UI", () => {
     const done = f.commands.get("speech").handler("", f.ctx);
     const c = f.overlay.component;
     c.handleInput("\r"); // Read aloud options
-    c.handleInput("\x1b[C"); // right: Read Summary
+    c.handleInput("\x1b[C"); // right: Read Summarized
     expect(engine.readAloud.mode).toBe("summary");
     expect(stripVTControlCharacters(f.screen())).toMatch(
-      /Read aloud options ─[\s\S]*Read\s+Summary[\s\S]*Reads the model's spoken summary of its reply\./,
+      /Read aloud options ─[\s\S]*Read\s+Summarized[\s\S]*Reads a spoken summary of the reply when the run ends\./,
     );
     c.handleInput("\x1b"); // back to the main view
-    expect(stripVTControlCharacters(f.screen())).toMatch(/Read aloud options\s+Summary ›/);
-    c.handleInput("\x1b[A"); // up: wraps to Bridge connection
+    expect(stripVTControlCharacters(f.screen())).toMatch(/Read aloud options\s+Summarized ›/);
+    c.handleInput("\x1b[A"); // up: wraps to Spectrum OSD
+    c.handleInput("\x1b[A"); // up: Bridge connection
     c.handleInput("\r");
     c.handleInput("\x1b[C"); // right: Bridge on
     await vi.waitFor(() => expect(engine.speech.settings.bridge).toBe("on"));
@@ -366,14 +369,14 @@ describe("the panel in Pi's terminal UI", () => {
   it("fits a short terminal: never more lines than rows", async () => {
     fakeOpenRouter();
     const f = tuiPi();
-    f.overlay.rows = 15;
+    f.overlay.rows = 16;
     registerPi(f.pi, makeEngine().engine, {});
     await f.emit("session_start");
     const done = f.commands.get("speech").handler("", f.ctx);
     const lines: string[] = f.overlay.component.render(100);
     // Pi's footer keeps its rows
-    expect(lines.length).toBeLessThanOrEqual(12);
-    expect(lines.join("\n")).toMatch(/Speech[\s\S]*Bridge connection[\s\S]*Esc close/);
+    expect(lines.length).toBeLessThanOrEqual(13);
+    expect(lines.join("\n")).toMatch(/Speech[\s\S]*Spectrum OSD[\s\S]*Esc close/);
     f.overlay.component.handleInput("\x1b");
     await done;
   });

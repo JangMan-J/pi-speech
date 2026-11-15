@@ -38,12 +38,18 @@ export const SOURCES: Source[] = ["provider", "local"];
 export type ModelSort = "price" | "provider" | "features" | "newest" | "name";
 export const MODEL_SORTS: ModelSort[] = ["price", "provider", "features", "newest", "name"];
 
-/** The keys of the two Pi shortcuts, as Pi names them (`alt+s`). Pi binds them when the extension loads. */
+/** How the live audio spectrum OSD above the editor is drawn (`off` hides it). */
+export type OsdStyle = "braille" | "bars" | "mirror" | "line" | "off";
+export const OSD_STYLES: OsdStyle[] = ["braille", "bars", "mirror", "line", "off"];
+
+/** The keys of the Pi shortcuts, as Pi names them (`alt+s`). Pi binds speak/dictate when loading. */
 export interface Hotkeys {
   /** Opens the speak composer. */
   speak: string;
   /** Starts and stops dictation. */
   dictate: string;
+  /** Push-to-talk dictation (hold to record, release to transcribe); optional. */
+  ptt?: string;
 }
 
 export const DEFAULT_HOTKEYS: Readonly<Hotkeys> = Object.freeze({ speak: "alt+s", dictate: "alt+z" });
@@ -59,6 +65,23 @@ export function hotkeyId(key: string): string | undefined {
   const mods = new Set(parts);
   if (!mods.has("alt") || mods.size !== parts.length || [...mods].some((m) => !["ctrl", "alt", "shift"].includes(m)))
     return undefined;
+  return [...["ctrl", "alt", "shift"].filter((m) => mods.has(m)), base].join("+");
+}
+
+/**
+ * A key push-to-talk may be set to: any `hotkeyId`, or a function key (`f1`–`f12`, optionally modified), or
+ * `space` with `alt` or `ctrl`.
+ */
+export function pttHotkeyId(key: string): string | undefined {
+  const std = hotkeyId(key);
+  if (std) return std;
+  const parts = key.trim().toLowerCase().split("+");
+  const base = parts.pop() ?? "";
+  const mods = new Set(parts);
+  if (mods.size !== parts.length || [...mods].some((m) => !["ctrl", "alt", "shift"].includes(m))) return undefined;
+  const isFn = /^f([1-9]|1[0-2])$/.test(base);
+  const isModSpace = base === "space" && (mods.has("alt") || mods.has("ctrl"));
+  if (!isFn && !isModSpace) return undefined;
   return [...["ctrl", "alt", "shift"].filter((m) => mods.has(m)), base].join("+");
 }
 
@@ -113,6 +136,8 @@ export interface Settings {
   bridgeAddress?: string;
   /** macOS: the notice that Option+letter reached Pi as a character has been shown (once per install). */
   optionKeyHintShown?: boolean;
+  /** Live audio spectrum OSD style above the editor. */
+  osdStyle: OsdStyle;
 }
 
 export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
@@ -131,6 +156,7 @@ export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
   playOn: "remote",
   recordOn: "remote",
   modelsOn: "remote",
+  osdStyle: "braille",
 });
 
 /** The saved directions, in the order the panel shows them. */
@@ -155,6 +181,7 @@ const isMode = (v: unknown): v is BridgeMode => v === "auto" || v === "on" || v 
 const isSort = (v: unknown): v is ModelSort => MODEL_SORTS.includes(v as ModelSort);
 const isSource = (v: unknown): v is Source => SOURCES.includes(v as Source);
 const isMachine = (v: unknown): v is Machine => MACHINES.includes(v as Machine);
+const isOsdStyle = (v: unknown): v is OsdStyle => OSD_STYLES.includes(v as OsdStyle);
 
 function languagesFrom(raw: unknown): LanguageOverrides {
   const out: LanguageOverrides = {};
@@ -194,16 +221,22 @@ function endpointsFrom(raw: unknown): Record<string, EndpointConfig> {
   return out;
 }
 
-/** Saved hotkeys over the defaults; a key that is not a valid hotkey, or both on one key, keeps the default. */
+/** Saved hotkeys over the defaults; a key that is not a valid hotkey, or colliding keys, keeps the default. */
 function hotkeysFrom(raw: unknown): Hotkeys {
-  const out = { ...DEFAULT_HOTKEYS };
+  const out: Hotkeys = { ...DEFAULT_HOTKEYS };
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
   const r = raw as Json;
   const speak = typeof r.speak === "string" ? hotkeyId(r.speak) : undefined;
   const dictate = typeof r.dictate === "string" ? hotkeyId(r.dictate) : undefined;
   if (speak) out.speak = speak;
   if (dictate) out.dictate = dictate;
-  return out.speak === out.dictate ? { ...DEFAULT_HOTKEYS } : out;
+  if (out.speak === out.dictate) {
+    out.speak = DEFAULT_HOTKEYS.speak;
+    out.dictate = DEFAULT_HOTKEYS.dictate;
+  }
+  const ptt = typeof r.ptt === "string" ? pttHotkeyId(r.ptt) : undefined;
+  if (ptt && ptt !== out.speak && ptt !== out.dictate) out.ptt = ptt;
+  return out;
 }
 
 /** Saved read-aloud options over the defaults; a value that is not one of the choices keeps the default. */
@@ -267,6 +300,7 @@ export class SettingsFile {
       const localTranscription = str(raw.localTranscriptionModel);
       if (localTranscription) s.localTranscriptionModel = localTranscription;
       if (raw.optionKeyHintShown === true) s.optionKeyHintShown = true;
+      if (isOsdStyle(raw.osdStyle)) s.osdStyle = raw.osdStyle;
       const address = str(raw.bridgeAddress);
       if (address) s.bridgeAddress = address;
       for (const d of DIRECTIONS) if (isMachine(raw[d])) s[d] = raw[d];
@@ -314,9 +348,16 @@ export class SettingsFile {
       ...(s.dictationOutput ? { dictationOutput: s.dictationOutput } : {}),
       ...(s.modelSort !== DEFAULT_SETTINGS.modelSort ? { modelSort: s.modelSort } : {}),
       ...(Object.keys(s.endpoints).length ? { endpoints: s.endpoints } : {}),
-      ...(s.hotkeys.speak !== DEFAULT_HOTKEYS.speak || s.hotkeys.dictate !== DEFAULT_HOTKEYS.dictate
-        ? { hotkeys: { speak: s.hotkeys.speak, dictate: s.hotkeys.dictate } }
+      ...(s.hotkeys.speak !== DEFAULT_HOTKEYS.speak || s.hotkeys.dictate !== DEFAULT_HOTKEYS.dictate || s.hotkeys.ptt
+        ? {
+            hotkeys: {
+              speak: s.hotkeys.speak,
+              dictate: s.hotkeys.dictate,
+              ...(s.hotkeys.ptt ? { ptt: s.hotkeys.ptt } : {}),
+            },
+          }
         : {}),
+      ...(s.osdStyle !== DEFAULT_SETTINGS.osdStyle ? { osdStyle: s.osdStyle } : {}),
       ...(sameReadAloud(s.readAloud, DEFAULT_READ_ALOUD) ? {} : { readAloud: s.readAloud }),
       ...(s.speechSource !== "provider" ? { speechSource: s.speechSource } : {}),
       ...(s.transcriptionSource !== "provider" ? { transcriptionSource: s.transcriptionSource } : {}),

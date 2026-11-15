@@ -1,5 +1,6 @@
 //! The playback bridge: endpoints, playback and recording state.
 
+use crate::audio::spectrum;
 use crate::front::{self, Ready};
 use crate::http::{answer_nonblocking, json_str, BodyFault, Conn, Framing, Request, Response};
 use crate::pair::{self, Notice, Pairing};
@@ -174,6 +175,7 @@ struct Play {
     error: Option<String>,
     ctl: Arc<ProcCtl>,
     feed: Feed,
+    levels: Option<PathBuf>,
 }
 
 impl Play {
@@ -200,6 +202,7 @@ enum RecPhase {
 struct Rec {
     id: String,
     path: PathBuf,
+    levels: Option<PathBuf>,
     ctl: Arc<ProcCtl>,
     /// The built-in recorder's input, open while it records; it stops when this closes,
     /// should the receiver go away without stopping it. (On Windows the recorder's
@@ -332,6 +335,9 @@ fn janitor(sh: Arc<Shared>) {
                     .is_some_and(|t| now.duration_since(t) >= sh.cfg.pickup);
             if expired {
                 let _ = fs::remove_file(&r.path);
+                if let Some(p) = &r.levels {
+                    let _ = fs::remove_file(p);
+                }
             }
             !expired
         });
@@ -701,6 +707,7 @@ impl Shared {
                 Response::json(200, format!("{{\"stopped\": {n}}}"))
             }
             ("POST", ["v1", "pair"]) => self.pair(conn, req),
+            ("GET", ["v1", "levels"]) => self.get_levels(req),
             ("POST", ["v1", "record", "start"]) => self.start_recording(),
             ("POST", ["v1", "record", id, "stop"]) => self.stop_recording(id),
             ("POST", ["v1", "record", id, "cancel"]) => self.cancel_recording(id),
@@ -735,15 +742,57 @@ impl Shared {
                 )),
             )
         };
+        let mut removed_levels = None;
         let mut g = lock(&self.inner);
         if let Some(p) = g.plays.iter_mut().find(|p| p.id == id) {
             p.state = state;
             p.error = error;
+            removed_levels = p.levels.take();
             if let Feed::Waiting(_) = p.feed {
                 p.feed = Feed::Taken; // closes the input nobody will write to now
             }
         }
         self.cv.notify_all();
+        drop(g);
+        if let Some(path) = removed_levels {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    fn get_levels(&self, req: &Request) -> Response {
+        let client = match client_of(req) {
+            Ok(c) => c,
+            Err(resp) => return resp,
+        };
+        let (rec_levels, play_levels) = {
+            let g = lock(&self.inner);
+            let rec = g
+                .recs
+                .iter()
+                .find(|r| r.phase == RecPhase::Recording)
+                .and_then(|r| r.levels.clone());
+            let play = g
+                .plays
+                .iter()
+                .rev()
+                .find(|p| p.state == PlayState::Playing && (client.is_none() || p.client == client))
+                .and_then(|p| p.levels.clone());
+            (rec, play)
+        };
+        let rec = rec_levels.as_deref().and_then(spectrum::read_levels);
+        let play = play_levels.as_deref().and_then(spectrum::read_levels);
+        let fmt_bands = |b: &[u8; spectrum::BANDS]| {
+            let parts: Vec<String> = b.iter().map(|v| v.to_string()).collect();
+            format!("[{}]", parts.join(","))
+        };
+        let mut fields = Vec::new();
+        if let Some(b) = rec.as_ref() {
+            fields.push(format!("\"recording\":{}", fmt_bands(b)));
+        }
+        if let Some(b) = play.as_ref() {
+            fields.push(format!("\"playing\":{}", fmt_bands(b)));
+        }
+        Response::json(200, format!("{{{}}}", fields.join(",")))
     }
 
     // ---- Streams ----
@@ -819,7 +868,13 @@ impl Shared {
             Err(e) => return Response::error(503, &format!("no random source: {e}")),
         };
         self.stop_playing(|p| p.client == client);
-        let cmd = program.command();
+        let levels = program
+            .builtin
+            .then(|| self.cfg.tmp_dir.join(format!("play-{id}.levels")));
+        let mut cmd = program.command();
+        if let Some(path) = &levels {
+            cmd.env(spectrum::LEVELS_ENV, path);
+        }
         let sh = Arc::clone(self);
         let done_id = id.clone();
         // Hold the lock across spawn so the exit callback cannot run before the entry exists.
@@ -829,6 +884,9 @@ impl Shared {
             Ok(x) => x,
             Err(e) => {
                 drop(g);
+                if let Some(path) = levels {
+                    let _ = fs::remove_file(path);
+                }
                 return Response::error(
                     503,
                     &format!("cannot start the Stream player {}: {e}", program.name()),
@@ -842,6 +900,9 @@ impl Shared {
             drop(g);
             ctl.stop();
             drop(input);
+            if let Some(path) = levels {
+                let _ = fs::remove_file(path);
+            }
             return Response::error(503, &format!("cannot start the Stream timer: {e}"));
         }
         g.plays.push(Play {
@@ -851,6 +912,7 @@ impl Shared {
             error: None,
             ctl,
             feed: Feed::Waiting(input),
+            levels,
         });
         prune(&mut g);
         Response::json(202, format!("{{\"id\": {}}}", json_str(&id)))
@@ -1060,8 +1122,14 @@ impl Shared {
             _ => return Response::error(503, "no random source"),
         };
         let path = self.cfg.tmp_dir.join(name);
+        let levels = program
+            .builtin
+            .then(|| self.cfg.tmp_dir.join(format!("rec-{id}.levels")));
         let mut cmd = program.command();
         cmd.arg(&path);
+        if let Some(lp) = &levels {
+            cmd.env(spectrum::LEVELS_ENV, lp);
+        }
 
         let sh = Arc::clone(self);
         let done_id = id.clone();
@@ -1098,6 +1166,7 @@ impl Shared {
         g.recs.push(Rec {
             id: id.clone(),
             path: path.clone(),
+            levels: levels.clone(),
             ctl: Arc::clone(&ctl),
             input,
             phase: RecPhase::Recording,
@@ -1133,6 +1202,9 @@ impl Shared {
             .map(|i| g.recs.remove(i));
         drop(g);
         let _ = fs::remove_file(&path);
+        if let Some(lp) = levels {
+            let _ = fs::remove_file(lp);
+        }
         let note = rec.map(|r| r.note).unwrap_or_default();
         Response::error(
             503,
@@ -1160,6 +1232,9 @@ impl Shared {
             r.finished = Some(Instant::now());
             if error.is_some() {
                 let _ = fs::remove_file(&r.path);
+            }
+            if let Some(lp) = r.levels.take() {
+                let _ = fs::remove_file(lp);
             }
             r.error = error;
             // At start-up the recorder's own words are the reason; keep just those.
@@ -1207,6 +1282,9 @@ impl Shared {
         }
         let bytes = fs::read(&rec.path);
         let _ = fs::remove_file(&rec.path);
+        if let Some(lp) = &rec.levels {
+            let _ = fs::remove_file(lp);
+        }
         let Ok(bytes) = bytes else {
             return Response::error(
                 503,
@@ -1231,6 +1309,9 @@ impl Shared {
             Some(Err(resp)) => resp,
             Some(Ok(rec)) => {
                 let _ = fs::remove_file(&rec.path);
+                if let Some(lp) = &rec.levels {
+                    let _ = fs::remove_file(lp);
+                }
                 Response::json(
                     200,
                     format!("{{\"id\": {}, \"state\": \"cancelled\"}}", json_str(id)),

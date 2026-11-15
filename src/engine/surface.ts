@@ -57,8 +57,8 @@ const ACTIONS: Record<string, ActionSpec> = {
   voices: { args: "", help: "list the voices of the speech model", min: 0, max: 0 },
   languages: { args: "", help: "list the voice languages of the speech model", min: 0, max: 0 },
   "read-aloud": {
-    args: "on|off|summary|thinking|all",
-    help: "speak the final reply of each run, or a spoken summary of it",
+    args: "on|off|summary|streaming",
+    help: "speak a spoken summary of the reply, or narrate each reasoning step live",
     min: 1,
     max: 1,
   },
@@ -215,9 +215,8 @@ export class Surface {
     else r.mode = on;
     const what: Record<ReadMode, string> = {
       off: "off",
-      all: "on (the final reply of each run is spoken)",
-      summary: "summary (a spoken summary of each reply is read)",
-      thinking: "thinking (a spoken summary of the reasoning, then of the reply, is read)",
+      summary: "summarized (a spoken summary of the reply is read when the run ends)",
+      streaming: "streaming (each reasoning step is summarized and spoken as it is produced)",
     };
     ui.notify(`Read-aloud: ${what[r.mode]}`, "info");
   }
@@ -269,7 +268,7 @@ export class Surface {
       case "read-aloud":
         if (args[0] === "on" || args[0] === "off") return this.setReadAloud(args[0] === "on", ui);
         if (!READ_MODES.includes(args[0] as ReadMode)) {
-          throw new Error(`Usage: /speech --read-aloud on|off|summary|thinking|all`);
+          throw new Error(`Usage: /speech --read-aloud on|off|summary|streaming`);
         }
         return this.setReadAloud(args[0] as ReadMode, ui);
       case "bridge":

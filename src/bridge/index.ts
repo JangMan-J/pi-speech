@@ -7,6 +7,7 @@ export type {
   BridgeAudio,
   BridgeConfig,
   BridgeHealth,
+  BridgeLevels,
   BridgeModels,
   BridgeProbe,
   BridgeVoice,

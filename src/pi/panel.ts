@@ -6,7 +6,7 @@
  */
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { decodeKittyPrintable, Key, matchesKey, parseKey, truncateToWidth } from "@earendil-works/pi-tui";
+import { decodeKittyPrintable, isKeyRelease, Key, matchesKey, parseKey, truncateToWidth } from "@earendil-works/pi-tui";
 import type { Engine } from "../engine/engine";
 import type { Env } from "../engine/env";
 import { type NamedKey, Panel, type PanelKey } from "../engine/panel";
@@ -107,6 +107,7 @@ export class KeyDecoder {
       this.paste = undefined;
       return [...(text ? [{ text, paste: true }] : []), ...(rest ? this.decode(rest) : [])];
     }
+    if (this.paste === undefined && isKeyRelease(data)) return [];
     const id = parseKey(data);
     for (const [match, key] of this.named) {
       if (matchesKey(data, match)) return [id?.includes("+") ? { key, id } : { key }];
@@ -114,7 +115,7 @@ export class KeyDecoder {
     const plain = data.length > 0 && [...data].every((c) => c >= " " && c !== "\x7f");
     const printable = decodeKittyPrintable(data) ?? (plain ? data : undefined);
     if (printable) return [{ text: printable }];
-    return id?.includes("+") ? [{ combo: id }] : [];
+    return id && (id.includes("+") || /^f([1-9]|1[0-2])$/.test(id)) ? [{ combo: id }] : [];
   }
 }
 

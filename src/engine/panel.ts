@@ -41,6 +41,9 @@ import {
   type Machine,
   MODEL_SORTS,
   type ModelSort,
+  OSD_STYLES,
+  type OsdStyle,
+  pttHotkeyId,
   SOURCES,
   type Source,
 } from "./settings";
@@ -58,11 +61,13 @@ export type RowId =
   | "transcription"
   | "language"
   | "output"
+  | "osdStyle"
   | "hotkeys"
   | "bridge"
   // Hotkeys: the actions
   | "speak"
   | "dictate"
+  | "ptt"
   | "replay"
   | "history"
   | "stop"
@@ -384,12 +389,14 @@ const MAIN: RowBase[] = [
   { id: "output", section: "listen", label: "Dictation output", opens: true },
   { id: "hotkeys", section: "settings", label: "Hotkeys", opens: true },
   { id: "bridge", section: "settings", label: "Bridge connection", opens: true },
+  { id: "osdStyle", section: "settings", label: "Spectrum OSD" },
 ];
 
 /** Every action, with its key; Enter runs it. */
 const HOTKEYS: RowBase[] = [
   { id: "speak", label: "Speak…" },
   { id: "dictate", label: "Dictate" },
+  { id: "ptt", label: "Push-to-talk" },
   { id: "replay", label: "Replay last" },
   { id: "history", label: "History…" },
   { id: "stop", label: "Stop" },
@@ -451,7 +458,14 @@ const MENUS: Record<MenuMode["menu"], { title: string; rows: RowBase[] }> = {
 
 /** The keys of the actions that only work inside the panel. */
 const LETTERS: Partial<Record<RowId, string>> = { replay: "r", history: "h", stop: "s", transcribe: "t" };
-const HOTKEY_NAMES: Record<HotkeyName, string> = { speak: "Speak", dictate: "Dictate" };
+const HOTKEY_NAMES: Record<HotkeyName, string> = { speak: "Speak", dictate: "Dictate", ptt: "Push-to-talk" };
+const OSD_WORDS: Record<OsdStyle, string> = {
+  braille: "Braille",
+  bars: "Bars",
+  mirror: "Mirrored",
+  line: "1-line",
+  off: "Off",
+};
 
 const PICKER_ROWS: ListRow[] = ["speechModel", "transcription", "voice"];
 const isPickerRow = (id: RowId): id is ListRow => (PICKER_ROWS as RowId[]).includes(id);
@@ -493,7 +507,7 @@ function downloadLine(id: string, p: DownloadProgress): string {
 }
 
 /** The Read values as shown. */
-const READ_WORDS: Record<ReadMode, string> = { off: "Off", summary: "Summary", thinking: "Thinking", all: "All" };
+const READ_WORDS: Record<ReadMode, string> = { off: "Off", summary: "Summarized", streaming: "Streaming" };
 const LENGTH_WORDS: Record<SummaryLength, string> = {
   minimum: "Minimum ~15 s",
   abridged: "Abridged ~30 s",
@@ -506,9 +520,8 @@ const SAME_MODEL_LABEL = "Same model";
 /** What the highlighted Read value does. */
 const READ_INFO: Record<ReadMode, string> = {
   off: "Off: nothing is read aloud.",
-  summary: "Reads the model's spoken summary of its reply.",
-  thinking: "Reads a spoken summary of the reasoning, then of the reply.",
-  all: "Reads the whole reply.",
+  summary: "Reads a spoken summary of the reply when the run ends.",
+  streaming: "Narrates a spoken summary of each reasoning step as it is produced.",
 };
 /** Step through `list` from `current` by `dir`, wrapping. */
 function cycle<T>(list: readonly T[], current: T, dir: 1 | -1): T {
@@ -651,6 +664,26 @@ export class Panel {
     this.unlisten?.();
     if (this.statusTimer) clearTimeout(this.statusTimer);
     this.stopPairing();
+  }
+
+  /** Whether a hotkey capture prompt is active (raw input goes to the panel). */
+  isCapturingHotkey(): boolean {
+    return this.mode.kind === "menu" && this.mode.capture !== undefined;
+  }
+
+  /** Whether the Speak composer is open. */
+  inSpeakComposer(): boolean {
+    return this.mode.kind === "input" && this.mode.purpose === "speak";
+  }
+
+  /** Close the panel from outside (e.g. a PTT hotkey pressed while browsing settings). */
+  close(): void {
+    this.deps.close();
+  }
+
+  /** Toggle dictation through the panel (inserts into the Speak composer when open). */
+  dictateNow(): void {
+    this.dictate();
   }
 
   /** Open the repeated-speaking composer. Standalone mode closes on Esc instead of returning to settings. */
@@ -796,8 +829,11 @@ export class Panel {
         return { ...base, value: value(s.dictationLanguage ?? "auto") };
       case "output":
         return { ...base, value: s.dictationOutput ? "User-defined" : "Pi" };
+      case "osdStyle":
+        return { ...base, value: value(OSD_WORDS[s.osdStyle]) };
       case "speak":
       case "dictate":
+      case "ptt":
         return { ...base, ...this.hotkeyValue(base.id, home) };
       case "bridgeMode": {
         const v = value(this.engine.routes.mode);
@@ -839,8 +875,11 @@ export class Panel {
       case "readMode":
         return READ_INFO[this.engine.readAloud.mode];
       case "summarizer":
+        if (this.engine.readAloud.mode === "streaming" && !o.summarizer) {
+          return "Streaming needs a separate model (Same model cannot summarize mid-run).";
+        }
         return o.summarizer
-          ? `Extra request to ${o.summarizer} per reply.`
+          ? `Extra request to ${o.summarizer} per ${this.engine.readAloud.mode === "streaming" ? "reasoning step" : "reply"}.`
           : "Same model, same reply. No extra request.";
       case "summaryLength":
         return `Best effort: about ${LENGTH_SECONDS[o.length]} s.`;
@@ -849,10 +888,12 @@ export class Panel {
     }
   }
 
-  /** The key of Speak or Dictate as saved: a changed one is bound when the user leaves Hotkeys. */
+  /** The key of Speak, Dictate, or Push-to-talk as saved. */
   private hotkeyValue(name: HotkeyName, home: { kind: "list" } | MenuMode): Pick<PanelRow, "value" | "note"> {
     if (home.kind === "menu" && home.capture === name) return { value: "press a key…" };
-    return { value: keyLabel(this.speech.settings.hotkeys[name]) };
+    const key = this.speech.settings.hotkeys[name];
+    if (!key) return { value: "off", note: "hold to dictate (Kitty key-release)" };
+    return { value: keyLabel(key) };
   }
 
   /** A saved key of Speak or Dictate differs from the one Pi has bound. */
@@ -1121,6 +1162,8 @@ export class Panel {
       case "language":
       case "output":
         return [{ key: "Enter", action: "set" }, close];
+      case "osdStyle":
+        return [{ key: "←→", action: OSD_STYLES.map((s) => OSD_WORDS[s]).join(" · ") }, close];
       case "hotkeys":
         return [{ key: "Enter", action: "run actions, change keys" }, close];
       default:
@@ -1131,6 +1174,13 @@ export class Panel {
   private menuHints(m: MenuMode): Hint[] {
     const back: Hint = { key: "Esc", action: "back" };
     if (m.capture) {
+      if (m.capture === "ptt") {
+        return [
+          { key: "Alt+key / F1-F12", action: "new key for Push-to-talk" },
+          ...(this.speech.settings.hotkeys.ptt ? [{ key: "Backspace", action: "clear" }] : []),
+          { key: "Esc", action: "cancel" },
+        ];
+      }
       return [
         { key: "Alt+letter", action: `new key for ${HOTKEY_NAMES[m.capture]}` },
         { key: "Esc", action: "cancel" },
@@ -1155,6 +1205,10 @@ export class Panel {
       return [{ key: "←→", action: values.join(" · ") }, back];
     }
     const id = HOTKEYS[m.selected].id;
+    if (id === "ptt") {
+      const clear: Hint[] = this.speech.settings.hotkeys.ptt ? [{ key: "Backspace", action: "clear" }] : [];
+      return [{ key: "k", action: "set key" }, ...clear, back];
+    }
     const change: Hint[] = id === "speak" || id === "dictate" ? [{ key: "k", action: "change key" }] : [];
     return [{ key: "Enter", action: "run" }, ...change, back];
   }
@@ -1240,6 +1294,7 @@ export class Panel {
         m.selected = (m.selected + (key === "up" ? rows.length - 1 : 1)) % rows.length;
       else if (key === "enter") this.activate(id);
       else if (key === "left" || key === "right") this.step(id, key === "left" ? -1 : 1);
+      else if (m.menu === "hotkeys" && id === "ptt" && (key === "backspace" || key === "delete")) this.clearPtt();
       else if (key === "escape") {
         // Leaving Hotkeys with a changed key closes the panel, and the host reloads Pi to bind it.
         if (m.menu === "hotkeys" && this.hotkeysChanged()) {
@@ -1303,8 +1358,8 @@ export class Panel {
     const ch = [...text][0];
     if (m.kind === "menu" && m.menu === "hotkeys" && ch === "k") {
       const id = HOTKEYS[m.selected].id;
-      if (id === "speak" || id === "dictate") m.capture = id;
-      else this.setStatus("info", "Only Speak and Dictate have keys of their own to change");
+      if (id === "speak" || id === "dictate" || id === "ptt") m.capture = id;
+      else this.setStatus("info", "Only Speak, Dictate and Push-to-talk have keys of their own to change");
       return;
     }
     if (m.kind === "menu" && m.menu !== "hotkeys") return;
@@ -1313,29 +1368,55 @@ export class Panel {
     if (action) this.activate(action);
   }
 
+  /** Clear the Push-to-talk hotkey back to off. */
+  private clearPtt(): void {
+    const saved = this.speech.settings.hotkeys;
+    if (!saved.ptt) {
+      this.setStatus("info", "Push-to-talk is already off");
+      return;
+    }
+    const next = { ...saved };
+    delete next.ptt;
+    this.speech.settings.hotkeys = next;
+    this.speech.save();
+    this.setStatus("success", "✓ Push-to-talk is off");
+  }
+
   /**
-   * The new key of Speak or Dictate, saved in the settings. Pi binds an extension's shortcuts when it loads the
-   * extension: leaving Hotkeys closes the panel and the host reloads Pi, so the key works at once.
+   * The new key of Speak, Dictate, or Push-to-talk, saved in the settings. Changing Speak or Dictate rebinds
+   * Pi's shortcuts when leaving Hotkeys; Push-to-talk applies immediately.
    */
   private capture(m: MenuMode, name: HotkeyName, k: PanelKey): void {
     if ("key" in k && k.key === "escape") {
       m.capture = undefined;
       return;
     }
-    const pressed = "combo" in k ? k.combo : "key" in k ? k.id : k.text;
+    if (name === "ptt" && "key" in k && (k.key === "backspace" || k.key === "delete")) {
+      m.capture = undefined;
+      this.clearPtt();
+      return;
+    }
+    const pressed = "combo" in k ? k.combo : "key" in k ? (k.key === "language" ? "f2" : k.id) : k.text;
     if (!pressed) return;
     m.capture = undefined;
-    const key = hotkeyId(pressed);
+    const key = name === "ptt" ? pttHotkeyId(pressed) : hotkeyId(pressed);
     if (!key) {
       const shown = pressed.length === 1 ? pressed : keyLabel(pressed);
-      this.setStatus("error", `✗ ${shown} cannot be a hotkey: use Alt with a letter or a digit`);
+      this.setStatus(
+        "error",
+        name === "ptt"
+          ? `✗ ${shown} cannot be a hotkey: use Alt with a letter or digit, F1–F12, or Alt/Ctrl+Space`
+          : `✗ ${shown} cannot be a hotkey: use Alt with a letter or a digit`,
+      );
       return;
     }
     const saved = this.speech.settings.hotkeys;
-    const other: HotkeyName = name === "speak" ? "dictate" : "speak";
-    if (key === saved[other]) {
-      this.setStatus("error", `✗ ${keyLabel(key)} is already the key of ${HOTKEY_NAMES[other]}`);
-      return;
+    const others = (["speak", "dictate", "ptt"] as const).filter((n) => n !== name);
+    for (const other of others) {
+      if (saved[other] && key === saved[other]) {
+        this.setStatus("error", `✗ ${keyLabel(key)} is already the key of ${HOTKEY_NAMES[other]}`);
+        return;
+      }
     }
     if (key === saved[name]) {
       this.setStatus("info", `${HOTKEY_NAMES[name]} is already ${keyLabel(key)}`);
@@ -1345,7 +1426,7 @@ export class Panel {
     this.speech.save();
     this.setStatus(
       "success",
-      key === this.bound[name]
+      name !== "ptt" && key === this.bound[name]
         ? `✓ ${HOTKEY_NAMES[name]} is ${keyLabel(key)} again`
         : `✓ ${HOTKEY_NAMES[name]} is ${keyLabel(key)}`,
     );
@@ -1369,6 +1450,9 @@ export class Panel {
         return;
       case "dictate":
         this.dictate();
+        return;
+      case "ptt":
+        if (this.mode.kind === "menu") this.mode.capture = "ptt";
         return;
       case "transcribe":
         this.ask("transcribe");
@@ -1431,6 +1515,11 @@ export class Panel {
         truncate: cycle(TRUNCATE_SECONDS, this.speech.settings.readAloud.truncate, dir),
       });
       this.clearStatus();
+    } else if (id === "osdStyle") {
+      const next = cycle(OSD_STYLES, this.speech.settings.osdStyle, dir);
+      this.speech.settings.osdStyle = next;
+      this.speech.save();
+      this.setStatus("success", `✓ Spectrum OSD: ${OSD_WORDS[next]}`);
     } else if (id === "speechSource" || id === "transcriptionSource") {
       const direction = directionOf(id);
       const s = this.speech.settings;
@@ -1537,7 +1626,8 @@ export class Panel {
       return;
     }
     if (row === "summarizer") {
-      p.ids = [SAME_MODEL, ...this.engine.readAloud.models()];
+      const sameModel = this.engine.readAloud.mode !== "streaming" ? [SAME_MODEL] : [];
+      p.ids = [...sameModel, ...this.engine.readAloud.models()];
       return;
     }
     if (isModelRow(row) && this.sourceOf(row) === "local") {
@@ -1948,8 +2038,37 @@ export class Panel {
     );
   }
 
-  /** Dictate closes the panel and toggles dictation exactly like Alt+Z (which needs the editor). */
+  /**
+   * Dictate: inside the Speak composer, keeps the panel open and inserts the transcript into it;
+   * elsewhere, closes the panel and toggles dictation into Pi's editor.
+   */
   private dictate(): void {
+    const m = this.mode;
+    if (m.kind === "input" && m.purpose === "speak") {
+      const edit = m.edit;
+      const inComposer = () =>
+        !this.disposed && this.mode.kind === "input" && this.mode.purpose === "speak" && this.mode.edit === edit;
+      const ui = {
+        notify: (message: string, level: "info" | "warning" | "error") => {
+          if (inComposer()) {
+            this.setStatus(level === "info" ? "info" : "error", level === "info" ? message : `✗ ${message}`);
+            this.changed();
+          } else {
+            this.deps.ui.notify(message, level);
+          }
+        },
+        paste: (text: string) => {
+          if (inComposer()) {
+            edit.insert(text);
+            this.changed();
+          } else {
+            this.deps.ui.paste(text);
+          }
+        },
+      };
+      void this.engine.dictation.toggle(ui).catch((err) => ui.notify(errorMessage(err), "error"));
+      return;
+    }
     this.deps.close();
     void this.engine.dictation.toggle(this.deps.ui).catch((err) => this.deps.ui.notify(errorMessage(err), "error"));
   }

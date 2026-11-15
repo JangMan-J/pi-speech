@@ -22,10 +22,11 @@ const ROWS = [
   "Dictation output",
   "Hotkeys",
   "Bridge connection",
+  "Spectrum OSD",
 ];
 
 /** The rows of Hotkeys: every action. */
-const ACTIONS = ["Speak…", "Dictate", "Replay last", "History…", "Stop", "Transcribe file…"];
+const ACTIONS = ["Speak…", "Dictate", "Push-to-talk", "Replay last", "History…", "Stop", "Transcribe file…"];
 
 /** The rows of Bridge connection. */
 const BRIDGE_ROWS = ["Bridge", "Remote machine", "Pairing", "Play audio on", "Record audio on", "Run models on"];
@@ -149,6 +150,7 @@ describe("the panel view model: the main view", () => {
       "Dictation output": "Pi",
       Hotkeys: undefined,
       "Bridge connection": undefined,
+      "Spectrum OSD": "Braille",
     });
   });
 
@@ -240,7 +242,7 @@ describe("the panel view model: keys in the main view", () => {
   it("↑↓ move row by row and wrap", async () => {
     const p = open();
     await p.press("up");
-    expect(p.selectedLabel()).toBe("Bridge connection");
+    expect(p.selectedLabel()).toBe("Spectrum OSD");
     await p.press("down");
     expect(p.selectedLabel()).toBe("Read aloud options");
     for (const label of ROWS.slice(1)) {
@@ -263,30 +265,29 @@ describe("the panel view model: keys in the main view", () => {
       ["Truncate at", "Off", false],
     ]);
     expect(v.status).toEqual({ tone: "info", text: "Off: nothing is read aloud." });
-    expect(p.hint()).toBe("←→ Off · Summary · Thinking · All · Esc back");
+    expect(p.hint()).toBe("←→ Off · Summarized · Streaming · Esc back");
     await p.press("escape");
     expect(p.panel.view().menu).toBe("main");
     expect(p.selectedLabel()).toBe("Read aloud options");
   });
 
-  it("Read cycles Off, Summary, Thinking and All in place with Enter and ←→; one line says what it does", async () => {
+  it("Read cycles Off, Summarized and Streaming in place with Enter and ←→; one line says what it does", async () => {
     const p = open();
     await p.press("enter");
     const lines: Array<[string | undefined, string | undefined]> = [];
-    for (let i = 0; i < 4; i++) {
-      await p.press(i === 3 ? "enter" : "right");
+    for (let i = 0; i < 3; i++) {
+      await p.press(i === 2 ? "enter" : "right");
       lines.push([p.row("Read")?.value, p.panel.view().status?.text]);
     }
     expect(lines).toEqual([
-      ["Summary", "Reads the model's spoken summary of its reply."],
-      ["Thinking", "Reads a spoken summary of the reasoning, then of the reply."],
-      ["All", "Reads the whole reply."],
+      ["Summarized", "Reads a spoken summary of the reply when the run ends."],
+      ["Streaming", "Narrates a spoken summary of each reasoning step as it is produced."],
       ["Off", "Off: nothing is read aloud."],
     ]);
     await p.press("left");
-    expect(p.engine.readAloud.mode).toBe("all");
+    expect(p.engine.readAloud.mode).toBe("streaming");
     await p.press("escape");
-    expect(p.row("Read aloud options")?.value).toBe("All");
+    expect(p.row("Read aloud options")?.value).toBe("Streaming");
     expect(p.notes).toEqual([]);
   });
 
@@ -479,6 +480,7 @@ describe("the panel view model: keys in the main view", () => {
       "Dictation output": "Enter set · Esc close",
       Hotkeys: "Enter run actions, change keys · Esc close",
       "Bridge connection": "Enter where audio plays · Esc close",
+      "Spectrum OSD": "←→ Braille · Bars · Mirrored · 1-line · Off · Esc close",
     };
     for (const label of ROWS) {
       await p.goTo(label);
@@ -763,6 +765,7 @@ describe("the panel view model: Hotkeys", () => {
     expect(v.rows.map((r) => [r.label, r.value])).toEqual([
       ["Speak…", "Alt+S"],
       ["Dictate", "Alt+Z"],
+      ["Push-to-talk", "off"],
       ["Replay last", "r"],
       ["History…", "h"],
       ["Stop", "s"],
@@ -772,8 +775,11 @@ describe("the panel view model: Hotkeys", () => {
     await p.press("down");
     expect(p.hint()).toBe("Enter run · k change key · Esc back");
     await p.press("down");
+    expect(p.selectedLabel()).toBe("Push-to-talk");
+    expect(p.hint()).toBe("k set key · Esc back");
+    await p.press("down");
     expect(p.hint()).toBe("Enter run · Esc back");
-    await p.press("up", "up", "up");
+    await p.press("up", "up", "up", "up");
     expect(p.selectedLabel()).toBe("Transcribe file…");
     await p.press("escape");
     expect(p.panel.view().menu).toBe("main");
@@ -897,6 +903,33 @@ describe("the panel view model: Hotkeys", () => {
     expect(k.close).toHaveBeenCalledTimes(1);
   });
 
+  it("Dictate inside the Speak composer keeps it open and inserts the transcript there", async () => {
+    const p = open(
+      {},
+      {
+        before: (e) => {
+          vi.spyOn(e.routes, "input").mockReturnValue({
+            name: "local",
+            start: async () => ({
+              stop: async () => ({ audio: Buffer.from("RIFF"), format: "wav" }),
+              cancel: async () => {},
+            }),
+          });
+        },
+      },
+    );
+    p.panel.openSpeaker(true);
+    await p.type("hello ");
+    await p.press({ key: "dictate", id: "alt+z" });
+    expect(p.close).not.toHaveBeenCalled();
+    expect(p.engine.dictation.state).toBe("recording");
+    await p.press({ key: "dictate", id: "alt+z" });
+    await vi.waitFor(() => expect(p.engine.dictation.state).toBe("idle"));
+    expect(p.close).not.toHaveBeenCalled();
+    expect(p.pasted).toEqual([]);
+    expect(p.panel.view().input?.value).toBe("hello hello world");
+  });
+
   it("History… opens the history; Esc returns to Hotkeys", async () => {
     const p = open();
     await p.engine.speech.speak("first words");
@@ -994,9 +1027,46 @@ describe("the panel view model: Hotkeys", () => {
     expect(p.panel.view().menu).toBe("hotkeys");
     expect(p.row("Speak…")?.value).toBe("Alt+S");
     expect(p.engine.speech.settings.hotkeys).toEqual({ speak: "alt+s", dictate: "alt+z" });
-    await p.press("down", "down");
+    await p.press("down", "down", "down");
     await p.type("k");
-    expect(p.panel.view().status?.text).toBe("Only Speak and Dictate have keys of their own to change");
+    expect(p.panel.view().status?.text).toBe("Only Speak, Dictate and Push-to-talk have keys of their own to change");
+  });
+
+  it("Push-to-talk captures F8 or Alt+key, rejects collisions, and clears with Backspace", async () => {
+    const p = open();
+    await p.goTo("Push-to-talk");
+    await p.type("k");
+    await p.press({ combo: "f8" });
+    expect(p.row("Push-to-talk")?.value).toBe("F8");
+    expect(p.engine.speech.settings.hotkeys.ptt).toBe("f8");
+    expect(p.hint()).toBe("k set key · Backspace clear · Esc back");
+    // Leaving Hotkeys after changing PTT alone does not require a Pi reload.
+    await p.press("escape");
+    expect(p.panel.rebind).toBe(false);
+    expect(p.close).not.toHaveBeenCalled();
+
+    // Backspace clears Push-to-talk back to off.
+    await p.goTo("Push-to-talk");
+    await p.press("backspace");
+    expect(p.row("Push-to-talk")?.value).toBe("off");
+    expect(p.engine.speech.settings.hotkeys.ptt).toBeUndefined();
+  });
+
+  it("Spectrum OSD cycles through braille, bars, mirror, line, and off", async () => {
+    const p = open();
+    await p.goTo("Spectrum OSD");
+    expect(p.row("Spectrum OSD")?.value).toBe("Braille");
+    await p.press("right");
+    expect(p.row("Spectrum OSD")?.value).toBe("Bars");
+    expect(p.engine.speech.settings.osdStyle).toBe("bars");
+    await p.press("right");
+    expect(p.row("Spectrum OSD")?.value).toBe("Mirrored");
+    await p.press("right");
+    expect(p.row("Spectrum OSD")?.value).toBe("1-line");
+    await p.press("right");
+    expect(p.row("Spectrum OSD")?.value).toBe("Off");
+    await p.press("right");
+    expect(p.row("Spectrum OSD")?.value).toBe("Braille");
   });
 });
 

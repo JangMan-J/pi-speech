@@ -197,22 +197,7 @@ impl Device {
                 let stalls_after = (null == Null::Stuck).then_some(STUCK_AFTER);
                 Ok(Device::null(direction, stalls_after))
             }
-            Mode::System => {
-                let host = cpal::default_host();
-                let device = match direction {
-                    Direction::Output => host.default_output_device(),
-                    Direction::Input => host.default_input_device(),
-                }
-                .ok_or(direction.missing())?;
-                let sup = match direction {
-                    Direction::Output => device.default_output_config(),
-                    Direction::Input => device.default_input_config(),
-                }
-                .map_err(|e| {
-                    format!("the audio {} device cannot be used: {e}", direction.name())
-                })?;
-                Ok(cpal_device(device, sup, direction))
-            }
+            Mode::System => open_system_device(direction),
         }
     }
 
@@ -382,6 +367,72 @@ where
             self.fatal
         )
     }
+}
+
+fn default_config(
+    device: &cpal::Device,
+    direction: Direction,
+) -> Result<SupportedStreamConfig, String> {
+    match direction {
+        Direction::Output => device.default_output_config(),
+        Direction::Input => device.default_input_config(),
+    }
+    .map_err(|e| format!("the audio {} device cannot be used: {e}", direction.name()))
+}
+
+fn open_on_host(host: &cpal::Host, direction: Direction) -> Result<Option<Device>, String> {
+    let default = match direction {
+        Direction::Output => host.default_output_device(),
+        Direction::Input => host.default_input_device(),
+    };
+    let mut default_err = None;
+    if let Some(device) = default {
+        match default_config(&device, direction) {
+            Ok(sup) => return Ok(Some(cpal_device(device, sup, direction))),
+            Err(e) => default_err = Some(e),
+        }
+    }
+
+    // Some backends (notably PulseAudio on pipewire-pulse, or CoreAudio when the default
+    // device ID is unknown/stale) can fail on the default alias even when devices exist;
+    // fall back to the first usable device on the host.
+    let devices = match direction {
+        Direction::Output => host.output_devices(),
+        Direction::Input => host.input_devices(),
+    };
+    if let Ok(devices) = devices {
+        for device in devices {
+            if let Ok(sup) = default_config(&device, direction) {
+                return Ok(Some(cpal_device(device, sup, direction)));
+            }
+        }
+    }
+    match default_err {
+        Some(e) => Err(e),
+        None => Ok(None),
+    }
+}
+
+fn open_system_device(direction: Direction) -> Result<Device, String> {
+    let default_host = cpal::default_host();
+    let default_err = match open_on_host(&default_host, direction) {
+        Ok(Some(device)) => return Ok(device),
+        Ok(None) => None,
+        Err(e) => Some(e),
+    };
+
+    let default_id = default_host.id();
+    for id in cpal::available_hosts() {
+        if id == default_id {
+            continue;
+        }
+        if let Ok(host) = cpal::host_from_id(id) {
+            if let Ok(Some(device)) = open_on_host(&host, direction) {
+                return Ok(device);
+            }
+        }
+    }
+    Err(default_err.unwrap_or_else(|| direction.missing().into()))
 }
 
 fn cpal_device(device: cpal::Device, sup: SupportedStreamConfig, direction: Direction) -> Device {

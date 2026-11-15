@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { DEFAULT_SETTINGS, hotkeyId, keyLabel, SettingsFile } from "../../src/engine/settings";
+import { DEFAULT_SETTINGS, hotkeyId, keyLabel, pttHotkeyId, SettingsFile } from "../../src/engine/settings";
 
 let dir: string;
 beforeEach(() => {
@@ -29,7 +29,31 @@ describe("the settings file", () => {
       playOn: "remote",
       recordOn: "remote",
       modelsOn: "remote",
+      osdStyle: "braille",
     });
+  });
+
+  it("validates pttHotkeyId and persists hotkeys.ptt and osdStyle", () => {
+    expect(pttHotkeyId("F8")).toBe("f8");
+    expect(pttHotkeyId("alt+space")).toBe("alt+space");
+    expect(pttHotkeyId("ctrl+shift+f12")).toBe("ctrl+shift+f12");
+    expect(pttHotkeyId("alt+x")).toBe("alt+x");
+    expect(pttHotkeyId("space")).toBeUndefined();
+    expect(pttHotkeyId("ctrl+x")).toBeUndefined();
+
+    const f = new SettingsFile(dir);
+    const s = f.load();
+    s.hotkeys = { ...s.hotkeys, ptt: "f8" };
+    s.osdStyle = "mirror";
+    f.save(s);
+    const reloaded = f.load();
+    expect(reloaded.hotkeys.ptt).toBe("f8");
+    expect(reloaded.osdStyle).toBe("mirror");
+
+    // Colliding PTT with speak/dictate is ignored on load.
+    s.hotkeys.ptt = "alt+z";
+    f.save(s);
+    expect(f.load().hotkeys.ptt).toBeUndefined();
   });
 
   it("keeps a direction set to This machine, and a value that is not a machine keeps Remote machine", () => {

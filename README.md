@@ -99,21 +99,21 @@ the highlighted one does:
 
 ```
 Speech › Read aloud options ──────────────────────────────────────────────────────
-  ▸ Read               Summary
+  ▸ Read               Summarized
     Summarized by      Same model ›
     Length             Minimum ~15 s
     Truncate at        Off
 
-  Reads the model's spoken summary of its reply.
-  ←→ Off · Summary · Thinking · All · Esc back
+  Reads a spoken summary of the reply when the run ends.
+  ←→ Off · Summarized · Streaming · Esc back
 ```
 
-- **Read**: Off; Summary (a spoken summary of the reply); Thinking (a spoken summary of the reasoning, then of
-  the reply); All (the whole reply). It starts Off in every session.
+- **Read**: Off; Summarized (a spoken summary of the reply, read when the run ends); Streaming (a spoken summary
+  of each reasoning step, read as it is produced, through a separate Pi model). It starts Off in every session.
 - **Summarized by**: Same model (no extra request: the model ends its reply with the summary, which is read and
   then taken out of the reply, so you never see it and it is not kept in the session), or one of your Pi models
-  from a picker (one extra request to it per reply, with the reply, and the reasoning for Thinking when the model
-  shows it).
+  from a picker (one extra request to it per reply, with the reply). Streaming needs a separate model, so the
+  picker does not offer Same model there.
 - **Length**: Minimum ~15 s, Abridged ~30 s or Full ~60 s; the model is shown a placeholder of that many words
   (about 2.5 words a second), so the length is a best effort.
 - **Truncate at**: Off, 15, 30, 60 or 120 s; reading stops at the last sentence end before the limit, in every
@@ -276,7 +276,7 @@ starts a turn. Text is always spoken, never interpreted: `/speech stop the press
 | `--models`                                         | Speech and transcription models with their prices and features                                                                                          |
 | `--voices`                                         | Voices of the current speech model                                                                                                                      |
 | `--languages`                                      | The voice language of each voice, with its evidence                                                                                                     |
-| `--read-aloud on\|off\|summary\|thinking\|all`     | Speak the final reply of each run (`on` is All), or a spoken summary of it (see [Read aloud options](#speech))                                          |
+| `--read-aloud on\|off\|summary\|streaming`         | Speak a spoken summary of the reply when each run ends (`on` is Summarized), or narrate each reasoning step live (see [Read aloud options](#speech))    |
 | `--bridge auto\|on\|off\|status`                   | Where audio plays and records (see [The bridge](#the-bridge))                                                                                           |
 | `--language <voice> <tag\|auto>`                   | Set the language of a voice (`ja`, `pt-BR`, …), or remove it                                                                                            |
 | `--set <setting> <value>`                          | Change a setting: `tts-model`, `voice`, `stt-model`, `stt-language`, `tools`, `dictation-output`, `tts-source` and `stt-source` (`provider` or `local`) |
@@ -342,8 +342,8 @@ Orpheus, Kokoro, MAI Voice, Speechify) send it all at the end, and play then (me
 stopped or replaced before its audio has fully arrived cancels the request and is not saved; once it has
 arrived it is saved, whether or not it is still playing.
 
-Read-aloud (off at the start of every session) speaks the final reply of each run, or a spoken summary of it
-(see Read aloud options under [`/speech`](#speech)), as readable text: markdown
+Read-aloud (off at the start of every session) speaks a spoken summary of the reply when each run ends
+(Summarized), or a spoken summary of each reasoning step as it streams (Streaming), as readable text: markdown
 formatting is removed, fenced code blocks are skipped, links are read as their text and bare URLs as their
 host. Replies longer than 2000 characters are cut at a sentence boundary, and a notification says so. A reply
 (or `/speech <text>`) longer than 280 characters is spoken in pieces split at sentence ends, requested in order

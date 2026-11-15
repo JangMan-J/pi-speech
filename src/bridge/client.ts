@@ -54,10 +54,17 @@ export interface BridgeModels {
   ): Promise<AudioStream>;
 }
 
+export interface BridgeLevels {
+  recording?: number[];
+  playing?: number[];
+}
+
 export interface BridgeAudio {
   output: AudioOutput;
   input: AudioInput;
   health(): Promise<BridgeHealth>;
+  /** Live 12-band spectrum levels (`0..100`) when supported; undefined when older/unreachable. */
+  levels?(): Promise<BridgeLevels | undefined>;
   /** Local models run on the Remote machine; absent in stand-ins that have none. */
   models?: BridgeModels;
   /** The base URL requests go to now (a spare port once found); undefined before the first. */
@@ -637,7 +644,27 @@ export function createBridgeAudioFrom(getConfig: () => BridgeConfig, opts: { cli
     },
   };
 
-  return { output, input, health, models, at: () => last };
+  const levels = async (): Promise<BridgeLevels | undefined> => {
+    try {
+      const { base: at, token } = await target();
+      const res = await fetch(`${at}/v1/levels`, {
+        headers: { Authorization: `Bearer ${token}`, [CLIENT_HEADER]: clientId },
+        redirect: "error",
+        signal: AbortSignal.timeout(500),
+      });
+      if (!res.ok) return undefined;
+      const body = (await res.json()) as { recording?: unknown; playing?: unknown };
+      const clean = (v: unknown) =>
+        Array.isArray(v)
+          ? v.map((n) => (typeof n === "number" && Number.isFinite(n) ? Math.max(0, Math.min(100, n)) : 0))
+          : undefined;
+      return { recording: clean(body.recording), playing: clean(body.playing) };
+    } catch {
+      return undefined;
+    }
+  };
+
+  return { output, input, health, levels, models, at: () => last };
 }
 
 export function createBridgeAudio(config: BridgeConfig, opts: { clientId?: string } = {}): BridgeAudio {

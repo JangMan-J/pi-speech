@@ -14,6 +14,7 @@ use super::decode::{Decode, Pcm, WavOrMp3};
 use super::device::{Format, Output};
 use super::fail;
 use super::ring::{self, Consumer, Producer};
+use super::spectrum::{Meter, SampleTap};
 use crate::proc::{lock, start_thread};
 use crate::signals;
 use crate::stream::{MAX_RATE, MIN_RATE};
@@ -33,8 +34,8 @@ pub const TAIL_MARGIN: Duration = Duration::from_millis(80);
 /// drain, before the playback fails.
 pub const STALL: Duration = Duration::from_secs(2);
 pub const STALLED: &str = "the audio device stopped responding";
-/// How often the waiting thread looks for callbacks.
-const WATCH: Duration = Duration::from_millis(100);
+/// How often the waiting thread looks for callbacks and updates the spectrum meter.
+const WATCH: Duration = Duration::from_millis(40);
 
 /// What to play.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,6 +134,7 @@ struct Shared {
     /// The largest latency the device reported, and its longest period, in ns.
     latency: AtomicU64,
     period: AtomicU64,
+    tap: SampleTap,
 }
 
 impl Shared {
@@ -157,16 +159,26 @@ impl Shared {
 
     /// Wait until the device has taken all the input, or the playback ended early. A
     /// device that has not called back for `stall` ends it.
-    fn wait_drained(&self, stall: Duration) -> Option<End> {
+    fn wait_drained(&self, stall: Duration, rate: u32) -> Option<End> {
         let mut end = self.lock_end();
         let mut seen = self.callbacks.load(Ordering::Relaxed);
         let mut since = Instant::now();
+        let mut meter = Meter::new(rate);
+        let mut seq = 0u64;
+        let mut window = [0.0f32; 256];
         while end.is_none() && !self.drained.load(Ordering::Acquire) {
             end = self
                 .done
                 .wait_timeout(end, WATCH)
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
+            if meter.enabled() {
+                if self.tap.snapshot(&mut seq, &mut window) {
+                    meter.update(&window);
+                } else {
+                    meter.decay();
+                }
+            }
             let now = self.callbacks.load(Ordering::Relaxed);
             if now != seen {
                 (seen, since) = (now, Instant::now());
@@ -259,6 +271,9 @@ impl Tap {
         } else {
             self.ring.pop(out)
         };
+        if n > 0 {
+            s.tap.try_push_interleaved(&out[..n], self.format.channels);
+        }
         out[n..].fill(0.0);
         // See `Feeder::wait_for_room`.
         fence(Ordering::SeqCst);
@@ -333,7 +348,9 @@ impl Player {
             Err(e) => feeder.shared.end(End::Failed(e)),
         })
         .map_err(|e| format!("cannot start the feeder: {e}"))?;
-        let end = shared.wait_drained(STALL).or_else(|| shared.wait_heard());
+        let end = shared
+            .wait_drained(STALL, format.rate)
+            .or_else(|| shared.wait_heard());
         drop(device);
         outcome(end)
     }
@@ -487,7 +504,7 @@ mod tests {
         tap.fill(&mut out, Duration::ZERO);
         assert_eq!(out[..5], [0.25; 5]);
         assert!(s.drained.load(Ordering::Relaxed));
-        assert!(s.wait_drained(STALL).is_none());
+        assert!(s.wait_drained(STALL, FORMAT.rate).is_none());
     }
 
     #[test]
@@ -536,7 +553,10 @@ mod tests {
         let mut out = [9.0; 10];
         tap.fill(&mut out, Duration::ZERO);
         assert_eq!(out, [0.0; 10]);
-        assert!(matches!(s.wait_drained(STALL), Some(End::Stopped(2))));
+        assert!(matches!(
+            s.wait_drained(STALL, FORMAT.rate),
+            Some(End::Stopped(2))
+        ));
     }
 
     #[test]
@@ -545,7 +565,7 @@ mod tests {
         let feeder = std::thread::spawn(move || feeder.push(&[0.1; 2000]));
         tap.fill(&mut [0.0; 10], Duration::ZERO);
         let t = Instant::now();
-        let end = s.wait_drained(Duration::from_millis(300));
+        let end = s.wait_drained(Duration::from_millis(300), FORMAT.rate);
         let waited = t.elapsed();
         assert!(
             matches!(&end, Some(End::Failed(w)) if w == STALLED),

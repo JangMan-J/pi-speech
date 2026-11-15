@@ -1,26 +1,27 @@
 /**
- * Assistant read-aloud: what is spoken once a run ends. It starts Off in every session; its options (who
- * summarizes, how long a summary is, where reading stops) are saved in the settings.
+ * Assistant read-aloud: what is spoken. It starts Off in every session; its options (who summarizes, how long
+ * a summary is, where reading stops) are saved in the settings.
  *
- * - All reads the whole final reply as readable text.
- * - Summary reads a spoken summary of the reply; Thinking a spoken summary of the reasoning, then of the reply.
- *   With the same model, a guideline in the system prompt asks the model to end each reply with the summary
- *   between markers; the marked block is taken out of the finished message (so it is neither shown nor kept in
- *   the history) and read. With another Pi model, one extra request per reply asks that model for the summary.
+ * - Summarized reads a spoken summary of the reply once the run ends. With the same model, a guideline in the
+ *   system prompt asks the model to end each reply with the summary between markers; the marked block is taken
+ *   out of the finished message (so it is neither shown nor kept in the history) and read. With another Pi
+ *   model, one extra request per reply asks that model for the summary.
+ * - Streaming narrates a spoken summary of each reasoning block as it finishes streaming, through a separate Pi
+ *   model (the main model is busy, so Same model is not offered).
  * - Truncate at stops reading at the last sentence end before the limit, in every mode.
  */
 
 import { errorMessage } from "./env";
 import { REPLACED } from "./player";
-import { cutForSpeech, finalAssistantText, speakable } from "./readable";
+import { finalAssistantText, speakable } from "./readable";
 import { ReadingFailed, readingFailedMessage } from "./reading";
 import type { Speech } from "./speech";
 
 export type Notify = (message: string, level: "info" | "warning" | "error") => void;
 
-/** What is read once a run ends. */
-export type ReadMode = "off" | "summary" | "thinking" | "all";
-export const READ_MODES: ReadMode[] = ["off", "summary", "thinking", "all"];
+/** What is read: a spoken summary of the reply at run end, or each reasoning step live as it is produced. */
+export type ReadMode = "off" | "summary" | "streaming";
+export const READ_MODES: ReadMode[] = ["off", "summary", "streaming"];
 
 /** The target length of a summary. */
 export type SummaryLength = "minimum" | "abridged" | "full";
@@ -65,11 +66,9 @@ export function loremWords(n: number): string {
   return Array.from({ length: n }, (_, i) => LOREM[i % LOREM.length]).join(" ");
 }
 
-/** What a summary is asked to say, by mode. */
-function what(mode: "summary" | "thinking", whose: "your" | "the"): string {
-  return mode === "thinking"
-    ? `a spoken summary of ${whose} reasoning, then of the reply`
-    : `a spoken summary of ${whose === "your" ? "that" : "the"} reply`;
+/** What a summary is asked to say. */
+function what(whose: "your" | "the"): string {
+  return `a spoken summary of ${whose === "your" ? "that" : "the"} reply`;
 }
 
 function lengthClause(length: SummaryLength): string {
@@ -81,28 +80,29 @@ function lengthClause(length: SummaryLength): string {
 const SPOKEN_STYLE = "written to be heard: plain sentences in the reply's language, no markdown, code, lists or links.";
 
 /** The system-prompt guideline that asks the model for a marked summary at the end of each reply. */
-export function guidelineFor(mode: "summary" | "thinking", length: SummaryLength): string {
+export function guidelineFor(length: SummaryLength): string {
   return (
-    `${GUIDELINE_PREFIX} end every final reply to the user with ${what(mode, "your")}, between ${SUMMARY_OPEN} ` +
+    `${GUIDELINE_PREFIX} end every final reply to the user with ${what("your")}, between ${SUMMARY_OPEN} ` +
     `and ${SUMMARY_CLOSE}, ${SPOKEN_STYLE} It is read aloud and hidden from the transcript, so never refer to it. ` +
     lengthClause(length)
   );
 }
 
-/** The one extra request to another model: the reply (and the reasoning, for Thinking), asking for the summary. */
-export function summaryPrompt(
-  mode: "summary" | "thinking",
-  length: SummaryLength,
-  reply: string,
-  reasoning?: string,
-): string {
-  const parts = [
-    `Write ${what(mode, "the")} below, to be read aloud by text-to-speech, ${SPOKEN_STYLE} ${lengthClause(length)}`,
+/** The one extra request to another model: the reply, asking for the summary. */
+export function summaryPrompt(length: SummaryLength, reply: string): string {
+  return [
+    `Write ${what("the")} below, to be read aloud by text-to-speech, ${SPOKEN_STYLE} ${lengthClause(length)}`,
     "Answer with the summary only.",
-  ];
-  if (mode === "thinking" && reasoning) parts.push(`<reasoning>\n${reasoning}\n</reasoning>`);
-  parts.push(`<reply>\n${reply}\n</reply>`);
-  return parts.join("\n\n");
+    `<reply>\n${reply}\n</reply>`,
+  ].join("\n\n");
+}
+
+/** The one extra request for Streaming: a single reasoning block, asking for a spoken summary. */
+export function streamingPrompt(length: SummaryLength, block: string): string {
+  return (
+    `Write a spoken summary of this reasoning step below, to be read aloud by text-to-speech, ${SPOKEN_STYLE} ` +
+    `${lengthClause(length)}\nAnswer with the summary only.\n\n<reasoning>\n${block}\n</reasoning>`
+  );
 }
 
 /**
@@ -151,20 +151,6 @@ export function truncateToSeconds(text: string, seconds: number): { text: string
 
 type Part = { type?: string; text?: unknown; thinking?: unknown };
 
-/** The reasoning the run exposed (thinking parts of its assistant messages), the latest kept when long. */
-export function runReasoning(messages: readonly unknown[], max = 8000): string {
-  const out: string[] = [];
-  for (const raw of messages) {
-    const m = raw as { role?: string; content?: unknown };
-    if (m?.role !== "assistant" || !Array.isArray(m.content)) continue;
-    for (const p of m.content as Part[]) {
-      if (p?.type === "thinking" && typeof p.thinking === "string" && p.thinking.trim()) out.push(p.thinking.trim());
-    }
-  }
-  const all = out.join("\n\n");
-  return all.length > max ? all.slice(all.length - max) : all;
-}
-
 export class ReadAloud {
   /** Starts off in every session. */
   mode: ReadMode = "off";
@@ -174,6 +160,10 @@ export class ReadAloud {
   models: () => string[] = () => [];
   /** The summary taken from the marked block of this run's reply. */
   private taken?: string;
+  /** Streaming: reasoning blocks awaiting their spoken summary, the newest merged into the tail when full. */
+  private queue: string[] = [];
+  /** Streaming: one summary is being requested or spoken now. */
+  private narrating = false;
 
   constructor(
     private readonly speech: Pick<Speech, "say">,
@@ -181,24 +171,24 @@ export class ReadAloud {
     private readonly options: () => ReadAloudOptions = () => DEFAULT_READ_ALOUD,
   ) {}
 
-  /** On: reading the whole reply unless a summary mode is chosen. */
+  /** On: reading a spoken summary of the reply, unless Streaming is chosen. */
   get enabled(): boolean {
     return this.mode !== "off";
   }
 
   set enabled(on: boolean) {
-    this.mode = on ? (this.mode === "off" ? "all" : this.mode) : "off";
+    this.mode = on ? (this.mode === "off" ? "summary" : this.mode) : "off";
   }
 
   /** Whether the model itself is asked for the summary, in the same reply. */
   private sameModel(): boolean {
-    return (this.mode === "summary" || this.mode === "thinking") && !this.options().summarizer;
+    return this.mode === "summary" && !this.options().summarizer;
   }
 
   /** The system-prompt guideline for the run that starts; undefined when none is needed. */
   guideline(): string | undefined {
     if (!this.sameModel()) return undefined;
-    return guidelineFor(this.mode as "summary" | "thinking", this.options().length);
+    return guidelineFor(this.options().length);
   }
 
   /**
@@ -207,6 +197,7 @@ export class ReadAloud {
    */
   onRunStart(guidelines: string[]): string[] {
     this.taken = undefined;
+    this.queue = [];
     for (let i = guidelines.length - 1; i >= 0; i--) {
       if (guidelines[i].startsWith(GUIDELINE_PREFIX)) guidelines.splice(i, 1);
     }
@@ -244,23 +235,12 @@ export class ReadAloud {
     const mode = this.mode;
     const taken = this.taken;
     this.taken = undefined;
-    if (mode === "off") return;
+    if (mode !== "summary") return;
     const opts = this.options();
-    let text: string;
-    if (mode === "all") {
-      text = speakable(splitSummary(finalAssistantText(messages)).reply);
-      if (!text) return;
-      const { text: spoken, cut } = cutForSpeech(text);
-      if (cut && !opts.truncate) {
-        this.notify(`Read-aloud: the reply is long, so only its first ${spoken.length} characters are spoken`, "info");
-      }
-      text = spoken;
-    } else {
-      const summary = await this.summary(mode, messages, taken, opts, signal);
-      if (summary === undefined) return;
-      text = speakable(summary);
-      if (!text) return;
-    }
+    const summary = await this.summary(messages, taken, opts, signal);
+    if (summary === undefined) return;
+    let text = speakable(summary);
+    if (!text) return;
     if (opts.truncate) text = truncateToSeconds(text, opts.truncate).text;
     try {
       const r = await this.speech.say(text);
@@ -273,9 +253,64 @@ export class ReadAloud {
     }
   }
 
+  /** Streaming: a reasoning block finished streaming; queue its spoken summary when the mode says so. */
+  onThinkingBlock(block: string, signal?: AbortSignal): void {
+    if (this.mode !== "streaming") return;
+    const text = block.trim();
+    if (!text) return;
+    // Stay near live: instead of growing without bound, merge into the last pending block.
+    if (this.queue.length >= 2) this.queue[this.queue.length - 1] += `\n\n${text}`;
+    else this.queue.push(text);
+    void this.drain(signal);
+  }
+
+  /** Speak one spoken summary per queued block, in order, until the queue is empty. */
+  private async drain(signal?: AbortSignal): Promise<void> {
+    if (this.narrating) return;
+    this.narrating = true;
+    try {
+      while (this.queue.length) {
+        const block = this.queue.shift() as string;
+        const opts = this.options();
+        if (!opts.summarizer || !this.summarize) {
+          this.queue.length = 0;
+          this.notify(
+            "Streaming needs a separate Summarized by model (Same model cannot summarize mid-run)",
+            "warning",
+          );
+          return;
+        }
+        let spoken: string;
+        try {
+          const answer = await this.summarize(opts.summarizer, streamingPrompt(opts.length, block), signal);
+          const marked = splitSummary(answer).summary;
+          spoken = speakable((marked ?? answer).trim());
+        } catch (err) {
+          if (signal?.aborted) return;
+          this.notify(`Streaming: the summary by ${opts.summarizer} failed: ${errorMessage(err)}`, "error");
+          continue;
+        }
+        if (!spoken) continue;
+        if (opts.truncate) spoken = truncateToSeconds(spoken, opts.truncate).text;
+        try {
+          const r = await this.speech.say(spoken, { signal });
+          if (!r.stopped && !r.player && r.notPlayed !== REPLACED) {
+            this.notify(`Streaming could not play: ${r.notPlayed ?? "unknown reason"}`, "error");
+          }
+        } catch (err) {
+          if (signal?.aborted) return;
+          if (err instanceof ReadingFailed) {
+            this.notify(readingFailedMessage("Streaming", "reasoning", err.reason), "error");
+          } else this.notify(`Streaming failed: ${errorMessage(err)}`, "error");
+        }
+      }
+    } finally {
+      this.narrating = false;
+    }
+  }
+
   /** The summary to read: the marked block of the reply, or another model's answer; undefined when none. */
   private async summary(
-    mode: "summary" | "thinking",
     messages: readonly unknown[],
     taken: string | undefined,
     opts: ReadAloudOptions,
@@ -295,9 +330,8 @@ export class ReadAloud {
       this.notify(`Read-aloud: cannot ask ${opts.summarizer} for a summary here`, "error");
       return undefined;
     }
-    const reasoning = mode === "thinking" ? runReasoning(messages) : undefined;
     try {
-      const answer = await this.summarize(opts.summarizer, summaryPrompt(mode, opts.length, reply, reasoning), signal);
+      const answer = await this.summarize(opts.summarizer, summaryPrompt(opts.length, reply), signal);
       // A model that marked its answer anyway: only the marked part.
       const marked = splitSummary(answer).summary;
       return (marked ?? answer).trim() || undefined;

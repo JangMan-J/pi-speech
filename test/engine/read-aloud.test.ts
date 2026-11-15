@@ -7,6 +7,7 @@ import {
   ReadAloud,
   type ReadAloudOptions,
   splitSummary,
+  streamingPrompt,
   summaryPrompt,
   truncateToSeconds,
   wordsFor,
@@ -42,52 +43,28 @@ describe("read-aloud", () => {
     expect(h.spoken).toEqual([]);
   });
 
-  it("speaks the final reply as readable text", async () => {
-    const h = harness();
-    h.r.enabled = true;
-    await h.r.onRunEnd(reply("# Title\n\nSee [docs](https://x.y/z).\n\n```\ncode\n```"));
-    expect(h.spoken).toEqual(["Title.\n\nSee docs."]);
-    expect(h.notes).toEqual([]);
-  });
-
-  it("skips a reply without words", async () => {
-    const h = harness();
-    h.r.enabled = true;
-    await h.r.onRunEnd(reply("```\nonly code\n```"));
-    await h.r.onRunEnd([{ role: "assistant", content: [] }]);
-    expect(h.spoken).toEqual([]);
-  });
-
-  it("cuts a long reply and says so", async () => {
-    const h = harness();
-    h.r.enabled = true;
-    await h.r.onRunEnd(reply("A sentence that goes on. ".repeat(200)));
-    expect(h.spoken[0].length).toBeLessThanOrEqual(2000);
-    expect(h.notes[0]).toMatchObject({ level: "info", message: expect.stringMatching(/first \d+ characters/) });
-  });
-
   it("reports a synthesis failure and a playback that did not start, but not a replaced one", async () => {
     let h = harness(new Error("Speech synthesis failed: HTTP 500"));
-    h.r.enabled = true;
-    await h.r.onRunEnd(reply("Hi."));
+    h.r.mode = "summary";
+    await h.r.onRunEnd(reply(`Answer.\n\n${SUMMARY}`));
     expect(h.notes).toEqual([{ level: "error", message: "Read-aloud failed: Speech synthesis failed: HTTP 500" }]);
     h = harness({ notPlayed: "no audio player found" });
-    h.r.enabled = true;
-    await h.r.onRunEnd(reply("Hi."));
+    h.r.mode = "summary";
+    await h.r.onRunEnd(reply(`Answer.\n\n${SUMMARY}`));
     expect(h.notes[0]).toMatchObject({ level: "error", message: expect.stringMatching(/no audio player/) });
     h = harness({ notPlayed: REPLACED });
-    h.r.enabled = true;
-    await h.r.onRunEnd(reply("Hi."));
+    h.r.mode = "summary";
+    await h.r.onRunEnd(reply(`Answer.\n\n${SUMMARY}`));
     expect(h.notes).toEqual([]);
   });
 
-  it("on keeps a summary mode; off turns every mode off", () => {
+  it("on keeps the chosen mode; off turns every mode off", () => {
     const h = harness();
     h.r.enabled = true;
-    expect(h.r.mode).toBe("all");
-    h.r.mode = "summary";
-    h.r.enabled = true;
     expect(h.r.mode).toBe("summary");
+    h.r.mode = "streaming";
+    h.r.enabled = true;
+    expect(h.r.mode).toBe("streaming");
     h.r.enabled = false;
     expect(h.r.mode).toBe("off");
   });
@@ -101,25 +78,24 @@ describe("read-aloud summaries", () => {
       ["abridged", 75],
       ["full", 150],
     ] as const) {
-      const g = guidelineFor("summary", length);
+      const g = guidelineFor(length);
       expect(g).toContain(loremWords(n));
       expect(g).not.toContain(loremWords(n + 1));
       expect(g).toContain(`${n}-word placeholder`);
     }
     expect(loremWords(75).split(" ")).toHaveLength(75);
-    expect(guidelineFor("thinking", "abridged")).toMatch(/summary of your reasoning, then of the reply/);
+    expect(guidelineFor("abridged")).toMatch(/a spoken summary of that reply/);
   });
 
-  it("asks for the guideline only for Summary and Thinking with the same model", () => {
+  it("asks for the guideline only for Summarized with the same model", () => {
     const h = harness();
     expect(h.r.guideline()).toBeUndefined();
-    h.r.mode = "all";
+    h.r.mode = "streaming";
     expect(h.r.guideline()).toBeUndefined();
     h.r.mode = "summary";
-    expect(h.r.guideline()).toBe(guidelineFor("summary", "minimum"));
+    expect(h.r.guideline()).toBe(guidelineFor("minimum"));
     h.opts.length = "full";
-    h.r.mode = "thinking";
-    expect(h.r.guideline()).toBe(guidelineFor("thinking", "full"));
+    expect(h.r.guideline()).toBe(guidelineFor("full"));
     h.opts.summarizer = "anthropic/claude-haiku";
     expect(h.r.guideline()).toBeUndefined();
   });
@@ -130,7 +106,7 @@ describe("read-aloud summaries", () => {
     const list = ["other rule"];
     h.r.onRunStart(list);
     h.r.onRunStart(list);
-    expect(list).toEqual(["other rule", guidelineFor("summary", "minimum")]);
+    expect(list).toEqual(["other rule", guidelineFor("minimum")]);
     h.r.mode = "off";
     expect(h.r.onRunStart(list)).toEqual(["other rule"]);
   });
@@ -141,7 +117,7 @@ describe("read-aloud summaries", () => {
     expect(splitSummary("No block.")).toEqual({ reply: "No block." });
   });
 
-  it("message_end: the summary is removed from the message and read when the run ends (Summary)", async () => {
+  it("message_end: the summary is removed from the message and read when the run ends", async () => {
     const h = harness();
     h.r.mode = "summary";
     const message = {
@@ -179,14 +155,7 @@ describe("read-aloud summaries", () => {
     expect(out).toEqual({ role: "assistant", content: [] });
   });
 
-  it("All reads the reply without a marked block that slipped in", async () => {
-    const h = harness();
-    h.r.mode = "all";
-    await h.r.onRunEnd(reply(`Whole reply.\n\n${SUMMARY}`));
-    expect(h.spoken).toEqual(["Whole reply."]);
-  });
-
-  it("another Pi model: one request with the reply (and for Thinking the reasoning); its answer is read", async () => {
+  it("another Pi model: one request with the reply (without the reasoning); its answer is read", async () => {
     const h = harness(undefined, { summarizer: "anthropic/claude-haiku", length: "minimum" });
     const asked: Array<[string, string]> = [];
     h.r.summarize = async (model, prompt) => {
@@ -206,14 +175,11 @@ describe("read-aloud summaries", () => {
     await h.r.onRunEnd(run);
     expect(asked).toHaveLength(1);
     expect(asked[0][0]).toBe("anthropic/claude-haiku");
-    expect(asked[0][1]).toBe(summaryPrompt("summary", "minimum", "Done: two things."));
+    expect(asked[0][1]).toBe(summaryPrompt("minimum", "Done: two things."));
     expect(asked[0][1]).not.toContain("check the logs");
-    h.r.mode = "thinking";
-    await h.r.onRunEnd(run);
-    expect(asked[1][1]).toContain("<reasoning>\nI should check the logs.\n</reasoning>");
-    expect(asked[1][1]).toContain("<reply>\nDone: two things.\n</reply>");
-    expect(asked[1][1]).toContain(loremWords(38));
-    expect(h.spoken).toEqual(["Two things changed.", "Two things changed."]);
+    expect(asked[0][1]).toContain("<reply>\nDone: two things.\n</reply>");
+    expect(asked[0][1]).toContain(loremWords(38));
+    expect(h.spoken).toEqual(["Two things changed."]);
   });
 
   it("another Pi model that fails is reported, and nothing is read", async () => {
@@ -227,6 +193,90 @@ describe("read-aloud summaries", () => {
     expect(h.notes).toEqual([
       { level: "error", message: "Read-aloud: the summary by anthropic/claude-haiku failed: rate limited" },
     ]);
+  });
+});
+
+describe("streaming", () => {
+  const flush = () => new Promise<void>((r) => setTimeout(r, 0));
+
+  it("speaks a summary of each reasoning block as it arrives, in order", async () => {
+    const h = harness(undefined, { summarizer: "anthropic/claude-haiku", length: "abridged" });
+    const asked: Array<[string, string]> = [];
+    h.r.summarize = async (model, prompt) => {
+      asked.push([model, prompt]);
+      return `step ${asked.length}`;
+    };
+    h.r.mode = "streaming";
+    h.r.onThinkingBlock("I should read the logs first.");
+    h.r.onThinkingBlock("Then I will patch the config.");
+    await flush();
+    expect(asked).toEqual([
+      ["anthropic/claude-haiku", streamingPrompt("abridged", "I should read the logs first.")],
+      ["anthropic/claude-haiku", streamingPrompt("abridged", "Then I will patch the config.")],
+    ]);
+    expect(h.spoken).toEqual(["step 1", "step 2"]);
+  });
+
+  it("merges a new block into the last pending one instead of queueing without bound", async () => {
+    const h = harness(undefined, { summarizer: "anthropic/claude-haiku" });
+    const seen: string[] = [];
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    h.r.summarize = async (_model, prompt) => {
+      if (seen.length === 0) await gate;
+      seen.push(prompt);
+      return "ok";
+    };
+    h.r.mode = "streaming";
+    h.r.onThinkingBlock("one");
+    h.r.onThinkingBlock("two");
+    h.r.onThinkingBlock("three");
+    h.r.onThinkingBlock("four");
+    await flush();
+    release();
+    await flush();
+    expect(seen).toHaveLength(3);
+    expect(seen[0]).toContain("<reasoning>\none\n</reasoning>");
+    expect(seen[1]).toContain("<reasoning>\ntwo\n</reasoning>");
+    expect(seen[2]).toContain("<reasoning>\nthree\n\nfour\n</reasoning>");
+  });
+
+  it("warns once when no separate Summarized by model is chosen", async () => {
+    const h = harness();
+    h.r.mode = "streaming";
+    h.r.onThinkingBlock("some reasoning");
+    await flush();
+    expect(h.spoken).toEqual([]);
+    expect(h.notes).toEqual([
+      {
+        level: "warning",
+        message: "Streaming needs a separate Summarized by model (Same model cannot summarize mid-run)",
+      },
+    ]);
+  });
+
+  it("does nothing outside streaming mode, and does not read a final reply at run end", async () => {
+    const h = harness(undefined, { summarizer: "anthropic/claude-haiku" });
+    h.r.summarize = async () => "summary";
+    h.r.mode = "summary";
+    h.r.onThinkingBlock("reasoning");
+    await flush();
+    expect(h.spoken).toEqual([]);
+    h.r.mode = "streaming";
+    h.r.onThinkingBlock("reasoning");
+    await flush();
+    await h.r.onRunEnd(reply("Final answer."));
+    expect(h.spoken).toEqual(["summary"]);
+  });
+
+  it("truncates each spoken summary to the Truncate at limit", async () => {
+    const long = "A sentence with some words. ".repeat(20);
+    const h = harness(undefined, { summarizer: "anthropic/claude-haiku", truncate: 15 });
+    h.r.summarize = async () => long;
+    h.r.mode = "streaming";
+    h.r.onThinkingBlock("reasoning");
+    await flush();
+    expect(h.spoken).toEqual([truncateToSeconds(long, 15).text]);
   });
 });
 
@@ -247,13 +297,10 @@ describe("Truncate at", () => {
     expect(truncateToSeconds(long, 15).text.split(" ")).toHaveLength(37);
   });
 
-  it("applies in every Read mode", async () => {
-    for (const mode of ["all", "summary", "thinking"] as const) {
-      const h = harness(undefined, { truncate: 15 });
-      h.r.mode = mode;
-      const body = mode === "all" ? text : `Answer.\n<spoken_summary>${text}</spoken_summary>`;
-      await h.r.onRunEnd(reply(body));
-      expect(h.spoken[0], mode).toBe(truncateToSeconds(text, 15).text);
-    }
+  it("applies to the Summarized reply", async () => {
+    const h = harness(undefined, { truncate: 15 });
+    h.r.mode = "summary";
+    await h.r.onRunEnd(reply(`Answer.\n<spoken_summary>${text}</spoken_summary>`));
+    expect(h.spoken[0]).toBe(truncateToSeconds(text, 15).text);
   });
 });

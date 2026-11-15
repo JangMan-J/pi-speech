@@ -669,3 +669,33 @@ fn a_signal_during_a_built_in_playback_and_recording_stops_both_and_removes_the_
     drop(up);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn levels_endpoint_reports_active_recording_and_playback_bands() {
+    let dir = scratch("cli-levels");
+    let mut r = self_contained(&dir, &[]);
+
+    let idle = call(r.addr, "GET", "/v1/levels");
+    assert_eq!(idle.status, 200);
+    assert_eq!(idle.text(), "{}");
+
+    let rep = call(r.addr, "POST", "/v1/record/start");
+    assert_eq!(rep.status, 201, "{}", rep.text());
+    let id = json_field(&rep.text(), "id").unwrap();
+    let seen = wait_until(Duration::from_secs(3), || {
+        let lv = call(r.addr, "GET", "/v1/levels");
+        lv.status == 200 && lv.text().contains("\"recording\":[")
+    });
+    assert!(seen, "expected recording bands from GET /v1/levels");
+
+    let stop = call(r.addr, "POST", &format!("/v1/record/{id}/stop"));
+    assert_eq!(stop.status, 200);
+    let after = call(r.addr, "GET", "/v1/levels");
+    assert_eq!(after.status, 200);
+    assert_eq!(after.text(), "{}");
+
+    terminate(&r.child);
+    assert_eq!(exit_code_within(&mut r.child, 8), Some(0));
+    assert!(temp_entries(&dir).is_empty());
+    std::fs::remove_dir_all(dir).ok();
+}

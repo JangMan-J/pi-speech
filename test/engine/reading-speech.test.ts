@@ -77,7 +77,9 @@ describe("playback-only speech of a long text", () => {
     expect(ui.notes[0]).toMatchObject({ level: "info", message: expect.stringMatching(/^Speaking with/) });
     const before = requests.length;
     engine.readAloud.enabled = true;
-    await engine.readAloud.onRunEnd([{ role: "assistant", content: [{ type: "text", text: LONG }] }]);
+    await engine.readAloud.onRunEnd([
+      { role: "assistant", content: [{ type: "text", text: `<spoken_summary>${LONG}</spoken_summary>` }] },
+    ]);
     expect(requests.length - before).toBeGreaterThan(1);
   });
 
@@ -145,7 +147,9 @@ describe("playback-only speech of a long text", () => {
     );
     const { engine, work, notes } = makeEngine();
     engine.readAloud.enabled = true;
-    await engine.readAloud.onRunEnd([{ role: "assistant", content: [{ type: "text", text: LONG }] }]);
+    await engine.readAloud.onRunEnd([
+      { role: "assistant", content: [{ type: "text", text: `<spoken_summary>${LONG}</spoken_summary>` }] },
+    ]);
     const errors = notes.filter((x) => x.level === "error");
     expect(errors.length).toBe(1);
     expect(errors[0].message).toMatch(/^Read-aloud stopped: HTTP 429.*rate limited.*The reply was not saved/);
@@ -201,7 +205,9 @@ describe("playback-only speech of a long text", () => {
     );
     const { engine, notes } = makeEngine();
     engine.readAloud.enabled = true;
-    const run = engine.readAloud.onRunEnd([{ role: "assistant", content: [{ type: "text", text: LONG }] }]);
+    const run = engine.readAloud.onRunEnd([
+      { role: "assistant", content: [{ type: "text", text: `<spoken_summary>${LONG}</spoken_summary>` }] },
+    ]);
     for (let i = 0; i < 50 && asked.length < 2; i++) await tick();
     await engine.player.stop();
     await run;

@@ -4,11 +4,19 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { KeyId } from "@earendil-works/pi-tui";
+import {
+  isKeyRelease,
+  isKeyRepeat,
+  isKittyProtocolActive,
+  type KeyId,
+  matchesKey,
+  parseKey,
+} from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import type { Engine } from "../engine/engine";
 import { errorMessage } from "../engine/env";
 import { STATUS_KEY } from "../engine/indicator";
+import { renderOsd } from "../engine/osd";
 import type { Panel } from "../engine/panel";
 import { type Hotkeys, keyLabel } from "../engine/settings";
 import type { SpeechResult } from "../engine/speech";
@@ -23,6 +31,8 @@ export const SYNTHESIZE_TOOL = "speech_synthesize";
  */
 export const RELOAD_ARG = "--reload-hotkeys";
 export const TRANSCRIBE_TOOL = "speech_transcribe";
+const OSD_KEY = "pi-speech-osd";
+const OSD_POLL_MS = 65;
 const TOOLS = [SYNTHESIZE_TOOL, TRANSCRIBE_TOOL];
 
 const ACTIONS = [
@@ -45,10 +55,42 @@ const ACTIONS = [
   "help",
 ];
 const ACTION_VALUES: Record<string, string[]> = {
-  "read-aloud": ["on", "off", "summary", "thinking", "all"],
+  "read-aloud": ["on", "off", "summary", "streaming"],
   bridge: ["auto", "on", "off", "status"],
   set: ["tts-model", "voice", "stt-model", "stt-language", "tools", "dictation-output", "tts-source", "stt-source"],
 };
+
+const KITTY_FN_CODES: Record<string, string> = {
+  "11": "f1",
+  "12": "f2",
+  "13": "f3",
+  "14": "f4",
+  "15": "f5",
+  "17": "f6",
+  "18": "f7",
+  "19": "f8",
+  "20": "f9",
+  "21": "f10",
+  "23": "f11",
+  "24": "f12",
+};
+
+/** Match `key`, including Kitty `F1`–`F12` press/repeat/release sequences on pi-tui 1.4.x. */
+function matchesPttKey(data: string, key: string): boolean {
+  if (matchesKey(data, key as KeyId)) return true;
+  if (!data.startsWith("\x1b[")) return false;
+  const rest = data.slice(1);
+  const tilde = /^\[(\d+)(?:;(\d+))?(?::\d+)?~$/.exec(rest);
+  const pqs = /^\[(?:1;(\d+)(?::\d+)?)?([PQS])$/.exec(rest);
+  const fn = tilde ? KITTY_FN_CODES[tilde[1]] : pqs ? ({ P: "f1", Q: "f2", S: "f4" }[pqs[2]] ?? "") : "";
+  if (!fn) return false;
+  const mod = Math.max(0, Number.parseInt(tilde?.[2] ?? pqs?.[1] ?? "1", 10) - 1);
+  const mods: string[] = [];
+  if (mod & 4) mods.push("ctrl");
+  if (mod & 2) mods.push("alt");
+  if (mod & 1) mods.push("shift");
+  return [...mods, fn].join("+") === key;
+}
 
 /** The tool result for a synthesis: files, model and voice, and whether it plays. Never contains the key. */
 export function describeForTool(r: SpeechResult): string {
@@ -189,6 +231,85 @@ export function registerPi(
   /** The latest context: its model registry has the user's Pi models. */
   let latest: ExtensionContext | undefined;
 
+  let osdShown = false;
+  let lastBands: number[] = [];
+  let levelsTimer: ReturnType<typeof setInterval> | undefined;
+  let levelsInflight = false;
+  let pttActive = false;
+  let pttTarget: "editor" | "composer" | undefined;
+  let stopPtt: (() => void) | undefined;
+
+  const stopLevels = () => {
+    if (levelsTimer) {
+      clearInterval(levelsTimer);
+      levelsTimer = undefined;
+    }
+    levelsInflight = false;
+  };
+
+  const updateOsd = () => {
+    if (!ui || typeof ui.setWidget !== "function") return;
+    const style = engine.speech.settings.osdStyle;
+    const dState = engine.dictation.state;
+    const recording = dState === "starting" || dState === "recording";
+    const playing = engine.player.playing;
+    if (style === "off" || (!recording && !playing)) {
+      stopLevels();
+      lastBands = [];
+      if (osdShown) {
+        osdShown = false;
+        ui.setWidget(OSD_KEY, undefined);
+      }
+      return;
+    }
+    const mode = recording ? "recording" : "playing";
+    const label = recording ? (engine.dictation.indicator() ?? "● REC 0:00") : "▶ speaking";
+    const tinted = latest ? hasTerminal(latest) && !env.NO_COLOR : false;
+    const theme = ui.theme;
+    const lines = renderOsd({
+      style,
+      mode,
+      label,
+      bands: lastBands,
+      tint:
+        tinted && theme
+          ? {
+              dot: (t) => theme.fg("error", t),
+              accent: (t) => theme.fg("accent", t),
+            }
+          : undefined,
+    });
+    osdShown = lines.length > 0;
+    ui.setWidget(OSD_KEY, lines.length ? lines : undefined, { placement: "aboveEditor" });
+    if (!levelsTimer) {
+      levelsTimer = setInterval(() => {
+        if (levelsInflight) return;
+        const poll = engine.routes.bridge.levels;
+        if (!poll || engine.routes.route !== "bridge") return;
+        levelsInflight = true;
+        void poll()
+          .then((r) => {
+            const next =
+              engine.dictation.state === "recording" ? r?.recording : engine.player.playing ? r?.playing : undefined;
+            lastBands = next ?? lastBands.map((v) => v * 0.65);
+            updateOsd();
+          })
+          .finally(() => {
+            levelsInflight = false;
+          });
+      }, OSD_POLL_MS);
+      levelsTimer.unref?.();
+    }
+  };
+
+  engine.indicator.listen(() => {
+    if (engine.dictation.state === "idle" && pttActive) {
+      pttActive = false;
+      pttTarget = undefined;
+    }
+    updateOsd();
+  });
+
   /** Follow the latest context: its UI hears notifications and shows the status; its registry has the key. */
   const attach = (ctx: ExtensionContext) => {
     latest = ctx;
@@ -200,6 +321,7 @@ export function registerPi(
     engine.indicator.attach((text) =>
       current.setStatus(STATUS_KEY, tinted ? tintRecordingDot(text, current.theme) : text),
     );
+    updateOsd();
   };
   engine.notify = (message, level) => {
     try {
@@ -223,12 +345,18 @@ export function registerPi(
     engine.start();
     applyTools();
     watchOptionKey(ctx);
+    watchPtt(ctx);
     void engine.announce().then((n) => {
       if (n) engine.notify(n.message, n.level);
     });
   });
 
   pi.on("session_shutdown", async () => {
+    stopPtt?.();
+    stopPtt = undefined;
+    stopLevels();
+    if (osdShown && ui && typeof ui.setWidget === "function") ui.setWidget(OSD_KEY, undefined);
+    osdShown = false;
     await engine.shutdown();
   });
 
@@ -239,10 +367,18 @@ export function registerPi(
     return summarizeWith(latest, ref, prompt, signal);
   };
 
-  // Summary and Thinking with the same model: a guideline asks for a marked summary at the end of each reply.
+  // Summarized with the same model: a guideline asks for a marked summary at the end of each reply.
   pi.on("before_agent_start", async (event, ctx) => {
     attach(ctx);
     engine.readAloud.onRunStart(event.systemPromptOptions.promptGuidelines);
+  });
+
+  // Streaming: each reasoning block is summarized and read as it finishes streaming.
+  pi.on("message_update", (event, ctx) => {
+    const e = event.assistantMessageEvent;
+    if (e.type !== "thinking_end") return;
+    attach(ctx);
+    engine.readAloud.onThinkingBlock(e.content, ctx.signal);
   });
 
   // The marked summary is taken out of the finished message, so it is neither shown nor kept in the session.
@@ -277,6 +413,7 @@ export function registerPi(
       env,
       (p) => {
         panel = p;
+        if (!p && latest) watchPtt(latest);
       },
       speak,
       hotkeys,
@@ -292,7 +429,7 @@ export function registerPi(
     stopWatching?.();
     stopWatching = undefined;
     if (platform !== "darwin" || !hasTerminal(ctx) || engine.speech.settings.optionKeyHintShown) return;
-    const chars = new Map<string, keyof Hotkeys>();
+    const chars = new Map<string, "speak" | "dictate">();
     for (const name of ["speak", "dictate"] as const) {
       const char = macOptionCharacter(hotkeys[name]);
       if (char) chars.set(char, name);
@@ -321,6 +458,69 @@ export function registerPi(
         }, 0);
       } catch {
         // Never in the way of typing.
+      }
+      return undefined;
+    });
+  };
+
+  /** Push-to-talk: hold the configured key to record, release to transcribe (requires Kitty key-release). */
+  const watchPtt = (ctx: ExtensionContext) => {
+    stopPtt?.();
+    stopPtt = undefined;
+    if (!engine.speech.settings.hotkeys.ptt) {
+      pttActive = false;
+      pttTarget = undefined;
+      return;
+    }
+    if (!hasTerminal(ctx) || typeof ctx.ui.onTerminalInput !== "function") return;
+    stopPtt = ctx.ui.onTerminalInput((data) => {
+      try {
+        const pttKey = engine.speech.settings.hotkeys.ptt;
+        if (!pttKey) {
+          pttActive = false;
+          pttTarget = undefined;
+          return undefined;
+        }
+        if (panel?.isCapturingHotkey()) return undefined;
+        const release = isKeyRelease(data);
+        const repeat = !release && isKeyRepeat(data);
+        const base = pttKey.split("+").pop() ?? "";
+        const hasMod = pttKey.includes("+");
+        if (!release) {
+          if (!matchesPttKey(data, pttKey)) return undefined;
+          if (repeat) return pttActive ? { consume: true } : undefined;
+          if (!isKittyProtocolActive()) {
+            ctx.ui.notify(
+              "Push-to-talk requires a terminal with key-release support (Kitty keyboard protocol); use Alt+Z to toggle",
+              "warning",
+            );
+            return { consume: true };
+          }
+          if (!pttActive && engine.dictation.state === "idle") {
+            pttActive = true;
+            if (panel?.inSpeakComposer()) {
+              pttTarget = "composer";
+              panel.dictateNow();
+            } else {
+              pttTarget = "editor";
+              panel?.close();
+              void engine.dictation.toggle(surfaceUi(ctx)).catch((err) => engine.notify(errorMessage(err), "error"));
+            }
+          }
+          return { consume: true };
+        }
+        if (pttActive && (matchesPttKey(data, pttKey) || (hasMod && parseKey(data) === base))) {
+          const target = pttTarget;
+          pttActive = false;
+          pttTarget = undefined;
+          if (engine.dictation.state === "starting" || engine.dictation.state === "recording") {
+            if (target === "composer" && panel?.inSpeakComposer()) panel.dictateNow();
+            else void engine.dictation.toggle(surfaceUi(ctx)).catch((err) => engine.notify(errorMessage(err), "error"));
+          }
+          return { consume: true };
+        }
+      } catch {
+        // Never block terminal input.
       }
       return undefined;
     });

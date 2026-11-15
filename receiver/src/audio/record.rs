@@ -17,6 +17,7 @@ use super::convert::Converter;
 use super::device::{Format, Input};
 use super::fail;
 use super::ring::{self, Consumer, Producer};
+use super::spectrum::Meter;
 use crate::proc::start_thread;
 use crate::signals;
 use crate::wav;
@@ -221,6 +222,7 @@ fn write_wav(
     lost: &Lost,
 ) -> Result<u64, String> {
     let mut conv = Converter::new(format.rate, format.channels, RATE, 1);
+    let mut meter = Meter::new(RATE);
     let mut buf = vec![0.0f32; format.samples_in(POLL * 4).max(format.channels)];
     let (mut mono, mut pcm) = (Vec::new(), Vec::new());
     let mut write = |samples: &[f32], conv: &mut Converter, end: bool| {
@@ -228,6 +230,9 @@ fn write_wav(
         conv.push(samples, &mut mono);
         if end {
             conv.finish(&mut mono);
+        }
+        if !mono.is_empty() {
+            meter.update(&mono);
         }
         pcm.clear();
         pcm.extend(

@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { setKittyProtocolActive } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { GUIDELINE_PREFIX } from "../../src/engine/read-aloud";
 import { macOptionCharacter, optionKeyNotice, piModels, registerPi, summarizeWith } from "../../src/pi/adapter";
@@ -265,5 +266,58 @@ describe("the Pi adapter", () => {
       .execute("id", { text: "hi", play: false }, undefined, undefined, f.ctx);
     expect(r.content[0].text).toMatch(/Saved: .*\.wav/);
     expect(r.content[0].text).toMatch(/Not played: play was false/);
+  });
+
+  it("push-to-talk records on key press, ignores repeat, and transcribes on release under Kitty protocol", async () => {
+    fakeOpenRouter("pushed and released");
+    const f = fakePi();
+    const listeners: Array<(data: string) => unknown> = [];
+    const widgets: Array<[string, string[] | undefined, unknown]> = [];
+    f.ctx.mode = "tui";
+    f.ctx.ui.onTerminalInput = (fn: (data: string) => unknown) => {
+      listeners.push(fn);
+      return () => {
+        const i = listeners.indexOf(fn);
+        if (i >= 0) listeners.splice(i, 1);
+      };
+    };
+    f.ctx.ui.setWidget = (k: string, lines?: string[], opts?: unknown) => widgets.push([k, lines, opts]);
+
+    const { engine } = makeEngine();
+    engine.speech.settings.hotkeys = { ...engine.speech.settings.hotkeys, ptt: "f8" };
+    engine.speech.save();
+    vi.spyOn(engine.routes, "input").mockReturnValue({
+      name: "local",
+      start: async () => ({
+        stop: async () => ({ audio: Buffer.from("RIFF"), format: "wav" }),
+        cancel: async () => {},
+      }),
+    });
+
+    setKittyProtocolActive(true);
+    try {
+      registerPi(f.pi, engine, { NO_COLOR: "1" }, "linux");
+      await f.emit("session_start");
+      expect(listeners).toHaveLength(1);
+
+      // Press F8 (Kitty CSI 19;1:1~)
+      expect(listeners[0]("\x1b[19;1:1~")).toEqual({ consume: true });
+      await vi.waitFor(() => expect(engine.dictation.state).toBe("recording"));
+      expect(widgets.at(-1)?.[0]).toBe("pi-speech-osd");
+      expect(widgets.at(-1)?.[1]).toHaveLength(2);
+      expect(widgets.at(-1)?.[2]).toEqual({ placement: "aboveEditor" });
+
+      // Repeat F8 while held is consumed without stopping
+      expect(listeners[0]("\x1b[19;1:2~")).toEqual({ consume: true });
+      expect(engine.dictation.state).toBe("recording");
+
+      // Release F8 (Kitty CSI 19;1:3~)
+      expect(listeners[0]("\x1b[19;1:3~")).toEqual({ consume: true });
+      await vi.waitFor(() => expect(engine.dictation.state).toBe("idle"));
+      expect(f.ctx.ui.pasteToEditor).toHaveBeenCalledWith("pushed and released");
+      expect(widgets.at(-1)).toEqual(["pi-speech-osd", undefined, undefined]);
+    } finally {
+      setKittyProtocolActive(false);
+    }
   });
 });
