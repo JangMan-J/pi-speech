@@ -317,6 +317,23 @@ describe("the panel view model: keys in the main view", () => {
     expect(p.engine.speech.settings.readAloud.summarizer).toBe("anthropic/claude-haiku");
   });
 
+  it("Space steps a value that changes in place, as Enter does, and nothing else", async () => {
+    const p = open();
+    await p.press("enter"); // Read aloud options
+    await p.type(" ");
+    expect(p.engine.readAloud.mode).toBe("summary");
+    await p.type(" ");
+    expect(p.engine.readAloud.mode).toBe("streaming");
+    await p.press("down"); // Summarized by opens a list: Space does not change it
+    const before = p.engine.speech.settings.readAloud.summarizer;
+    await p.type(" ");
+    expect(p.panel.view().picker).toBeUndefined();
+    expect(p.engine.speech.settings.readAloud.summarizer).toBe(before);
+    await p.press("down"); // Length
+    await p.type(" ");
+    expect(p.engine.speech.settings.readAloud.length).toBe("abridged");
+  });
+
   it("Streaming with no Pi model to take shows none, as a problem, never Same model", async () => {
     const p = open({}, { before: (e) => (e.readAloud.models = () => []) });
     p.engine.setReadMode("streaming");

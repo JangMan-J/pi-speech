@@ -456,6 +456,20 @@ const MENUS: Record<MenuMode["menu"], { title: string; rows: RowBase[] }> = {
   readAloud: { title: "Read aloud options", rows: READ_ALOUD },
 };
 
+/** The rows whose value changes in place (Enter, Space, ←→), rather than opening a list or running an action. */
+const CYCLES: ReadonlySet<RowId> = new Set<RowId>([
+  "readMode",
+  "summaryLength",
+  "truncate",
+  "osdStyle",
+  "speechSource",
+  "transcriptionSource",
+  "bridgeMode",
+  "playOn",
+  "recordOn",
+  "modelsOn",
+]);
+
 /** The keys of the actions that only work inside the panel. */
 const LETTERS: Partial<Record<RowId, string>> = { replay: "r", history: "h", stop: "s", transcribe: "t" };
 const HOTKEY_NAMES: Record<HotkeyName, string> = { speak: "Speak", dictate: "Dictate", ptt: "Push-to-talk" };
@@ -1339,6 +1353,14 @@ export class Panel {
     if (m.kind === "input") {
       m.edit.insert(text);
       return;
+    }
+    // Space steps a value that changes in place, as Enter does.
+    if (!paste && text === " " && (m.kind === "list" || m.kind === "menu")) {
+      const id = m.kind === "list" ? MAIN[this.selected].id : MENUS[m.menu].rows[m.selected].id;
+      if (CYCLES.has(id)) {
+        this.step(id, 1);
+        return;
+      }
     }
     if (m.kind === "picker") {
       // In a list of on-device models, d downloads and x deletes the highlighted one.
