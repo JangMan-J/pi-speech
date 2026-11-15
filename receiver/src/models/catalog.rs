@@ -290,6 +290,20 @@ const WHISPER_LANGUAGES: &str = "en zh de es ru ko fr ja pt tr pl ca nl ar sv it
     is hy ne mn bs kk sq sw gl mr pa si km sn yo so af oc ka be tg sd gu am yi lo uz fo ht ps tk \
     nn mt sa lb my bo tl mg as tt haw ln ha ba jw su";
 
+/// Nemotron 3.5 ASR's languages (40 locales).
+const NEMOTRON_LANGUAGES: &str =
+    "en es fr it pt nl de tr ru ar hi ja ko vi uk pl sv cs nb da bg fi \
+    hr sk zh hu ro et el lt lv mt sl he th nn";
+/// Qwen3-ASR's 30 languages (and 22 Chinese dialects, under zh and yue).
+const QWEN3_LANGUAGES: &str = "zh en yue ar de fr es pt id it ko ru th vi ja tr hi ms nl sv da fi \
+    pl cs fil fa el hu mk ro";
+/// Cohere Transcribe's 14 languages.
+const COHERE_LANGUAGES: &str = "ar de el en es fr it ja ko nl pl pt vi zh";
+/// Dolphin's 40 Eastern languages (and 22 Chinese dialects, under zh and yue); not English.
+const DOLPHIN_LANGUAGES: &str =
+    "zh ja th ru ko id vi yue hi ur ms uz ar fa bn ta te ug gu my tl kk \
+    or ne mn km jv lo si fil ps pa kab ba ks tg su mr ky az";
+
 const BUILTIN: &[Builtin] = &[
     Builtin {
         id: "parakeet-tdt-0.6b-v3-int8",
@@ -319,6 +333,226 @@ const BUILTIN: &[Builtin] = &[
         size: 163_002_883,
         path: "asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2",
         sha256: "7d1efa2138a65b0b488df37f8b89e3d91a60676e416f515b952358d83dfd347e",
+        lexicon: None,
+    },
+    Builtin {
+        id: "whisper-tiny.en",
+        kind: Kind::Transcription,
+        name: "Whisper tiny (English)",
+        languages: "en",
+        size: 118_071_777,
+        path: "asr-models/sherpa-onnx-whisper-tiny.en.tar.bz2",
+        sha256: "2bd6cf965c8bb3e068ef9fa2191387ee63a9dfa2a4e37582a8109641c20005dd",
+        lexicon: None,
+    },
+    Builtin {
+        id: "whisper-base.en",
+        kind: Kind::Transcription,
+        name: "Whisper base (English)",
+        languages: "en",
+        size: 208_576_005,
+        path: "asr-models/sherpa-onnx-whisper-base.en.tar.bz2",
+        sha256: "475bc7052ce299c007f6d5d5407ba8601f819a2867f6eecee510ed17df581542",
+        lexicon: None,
+    },
+    Builtin {
+        id: "whisper-turbo",
+        kind: Kind::Transcription,
+        name: "Whisper large-v3 turbo",
+        languages: WHISPER_LANGUAGES,
+        size: 563_790_207,
+        path: "asr-models/sherpa-onnx-whisper-turbo.tar.bz2",
+        sha256: "b11acbbcd660b44a8e0df33724feb5aaa709cf65668f2823d59f656312544f22",
+        lexicon: None,
+    },
+    Builtin {
+        id: "whisper-distil-large-v3.5",
+        kind: Kind::Transcription,
+        name: "Distil-Whisper large-v3.5 (English)",
+        languages: "en",
+        size: 528_659_059,
+        path: "asr-models/sherpa-onnx-whisper-distil-large-v3.5.tar.bz2",
+        sha256: "ec874c7346d24ef8063e05430ede616d66d80a410360283099d0bdf659187b1d",
+        lexicon: None,
+    },
+    Builtin {
+        id: "moonshine-tiny-en-v2",
+        kind: Kind::Transcription,
+        name: "Moonshine v2 tiny, English",
+        languages: "en",
+        size: 29_858_559,
+        path: "asr-models/sherpa-onnx-moonshine-tiny-en-quantized-2026-02-27.tar.bz2",
+        sha256: "9ec31b342d8fa3240c3b81b8f82e1cf7e3ac467c93ca5a999b741d5887164f8d",
+        lexicon: None,
+    },
+    Builtin {
+        id: "moonshine-base-en-v2",
+        kind: Kind::Transcription,
+        name: "Moonshine v2 base, English",
+        languages: "en",
+        size: 111_266_225,
+        path: "asr-models/sherpa-onnx-moonshine-base-en-quantized-2026-02-27.tar.bz2",
+        sha256: "43232c1d13013d37317163baec3135bd771a186a4356f28c889bab453bb0e891",
+        lexicon: None,
+    },
+    Builtin {
+        id: "moonshine-base-es-v2",
+        kind: Kind::Transcription,
+        name: "Moonshine v2 base, Spanish",
+        languages: "es",
+        size: 50_846_902,
+        path: "asr-models/sherpa-onnx-moonshine-base-es-quantized-2026-02-27.tar.bz2",
+        sha256: "850c3dcc5dfccc8b1feb10bb221b11d6039b6f5c626241729f46863771016383",
+        lexicon: None,
+    },
+    Builtin {
+        id: "moonshine-base-zh-v2",
+        kind: Kind::Transcription,
+        name: "Moonshine v2 base, Chinese",
+        languages: "zh",
+        size: 99_905_420,
+        path: "asr-models/sherpa-onnx-moonshine-base-zh-quantized-2026-02-27.tar.bz2",
+        sha256: "6495d4240f66bcdd2bbbbfefaa687c463150d467854001270934e88940b733c1",
+        lexicon: None,
+    },
+    Builtin {
+        id: "moonshine-base-ja-v2",
+        kind: Kind::Transcription,
+        name: "Moonshine v2 base, Japanese",
+        languages: "ja",
+        size: 104_162_109,
+        path: "asr-models/sherpa-onnx-moonshine-base-ja-quantized-2026-02-27.tar.bz2",
+        sha256: "c66eb87d229a52d43bbe3b7c52a1d23f6208c0fd7c2e81802ecbda83b192798a",
+        lexicon: None,
+    },
+    Builtin {
+        id: "moonshine-tiny-ko-v2",
+        kind: Kind::Transcription,
+        name: "Moonshine v2 tiny, Korean",
+        languages: "ko",
+        size: 49_153_415,
+        path: "asr-models/sherpa-onnx-moonshine-tiny-ko-quantized-2026-02-27.tar.bz2",
+        sha256: "d3b6c5390a7859c9ef20ff4f20b0766fcbad1dc06c0f509fe4840a3a302112dc",
+        lexicon: None,
+    },
+    Builtin {
+        id: "moonshine-base-ar-v2",
+        kind: Kind::Transcription,
+        name: "Moonshine v2 base, Arabic",
+        languages: "ar",
+        size: 119_143_068,
+        path: "asr-models/sherpa-onnx-moonshine-base-ar-quantized-2026-02-27.tar.bz2",
+        sha256: "4d3f16fe354d8536d3323d3eaf4c12fafb1976b5dc0a12862ab25934da94285b",
+        lexicon: None,
+    },
+    Builtin {
+        id: "moonshine-base-uk-v2",
+        kind: Kind::Transcription,
+        name: "Moonshine v2 base, Ukrainian",
+        languages: "uk",
+        size: 111_037_143,
+        path: "asr-models/sherpa-onnx-moonshine-base-uk-quantized-2026-02-27.tar.bz2",
+        sha256: "d8489b159afabf4cfb734002ae8a5361781ff8a381fa18d284d32d1eeb1c0376",
+        lexicon: None,
+    },
+    Builtin {
+        id: "moonshine-base-vi-v2",
+        kind: Kind::Transcription,
+        name: "Moonshine v2 base, Vietnamese",
+        languages: "vi",
+        size: 106_719_129,
+        path: "asr-models/sherpa-onnx-moonshine-base-vi-quantized-2026-02-27.tar.bz2",
+        sha256: "97b53f5fb75a2a9dd6327440a34f45fc06c927ed2fa7217e5ebe54058e269416",
+        lexicon: None,
+    },
+    Builtin {
+        id: "parakeet-tdt-0.6b-v2-int8",
+        kind: Kind::Transcription,
+        name: "Parakeet TDT 0.6b v2, English (int8)",
+        languages: "en",
+        size: 482_440_461,
+        path: "asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2",
+        sha256: "6fc4426b54aa549a0019b8a75b8dea59164e71790a37ac56a045ad57f915f714",
+        lexicon: None,
+    },
+    Builtin {
+        id: "parakeet-tdt-0.6b-redux-int8",
+        kind: Kind::Transcription,
+        name: "Parakeet TDT 0.6b Redux (int8)",
+        languages: PARAKEET_LANGUAGES,
+        size: 327_703_955,
+        path: "asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-redux-int8.tar.bz2",
+        sha256: "6f76c0ff70de59cc4f23fa046a7449e6d7448ac6473496e923b2a65afe4dba32",
+        lexicon: None,
+    },
+    Builtin {
+        id: "parakeet-tdt-110m-en-int8",
+        kind: Kind::Transcription,
+        name: "Parakeet TDT 110m, English (int8)",
+        languages: "en",
+        size: 108_035_095,
+        path: "asr-models/sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000-int8.tar.bz2",
+        sha256: "f628312e9fdf8686374cb01a69425c41732529d540860311f16f37cbc32cfe9b",
+        lexicon: None,
+    },
+    Builtin {
+        id: "canary-180m-flash-int8",
+        kind: Kind::Transcription,
+        name: "Canary 180M Flash (int8; set the language)",
+        languages: "en es de fr",
+        size: 153_692_328,
+        path: "asr-models/sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8.tar.bz2",
+        sha256: "7a38ed8b13f014ad632b09ff8d22e0c6f1359dd046af9235d281dfae841b9ab9",
+        lexicon: None,
+    },
+    Builtin {
+        id: "nemotron-3.5-asr-0.6b-int8",
+        kind: Kind::Transcription,
+        name: "Nemotron 3.5 ASR 0.6b (int8)",
+        languages: NEMOTRON_LANGUAGES,
+        size: 475_271_763,
+        path: "asr-models/sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-int8-2026-06-11.tar.bz2",
+        sha256: "c6bf5e0df765f9d5b43bc9e0536d4b4b3e7d40bdf5ecf13e45f134c51c05ae3a",
+        lexicon: None,
+    },
+    Builtin {
+        id: "qwen3-asr-0.6b-int8",
+        kind: Kind::Transcription,
+        name: "Qwen3-ASR 0.6B (int8)",
+        languages: QWEN3_LANGUAGES,
+        size: 878_702_423,
+        path: "asr-models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25.tar.bz2",
+        sha256: "393f8a14e2f5fb96746aaab342997a40641001fbd5bf9592a080a8329178ee96",
+        lexicon: None,
+    },
+    Builtin {
+        id: "cohere-transcribe-int8",
+        kind: Kind::Transcription,
+        name: "Cohere Transcribe (int8)",
+        languages: COHERE_LANGUAGES,
+        size: 1_699_791_751,
+        path: "asr-models/sherpa-onnx-cohere-transcribe-14-lang-int8-2026-04-01.tar.bz2",
+        sha256: "bd582588d50685a795dcd2807ab77e11361b8312d96c53884682def45ab4206d",
+        lexicon: None,
+    },
+    Builtin {
+        id: "dolphin-base-int8",
+        kind: Kind::Transcription,
+        name: "Dolphin base (int8)",
+        languages: DOLPHIN_LANGUAGES,
+        size: 80_671_385,
+        path: "asr-models/sherpa-onnx-dolphin-base-ctc-multi-lang-int8-2025-04-02.tar.bz2",
+        sha256: "6f23da2303c3c2e5fa6445c450fa2a7133cd57e3da070ae5f97ab9e0dfbb4a54",
+        lexicon: None,
+    },
+    Builtin {
+        id: "omnilingual-300m-v2-int8",
+        kind: Kind::Transcription,
+        name: "Omnilingual ASR 300M v2 (int8)",
+        languages: "mul",
+        size: 292_313_120,
+        path: "asr-models/sherpa-onnx-omnilingual-asr-1600-languages-300M-ctc-v2-int8-2026-02-05.tar.bz2",
+        sha256: "951b32409aade32bd525310bb39e9666773ba3fc611a39e817f620936d76c631",
         lexicon: None,
     },
     Builtin {
@@ -390,7 +624,7 @@ mod tests {
             assert_eq!(format!("{}.tar.bz2", e.dir), e.archive_name());
         }
         let kinds = |k| c.entries.iter().filter(|e| e.kind == k).count();
-        assert_eq!(kinds(Kind::Transcription), 3);
+        assert_eq!(kinds(Kind::Transcription), 25);
         assert_eq!(kinds(Kind::Speech), 3);
         // Every Piper voice names the English lexicon; Kokoro carries its own.
         for e in c.entries.iter().filter(|e| e.kind == Kind::Speech) {

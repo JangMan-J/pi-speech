@@ -79,7 +79,7 @@ fn an_unrecognised_model_directory_is_named() {
     let e = stderr(&o);
     assert!(e.contains("unrecognised model directory"), "{e}");
     assert!(
-        e.contains("Parakeet (transducer), Whisper or SenseVoice"),
+        e.contains("Parakeet or Nemotron (transducer), Whisper, Canary"),
         "{e}"
     );
     std::fs::remove_dir_all(&dir).ok();

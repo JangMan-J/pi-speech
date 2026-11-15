@@ -995,7 +995,7 @@ export class Speech {
     if (this.settings.transcriptionSource === "local") {
       const id = this.localTranscription(opts.model);
       try {
-        return await this.local.transcribe(id, audio, format, opts.signal);
+        return await this.local.transcribe(id, audio, format, opts.signal, opts.language);
       } catch (err) {
         throw new Error(`Transcription failed: ${errorMessage(err)}`);
       }

@@ -3,7 +3,15 @@
 //! - Parakeet and other transducers: `encoder`, `decoder` and `joiner` `.onnx` files and `tokens.txt`.
 //! - Whisper: `<name>-encoder.onnx`, `<name>-decoder.onnx` and `<name>-tokens.txt` (sherpa-onnx's
 //!   Whisper exports carry the size as the prefix, as `small-encoder.onnx`).
-//! - SenseVoice: `model.onnx` and `tokens.txt` whose tokens include SenseVoice's `<|withitn|>`.
+//! - Canary: `encoder.onnx`, `decoder.onnx` and `tokens.txt` whose tokens include `<|startofcontext|>`.
+//! - Cohere Transcribe: as Canary (the same tokenizer), with a `README.md` that names Cohere.
+//! - Moonshine (v2): `encoder_model.ort`, `decoder_model_merged.ort` and `tokens.txt`.
+//! - Qwen3-ASR: `conv_frontend.onnx`, `encoder.onnx`, `decoder.onnx` and a `tokenizer/` directory.
+//! - A streaming transducer (Nemotron): a transducer whose `README.md` says it streams; it is run
+//!   by sherpa-onnx's online recogniser, fed the whole recording at once.
+//! - SenseVoice, Dolphin and Omnilingual: `model.onnx` and `tokens.txt`, told apart by their tokens
+//!   (SenseVoice's `<|withitn|>`; Dolphin's `<nospeech>` and `<asr>`; Omnilingual's list starts
+//!   `<s>`, `<pad>`, `</s>`, `<unk>`).
 //!
 //! Where both a full-precision and an `.int8.onnx` file exist, the int8 one is used: it is
 //! smaller and faster on a CPU.
@@ -18,6 +26,13 @@ pub enum Kind {
     Transducer,
     Whisper,
     SenseVoice,
+    Canary,
+    Moonshine,
+    Dolphin,
+    Omnilingual,
+    Qwen3,
+    Streaming,
+    Cohere,
 }
 
 impl Kind {
@@ -26,43 +41,192 @@ impl Kind {
             Kind::Transducer => "transducer (Parakeet)",
             Kind::Whisper => "Whisper",
             Kind::SenseVoice => "SenseVoice",
+            Kind::Canary => "Canary",
+            Kind::Moonshine => "Moonshine",
+            Kind::Dolphin => "Dolphin",
+            Kind::Omnilingual => "Omnilingual",
+            Kind::Qwen3 => "Qwen3-ASR",
+            Kind::Streaming => "streaming transducer (Nemotron)",
+            Kind::Cohere => "Cohere Transcribe",
+        }
+    }
+
+    /// The longest piece of audio the model hears well at once, in seconds; longer audio is cut
+    /// at its quiet moments. `None`: any length.
+    pub fn max_seconds(self) -> Option<f64> {
+        match self {
+            Kind::Transducer | Kind::SenseVoice | Kind::Streaming => None,
+            // Whisper and Moonshine hear 30 s at most, Omnilingual's CTC models 40 s; Canary, Dolphin
+            // were trained on clips of that order.
+            _ => Some(28.0),
         }
     }
 }
 
-/// A model's files, as paths inside its directory.
+/// A model's files: names (`Found`) or paths in its directory (`Model`).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Model {
+pub enum Files<P> {
     Transducer {
-        encoder: PathBuf,
-        decoder: PathBuf,
-        joiner: PathBuf,
-        tokens: PathBuf,
+        encoder: P,
+        decoder: P,
+        joiner: P,
+        tokens: P,
     },
     Whisper {
-        encoder: PathBuf,
-        decoder: PathBuf,
-        tokens: PathBuf,
+        encoder: P,
+        decoder: P,
+        tokens: P,
     },
-    SenseVoice {
-        model: PathBuf,
-        tokens: PathBuf,
+    Canary {
+        encoder: P,
+        decoder: P,
+        tokens: P,
+    },
+    Cohere {
+        encoder: P,
+        decoder: P,
+        tokens: P,
+    },
+    Moonshine {
+        encoder: P,
+        merged_decoder: P,
+        tokens: P,
+    },
+    Qwen3 {
+        conv_frontend: P,
+        encoder: P,
+        decoder: P,
+        /// A directory.
+        tokenizer: P,
+    },
+    /// Run by the online recogniser.
+    Streaming {
+        encoder: P,
+        decoder: P,
+        joiner: P,
+        tokens: P,
+    },
+    /// One `model` file and `tokens` (SenseVoice, Dolphin, Omnilingual).
+    Single {
+        kind: Kind,
+        model: P,
+        tokens: P,
     },
 }
 
-impl Model {
+/// What `from_names` found: file names, not yet paths.
+pub type Found = Files<String>;
+/// A model's files, as paths inside its directory.
+pub type Model = Files<PathBuf>;
+
+impl<P> Files<P> {
     pub fn kind(&self) -> Kind {
         match self {
-            Model::Transducer { .. } => Kind::Transducer,
-            Model::Whisper { .. } => Kind::Whisper,
-            Model::SenseVoice { .. } => Kind::SenseVoice,
+            Files::Transducer { .. } => Kind::Transducer,
+            Files::Whisper { .. } => Kind::Whisper,
+            Files::Canary { .. } => Kind::Canary,
+            Files::Cohere { .. } => Kind::Cohere,
+            Files::Moonshine { .. } => Kind::Moonshine,
+            Files::Qwen3 { .. } => Kind::Qwen3,
+            Files::Streaming { .. } => Kind::Streaming,
+            Files::Single { kind, .. } => *kind,
+        }
+    }
+
+    fn map<Q>(self, f: impl Fn(P) -> Q) -> Files<Q> {
+        match self {
+            Files::Transducer {
+                encoder,
+                decoder,
+                joiner,
+                tokens,
+            } => Files::Transducer {
+                encoder: f(encoder),
+                decoder: f(decoder),
+                joiner: f(joiner),
+                tokens: f(tokens),
+            },
+            Files::Whisper {
+                encoder,
+                decoder,
+                tokens,
+            } => Files::Whisper {
+                encoder: f(encoder),
+                decoder: f(decoder),
+                tokens: f(tokens),
+            },
+            Files::Canary {
+                encoder,
+                decoder,
+                tokens,
+            } => Files::Canary {
+                encoder: f(encoder),
+                decoder: f(decoder),
+                tokens: f(tokens),
+            },
+            Files::Cohere {
+                encoder,
+                decoder,
+                tokens,
+            } => Files::Cohere {
+                encoder: f(encoder),
+                decoder: f(decoder),
+                tokens: f(tokens),
+            },
+            Files::Moonshine {
+                encoder,
+                merged_decoder,
+                tokens,
+            } => Files::Moonshine {
+                encoder: f(encoder),
+                merged_decoder: f(merged_decoder),
+                tokens: f(tokens),
+            },
+            Files::Qwen3 {
+                conv_frontend,
+                encoder,
+                decoder,
+                tokenizer,
+            } => Files::Qwen3 {
+                conv_frontend: f(conv_frontend),
+                encoder: f(encoder),
+                decoder: f(decoder),
+                tokenizer: f(tokenizer),
+            },
+            Files::Streaming {
+                encoder,
+                decoder,
+                joiner,
+                tokens,
+            } => Files::Streaming {
+                encoder: f(encoder),
+                decoder: f(decoder),
+                joiner: f(joiner),
+                tokens: f(tokens),
+            },
+            Files::Single {
+                kind,
+                model,
+                tokens,
+            } => Files::Single {
+                kind,
+                model: f(model),
+                tokens: f(tokens),
+            },
         }
     }
 }
 
-const SUPPORTED: &str = "a Parakeet (transducer), Whisper or SenseVoice model from sherpa-onnx";
+const SUPPORTED: &str = "a Parakeet or Nemotron (transducer), Whisper, Canary, Cohere Transcribe, Moonshine, Qwen3-ASR, SenseVoice, Dolphin or Omnilingual model from sherpa-onnx";
+/// Qwen3-ASR's tokenizer directory, as `from_names` sees it (directories end in `/`).
+const QWEN3_TOKENIZER: &str = "tokenizer/";
 /// A token only SenseVoice's vocabulary has (inverse text normalisation on).
 const SENSE_VOICE_TOKEN: &str = "<|withitn|>";
+/// A token Canary's vocabulary has (the start of its prompt's context).
+const CANARY_TOKEN: &str = "<|startofcontext|>";
+/// Moonshine v2's files (sherpa-onnx ships them as ONNX Runtime `.ort` files).
+const MOONSHINE_ENCODER: &str = "encoder_model.ort";
+const MOONSHINE_DECODER: &str = "decoder_model_merged.ort";
 
 /// The model in `dir`.
 pub fn detect(dir: &Path) -> Result<Model, String> {
@@ -81,69 +245,21 @@ pub fn detect(dir: &Path) -> Result<Model, String> {
     let mut names = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|e| format!("cannot read the model directory {shown}: {e}"))?;
-        // Following links: a model directory may link to files elsewhere.
-        if fs::metadata(entry.path()).is_ok_and(|m| m.is_file()) {
-            if let Some(name) = entry.file_name().to_str() {
-                names.push(name.to_string());
-            }
+        // Following links: a model directory may link to files elsewhere. Directories are
+        // named with a trailing `/`.
+        let Some(name) = entry.file_name().to_str().map(String::from) else {
+            continue;
+        };
+        match fs::metadata(entry.path()) {
+            Ok(m) if m.is_file() => names.push(name),
+            Ok(m) if m.is_dir() => names.push(format!("{name}/")),
+            _ => {}
         }
     }
     let read_tokens = |name: &str| fs::read_to_string(dir.join(name)).ok();
     let found = from_names(&names, read_tokens)
         .map_err(|why| format!("unrecognised model directory {shown}: {why}"))?;
-    Ok(found.into_model(dir))
-}
-
-/// What `from_names` found: file names, not yet paths.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Found {
-    Transducer {
-        encoder: String,
-        decoder: String,
-        joiner: String,
-        tokens: String,
-    },
-    Whisper {
-        encoder: String,
-        decoder: String,
-        tokens: String,
-    },
-    SenseVoice {
-        model: String,
-        tokens: String,
-    },
-}
-
-impl Found {
-    fn into_model(self, dir: &Path) -> Model {
-        let p = |n: String| dir.join(n);
-        match self {
-            Found::Transducer {
-                encoder,
-                decoder,
-                joiner,
-                tokens,
-            } => Model::Transducer {
-                encoder: p(encoder),
-                decoder: p(decoder),
-                joiner: p(joiner),
-                tokens: p(tokens),
-            },
-            Found::Whisper {
-                encoder,
-                decoder,
-                tokens,
-            } => Model::Whisper {
-                encoder: p(encoder),
-                decoder: p(decoder),
-                tokens: p(tokens),
-            },
-            Found::SenseVoice { model, tokens } => Model::SenseVoice {
-                model: p(model),
-                tokens: p(tokens),
-            },
-        }
-    }
+    Ok(found.map(|n| dir.join(n.trim_end_matches('/'))))
 }
 
 /// One `.onnx` file playing `role`: its name and the prefix before the role (`small-`).
@@ -201,28 +317,98 @@ fn has(names: &[String], name: &str) -> bool {
     names.iter().any(|n| n == name)
 }
 
-/// Tell the model from the names of the files in its directory. `read_tokens` reads a file
-/// of tokens by name (`None` when it cannot be read).
+/// Tell the model from the names of the files in its directory (directories end in `/`).
+/// `read_tokens` reads a file of tokens, or the README, by name (`None` when it cannot be read).
 pub fn from_names(
     names: &[String],
     read_tokens: impl Fn(&str) -> Option<String>,
 ) -> Result<Found, String> {
+    let need_tokens = |what: &str| -> Result<String, String> {
+        if has(names, "tokens.txt") {
+            Ok("tokens.txt".into())
+        } else {
+            Err(format!("it has {what} but no tokens.txt"))
+        }
+    };
+    if has(names, MOONSHINE_ENCODER) || has(names, MOONSHINE_DECODER) {
+        if !(has(names, MOONSHINE_ENCODER) && has(names, MOONSHINE_DECODER)) {
+            return Err(format!(
+                "it has one of Moonshine's {MOONSHINE_ENCODER} and {MOONSHINE_DECODER} but not the other"
+            ));
+        }
+        return Ok(Found::Moonshine {
+            encoder: MOONSHINE_ENCODER.into(),
+            merged_decoder: MOONSHINE_DECODER.into(),
+            tokens: need_tokens("Moonshine's encoder and decoder")?,
+        });
+    }
     let encoder = part(names, "encoder")?;
     let decoder = part(names, "decoder")?;
     let joiner = part(names, "joiner")?;
+    if let Some(front) = part(names, "conv_frontend")? {
+        let (Some(e), Some(d)) = (encoder, decoder) else {
+            return Err(format!(
+                "it has Qwen3-ASR's {} but not its encoder and decoder",
+                front.name
+            ));
+        };
+        if !has(names, QWEN3_TOKENIZER) {
+            return Err("it has Qwen3-ASR's model files but no tokenizer directory".into());
+        }
+        return Ok(Found::Qwen3 {
+            conv_frontend: front.name,
+            encoder: e.name,
+            decoder: d.name,
+            tokenizer: QWEN3_TOKENIZER.into(),
+        });
+    }
     match (encoder, decoder, joiner) {
         (Some(e), Some(d), Some(j)) => {
-            if !has(names, "tokens.txt") {
-                return Err(
-                    "it has a transducer's encoder, decoder and joiner but no tokens.txt".into(),
-                );
-            }
-            Ok(Found::Transducer {
-                encoder: e.name,
-                decoder: d.name,
-                joiner: j.name,
-                tokens: "tokens.txt".into(),
+            let tokens = need_tokens("a transducer's encoder, decoder and joiner")?;
+            let streams = read_tokens("README.md")
+                .is_some_and(|r| r.to_ascii_lowercase().contains("streaming"));
+            Ok(if streams {
+                Found::Streaming {
+                    encoder: e.name,
+                    decoder: d.name,
+                    joiner: j.name,
+                    tokens,
+                }
+            } else {
+                Found::Transducer {
+                    encoder: e.name,
+                    decoder: d.name,
+                    joiner: j.name,
+                    tokens,
+                }
             })
+        }
+        (Some(e), Some(d), None) if e.prefix.is_empty() && d.prefix.is_empty() => {
+            let tokens = need_tokens("an encoder and a decoder")?;
+            match read_tokens(&tokens) {
+                None => Err(format!("cannot read its {tokens}")),
+                Some(t) if t.contains(CANARY_TOKEN) => {
+                    let cohere = read_tokens("README.md")
+                        .is_some_and(|r| r.to_ascii_lowercase().contains("cohere"));
+                    Ok(if cohere {
+                        Found::Cohere {
+                            encoder: e.name,
+                            decoder: d.name,
+                            tokens,
+                        }
+                    } else {
+                        Found::Canary {
+                            encoder: e.name,
+                            decoder: d.name,
+                            tokens,
+                        }
+                    })
+                }
+                Some(_) => Err(format!(
+                    "it has an encoder and a decoder ({}, {}) but no joiner, and its tokens are not Canary's; expected {SUPPORTED}",
+                    e.name, d.name
+                )),
+            }
         }
         (Some(e), Some(d), None) => {
             let tokens = format!("{}tokens.txt", e.prefix);
@@ -248,20 +434,21 @@ pub fn from_names(
             let Some(model) = model else {
                 return Err(format!("it has no model files; expected {SUPPORTED}"));
             };
-            if !has(names, "tokens.txt") {
-                return Err(format!("it has {} but no tokens.txt", model.name));
-            }
-            match read_tokens("tokens.txt") {
-                None => Err("cannot read its tokens.txt".into()),
-                Some(t) if t.contains(SENSE_VOICE_TOKEN) => Ok(Found::SenseVoice {
-                    model: model.name,
-                    tokens: "tokens.txt".into(),
-                }),
-                Some(_) => Err(format!(
-                    "it has {} and tokens.txt, but the tokens are not SenseVoice's; expected {SUPPORTED}",
+            let tokens = need_tokens(&model.name)?;
+            let Some(t) = read_tokens(&tokens) else {
+                return Err(format!("cannot read its {tokens}"));
+            };
+            let kind = single_kind(&t).ok_or_else(|| {
+                format!(
+                    "it has {} and tokens.txt, but the tokens are not SenseVoice's, Dolphin's or Omnilingual's; expected {SUPPORTED}",
                     model.name
-                )),
-            }
+                )
+            })?;
+            Ok(Found::Single {
+                kind,
+                model: model.name,
+                tokens,
+            })
         }
         (e, d, j) => {
             let missing: Vec<&str> = [("encoder", &e), ("decoder", &d)]
@@ -279,6 +466,29 @@ pub fn from_names(
                 missing.join(" or ")
             ))
         }
+    }
+}
+
+/// Which one-file model a list of tokens belongs to.
+fn single_kind(tokens: &str) -> Option<Kind> {
+    let first: Vec<&str> = tokens
+        .lines()
+        .take(4)
+        .filter_map(|l| l.split_whitespace().next())
+        .collect();
+    let line = |t: &str| {
+        tokens
+            .lines()
+            .any(|l| l.split_whitespace().next() == Some(t))
+    };
+    if tokens.contains(SENSE_VOICE_TOKEN) {
+        Some(Kind::SenseVoice)
+    } else if line("<nospeech>") && line("<asr>") {
+        Some(Kind::Dolphin)
+    } else if first == ["<s>", "<pad>", "</s>", "<unk>"] {
+        Some(Kind::Omnilingual)
+    } else {
+        None
     }
 }
 
@@ -364,7 +574,8 @@ mod tests {
         );
         assert_eq!(
             got,
-            Ok(Found::SenseVoice {
+            Ok(Found::Single {
+                kind: Kind::SenseVoice,
                 model: "model.int8.onnx".into(),
                 tokens: "tokens.txt".into(),
             })
@@ -372,18 +583,123 @@ mod tests {
         let other = from_names(&names("model.onnx tokens.txt"), |_| {
             Some("<unk> 0\n".into())
         });
-        assert!(other.unwrap_err().contains("not SenseVoice's"));
+        assert!(other
+            .unwrap_err()
+            .contains("not SenseVoice's, Dolphin's or Omnilingual's"));
     }
 
     #[test]
-    fn an_encoder_and_decoder_without_whisper_names_is_refused() {
-        // A Canary model: encoder and decoder, no prefix.
+    fn canary_is_an_encoder_and_decoder_told_by_its_tokens() {
+        let canary = |_: &str| Some("<unk> 0\n<|startofcontext|> 7\n<|en|> 62\n".into());
+        let got = from_names(
+            &names("encoder.int8.onnx decoder.int8.onnx tokens.txt"),
+            canary,
+        );
+        assert_eq!(
+            got,
+            Ok(Found::Canary {
+                encoder: "encoder.int8.onnx".into(),
+                decoder: "decoder.int8.onnx".into(),
+                tokens: "tokens.txt".into(),
+            })
+        );
+        // The same tokens with a README naming Cohere: Cohere Transcribe.
+        let cohere = |n: &str| {
+            Some(if n == "README.md" {
+                "converted from https://huggingface.co/CohereLabs/cohere-transcribe-03-2026".into()
+            } else {
+                "<unk> 0\n<|startofcontext|> 7\n".into()
+            })
+        };
+        let got = from_names(
+            &names(
+                "encoder.int8.onnx encoder.int8.onnx.data decoder.int8.onnx README.md tokens.txt",
+            ),
+            cohere,
+        );
+        assert_eq!(got.map(|f| f.kind()), Ok(Kind::Cohere));
+        // Other tokens: neither Canary nor Whisper.
         let e = from_names(
             &names("encoder.int8.onnx decoder.int8.onnx tokens.txt"),
+            |_| Some("<unk> 0\n".into()),
+        )
+        .unwrap_err();
+        assert!(e.contains("not Canary's"), "{e}");
+    }
+
+    #[test]
+    fn a_transducer_whose_readme_says_it_streams_is_run_streaming() {
+        let files =
+            names("encoder.int8.onnx decoder.int8.onnx joiner.int8.onnx README.md tokens.txt");
+        let got = from_names(&files, |n: &str| {
+            (n == "README.md")
+                .then(|| "This model is from nvidia/nemotron-3.5-asr-streaming-0.6b".into())
+        });
+        assert_eq!(got.map(|f| f.kind()), Ok(Kind::Streaming));
+        let got = from_names(&files, |n: &str| {
+            (n == "README.md").then(|| "Parakeet TDT".into())
+        });
+        assert_eq!(got.map(|f| f.kind()), Ok(Kind::Transducer));
+    }
+
+    #[test]
+    fn qwen3_asr_is_its_frontend_encoder_decoder_and_tokenizer() {
+        let got = from_names(
+            &names("conv_frontend.onnx encoder.int8.onnx decoder.int8.onnx tokenizer/ test_wavs/"),
+            no_tokens,
+        );
+        assert_eq!(
+            got,
+            Ok(Found::Qwen3 {
+                conv_frontend: "conv_frontend.onnx".into(),
+                encoder: "encoder.int8.onnx".into(),
+                decoder: "decoder.int8.onnx".into(),
+                tokenizer: "tokenizer/".into(),
+            })
+        );
+        let e = from_names(
+            &names("conv_frontend.onnx encoder.int8.onnx decoder.int8.onnx"),
             no_tokens,
         )
         .unwrap_err();
-        assert!(e.contains("not named as a Whisper model's"), "{e}");
+        assert!(e.contains("no tokenizer directory"), "{e}");
+    }
+
+    #[test]
+    fn moonshine_v2_is_its_two_ort_files() {
+        let got = from_names(
+            &names("decoder_model_merged.ort encoder_model.ort LICENSE tokens.txt"),
+            no_tokens,
+        );
+        assert_eq!(
+            got,
+            Ok(Found::Moonshine {
+                encoder: "encoder_model.ort".into(),
+                merged_decoder: "decoder_model_merged.ort".into(),
+                tokens: "tokens.txt".into(),
+            })
+        );
+        let e = from_names(&names("encoder_model.ort tokens.txt"), no_tokens).unwrap_err();
+        assert!(e.contains("not the other"), "{e}");
+    }
+
+    #[test]
+    fn one_file_models_are_told_by_their_tokens() {
+        let kind = |tokens: &'static str| {
+            from_names(&names("model.int8.onnx tokens.txt"), move |_| {
+                Some(tokens.into())
+            })
+            .map(|f| f.kind())
+        };
+        assert_eq!(
+            kind("<blank> 0\n<unk> 1\n<na> 2\n<nospeech> 3\n<nopunc> 4\n<itn> 5\n<asr> 6\n"),
+            Ok(Kind::Dolphin)
+        );
+        assert_eq!(
+            kind("<s> 0\n<pad> 1\n</s> 2\n<unk> 3\n  4\nR 5\n"),
+            Ok(Kind::Omnilingual)
+        );
+        assert_eq!(kind("<unk> 0\n<|withitn|> 25016\n"), Ok(Kind::SenseVoice));
     }
 
     #[test]
@@ -435,7 +751,8 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
         assert_eq!(
             got,
-            Ok(Model::SenseVoice {
+            Ok(Model::Single {
+                kind: Kind::SenseVoice,
                 model: dir.join("model.int8.onnx"),
                 tokens: dir.join("tokens.txt"),
             })

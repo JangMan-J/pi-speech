@@ -1,6 +1,7 @@
 //! `transcribe <model-dir|model-id> <audio>`: the text spoken in a WAV or MP3 file, by a local
 //! speech model run in-process, on standard output. A catalogue id (`models list`) names a
-//! model downloaded into the model cache.
+//! model downloaded into the model cache. `--language <code>` names the language spoken, for a
+//! model that must be told (Canary); the others detect it and ignore this.
 
 use crate::audio::convert::Converter;
 use crate::audio::decode::{Decode, WavOrMp3};
@@ -12,12 +13,16 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 pub const USAGE: &str =
-    "pi-speech-receiver transcribe <model-dir>|<model-id> <audio.wav|audio.mp3>";
+    "pi-speech-receiver transcribe <model-dir>|<model-id> <audio.wav|audio.mp3> [--language <code>]";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Help,
-    Run { model_dir: PathBuf, audio: PathBuf },
+    Run {
+        model_dir: PathBuf,
+        audio: PathBuf,
+        language: Option<String>,
+    },
 }
 
 pub fn parse_args(args: &[String]) -> Result<Command, String> {
@@ -27,7 +32,15 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
         [dir, audio] if usable(dir) && usable(audio) => Ok(Command::Run {
             model_dir: PathBuf::from(dir),
             audio: PathBuf::from(audio),
+            language: None,
         }),
+        [dir, audio, "--language", lang] if usable(dir) && usable(audio) && usable(lang) => {
+            Ok(Command::Run {
+                model_dir: PathBuf::from(dir),
+                audio: PathBuf::from(audio),
+                language: Some(lang.to_string()),
+            })
+        }
         _ => Err(format!("usage: {USAGE}")),
     }
 }
@@ -79,7 +92,11 @@ pub fn load_audio(path: &Path) -> Result<Vec<f32>, String> {
 
 /// The text spoken in `audio`, by the model in `model_dir` (or the downloaded model of
 /// that catalogue id).
-pub fn transcribe(model_dir: &Path, audio: &Path) -> Result<String, String> {
+pub fn transcribe(
+    model_dir: &Path,
+    audio: &Path,
+    language: Option<&str>,
+) -> Result<String, String> {
     // The cheap checks first: a wrong path fails before a large model is loaded.
     let model_dir = match model_dir.to_str() {
         Some(arg) => crate::models::resolve_model_dir(arg)?,
@@ -87,22 +104,26 @@ pub fn transcribe(model_dir: &Path, audio: &Path) -> Result<String, String> {
     };
     let model = model::detect(&model_dir)?;
     let samples = load_audio(audio)?;
-    Recognizer::load(&model)?.transcribe(&samples)
+    Recognizer::load(&model, language)?.transcribe(&samples)
 }
 
 pub fn main(args: &[String]) -> ExitCode {
-    let (model_dir, audio) = match parse_args(args) {
+    let (model_dir, audio, language) = match parse_args(args) {
         Ok(Command::Help) => {
             println!("usage: {USAGE}");
             return ExitCode::SUCCESS;
         }
-        Ok(Command::Run { model_dir, audio }) => (model_dir, audio),
+        Ok(Command::Run {
+            model_dir,
+            audio,
+            language,
+        }) => (model_dir, audio, language),
         Err(e) => {
             eprintln!("pi-speech-receiver: {e}");
             return ExitCode::from(2);
         }
     };
-    match transcribe(&model_dir, &audio) {
+    match transcribe(&model_dir, &audio, language.as_deref()) {
         Ok(text) => {
             println!("{text}");
             ExitCode::SUCCESS
@@ -129,8 +150,18 @@ mod tests {
             Ok(Command::Run {
                 model_dir: "models/parakeet".into(),
                 audio: "speech.wav".into(),
+                language: None,
             })
         );
+        assert_eq!(
+            parse_args(&args("canary speech.wav --language de")),
+            Ok(Command::Run {
+                model_dir: "canary".into(),
+                audio: "speech.wav".into(),
+                language: Some("de".into()),
+            })
+        );
+        assert!(parse_args(&args("canary speech.wav --language")).is_err());
         assert_eq!(parse_args(&args("--help")), Ok(Command::Help));
         assert_eq!(parse_args(&args("-h")), Ok(Command::Help));
         for bad in ["", "dir", "dir a.wav extra", "--model dir a.wav", "dir -"] {

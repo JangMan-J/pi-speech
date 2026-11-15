@@ -60,7 +60,13 @@ export interface BridgeModels {
   /** The catalogue with each model's state on the Remote machine, as `models list` prints it. */
   list(): Promise<Record<string, unknown>[]>;
   voices(id: string, signal?: AbortSignal): Promise<BridgeVoice[]>;
-  transcribe(id: string, audio: Buffer, format: "wav" | "mp3", signal?: AbortSignal): Promise<string>;
+  transcribe(
+    id: string,
+    audio: Buffer,
+    format: "wav" | "mp3",
+    signal?: AbortSignal,
+    language?: string,
+  ): Promise<string>;
   /**
    * Download a model into the Remote machine's cache, its progress as the local download gives it; cancelling
    * stops it there, keeping what arrived. Absent in stand-ins that cannot.
@@ -691,17 +697,21 @@ export function createBridgeAudioFrom(getConfig: () => BridgeConfig, opts: { cli
       }
     },
 
-    async transcribe(id, audio, format, signal) {
+    async transcribe(id, audio, format, signal, language) {
       const release = await turn();
       try {
         await requireModels();
         const r = await json<{ text?: unknown }>(
-          await call("POST", `/v1/transcribe?model=${encodeURIComponent(id)}`, {
-            body: audio,
-            contentType: format === "mp3" ? "audio/mpeg" : "audio/wav",
-            timeoutMs: TRANSCRIBE_TIMEOUT_MS,
-            signal,
-          }),
+          await call(
+            "POST",
+            `/v1/transcribe?model=${encodeURIComponent(id)}${language ? `&language=${encodeURIComponent(language)}` : ""}`,
+            {
+              body: audio,
+              contentType: format === "mp3" ? "audio/mpeg" : "audio/wav",
+              timeoutMs: TRANSCRIBE_TIMEOUT_MS,
+              signal,
+            },
+          ),
         );
         if (typeof r.text !== "string") throw new Error("the receiver on the Remote machine sent no text");
         return r.text.trim();

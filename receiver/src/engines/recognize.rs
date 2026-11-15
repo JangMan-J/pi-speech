@@ -2,24 +2,44 @@
 
 use super::model::{Kind, Model};
 use sherpa_onnx::{
+    OfflineCanaryModelConfig, OfflineCohereTranscribeModelConfig, OfflineDolphinModelConfig,
+    OfflineMoonshineModelConfig, OfflineOmnilingualAsrCtcModelConfig, OfflineQwen3ASRModelConfig,
     OfflineRecognizer, OfflineRecognizerConfig, OfflineSenseVoiceModelConfig,
-    OfflineTransducerModelConfig, OfflineWhisperModelConfig,
+    OfflineTransducerModelConfig, OfflineWhisperModelConfig, OnlineRecognizer,
+    OnlineRecognizerConfig, OnlineTransducerModelConfig,
 };
 use std::path::Path;
 
 /// The sample rate every supported model takes.
 pub const SAMPLE_RATE: u32 = 16_000;
-/// Whisper hears at most 30 s at a time; longer audio is cut into pieces no longer than this,
-/// at the quietest moment of the last [`WHISPER_SEARCH`] seconds before it.
-pub const WHISPER_MAX_SECONDS: f64 = 28.0;
-pub const WHISPER_SEARCH: f64 = 8.0;
+/// Audio longer than a model hears at once ([`Kind::max_seconds`]) is cut at the quietest moment
+/// of the last this many seconds before the limit.
+pub const CUT_SEARCH: f64 = 8.0;
+/// The languages Canary 180M Flash speaks; another (or none) is heard as English.
+const CANARY_LANGUAGES: [&str; 4] = ["en", "es", "de", "fr"];
+/// The languages Cohere Transcribe speaks; another (or none) is heard as English.
+const COHERE_LANGUAGES: [&str; 14] = [
+    "ar", "de", "el", "en", "es", "fr", "it", "ja", "ko", "nl", "pl", "pt", "vi", "zh",
+];
 /// The window over which loudness is measured when looking for a cut.
 const CUT_WINDOW_SECONDS: f64 = 0.05;
 
 pub struct Recognizer {
-    inner: OfflineRecognizer,
+    inner: Inner,
     kind: Kind,
+    language: Option<String>,
 }
+
+enum Inner {
+    Offline(OfflineRecognizer),
+    /// A streaming model, fed a whole recording at once.
+    Online(OnlineRecognizer),
+}
+
+/// Silence before and after the speech: a streaming model misses the first words of a recording
+/// that starts with them, and needs a moment after the last to finish it.
+const STREAMING_LEAD_SECONDS: f32 = 0.5;
+const STREAMING_TAIL_SECONDS: f32 = 0.6;
 
 fn path(p: &Path) -> Result<String, String> {
     p.to_str()
@@ -27,15 +47,51 @@ fn path(p: &Path) -> Result<String, String> {
         .ok_or_else(|| format!("the model path {} is not valid UTF-8", p.display()))
 }
 
+/// Up to 8 threads: measured on a 32-thread CPU, 8 runs the larger models (Cohere, Qwen3) a third
+/// faster than 4, and 16 no faster than 8.
 fn threads() -> i32 {
     std::thread::available_parallelism()
-        .map(|n| n.get().min(4) as i32)
+        .map(|n| n.get().min(8) as i32)
         .unwrap_or(1)
 }
 
 impl Recognizer {
-    /// Load `model` (reads several hundred megabytes for the larger models).
-    pub fn load(model: &Model) -> Result<Recognizer, String> {
+    /// Load `model` (reads several hundred megabytes for the larger models). `language` (`de`) is
+    /// the language spoken, for a model that must be told (Canary); the others detect it.
+    pub fn load(model: &Model, language: Option<&str>) -> Result<Recognizer, String> {
+        let language = language
+            .map(|l| l.split(['-', '_']).next().unwrap_or(l).to_ascii_lowercase())
+            .filter(|l| !l.is_empty() && l != "auto");
+        if let Model::Streaming {
+            encoder,
+            decoder,
+            joiner,
+            tokens,
+        } = model
+        {
+            let mut config = OnlineRecognizerConfig::default();
+            config.feat_config.sample_rate = SAMPLE_RATE as i32;
+            let m = &mut config.model_config;
+            m.num_threads = threads();
+            m.provider = Some("cpu".into());
+            m.transducer = OnlineTransducerModelConfig {
+                encoder: Some(path(encoder)?),
+                decoder: Some(path(decoder)?),
+                joiner: Some(path(joiner)?),
+            };
+            m.tokens = Some(path(tokens)?);
+            let inner = OnlineRecognizer::create(&config).ok_or_else(|| {
+                format!(
+                    "cannot load the {} model (sherpa-onnx refused its files)",
+                    model.kind().name()
+                )
+            })?;
+            return Ok(Recognizer {
+                inner: Inner::Online(inner),
+                kind: model.kind(),
+                language,
+            });
+        }
         let mut config = OfflineRecognizerConfig::default();
         config.feat_config.sample_rate = SAMPLE_RATE as i32;
         let m = &mut config.model_config;
@@ -71,12 +127,90 @@ impl Recognizer {
                 };
                 m.tokens = Some(path(tokens)?);
             }
-            Model::SenseVoice { model, tokens } => {
-                m.sense_voice = OfflineSenseVoiceModelConfig {
-                    model: Some(path(model)?),
-                    language: Some("auto".into()),
+            Model::Canary {
+                encoder,
+                decoder,
+                tokens,
+            } => {
+                let lang = language
+                    .clone()
+                    .filter(|l| CANARY_LANGUAGES.contains(&l.as_str()))
+                    .unwrap_or_else(|| "en".into());
+                m.canary = OfflineCanaryModelConfig {
+                    encoder: Some(path(encoder)?),
+                    decoder: Some(path(decoder)?),
+                    // The same language in and out: transcribed, not translated.
+                    src_lang: Some(lang.clone()),
+                    tgt_lang: Some(lang),
+                    use_pnc: true,
+                };
+                m.tokens = Some(path(tokens)?);
+            }
+            Model::Cohere {
+                encoder,
+                decoder,
+                tokens,
+            } => {
+                m.cohere_transcribe = OfflineCohereTranscribeModelConfig {
+                    encoder: Some(path(encoder)?),
+                    decoder: Some(path(decoder)?),
+                    language: Some(
+                        language
+                            .clone()
+                            .filter(|l| COHERE_LANGUAGES.contains(&l.as_str()))
+                            .unwrap_or_else(|| "en".into()),
+                    ),
+                    use_punct: true,
                     use_itn: true,
                 };
+                m.tokens = Some(path(tokens)?);
+            }
+            Model::Moonshine {
+                encoder,
+                merged_decoder,
+                tokens,
+            } => {
+                m.moonshine = OfflineMoonshineModelConfig {
+                    encoder: Some(path(encoder)?),
+                    merged_decoder: Some(path(merged_decoder)?),
+                    ..Default::default()
+                };
+                m.tokens = Some(path(tokens)?);
+            }
+            Model::Qwen3 {
+                conv_frontend,
+                encoder,
+                decoder,
+                tokenizer,
+            } => {
+                m.qwen3_asr = OfflineQwen3ASRModelConfig {
+                    conv_frontend: Some(path(conv_frontend)?),
+                    encoder: Some(path(encoder)?),
+                    decoder: Some(path(decoder)?),
+                    tokenizer: Some(path(tokenizer)?),
+                    ..Default::default()
+                };
+            }
+            Model::Streaming { .. } => unreachable!("loaded by the online recogniser above"),
+            Model::Single {
+                kind,
+                model,
+                tokens,
+            } => {
+                let model = Some(path(model)?);
+                match kind {
+                    Kind::Dolphin => m.dolphin = OfflineDolphinModelConfig { model },
+                    Kind::Omnilingual => {
+                        m.omnilingual = OfflineOmnilingualAsrCtcModelConfig { model }
+                    }
+                    _ => {
+                        m.sense_voice = OfflineSenseVoiceModelConfig {
+                            model,
+                            language: Some("auto".into()),
+                            use_itn: true,
+                        }
+                    }
+                }
                 m.tokens = Some(path(tokens)?);
             }
         }
@@ -87,8 +221,9 @@ impl Recognizer {
             )
         })?;
         Ok(Recognizer {
-            inner,
+            inner: Inner::Offline(inner),
             kind: model.kind(),
+            language,
         })
     }
 
@@ -98,21 +233,49 @@ impl Recognizer {
 
     /// The text spoken in `samples` (mono, [`SAMPLE_RATE`]).
     pub fn transcribe(&self, samples: &[f32]) -> Result<String, String> {
-        let pieces = match self.kind {
-            Kind::Whisper => cuts(samples, SAMPLE_RATE, WHISPER_MAX_SECONDS, WHISPER_SEARCH),
-            _ => std::iter::once(0..samples.len()).collect(),
+        let pieces = match self.kind.max_seconds() {
+            Some(max) => cuts(samples, SAMPLE_RATE, max, CUT_SEARCH),
+            None => std::iter::once(0..samples.len()).collect(),
         };
         let mut texts = Vec::new();
         for piece in pieces {
-            let stream = self.inner.create_stream();
-            stream.accept_waveform(SAMPLE_RATE as i32, &samples[piece]);
-            self.inner.decode(&stream);
-            let result = stream
-                .get_result()
-                .ok_or("the speech model returned no result")?;
-            let text = result.text.trim();
+            let text = match &self.inner {
+                Inner::Offline(r) => {
+                    let stream = r.create_stream();
+                    stream.accept_waveform(SAMPLE_RATE as i32, &samples[piece]);
+                    r.decode(&stream);
+                    stream
+                        .get_result()
+                        .ok_or("the speech model returned no result")?
+                        .text
+                }
+                Inner::Online(r) => {
+                    let stream = r.create_stream();
+                    if let Some(l) = &self.language {
+                        stream.set_option("language", l);
+                    }
+                    let silence = |s: f32| vec![0.0; (s * SAMPLE_RATE as f32) as usize];
+                    stream.accept_waveform(SAMPLE_RATE as i32, &silence(STREAMING_LEAD_SECONDS));
+                    stream.accept_waveform(SAMPLE_RATE as i32, &samples[piece]);
+                    stream.accept_waveform(SAMPLE_RATE as i32, &silence(STREAMING_TAIL_SECONDS));
+                    stream.input_finished();
+                    while r.is_ready(&stream) {
+                        r.decode(&stream);
+                    }
+                    r.get_result(&stream)
+                        .ok_or("the speech model returned no result")?
+                        .text
+                }
+            };
+            // One space between words (a streaming model writes two between sentences; a
+            // SentencePiece model may leave its word mark, ▁, in).
+            let text = text
+                .replace('\u{2581}', " ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
             if !text.is_empty() {
-                texts.push(text.to_string());
+                texts.push(text);
             }
         }
         Ok(texts.join(" "))

@@ -245,8 +245,11 @@ Deletes a model and any interrupted download of it. `200 {"id": "...", "freed": 
 
 `200 {"voices": [{"name": "af_maple", "number": 0}, ...]}`: the voices of a downloaded speech model.
 
-#### `POST /v1/transcribe?model=<id>`
+#### `POST /v1/transcribe?model=<id>[&language=<tag>]`
 
+- `language`: the language spoken (`de`, `pt-BR`), passed as `transcribe --language`. Only a model
+  that cannot tell it from the audio uses it (Canary, which otherwise hears English; Nemotron
+  takes it as a hint); the others ignore it. Letters, digits, `-` and `_`, at most 16 (else `400`).
 - Body: a WAV or MP3 file, with `Content-Type: audio/wav` or `audio/mpeg` (else `415`), at most
   the body limit (`413`). The receiver keeps it in its private directory while the model runs
   and deletes it after.

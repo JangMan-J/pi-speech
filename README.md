@@ -69,13 +69,13 @@ lists the models of the bundled `pi-speech-receiver` with their size and whether
 
 ```
 Speech › Transcription model ─────────────────────────────────────────────────────
-Find:                                                                     3 models
+Find:
 ▸ ✓ parakeet-tdt-0.6b-v3-int8  487 MB  downloaded      25 langs
     whisper-small              639 MB  not downloaded  99 langs
     sense-voice-int8           163 MB  not downloaded  5 langs
 Runs on This machine, with no network request once downloaded.
 
-  Enter pick · d download · x delete · Esc back
+  Enter pick · d download · x delete · Esc back                              1/25
 ```
 
 Enter picks a downloaded model. On one that is not downloaded, Enter says its size and Enter again downloads it,
@@ -85,6 +85,35 @@ model cache (`~/.cache/pi-speech/models` on Linux, or `PI_SPEECH_MODELS_DIR`).
 
 Local transcription (dictation, Transcribe file…, `--transcribe`, `speech_transcribe`) runs
 `pi-speech-receiver transcribe <model> <audio>` on This machine, with no network request; it reads WAV and MP3.
+The dictation language, when one is set, is passed as `--language`: Canary needs it (without it, it hears
+English and translates other speech into English); Cohere and Nemotron take it as a hint; the others detect the
+language themselves.
+
+The transcription models, and the time each took to load and transcribe an 8-second English sentence on an
+i9-14900HX (CPU only, 8 threads). Most of that time is loading the model, which every transcription does:
+
+| Model                                                                    | Languages                   | Download    | Time       |
+| ------------------------------------------------------------------------ | --------------------------- | ----------- | ---------- |
+| `moonshine-tiny-en-v2`                                                   | English                     | 30 MB       | 0.9 s      |
+| `moonshine-base-en-v2`                                                   | English                     | 111 MB      | 1.1 s      |
+| `moonshine-{base-es,base-zh,base-ja,tiny-ko,base-ar,base-uk,base-vi}-v2` | one each                    | 49–119 MB   | ~1 s       |
+| `whisper-tiny.en`, `whisper-base.en`                                     | English                     | 118, 209 MB | 1.4, 2.0 s |
+| `sense-voice-int8`                                                       | zh en ja ko yue             | 163 MB      | 1.7 s      |
+| `omnilingual-300m-v2-int8`                                               | 1600+                       | 292 MB      | 2.1 s      |
+| `canary-180m-flash-int8`                                                 | en es de fr (set it)        | 154 MB      | 2.7 s      |
+| `parakeet-tdt-110m-en-int8`                                              | English                     | 108 MB      | 3.6 s      |
+| `nemotron-3.5-asr-0.6b-int8`                                             | 35 (40 locales)             | 475 MB      | 4.7 s      |
+| `parakeet-tdt-0.6b-redux-int8`                                           | 25 European                 | 328 MB      | 5.7 s      |
+| `parakeet-tdt-0.6b-v2-int8`                                              | English                     | 482 MB      | 6.3 s      |
+| `parakeet-tdt-0.6b-v3-int8`                                              | 25 European                 | 487 MB      | 6.4 s      |
+| `qwen3-asr-0.6b-int8`                                                    | 30, and 22 Chinese dialects | 879 MB      | 6.2 s      |
+| `whisper-small`, `whisper-turbo`                                         | 99                          | 639, 564 MB | 6.0, 6.6 s |
+| `whisper-distil-large-v3.5`                                              | English                     | 529 MB      | 6.2 s      |
+| `cohere-transcribe-int8`                                                 | 14                          | 1.7 GB      | 8.4 s      |
+| `dolphin-base-int8`                                                      | 40 Eastern (not English)    | 81 MB       | —          |
+
+All were checked against real speech in their languages. Moonshine v2 is the quickest for dictation; Parakeet,
+Canary, Nemotron, Qwen3 and Cohere write punctuation and capitals.
 With Speech source Local, speech is made on This machine by the chosen on-device model (Kokoro, or an English
 Piper voice) through the bundled pi-speech-receiver: it plays as it is generated, sentence by sentence, and is
 saved in the history like provider speech; nothing goes over the network. The Voice row then opens the local

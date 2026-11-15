@@ -293,16 +293,17 @@ export function formatSize(bytes: number): string {
 
 /**
  * Transcribe a WAV or MP3 file with a downloaded model, on this machine: `transcribe <id> <file>` prints the
- * text. Nothing goes over the network. Aborting kills the binary.
+ * text. `language` (`de`) is passed for a model that must be told (Canary); the others detect it. Nothing goes over the network. Aborting kills the binary.
  */
 export async function transcribeLocal(
   binary: string,
   id: string,
   file: string,
-  options: { signal?: AbortSignal; env?: NodeJS.ProcessEnv } = {},
+  options: { signal?: AbortSignal; env?: NodeJS.ProcessEnv; language?: string } = {},
 ): Promise<string> {
   options.signal?.throwIfAborted();
-  const child = spawn(binary, ["transcribe", id, file], {
+  const language = options.language && options.language !== "auto" ? ["--language", options.language] : [];
+  const child = spawn(binary, ["transcribe", id, file, ...language], {
     env: options.env ?? process.env,
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
@@ -412,17 +413,24 @@ export class LocalModels {
   }
 
   /** Transcribe audio held in memory (a dictation recording), through a private temporary file. */
-  async transcribe(id: string, audio: Buffer, format: string, signal?: AbortSignal): Promise<string> {
+  async transcribe(
+    id: string,
+    audio: Buffer,
+    format: string,
+    signal?: AbortSignal,
+    language?: string,
+  ): Promise<string> {
     if (!LOCAL_AUDIO.includes(format)) {
       throw new LocalModelsError(`local models transcribe ${LOCAL_AUDIO.join(" and ")} audio, not ${format}`);
     }
     const remote = this.remote();
-    if (remote) return remote.transcribe(id, audio, format as "wav" | "mp3", signal);
+    const lang = language && language !== "auto" ? language : undefined;
+    if (remote) return remote.transcribe(id, audio, format as "wav" | "mp3", signal, lang);
     const dir = mkdtempSync(join(tmpdir(), "pi-speech-local-"));
     try {
       const file = join(dir, `audio.${format}`);
       writeFileSync(file, audio, { mode: 0o600 });
-      return await transcribeLocal(this.binary(), id, file, { signal, env: this.childEnv });
+      return await transcribeLocal(this.binary(), id, file, { signal, env: this.childEnv, language: lang });
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

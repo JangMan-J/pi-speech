@@ -333,6 +333,17 @@ pub fn transcribe(ctx: &Ctx, conn: &mut Conn, req: &Request) -> Response {
         Ok(m) => m,
         Err(r) => return r,
     };
+    // The language spoken (`de`), for a model that must be told; a short tag or nothing.
+    let language = query_param(req.query.as_deref(), "language").filter(|l| !l.is_empty());
+    if let Some(l) = &language {
+        if l.len() > 16
+            || !l
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Response::error(400, "language must be a language tag such as de or pt-BR");
+        }
+    }
     let Some(ext) = audio_ext(req) else {
         return Response::error(415, "the audio must be WAV (audio/wav) or MP3 (audio/mpeg)");
     };
@@ -352,7 +363,15 @@ pub fn transcribe(ctx: &Ctx, conn: &mut Conn, req: &Request) -> Response {
         Err(e) => return Response::error(503, &format!("no random source: {e}")),
     };
     let path = ctx.tmp_dir.join(name);
-    let r = transcribe_file(ctx, conn, req, framing, &model, &path, &too_large);
+    let r = transcribe_file(
+        ctx,
+        conn,
+        req,
+        framing,
+        (&model, language.as_deref()),
+        &path,
+        &too_large,
+    );
     let _ = fs::remove_file(&path);
     r
 }
@@ -363,7 +382,7 @@ fn transcribe_file(
     conn: &mut Conn,
     req: &Request,
     framing: Framing,
-    model: &str,
+    (model, language): (&str, Option<&str>),
     path: &PathBuf,
     too_large: &str,
 ) -> Response {
@@ -393,7 +412,11 @@ fn transcribe_file(
         Err(why) => return why.answer(),
     };
     let path_arg = path.to_string_lossy();
-    let child = match job.spawn(command(ctx.program, &["transcribe", model, &path_arg])) {
+    let mut args = vec!["transcribe", model, &path_arg];
+    if let Some(l) = language {
+        args.extend(["--language", l]);
+    }
+    let child = match job.spawn(command(ctx.program, &args)) {
         Ok(c) => c,
         Err(e) => return cannot_run(ctx.program, &e),
     };

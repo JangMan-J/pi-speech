@@ -1090,7 +1090,12 @@ export class Panel {
               : m.partial
                 ? "partly downloaded"
                 : "not downloaded";
-        const langs = m.languages.length > 4 ? `${m.languages.length} langs` : m.languages.join(" ");
+        // "mul" (ISO 639: many languages) stands for a list too long to give, as Omnilingual's 1600.
+        const langs = m.languages.includes("mul")
+          ? "many langs"
+          : m.languages.length > 4
+            ? `${m.languages.length} langs`
+            : m.languages.join(" ");
         return {
           id: m.id,
           label: m.id,
