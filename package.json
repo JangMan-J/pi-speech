@@ -1,6 +1,6 @@
 {
   "name": "@jangmanj/pi-speech",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Speech for Pi through OpenRouter: synthesis, transcription, Alt+Z dictation, voice-language samples, and remote-to-local playback",
   "license": "MIT",
   "author": "JangMan-J",
