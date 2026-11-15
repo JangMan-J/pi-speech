@@ -136,10 +136,7 @@ jobs:
       - run: cargo fmt --check
         if: runner.os == 'Linux'
       - run: cargo clippy --all-targets -- -D warnings
-      # Off on macOS for now: since the spectrum meter landed, a playback on the null device sometimes never
-      # finishes there (and nowhere else); being diagnosed in #9.
       - run: cargo test
-        if: runner.os != 'macOS'
       - name: Build the release binary
         run: cargo build --release
       - name: Report the release binary's size
