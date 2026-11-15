@@ -12,6 +12,7 @@ import { createInterface } from "node:readline";
 import type { BridgeModels } from "../bridge/index";
 import { type BinaryChoice, findBinary } from "./binary";
 import { childEnv, type Env } from "./env";
+import { TranscribeWorker } from "./transcribe-worker";
 
 export type ModelKind = "transcription" | "speech";
 
@@ -354,10 +355,37 @@ export class LocalModels {
   /** The Remote machine's models when they are the ones to use; set by the engine. */
   remote: () => BridgeModels | undefined = () => undefined;
 
+  /** The running `transcribe --serve`, which keeps the last model loaded between transcriptions. */
+  private readonly worker: TranscribeWorker;
+
   constructor(
     private readonly env: Env,
     private readonly locate: () => BinaryChoice = () => findBinary(env),
-  ) {}
+  ) {
+    this.worker = new TranscribeWorker(
+      () => this.binary(),
+      () => this.childEnv,
+    );
+  }
+
+  /**
+   * Load transcription model `id` now (as dictation starts), so the transcription after the recording does not
+   * wait for it. Only on This machine; never fails (a failure shows when the audio is sent).
+   */
+  preload(id: string, language?: string): void {
+    if (this.remote()) return;
+    try {
+      this.binary();
+    } catch {
+      return;
+    }
+    this.worker.load(id, language && language !== "auto" ? language : undefined);
+  }
+
+  /** End the transcription worker, giving back the memory of the model it holds. */
+  close(): void {
+    this.worker.close();
+  }
 
   /** The binary's path; throws why there is none. */
   binary(): string {
@@ -400,7 +428,7 @@ export class LocalModels {
   }
 
   /** Transcribe an audio file (WAV or MP3) with the downloaded model `id`. */
-  async transcribeFile(id: string, file: string, signal?: AbortSignal): Promise<string> {
+  async transcribeFile(id: string, file: string, signal?: AbortSignal, language?: string): Promise<string> {
     const ext = extname(file).slice(1).toLowerCase();
     if (!LOCAL_AUDIO.includes(ext)) {
       throw new LocalModelsError(
@@ -408,8 +436,10 @@ export class LocalModels {
       );
     }
     const remote = this.remote();
-    if (remote) return remote.transcribe(id, readFileSync(file), ext as "wav" | "mp3", signal);
-    return transcribeLocal(this.binary(), id, file, { signal, env: this.childEnv });
+    const lang = language && language !== "auto" ? language : undefined;
+    if (remote) return remote.transcribe(id, readFileSync(file), ext as "wav" | "mp3", signal, lang);
+    this.binary();
+    return this.worker.transcribe(id, file, lang, signal);
   }
 
   /** Transcribe audio held in memory (a dictation recording), through a private temporary file. */
@@ -430,7 +460,8 @@ export class LocalModels {
     try {
       const file = join(dir, `audio.${format}`);
       writeFileSync(file, audio, { mode: 0o600 });
-      return await transcribeLocal(this.binary(), id, file, { signal, env: this.childEnv, language: lang });
+      this.binary();
+      return await this.worker.transcribe(id, file, lang, signal);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

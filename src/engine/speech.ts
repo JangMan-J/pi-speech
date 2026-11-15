@@ -659,6 +659,13 @@ export class Speech {
     return { model, voice: voice || this.settings.localSpeechVoice || "" };
   }
 
+  /** Get transcription ready for audio to come: a local model is loaded while the user speaks. */
+  prepareTranscription(language?: string): void {
+    if (this.settings.transcriptionSource !== "local") return;
+    const id = this.settings.localTranscriptionModel;
+    if (id) this.local.preload(id, language);
+  }
+
   /** The local transcription model to use; throws when none is chosen. */
   private localTranscription(model?: string): string {
     const id = model || this.settings.localTranscriptionModel;

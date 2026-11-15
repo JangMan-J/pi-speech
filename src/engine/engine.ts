@@ -119,6 +119,7 @@ export class Engine {
       input: () => this.routes.input(),
       transcribe: (audio, format, signal, language) => this.speech.transcribeAudio(audio, format, { signal, language }),
       defaultLanguage: () => this.speech.settings.dictationLanguage,
+      prepare: (language) => this.speech.prepareTranscription(language),
       outputConfigured: () => !!this.speech.settings.dictationOutput,
       output: (text) => runDictationOutput(this.speech.settings.dictationOutput ?? "", text, opts.env),
       onChange: () => this.indicator.update(),
@@ -380,5 +381,6 @@ export class Engine {
     await this.dictation.cancel();
     await this.player.stop();
     await this.disconnectRemote(false);
+    this.speech.local.close();
   }
 }

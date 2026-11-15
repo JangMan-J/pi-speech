@@ -49,6 +49,18 @@ fn path(p: &Path) -> Result<String, String> {
 
 /// Up to 8 threads: measured on a 32-thread CPU, 8 runs the larger models (Cohere, Qwen3) a third
 /// faster than 4, and 16 no faster than 8.
+/// The environment variable naming the ONNX Runtime provider models run on: `cpu` (the
+/// default), or `cuda`, `coreml`, `directml` on a build that has it.
+pub const PROVIDER_ENV: &str = "PI_SPEECH_PROVIDER";
+
+fn provider() -> String {
+    std::env::var(PROVIDER_ENV)
+        .ok()
+        .map(|p| p.trim().to_ascii_lowercase())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "cpu".into())
+}
+
 fn threads() -> i32 {
     std::thread::available_parallelism()
         .map(|n| n.get().min(8) as i32)
@@ -58,7 +70,28 @@ fn threads() -> i32 {
 impl Recognizer {
     /// Load `model` (reads several hundred megabytes for the larger models). `language` (`de`) is
     /// the language spoken, for a model that must be told (Canary); the others detect it.
+    ///
+    /// It runs where [`PROVIDER_ENV`] says (`cuda` on a build linked with the GPU libraries),
+    /// else on the CPU; a model the GPU provider refuses (Moonshine's `.ort` files) runs on the CPU.
     pub fn load(model: &Model, language: Option<&str>) -> Result<Recognizer, String> {
+        let wanted = provider();
+        match Self::load_on(model, language, &wanted) {
+            Err(_) if wanted != "cpu" => Self::load_on(model, language, "cpu"),
+            r => r,
+        }
+    }
+
+    /// Whether `language` changes how `model` is loaded or run, so that a loaded model is kept
+    /// per language.
+    pub fn language_matters(kind: Kind) -> bool {
+        matches!(kind, Kind::Canary | Kind::Cohere | Kind::Streaming)
+    }
+
+    fn load_on(
+        model: &Model,
+        language: Option<&str>,
+        provider: &str,
+    ) -> Result<Recognizer, String> {
         let language = language
             .map(|l| l.split(['-', '_']).next().unwrap_or(l).to_ascii_lowercase())
             .filter(|l| !l.is_empty() && l != "auto");
@@ -73,7 +106,7 @@ impl Recognizer {
             config.feat_config.sample_rate = SAMPLE_RATE as i32;
             let m = &mut config.model_config;
             m.num_threads = threads();
-            m.provider = Some("cpu".into());
+            m.provider = Some(provider.into());
             m.transducer = OnlineTransducerModelConfig {
                 encoder: Some(path(encoder)?),
                 decoder: Some(path(decoder)?),
@@ -96,7 +129,7 @@ impl Recognizer {
         config.feat_config.sample_rate = SAMPLE_RATE as i32;
         let m = &mut config.model_config;
         m.num_threads = threads();
-        m.provider = Some("cpu".into());
+        m.provider = Some(provider.into());
         match model {
             Model::Transducer {
                 encoder,

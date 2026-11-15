@@ -89,8 +89,15 @@ The dictation language, when one is set, is passed as `--language`: Canary needs
 English and translates other speech into English); Cohere and Nemotron take it as a hint; the others detect the
 language themselves.
 
+Local transcription goes through one running `pi-speech-receiver transcribe --serve`, which keeps the last
+model loaded for ten minutes after its last use, and dictation starts loading the model as soon as recording
+starts, so the wait after speaking is only the transcription itself: Parakeet 0.6b takes about 0.7 s for an
+8-second sentence once loaded, Moonshine base 0.3 s, Cohere 1.8 s. `PI_SPEECH_PROVIDER=cuda` runs the models on
+an NVIDIA GPU on a receiver built against sherpa-onnx's CUDA libraries (not the published one); with these int8
+models it was no faster than the CPU in our measurements, so it is not built by default.
+
 The transcription models, and the time each took to load and transcribe an 8-second English sentence on an
-i9-14900HX (CPU only, 8 threads). Most of that time is loading the model, which every transcription does:
+i9-14900HX (CPU only, 8 threads), the first time (most of it is loading the model):
 
 | Model                                                                    | Languages                   | Download    | Time       |
 | ------------------------------------------------------------------------ | --------------------------- | ----------- | ---------- |

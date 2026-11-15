@@ -12,6 +12,7 @@ import {
   listModels,
   transcribeLocal,
 } from "../../src/engine/local-models";
+import { TranscribeWorker } from "../../src/engine/transcribe-worker";
 
 // The stand-in binary is a script with a shebang line, which Windows cannot start.
 const WINDOWS = process.platform === "win32";
@@ -33,6 +34,23 @@ function fakeBinary(): string {
     `#!${process.execPath}
 const [, , cmd, sub, id] = process.argv;
 const out = (v) => process.stdout.write(JSON.stringify(v) + "\\n");
+if (cmd === "transcribe" && sub === "--serve") {
+  // One process for many requests: it says how many it loaded and which process it is.
+  const fs = require("node:fs"), path = require("node:path");
+  let loaded, loads = 0;
+  require("node:readline").createInterface({ input: process.stdin }).on("line", async (line) => {
+    const r = JSON.parse(line);
+    if (r.model === "missing") return out({ error: "model missing is not downloaded" });
+    if (r.model === "crash") process.exit(3);
+    if (loaded !== r.model) { loaded = r.model; loads++; }
+    if (r.load) return out({ loaded: true });
+    if (r.model === "slow") await new Promise((res) => setTimeout(res, 5000));
+    const bytes = fs.readFileSync(r.audio).length;
+    out({ text: "heard " + r.model + " " + path.extname(r.audio) + " " + bytes + (r.language ? " " + r.language : "") +
+      " loads " + loads + " pid " + process.pid });
+  });
+  return;
+}
 if (cmd === "transcribe") {
   if (sub === "missing") { process.stderr.write("pi-speech-receiver: model missing is not downloaded\\n"); process.exit(1); }
   const bytes = require("node:fs").readFileSync(id).length;
@@ -232,13 +250,62 @@ describe.skipIf(WINDOWS)("transcription with a local model", () => {
     const local = new LocalModels({ PI_SPEECH_BINARY: fakeBinary(), PATH: process.env.PATH });
     expect((await local.list("speech")).map((m) => m.id)).toEqual(["kokoro", "piper"]);
     expect((await local.list("transcription")).map((m) => m.id)).toEqual(["whisper-small"]);
-    await expect(local.transcribe("whisper-small", Buffer.from("RIFFabcdef"), "wav")).resolves.toBe(
-      "heard whisper-small .wav 10",
+    await expect(local.transcribe("whisper-small", Buffer.from("RIFFabcdef"), "wav")).resolves.toMatch(
+      /^heard whisper-small \.wav 10 loads 1 pid \d+$/,
     );
+    local.close();
     await expect(local.transcribe("whisper-small", Buffer.from("x"), "ogg")).rejects.toThrow(
       /wav and mp3 audio, not ogg/,
     );
     await expect(local.transcribeFile("whisper-small", join(dir, "a.flac"))).rejects.toThrow(/not flac/);
+  });
+});
+
+describe.skipIf(WINDOWS)("the transcription worker", () => {
+  const pidOf = (t: string) => t.match(/pid (\d+)$/)?.[1];
+
+  it("keeps one process, and the model in it, across transcriptions; a preload loads it before the audio", async () => {
+    const local = new LocalModels({ PI_SPEECH_BINARY: fakeBinary(), PATH: process.env.PATH });
+    local.preload("whisper-small");
+    const a = await local.transcribe("whisper-small", Buffer.from("RIFF1"), "wav");
+    const b = await local.transcribe("whisper-small", Buffer.from("RIFF12"), "wav", undefined, "de");
+    expect(a).toMatch(/^heard whisper-small \.wav 5 loads 1 pid/);
+    expect(b).toMatch(/^heard whisper-small \.wav 6 de loads 1 pid/);
+    expect(pidOf(a)).toBe(pidOf(b));
+    // another model: loaded in the same process
+    expect(await local.transcribe("canary", Buffer.from("RIFF"), "wav")).toMatch(/loads 2 pid/);
+    local.close();
+  });
+
+  it("a failed request keeps the process; one that dies is started again; an abort ends it", async () => {
+    const local = new LocalModels({ PI_SPEECH_BINARY: fakeBinary(), PATH: process.env.PATH });
+    const first = await local.transcribe("whisper-small", Buffer.from("RIFF"), "wav");
+    await expect(local.transcribe("missing", Buffer.from("RIFF"), "wav")).rejects.toThrow(
+      /^model missing is not downloaded$/,
+    );
+    const same = await local.transcribe("whisper-small", Buffer.from("RIFF"), "wav");
+    expect(pidOf(same)).toBe(pidOf(first));
+    await expect(local.transcribe("crash", Buffer.from("RIFF"), "wav")).rejects.toThrow(/worker ended/);
+    const again = await local.transcribe("whisper-small", Buffer.from("RIFF"), "wav");
+    expect(pidOf(again)).not.toBe(pidOf(first));
+    const abort = new AbortController();
+    const slow = local.transcribe("slow", Buffer.from("RIFF"), "wav", abort.signal);
+    setTimeout(() => abort.abort(new Error("stopped")), 100);
+    await expect(slow).rejects.toThrow(/stopped/);
+    const after = await local.transcribe("whisper-small", Buffer.from("RIFF"), "wav");
+    expect(pidOf(after)).not.toBe(pidOf(again));
+    local.close();
+  });
+
+  it("ends after a while without requests", async () => {
+    const worker = new TranscribeWorker(fakeBinary, () => process.env, 50);
+    const file = join(dir, "idle.wav");
+    writeFileSync(file, "RIFF");
+    const a = await worker.transcribe("whisper-small", file);
+    await new Promise((r) => setTimeout(r, 200));
+    const b = await worker.transcribe("whisper-small", file);
+    expect(pidOf(b)).not.toBe(pidOf(a));
+    worker.close();
   });
 });
 

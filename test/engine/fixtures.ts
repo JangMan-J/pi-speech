@@ -233,6 +233,19 @@ const CATALOG = [
   { id: "whisper-small", kind: "transcription", name: "Whisper small", languages: ["en"], size: 639387718 },
   { id: "kokoro", kind: "speech", name: "Kokoro", languages: ["en"], size: 100000000 },
 ];
+if (cmd === "transcribe" && sub === "--serve") {
+  // Each request is logged as the one-shot command would be: transcribe <model> <file>.
+  require("node:readline").createInterface({ input: process.stdin }).on("line", (line) => {
+    const r = JSON.parse(line);
+    const now = JSON.parse(fs.readFileSync(state, "utf8"));
+    if (!now.includes(r.model)) return out({ error: r.model + " is not downloaded" });
+    if (r.load) return out({ loaded: true });
+    fs.appendFileSync(${JSON.stringify(log)}, "transcribe " + r.model + " " + r.audio + "\\n");
+    fs.readFileSync(r.audio);
+    out({ text: "local words from " + r.model });
+  });
+  return;
+}
 if (cmd === "transcribe") {
   if (!have.includes(sub)) { process.stderr.write("pi-speech-receiver: " + sub + " is not downloaded\\n"); process.exit(1); }
   fs.readFileSync(id);

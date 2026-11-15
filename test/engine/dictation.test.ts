@@ -72,6 +72,24 @@ function harness(opts: { start?: () => Promise<Recording>; transcript?: string |
 afterEach(() => vi.useRealTimers());
 
 describe("Dictation toggle", () => {
+  it("gets the transcription ready as soon as recording starts, in the dictation language", async () => {
+    const h = harness();
+    const prepared: Array<string | undefined> = [];
+    const d = h.make({ prepare: (language) => prepared.push(language), defaultLanguage: () => "de" });
+    await d.toggle(h.ctx);
+    expect(prepared).toEqual(["de"]);
+    await d.toggle(h.ctx, "auto");
+    // a failing preparation does not stop dictation
+    const broken = harness();
+    const e = broken.make({
+      prepare: () => {
+        throw new Error("no binary");
+      },
+    });
+    await e.toggle(broken.ctx);
+    expect(e.indicator()).toMatch(/REC/);
+  });
+
   it("first toggle records with a REC indicator; second transcribes and pastes the trimmed text", async () => {
     const h = harness();
     const d = h.make();

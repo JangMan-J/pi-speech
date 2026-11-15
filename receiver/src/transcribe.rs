@@ -2,6 +2,18 @@
 //! speech model run in-process, on standard output. A catalogue id (`models list`) names a
 //! model downloaded into the model cache. `--language <code>` names the language spoken, for a
 //! model that must be told (Canary); the others detect it and ignore this.
+//!
+//! `transcribe --serve` stays running and keeps the last model it used loaded, so that only the
+//! first transcription pays for loading it (seconds, for the larger models). It reads one JSON
+//! request a line on standard input and answers each, in order, with one JSON line on standard
+//! output:
+//!
+//! - `{"model":"<id or dir>","language":"de","load":true}`: load the model now (before the audio
+//!   is there), answered `{"loaded":true}`;
+//! - `{"model":"<id or dir>","audio":"<file>","language":"de"}`: answered `{"text":"..."}`;
+//! - a failure is answered `{"error":"..."}`, and the server goes on.
+//!
+//! `language` is optional. It exits when standard input closes.
 
 use crate::audio::convert::Converter;
 use crate::audio::decode::{Decode, WavOrMp3};
@@ -13,11 +25,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 pub const USAGE: &str =
-    "pi-speech-receiver transcribe <model-dir>|<model-id> <audio.wav|audio.mp3> [--language <code>]";
+    "pi-speech-receiver transcribe <model-dir>|<model-id> <audio.wav|audio.mp3> [--language <code>] | --serve";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Help,
+    Serve,
     Run {
         model_dir: PathBuf,
         audio: PathBuf,
@@ -29,6 +42,7 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     match args.as_slice() {
         ["-h" | "--help"] => Ok(Command::Help),
+        ["--serve"] => Ok(Command::Serve),
         [dir, audio] if usable(dir) && usable(audio) => Ok(Command::Run {
             model_dir: PathBuf::from(dir),
             audio: PathBuf::from(audio),
@@ -107,12 +121,93 @@ pub fn transcribe(
     Recognizer::load(&model, language)?.transcribe(&samples)
 }
 
+/// The loaded model `serve` keeps: its directory, the language it was loaded for (when that
+/// matters to it), and the recogniser.
+struct Kept {
+    dir: PathBuf,
+    language: Option<String>,
+    recognizer: Recognizer,
+}
+
+/// The recogniser for `model` and `language`: the kept one when it is that, else a new one,
+/// kept in its place (the old one is dropped first, so two large models are never held).
+fn recognizer<'a>(
+    kept: &'a mut Option<Kept>,
+    model: &str,
+    language: Option<&str>,
+) -> Result<&'a Recognizer, String> {
+    let dir = crate::models::resolve_model_dir(model)?;
+    let found = model::detect(&dir)?;
+    let language = Recognizer::language_matters(found.kind())
+        .then(|| language.map(String::from))
+        .flatten();
+    let same = kept
+        .as_ref()
+        .is_some_and(|k| k.dir == dir && k.language == language);
+    if !same {
+        *kept = None;
+        let recognizer = Recognizer::load(&found, language.as_deref())?;
+        *kept = Some(Kept {
+            dir,
+            language,
+            recognizer,
+        });
+    }
+    Ok(&kept.as_ref().expect("kept above").recognizer)
+}
+
+/// One request of `serve`, answered.
+fn answer(kept: &mut Option<Kept>, line: &str) -> serde_json::Value {
+    use serde_json::{json, Value};
+    let req: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(e) => return json!({ "error": format!("not a JSON request: {e}") }),
+    };
+    let s = |k: &str| req.get(k).and_then(Value::as_str).filter(|v| !v.is_empty());
+    let Some(model) = s("model") else {
+        return json!({ "error": "the request names no model" });
+    };
+    let language = s("language").filter(|l| *l != "auto");
+    let mut run = || -> Result<Value, String> {
+        if req.get("load").and_then(Value::as_bool) == Some(true) {
+            recognizer(kept, model, language)?;
+            return Ok(json!({ "loaded": true }));
+        }
+        let audio = s("audio").ok_or("the request names no audio file")?;
+        // The audio first: a bad file fails before a large model is loaded.
+        let samples = load_audio(Path::new(audio))?;
+        let text = recognizer(kept, model, language)?.transcribe(&samples)?;
+        Ok(json!({ "text": text }))
+    };
+    run().unwrap_or_else(|e| json!({ "error": e }))
+}
+
+/// `transcribe --serve`: requests on standard input, answers on standard output.
+pub fn serve() -> ExitCode {
+    use std::io::{BufRead, Write};
+    let mut kept = None;
+    let stdout = io::stdout();
+    for line in io::stdin().lock().lines() {
+        let Ok(line) = line else { break };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let reply = answer(&mut kept, &line);
+        let mut out = stdout.lock();
+        if writeln!(out, "{reply}").and_then(|_| out.flush()).is_err() {
+            break;
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 pub fn main(args: &[String]) -> ExitCode {
     let (model_dir, audio, language) = match parse_args(args) {
         Ok(Command::Help) => {
             println!("usage: {USAGE}");
             return ExitCode::SUCCESS;
         }
+        Ok(Command::Serve) => return serve(),
         Ok(Command::Run {
             model_dir,
             audio,

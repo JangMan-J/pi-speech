@@ -23,6 +23,8 @@ export interface DictationDeps {
   transcribe(audio: Buffer, format: string, signal: AbortSignal, language?: string): Promise<string>;
   /** The saved dictation language, used when a toggle names none. */
   defaultLanguage?(): string | undefined;
+  /** Recording has started: get the transcription ready (load a local model) while the user speaks. */
+  prepare?(language?: string): void;
   /** Whether a user-defined output command is configured; when false the transcript goes to the editor. */
   outputConfigured?(): boolean;
   /** Run the user-defined output command with the transcript; rejects when it fails. */
@@ -133,6 +135,11 @@ export class Dictation {
       this.recording = recording;
       this.startedAt = Date.now();
       this.set("recording");
+      try {
+        this.deps.prepare?.(this.language);
+      } catch {
+        /* only a head start */
+      }
       this.tick = setInterval(() => this.changed(), this.deps.tickMs ?? 1000);
       this.limit = setTimeout(() => {
         const u = this.ui;
