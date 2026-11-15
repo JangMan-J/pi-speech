@@ -33,5 +33,14 @@ describe("the status indicator", () => {
     const other: Array<string | undefined> = [];
     ind.attach((t) => other.push(t));
     expect(other).toEqual(["▶ speaking"]);
+    ind.refresh();
+    expect(other).toEqual(["▶ speaking", "▶ speaking"]);
+  });
+
+  it("the panel's header is silent while something else (the OSD) shows the live state", () => {
+    const ind = new Indicator(() => ({ dictation: "● REC 0:03", playing: false, route: "local" }));
+    expect(ind.live()).toBe("● REC 0:03");
+    ind.shownElsewhere = () => true;
+    expect(ind.live()).toBe("");
   });
 });

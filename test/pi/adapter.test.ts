@@ -70,6 +70,20 @@ describe("the Pi adapter", () => {
     expect(new Set(f.statuses.map(([k]) => k))).toEqual(new Set(["pi-speech"]));
   });
 
+  it("with the OSD on, recording and playback show in the OSD only, not in the footer", async () => {
+    fakeOpenRouter();
+    const f = fakePi();
+    const widgets: Array<[string, unknown]> = [];
+    f.ctx.ui.setWidget = (k: string, lines: unknown) => widgets.push([k, lines]);
+    const { engine } = makeEngine();
+    registerPi(f.pi, engine);
+    await f.emit("session_start");
+    engine.speech.settings.osdStyle = "braille";
+    await f.commands.get("speech").handler("hello there", f.ctx);
+    expect(f.statuses.at(-1)).toEqual(["pi-speech", undefined]);
+    expect(widgets.some(([k, lines]) => k === "pi-speech-osd" && Array.isArray(lines) && lines.length > 0)).toBe(true);
+  });
+
   it("--type inserts literal text into the editor without speaking or submitting it", async () => {
     const requests = fakeOpenRouter();
     const f = fakePi();

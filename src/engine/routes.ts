@@ -107,6 +107,21 @@ export class Routes {
     return this.route === "bridge" ? this.plainInput() : this.localInput;
   }
 
+  /**
+   * The spectrum levels of what plays and what records now, each from where it runs: the receiver through the
+   * bridge, else the player or recorder on this machine. Never throws.
+   */
+  async levels(): Promise<{ recording?: number[]; playing?: number[] }> {
+    const remote =
+      this.outputRoute === "bridge" || this.inputRoute === "bridge"
+        ? await this.bridge.levels?.().catch(() => undefined)
+        : undefined;
+    return {
+      playing: this.outputRoute === "bridge" ? remote?.playing : this.localOutput.levels?.(),
+      recording: this.inputRoute === "bridge" ? remote?.recording : this.localInput.levels?.(),
+    };
+  }
+
   /** Why a direction chosen as This machine failed while the bridge is in use, said plainly with the way out. */
   private plainly(direction: DirectionSetting, what: string, reason: string): string {
     const label = DIRECTION_LABELS[direction];

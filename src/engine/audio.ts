@@ -29,6 +29,8 @@ export interface AudioOutput {
   playStream(stream: AudioStream, kind: PlayKind): Promise<PlayStart>;
   /** Stop what this output plays: everything, or only one kind. */
   stop(kind?: PlayKind): Promise<void>;
+  /** The 12 spectrum bands (`0..100`) of what plays now; undefined when nothing does or it cannot tell. */
+  levels?(): number[] | undefined;
 }
 
 export interface Recording {
@@ -47,4 +49,6 @@ export interface AudioInput {
   readonly name: string;
   /** Start recording the microphone. Throws a readable Error when it cannot. */
   start(): Promise<Recording>;
+  /** The 12 spectrum bands (`0..100`) of the recording now; undefined when none runs or it cannot tell. */
+  levels?(): number[] | undefined;
 }

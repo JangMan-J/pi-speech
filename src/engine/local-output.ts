@@ -13,6 +13,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import type { AudioOutput, PlayKind, PlayOutcome, PlayStart } from "./audio";
 import { type BinaryChoice, findBinary } from "./binary";
 import { childEnv, type Env, errorMessage, findExecutable } from "./env";
+import { LEVELS_ENV, levelsFile, readLevels, removeLevels } from "./levels";
 import type { AudioStream, PcmFormat, StreamFormat } from "./provider";
 
 /** Players of raw signed 16-bit little-endian PCM on stdin; each exits once its input has ended and played. */
@@ -104,6 +105,8 @@ function kill(c: ChildProcess): void {
 export interface LocalOutputOptions {
   /** Where the bundled binary is; replaceable for tests. */
   binary?: () => BinaryChoice;
+  /** Where the bundled binary writes the spectrum levels of a playback. */
+  levelsFile?: string;
 }
 
 /** Plays on this machine, each Stream in its own player process. */
@@ -116,6 +119,14 @@ export class LocalOutput implements AudioOutput {
     private readonly env: Env,
     private readonly opts: LocalOutputOptions = {},
   ) {}
+
+  private get levelsPath(): string {
+    return this.opts.levelsFile ?? levelsFile("play");
+  }
+
+  levels(): number[] | undefined {
+    return this.playing.size ? readLevels(this.levelsPath) : undefined;
+  }
 
   async playStream(stream: AudioStream, kind: PlayKind): Promise<PlayStart> {
     const choice = chooseStreamPlayer(this.env, stream.format, this.opts.binary);
@@ -147,7 +158,8 @@ export class LocalOutput implements AudioOutput {
         detached: process.platform !== "win32",
         windowsHide: true,
         stdio: ["pipe", "ignore", "ignore"],
-        env: childEnv(this.env),
+        // The bundled binary writes its spectrum levels there; other players ignore it.
+        env: { ...childEnv(this.env), [LEVELS_ENV]: this.levelsPath },
       });
     } catch (err) {
       return { ok: false, reason: `cannot start ${name}: ${errorMessage(err)}` };
@@ -162,6 +174,7 @@ export class LocalOutput implements AudioOutput {
         if (settled) return;
         settled = true;
         this.playing.delete(child);
+        if (!this.playing.size) removeLevels(this.levelsPath);
         resolve(outcome);
       };
       child.on("error", (err) => finish({ state: "failed", error: `cannot run ${name}: ${err.message}` }));

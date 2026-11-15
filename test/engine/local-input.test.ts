@@ -141,6 +141,21 @@ describe.skipIf(onWindows)("LocalInput", () => {
     expect(leftovers().length).toBe(before);
   });
 
+  it("tells the recorder where to write its spectrum levels, and reads them only while it records", async () => {
+    const levels = join(dir, "rec.levels");
+    const r = recorder(
+      "levels",
+      `${WAV_FN}\nfs.writeFileSync(process.env.PI_SPEECH_LEVELS_FILE, Buffer.from([1,2,3,4,5,6,7,8,9,10,11,12]));\nprocess.on("SIGINT", () => { fs.writeFileSync(out, wav(1)); process.exit(0); });\nsetInterval(() => {}, 100);`,
+    );
+    const input = new LocalInput({ ...base, PI_SPEECH_RECORDER: r }, { levelsFile: levels });
+    expect(input.levels()).toBeUndefined();
+    const rec = await input.start();
+    expect(input.levels()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    await rec.stop();
+    expect(input.levels()).toBeUndefined();
+    expect(existsSync(levels)).toBe(false);
+  });
+
   it("gives the recorder no OpenRouter key", async () => {
     const r = recorder(
       "envcheck",

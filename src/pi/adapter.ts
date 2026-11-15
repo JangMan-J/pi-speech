@@ -15,7 +15,7 @@ import {
 import { Type } from "typebox";
 import type { Engine } from "../engine/engine";
 import { errorMessage } from "../engine/env";
-import { STATUS_KEY } from "../engine/indicator";
+import { indicatorText, STATUS_KEY } from "../engine/indicator";
 import { renderOsd } from "../engine/osd";
 import type { Panel } from "../engine/panel";
 import { type Hotkeys, keyLabel } from "../engine/settings";
@@ -247,6 +247,10 @@ export function registerPi(
     levelsInflight = false;
   };
 
+  /** The OSD is on and this UI can draw it: then it alone shows recording and playback. */
+  const osdOn = () => engine.speech.settings.osdStyle !== "off" && typeof ui?.setWidget === "function";
+  engine.indicator.shownElsewhere = osdOn;
+
   const updateOsd = () => {
     if (!ui || typeof ui.setWidget !== "function") return;
     const style = engine.speech.settings.osdStyle;
@@ -284,10 +288,9 @@ export function registerPi(
     if (!levelsTimer) {
       levelsTimer = setInterval(() => {
         if (levelsInflight) return;
-        const poll = engine.routes.bridge.levels;
-        if (!poll || engine.routes.route !== "bridge") return;
         levelsInflight = true;
-        void poll()
+        void engine.routes
+          .levels()
           .then((r) => {
             const next =
               engine.dictation.state === "recording" ? r?.recording : engine.player.playing ? r?.playing : undefined;
@@ -318,9 +321,11 @@ export function registerPi(
     ui = ctx.ui;
     const current = ctx.ui;
     const tinted = hasTerminal(ctx) && !env.NO_COLOR;
-    engine.indicator.attach((text) =>
-      current.setStatus(STATUS_KEY, tinted ? tintRecordingDot(text, current.theme) : text),
-    );
+    engine.indicator.attach((text) => {
+      // Recording and playback show in one place: the OSD when it is on, else the open panel's header, else here.
+      const shown = osdOn() || panel ? indicatorText({ playing: false, route: engine.routes.route }) : text;
+      current.setStatus(STATUS_KEY, tinted ? tintRecordingDot(shown, current.theme) : shown);
+    });
     updateOsd();
   };
   engine.notify = (message, level) => {
@@ -414,6 +419,9 @@ export function registerPi(
       (p) => {
         panel = p;
         if (!p && latest) watchPtt(latest);
+        // Who shows the live state depends on whether the panel is open, and on the OSD it may have changed.
+        engine.indicator.refresh();
+        updateOsd();
       },
       speak,
       hotkeys,

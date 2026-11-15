@@ -16,6 +16,7 @@ import { join } from "node:path";
 import type { AudioInput, Recording } from "./audio";
 import { type BinaryChoice, findBinary } from "./binary";
 import { childEnv, type Env, findExecutable, overSsh } from "./env";
+import { LEVELS_ENV, levelsFile, readLevels, removeLevels } from "./levels";
 import { wavSeconds } from "./wav";
 
 /** A recorder that exits sooner than this after starting has failed to start. */
@@ -173,10 +174,22 @@ class LocalRecording implements Recording {
 export interface LocalInputOptions {
   /** Where the bundled binary is; replaceable for tests. */
   binary?: () => BinaryChoice;
+  /** Where the bundled binary writes the spectrum levels of a recording. */
+  levelsFile?: string;
 }
 
 export class LocalInput implements AudioInput {
   readonly name = "local";
+  /** Recorders still running. */
+  private running = 0;
+
+  private get levelsPath(): string {
+    return this.opts.levelsFile ?? levelsFile("record");
+  }
+
+  levels(): number[] | undefined {
+    return this.running ? readLevels(this.levelsPath) : undefined;
+  }
 
   constructor(
     private readonly env: Env,
@@ -204,7 +217,8 @@ export class LocalInput implements AudioInput {
     try {
       child = spawn(choice.bin, choice.args(file), {
         stdio: [choice.stdinStops ? "pipe" : "ignore", "ignore", "pipe"],
-        env: childEnv(this.env),
+        // The bundled binary writes its spectrum levels there; other recorders ignore it.
+        env: { ...childEnv(this.env), [LEVELS_ENV]: this.levelsPath },
       });
     } catch (err) {
       return fail(`cannot start ${choice.name}: ${err instanceof Error ? err.message : String(err)}`);
@@ -220,7 +234,14 @@ export class LocalInput implements AudioInput {
     child.on("error", (err) => {
       spawnError = err;
     });
-    const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
+    this.running++;
+    const closed = new Promise<void>((resolve) =>
+      child.once("close", () => {
+        this.running--;
+        if (!this.running) removeLevels(this.levelsPath);
+        resolve();
+      }),
+    );
 
     const early = await Promise.race([closed.then(() => true), sleep(START_WINDOW_MS).then(() => false)]);
     if (early || spawnError) {

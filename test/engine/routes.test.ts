@@ -29,6 +29,38 @@ function routes(mode: BridgeMode, env: Record<string, string>, health: BridgeHea
 
 const SSH = { SSH_CONNECTION: "10.0.0.1 50000 10.0.0.2 22" };
 
+describe("spectrum levels", () => {
+  const LOCAL_PLAY = [1, 1, 1];
+  const LOCAL_REC = [2, 2, 2];
+  const REMOTE = { playing: [3, 3, 3], recording: [4, 4, 4] };
+  function levelRoutes(mode: BridgeMode, directions = { playOn: "remote", recordOn: "remote", modelsOn: "remote" }) {
+    const bridge: BridgeAudio = {
+      output: output("bridge"),
+      input: input("bridge"),
+      health: async () => ({ ok: true, version: "0.1.0" }),
+      levels: async () => REMOTE,
+    };
+    return new Routes({
+      env: { PI_SPEECH_BRIDGE_URL: "http://127.0.0.1:47613" },
+      mode,
+      bridge,
+      localOutput: { ...output("local"), levels: () => LOCAL_PLAY },
+      localInput: { ...input("local"), levels: () => LOCAL_REC },
+      directions: () => directions as never,
+    });
+  }
+
+  it("come from this machine's player and recorder without the bridge", async () => {
+    expect(await levelRoutes("off").levels()).toEqual({ playing: LOCAL_PLAY, recording: LOCAL_REC });
+  });
+
+  it("come from the receiver through the bridge, each direction from where it runs", async () => {
+    expect(await levelRoutes("on").levels()).toEqual(REMOTE);
+    const split = levelRoutes("on", { playOn: "remote", recordOn: "this", modelsOn: "remote" });
+    expect(await split.levels()).toEqual({ playing: REMOTE.playing, recording: LOCAL_REC });
+  });
+});
+
 describe("routes", () => {
   it("auto uses the bridge over SSH and the Pi host otherwise", () => {
     expect(routes("auto", SSH).route).toBe("bridge");

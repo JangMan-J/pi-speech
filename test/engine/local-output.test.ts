@@ -105,6 +105,23 @@ describe.skipIf(onWindows)("local playback", () => {
     expect(await b.done).toMatchObject({ state: "failed" });
   });
 
+  it("tells the player where to write its spectrum levels, and reads them only while it plays", async () => {
+    const levels = join(dir, "play.levels");
+    const p = exe(
+      "meter",
+      `printf '\\001\\002\\003\\004\\005\\006\\007\\010\\011\\012\\013\\014' > "$PI_SPEECH_LEVELS_FILE"; sleep 5`,
+    );
+    const out = new LocalOutput({ PI_SPEECH_STREAM_PLAYER: p, PATH: "/usr/bin:/bin" }, { levelsFile: levels });
+    expect(out.levels()).toBeUndefined();
+    const r = await out.playStream(whole(10), "message");
+    if (!r.ok) throw new Error(r.reason);
+    await until(() => out.levels() !== undefined);
+    expect(out.levels()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    await r.stop();
+    expect(out.levels()).toBeUndefined();
+    expect(existsSync(levels)).toBe(false);
+  });
+
   it("never hands the OpenRouter key or the bridge token to the player", async () => {
     const log = join(dir, "env");
     const p = exe("envdump", `env > "${log}"; cat > /dev/null`);

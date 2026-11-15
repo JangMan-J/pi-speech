@@ -31,6 +31,11 @@ export function liveState(s: IndicatorState): string {
 export class Indicator {
   private last: string | undefined | null = null;
   private readonly listeners = new Set<() => void>();
+  /**
+   * Whether something else shows the live state now (the spectrum OSD): the panel's header then says nothing
+   * of it, so the state is shown in one place. Set by the host.
+   */
+  shownElsewhere: () => boolean = () => false;
 
   constructor(
     private readonly read: () => IndicatorState,
@@ -44,9 +49,15 @@ export class Indicator {
     this.update();
   }
 
+  /** Send the text again, whether or not it changed: what the sink shows may depend on more than the state. */
+  refresh(): void {
+    this.last = null;
+    this.update();
+  }
+
   /** The state now, as `liveState` words it. */
   live(): string {
-    return liveState(this.read());
+    return this.shownElsewhere() ? "" : liveState(this.read());
   }
 
   /** Hear every change of the text; returns the function that stops listening. */
