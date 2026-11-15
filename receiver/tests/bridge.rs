@@ -792,6 +792,9 @@ fn an_upload_that_breaks_off_fails_the_stream_and_leaves_no_player() {
         let id = r.stream();
         let mut up = r.upload(&id);
         up.0.write_all(b"20\r\nonly part of it").unwrap();
+        // The idle clock starts at the last byte: measure from here, not from the reply, so a
+        // slow runner (a long wait_until) cannot eat into the margin.
+        let t0 = Instant::now();
         assert!(wait_until(Duration::from_secs(5), || r.streamed()
             == b"only part of it"));
         match how {
@@ -802,7 +805,6 @@ fn an_upload_that_breaks_off_fails_the_stream_and_leaves_no_player() {
                 assert_eq!(rep.status, 400, "{}", rep.text());
             }
             _ => {
-                let t0 = Instant::now();
                 let rep = up.reply();
                 assert_eq!(rep.status, 400, "{}", rep.text());
                 assert!(
