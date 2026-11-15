@@ -13,8 +13,9 @@
 //!   (SenseVoice's `<|withitn|>`; Dolphin's `<nospeech>` and `<asr>`; Omnilingual's list starts
 //!   `<s>`, `<pad>`, `</s>`, `<unk>`).
 //!
-//! Where both a full-precision and an `.int8.onnx` file exist, the int8 one is used: it is
-//! smaller and faster on a CPU.
+//! Where a model comes in several precisions (`encoder.onnx`, `encoder.int8.onnx`,
+//! `encoder.fp16.onnx`), the int8 one is used on the CPU, where it is smaller and faster, and the
+//! fp16 one, else full precision, on a GPU.
 
 use std::fs;
 use std::io;
@@ -269,18 +270,22 @@ struct Part {
     prefix: String,
 }
 
-/// The `.onnx` file for `role` (`encoder`, `model`...), the int8 one first. Its stem is the
-/// role, or ends in `-role` or `_role`.
+/// The `.onnx` file for `role` (`encoder`, `model`...). Its stem is the role, or ends in `-role`
+/// or `_role`, then perhaps `.int8` or `.fp16`. Of several precisions, the CPU's best first
+/// (int8, then full, then fp16), or a GPU's ([`gpu_precision`]: fp16, full, int8).
 fn part(names: &[String], role: &str) -> Result<Option<Part>, String> {
-    let mut full = Vec::new();
-    let mut int8 = Vec::new();
+    // By precision: 0 int8, 1 full, 2 fp16.
+    let mut by: [Vec<Part>; 3] = Default::default();
     for name in names {
         let Some(stem) = name.strip_suffix(".onnx") else {
             continue;
         };
-        let (stem, quantised) = match stem.strip_suffix(".int8") {
-            Some(s) => (s, true),
-            None => (stem, false),
+        let (stem, precision) = if let Some(s) = stem.strip_suffix(".int8") {
+            (s, 0)
+        } else if let Some(s) = stem.strip_suffix(".fp16") {
+            (s, 2)
+        } else {
+            (stem, 1)
         };
         let Some(prefix) = stem.strip_suffix(role) else {
             continue;
@@ -288,19 +293,24 @@ fn part(names: &[String], role: &str) -> Result<Option<Part>, String> {
         if !(prefix.is_empty() || prefix.ends_with('-') || prefix.ends_with('_')) {
             continue;
         }
-        let p = Part {
+        by[precision].push(Part {
             name: name.clone(),
             prefix: prefix.to_string(),
-        };
-        if quantised {
-            int8.push(p)
-        } else {
-            full.push(p)
-        }
+        });
     }
-    let mut pick = if int8.is_empty() { full } else { int8 };
+    let order = if gpu_precision() {
+        [2, 1, 0]
+    } else {
+        [0, 1, 2]
+    };
+    let Some(mut pick) = order
+        .into_iter()
+        .map(|i| std::mem::take(&mut by[i]))
+        .find(|v| !v.is_empty())
+    else {
+        return Ok(None);
+    };
     match pick.len() {
-        0 => Ok(None),
         1 => Ok(pick.pop()),
         _ => {
             let mut all: Vec<&str> = pick.iter().map(|p| p.name.as_str()).collect();
@@ -311,6 +321,13 @@ fn part(names: &[String], role: &str) -> Result<Option<Part>, String> {
             ))
         }
     }
+}
+
+/// Whether models run on a GPU ([`crate::engines::recognize::PROVIDER_ENV`] names one), where
+/// fp16 and full-precision files run better than int8 ones.
+fn gpu_precision() -> bool {
+    std::env::var(crate::engines::recognize::PROVIDER_ENV)
+        .is_ok_and(|p| !p.trim().is_empty() && !p.trim().eq_ignore_ascii_case("cpu"))
 }
 
 fn has(names: &[String], name: &str) -> bool {
@@ -552,6 +569,26 @@ mod tests {
                 decoder: "small-decoder.int8.onnx".into(),
                 tokens: "small-tokens.txt".into(),
             })
+        );
+    }
+
+    #[test]
+    fn fp16_files_are_a_precision_the_cpu_takes_last() {
+        let got = from_names(
+            &names("encoder.fp16.onnx decoder.fp16.onnx encoder.int8.onnx decoder.int8.onnx tokens.txt"),
+            |_| Some("<|startofcontext|> 7\n".into()),
+        );
+        assert!(
+            matches!(got, Ok(Found::Canary { ref encoder, .. }) if encoder == "encoder.int8.onnx"),
+            "{got:?}"
+        );
+        let got = from_names(
+            &names("encoder.fp16.onnx decoder.fp16.onnx tokens.txt"),
+            |_| Some("<|startofcontext|> 7\n".into()),
+        );
+        assert!(
+            matches!(got, Ok(Found::Canary { ref encoder, .. }) if encoder == "encoder.fp16.onnx"),
+            "{got:?}"
         );
     }
 

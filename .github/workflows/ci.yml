@@ -180,6 +180,28 @@ jobs:
         env:
           PI_SPEECH_TEST_MODELS: ${{ github.workspace }}/test-models
         run: cargo test --release --test transcribe -- --nocapture
+      # The published Linux x64 receiver links sherpa-onnx's shared libraries (publish.yml): build it
+      # that way too, and transcribe with it with only its libraries beside it.
+      - name: Build and run the shared-library receiver (Linux x64, as published)
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        env:
+          GPU_BUNDLE: sherpa-onnx-v2.0.1-cuda-13.x-cudnn-9.x-onnxruntime1.28.2-linux-x64-gpu
+          GPU_BUNDLE_SHA256: 40ca5c7730a349258f23e9a7bf5c3cbf69f13c498cc50387e8f9f06924a554f8
+        run: |
+          curl -fsSL --retry 3 "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/$GPU_BUNDLE.tar.bz2" -o gpu.tar.bz2
+          echo "$GPU_BUNDLE_SHA256  gpu.tar.bz2" | sha256sum -c -
+          tar -xjf gpu.tar.bz2
+          SHERPA_ONNX_LIB_DIR="$PWD/$GPU_BUNDLE/lib" CARGO_TARGET_DIR=target-shared \
+            cargo build --release --no-default-features --features shared
+          mkdir shared && cp target-shared/release/pi-speech-receiver shared/
+          for lib in libsherpa-onnx-c-api.so libonnxruntime.so libonnxruntime_providers_shared.so; do
+            cp "$GPU_BUNDLE/lib/$lib" shared/
+          done
+          readelf -d shared/pi-speech-receiver | grep 'RUNPATH.*\$ORIGIN'
+          ./shared/pi-speech-receiver models list | head -3
+          text=$(./shared/pi-speech-receiver transcribe "${{ github.workspace }}/test-models/$TEST_MODEL" ../e2e/fixtures/quick-brown-fox.wav)
+          echo "$text"
+          echo "$text" | grep -qi "fox"
       - name: Keep the release binary for testing on real machines
         uses: actions/upload-artifact@v4
         with:

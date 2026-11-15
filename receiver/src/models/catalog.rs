@@ -23,6 +23,9 @@ pub enum Kind {
     Transcription,
     /// Text to speech.
     Speech,
+    /// Libraries the models run with: a GPU runtime (sherpa-onnx's CUDA bundle, with ONNX
+    /// Runtime's CUDA provider), listed only by a build that can use it ([`GPU_RUNTIMES`]).
+    Runtime,
 }
 
 impl Kind {
@@ -30,6 +33,7 @@ impl Kind {
         match self {
             Kind::Transcription => "transcription",
             Kind::Speech => "speech",
+            Kind::Runtime => "runtime",
         }
     }
 
@@ -37,6 +41,7 @@ impl Kind {
         match s {
             "transcription" => Some(Kind::Transcription),
             "speech" => Some(Kind::Speech),
+            "runtime" => Some(Kind::Runtime),
             _ => None,
         }
     }
@@ -57,6 +62,21 @@ pub struct Entry {
     pub sha256: String,
     /// The directory the archive unpacks to, and the model's directory name in the cache.
     pub dir: String,
+    /// A model published as separate files (a Hugging Face repository) instead of one archive:
+    /// each is fetched and checked on its own into the model's directory, and `url`, `sha256`
+    /// say nothing (`size` is their sum). Empty for an archive.
+    pub files: Vec<ModelFile>,
+}
+
+/// One file of a model published as separate files.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelFile {
+    /// Its path in the model's directory (`encoder.onnx`, `tokenizer/vocab.json`).
+    pub name: String,
+    pub url: String,
+    pub size: u64,
+    /// SHA-256, lowercase hex.
+    pub sha256: String,
 }
 
 impl Entry {
@@ -111,7 +131,12 @@ impl Catalog {
 
     pub fn builtin() -> Catalog {
         Catalog {
-            entries: BUILTIN.iter().map(Builtin::entry).collect(),
+            entries: BUILTIN
+                .iter()
+                .chain(GPU_RUNTIMES.iter())
+                .map(Builtin::entry)
+                .chain(BUILTIN_FILES.iter().map(BuiltinFiles::entry))
+                .collect(),
             lexicons: BUILTIN
                 .iter()
                 .filter_map(|b| Some((b.id.to_string(), b.lexicon?.lexicon())))
@@ -206,6 +231,15 @@ fn entry(v: &Value) -> Result<Entry, String> {
     if dir.is_empty() || dir.starts_with('.') || dir.contains(['/', '\\']) {
         return Err(format!("dir must be a plain directory name, got {dir:?}"));
     }
+    let files = match v.get("files") {
+        None => Vec::new(),
+        Some(f) => f
+            .as_array()
+            .ok_or("files must be an array")?
+            .iter()
+            .map(model_file)
+            .collect::<Result<Vec<_>, _>>()?,
+    };
     Ok(Entry {
         id: s("id")?,
         kind: Kind::parse(&kind).ok_or_else(|| format!("unknown kind {kind:?}"))?,
@@ -216,9 +250,48 @@ fn entry(v: &Value) -> Result<Entry, String> {
             .and_then(Value::as_u64)
             .ok_or("size must be a number")?,
         url: s("url")?,
-        sha256: s("sha256")?.to_ascii_lowercase(),
+        sha256: if files.is_empty() {
+            s("sha256")?.to_ascii_lowercase()
+        } else {
+            String::new()
+        },
         dir,
+        files,
     })
+}
+
+fn model_file(v: &Value) -> Result<ModelFile, String> {
+    let s = |k: &str| {
+        v.get(k)
+            .and_then(Value::as_str)
+            .map(String::from)
+            .ok_or_else(|| format!("files: {k} must be a string"))
+    };
+    let name = s("name")?;
+    if !plain_relative(&name) {
+        return Err(format!(
+            "files: name must be a plain relative path, got {name:?}"
+        ));
+    }
+    Ok(ModelFile {
+        name,
+        url: s("url")?,
+        size: v
+            .get("size")
+            .and_then(Value::as_u64)
+            .ok_or("files: size must be a number")?,
+        sha256: s("sha256")?.to_ascii_lowercase(),
+    })
+}
+
+/// A path that stays inside the model's directory: parts that are neither empty, `.`, `..`,
+/// nor start with a dot; `/` between them.
+pub fn plain_relative(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('\\')
+        && name
+            .split('/')
+            .all(|p| !p.is_empty() && !p.starts_with('.'))
 }
 
 struct Builtin {
@@ -277,6 +350,7 @@ impl Builtin {
             url: format!("{RELEASES}{}", self.path),
             sha256: self.sha256.into(),
             dir: archive.trim_end_matches(".tar.bz2").into(),
+            files: Vec::new(),
         }
     }
 }
@@ -303,6 +377,220 @@ const COHERE_LANGUAGES: &str = "ar de el en es fr it ja ko nl pl pt vi zh";
 const DOLPHIN_LANGUAGES: &str =
     "zh ja th ru ko id vi yue hi ur ms uz ar fa bn ta te ug gu my tl kk \
     or ne mn km jv lo si fil ps pa kab ba ks tg su mr ky az";
+
+/// A built-in model published as separate files in a Hugging Face repository, at a fixed commit.
+struct BuiltinFiles {
+    id: &'static str,
+    kind: Kind,
+    name: &'static str,
+    languages: &'static str,
+    /// `owner/name` on huggingface.co.
+    repo: &'static str,
+    /// The commit the files are taken from (so that they cannot change under their checksums).
+    revision: &'static str,
+    /// The model's directory name in the cache.
+    dir: &'static str,
+    /// Each file: its name in the repository (and the directory), size, SHA-256.
+    files: &'static [(&'static str, u64, &'static str)],
+}
+
+impl BuiltinFiles {
+    fn entry(&self) -> Entry {
+        let base = format!(
+            "https://huggingface.co/{}/resolve/{}",
+            self.repo, self.revision
+        );
+        Entry {
+            id: self.id.into(),
+            kind: self.kind,
+            name: self.name.into(),
+            languages: self
+                .languages
+                .split_whitespace()
+                .map(String::from)
+                .collect(),
+            size: self.files.iter().map(|f| f.1).sum(),
+            url: format!(
+                "https://huggingface.co/{}/tree/{}",
+                self.repo, self.revision
+            ),
+            sha256: String::new(),
+            dir: self.dir.into(),
+            files: self
+                .files
+                .iter()
+                .map(|&(name, size, sha256)| ModelFile {
+                    name: name.into(),
+                    url: format!("{base}/{name}"),
+                    size,
+                    sha256: sha256.into(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Full-precision models, for a GPU (`gpu`): an NVIDIA GPU runs them many times faster than the
+/// CPU runs the int8 ones (Parakeet v3 fp32: 0.06 s for 8 s of speech, warm, on an RTX 4090
+/// Laptop; int8 on 8 CPU threads 0.8 s). On the CPU they run, slower than the int8 ones.
+const BUILTIN_FILES: &[BuiltinFiles] = &[
+    BuiltinFiles {
+        id: "parakeet-tdt-0.6b-v3-fp32",
+        kind: Kind::Transcription,
+        name: "Parakeet TDT 0.6b v3 (fp32, for GPU)",
+        languages: PARAKEET_LANGUAGES,
+        repo: "csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3",
+        revision: "5fcc0122fe87e8365e339e467af90c67b746218f",
+        dir: "hf-sherpa-onnx-nemo-parakeet-tdt-0.6b-v3",
+        files: &[
+            (
+                "README.md",
+                4905,
+                "701a3375e3fe77308d280c673d34146162d2f1602b44f97d99086e3f537a1119",
+            ),
+            (
+                "decoder.onnx",
+                47_233_744,
+                "caed31af1bb08edcc09a01a1c3cbb4d4eb5bfdb9c4e5f307012f84bbf5dbfdbc",
+            ),
+            (
+                "encoder.onnx",
+                41_838_346,
+                "36b758364dfddce472b9a9f75bf6049bbd35c886d7927e3eda80d4ceb3348512",
+            ),
+            (
+                "encoder.weights",
+                2_435_420_160,
+                "3af3f51af5f2d01dbbf5af47d42c7962a2c205f11004254bb4f2b979862f39a8",
+            ),
+            (
+                "joiner.onnx",
+                25_286_331,
+                "0f294e5ba9021a3d80e492de94abe4c116f0afce78452c7debb5dd07690d0340",
+            ),
+            (
+                "tokens.txt",
+                93_939,
+                "d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d",
+            ),
+        ],
+    },
+    BuiltinFiles {
+        id: "nemotron-3.5-asr-0.6b-fp32",
+        kind: Kind::Transcription,
+        name: "Nemotron 3.5 ASR 0.6b (fp32, for GPU)",
+        languages: NEMOTRON_LANGUAGES,
+        repo: "csukuangfj2/sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-2026-06-11",
+        revision: "2072aba9fb2d6ee6202b69e441761599ab7520b8",
+        dir: "hf-sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-2026-06-11",
+        files: &[
+            (
+                "README.md",
+                214,
+                "4cec75ccd38f289f3bd39055bd7033bfcbaa145d38b85b31e3943b8f03ae86f1",
+            ),
+            (
+                "decoder.onnx",
+                59_764_944,
+                "f9c59ee6fa130bc2ba349dbcbba7c74a4a960a98d4196295ba4e8e5d6bde6b68",
+            ),
+            (
+                "encoder.data",
+                2_454_405_120,
+                "7584f85df76bc9ae6fbdfa53aa8d97b07a842525d1c501d536d77fd9e4f57ac7",
+            ),
+            (
+                "encoder.onnx",
+                42_247_484,
+                "f1e540e03cb2cc57f5c0f6416b893768cfda23e756bfc0a2c4d502a1350325af",
+            ),
+            (
+                "joiner.onnx",
+                37_824_291,
+                "a6bd74c0a31cbde0da0368c1e29d171752108c7ad1231630e079a7d97ceee6f0",
+            ),
+            (
+                "tokens.txt",
+                131_440,
+                "729cc103155bafa785f9cd45746cd41cabe97eab7182fc04d594129587958f8a",
+            ),
+        ],
+    },
+    BuiltinFiles {
+        id: "canary-1b-v2",
+        kind: Kind::Transcription,
+        name: "Canary 1B v2 (fp16 for GPU, int8 for CPU; set the language)",
+        languages: PARAKEET_LANGUAGES,
+        repo: "Sarphix/canary-1b-v2-sherpa-onnx-int8",
+        revision: "7d513cd4f39f6c7dc75c13a284b5e345b37f6198",
+        dir: "hf-canary-1b-v2-sherpa-onnx",
+        files: &[
+            (
+                "README.md",
+                7788,
+                "567ba1823832eca53aa8824dab7845b97216df775464c2e628c98c227320b552",
+            ),
+            (
+                "decoder.fp16.onnx",
+                338_252_012,
+                "4edc4237dee4822e7f42b4ea81f5e46b706ca9869d16c37f1581d6c4e5d2ead9",
+            ),
+            (
+                "decoder.int8.onnx",
+                558_682_707,
+                "e68d839a8939a0c1d55d03fd5c6e6d3f113cfc97038027ffe566b8e3a4be2cd8",
+            ),
+            (
+                "encoder.fp16.onnx",
+                1_644_472_275,
+                "8505ac066a56480a63cad2ef9fc2f67022e43f202998bbb5819c956bdec0db72",
+            ),
+            (
+                "encoder.int8.onnx",
+                857_602_351,
+                "0d8f349aaa015d47c81d88c4ba3a5461c19bc09ebb72bf4c61698eec9f09e968",
+            ),
+            (
+                "tokens.txt",
+                224_406,
+                "399db68418b655f50275779cfe425c55a5ef6dda12cf38375d709566927ef513",
+            ),
+        ],
+    },
+];
+
+/// sherpa-onnx's CUDA bundles, of the sherpa-onnx version this binary links: their `lib/` holds
+/// ONNX Runtime with its CUDA provider. A GPU run puts that directory first on the library path
+/// (the provider loads only from beside ONNX Runtime). Only a Linux x64 build linked against
+/// the shared libraries can use them; others list none. Which one fits is the CUDA the system
+/// has (`pi-speech-receiver gpu`).
+#[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "shared"))]
+const GPU_RUNTIMES: &[Builtin] = &[
+    Builtin {
+        id: "gpu-runtime-cuda13",
+        kind: Kind::Runtime,
+        name: "GPU runtime (NVIDIA CUDA 13, cuDNN 9)",
+        languages: "",
+        size: 254_696_132,
+        path:
+            "v2.0.1/sherpa-onnx-v2.0.1-cuda-13.x-cudnn-9.x-onnxruntime1.28.2-linux-x64-gpu.tar.bz2",
+        sha256: "40ca5c7730a349258f23e9a7bf5c3cbf69f13c498cc50387e8f9f06924a554f8",
+        lexicon: None,
+    },
+    Builtin {
+        id: "gpu-runtime-cuda12",
+        kind: Kind::Runtime,
+        name: "GPU runtime (NVIDIA CUDA 12, cuDNN 9)",
+        languages: "",
+        size: 393_636_488,
+        path:
+            "v2.0.1/sherpa-onnx-v2.0.1-cuda-12.x-cudnn-9.x-onnxruntime1.28.2-linux-x64-gpu.tar.bz2",
+        sha256: "2aa541a65c1e7d921a053283419b70b30c1f6ae0a0f52f64b947ebe88c5f2a77",
+        lexicon: None,
+    },
+];
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64", feature = "shared")))]
+const GPU_RUNTIMES: &[Builtin] = &[];
 
 const BUILTIN: &[Builtin] = &[
     Builtin {
@@ -556,6 +844,26 @@ const BUILTIN: &[Builtin] = &[
         lexicon: None,
     },
     Builtin {
+        id: "parakeet-tdt-0.6b-v2-fp16",
+        kind: Kind::Transcription,
+        name: "Parakeet TDT 0.6b v2, English (fp16, for GPU)",
+        languages: "en",
+        size: 1_120_982_957,
+        path: "asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-fp16.tar.bz2",
+        sha256: "37f67a1a6c942dae27d345ee395fbd19e25ee48996faf70fca25779026054cf0",
+        lexicon: None,
+    },
+    Builtin {
+        id: "canary-180m-flash-fp32",
+        kind: Kind::Transcription,
+        name: "Canary 180M Flash (fp32, for GPU; set the language)",
+        languages: "en es de fr",
+        size: 717_064_890,
+        path: "asr-models/sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr.tar.bz2",
+        sha256: "0b4a0a2630d6dccbf15ffc14ff2b6b446872bfdf7509d0ad602fe78bd8efc29d",
+        lexicon: None,
+    },
+    Builtin {
         id: "kokoro-multi-lang-v1.1-int8",
         kind: Kind::Speech,
         name: "Kokoro multi-lang v1.1 (int8)",
@@ -656,26 +964,57 @@ mod tests {
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), c.entries.len());
+        let hex = |h: &str| {
+            h.len() == 64
+                && h.bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        };
         for e in &c.entries {
-            assert!(
-                e.url.starts_with(
-                    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
-                ) || e.url.starts_with(
-                    "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/"
-                ),
-                "{}",
-                e.url
-            );
-            assert_eq!(e.sha256.len(), 64, "{}", e.id);
-            assert!(e
-                .sha256
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
-            assert!(e.size > 1_000_000 && !e.languages.is_empty());
-            assert_eq!(format!("{}.tar.bz2", e.dir), e.archive_name());
+            assert!(e.size > 1_000_000);
+            assert_eq!(e.languages.is_empty(), e.kind == Kind::Runtime, "{}", e.id);
+            if e.files.is_empty() {
+                // An archive of sherpa-onnx's releases.
+                let releases = "https://github.com/k2-fsa/sherpa-onnx/releases/download/";
+                let tag = e
+                    .url
+                    .strip_prefix(releases)
+                    .unwrap_or_else(|| panic!("{}", e.url));
+                assert!(
+                    tag.starts_with("asr-models/")
+                        || tag.starts_with("tts-models/")
+                        || (e.kind == Kind::Runtime && tag.starts_with("v2.0.1/")),
+                    "{}",
+                    e.url
+                );
+                assert!(hex(&e.sha256), "{}", e.id);
+                assert_eq!(format!("{}.tar.bz2", e.dir), e.archive_name());
+            } else {
+                // Separate files of a Hugging Face repository, at a fixed commit.
+                assert_eq!(
+                    e.size,
+                    e.files.iter().map(|f| f.size).sum::<u64>(),
+                    "{}",
+                    e.id
+                );
+                for f in &e.files {
+                    assert!(plain_relative(&f.name), "{}", f.name);
+                    assert!(f.url.starts_with("https://huggingface.co/"), "{}", f.url);
+                    assert!(f.url.contains("/resolve/") && f.url.ends_with(&f.name));
+                    let rev = f
+                        .url
+                        .split("/resolve/")
+                        .nth(1)
+                        .unwrap()
+                        .split('/')
+                        .next()
+                        .unwrap();
+                    assert_eq!(rev.len(), 40, "a commit, not a branch: {}", f.url);
+                    assert!(hex(&f.sha256), "{} {}", e.id, f.name);
+                }
+            }
         }
         let kinds = |k| c.entries.iter().filter(|e| e.kind == k).count();
-        assert_eq!(kinds(Kind::Transcription), 25);
+        assert_eq!(kinds(Kind::Transcription), 30);
         assert_eq!(kinds(Kind::Speech), 8);
         // Every Piper and Kitten voice names the English lexicon; Kokoro carries its own, and
         // Supertonic and Pocket TTS need none.

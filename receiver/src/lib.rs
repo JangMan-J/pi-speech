@@ -4,6 +4,7 @@
 pub mod audio;
 pub mod engines;
 pub mod front;
+pub mod gpu;
 pub mod http;
 pub mod lease;
 pub mod models;

@@ -15,8 +15,6 @@ pub const SAMPLE_RATE: u32 = 16_000;
 /// Audio longer than a model hears at once ([`Kind::max_seconds`]) is cut at the quietest moment
 /// of the last this many seconds before the limit.
 pub const CUT_SEARCH: f64 = 8.0;
-/// The languages Canary 180M Flash speaks; another (or none) is heard as English.
-const CANARY_LANGUAGES: [&str; 4] = ["en", "es", "de", "fr"];
 /// The languages Cohere Transcribe speaks; another (or none) is heard as English.
 const COHERE_LANGUAGES: [&str; 14] = [
     "ar", "de", "el", "en", "es", "fr", "it", "ja", "ko", "nl", "pl", "pt", "vi", "zh",
@@ -165,10 +163,9 @@ impl Recognizer {
                 decoder,
                 tokens,
             } => {
-                let lang = language
-                    .clone()
-                    .filter(|l| CANARY_LANGUAGES.contains(&l.as_str()))
-                    .unwrap_or_else(|| "en".into());
+                // English when none is given; sherpa-onnx itself falls back from a language the
+                // model does not offer (180M Flash: en es de fr; 1B v2: 25 European).
+                let lang = language.clone().unwrap_or_else(|| "en".into());
                 m.canary = OfflineCanaryModelConfig {
                     encoder: Some(path(encoder)?),
                     decoder: Some(path(decoder)?),

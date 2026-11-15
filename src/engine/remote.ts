@@ -15,10 +15,10 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
-import { createReadStream, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createReadStream, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 
 export interface RemotePrompts {
@@ -277,20 +277,35 @@ export async function connectRemote(dest: string, prompts: RemotePrompts, opts: 
           `${dest} has ${path ? "a pi-speech-receiver too old to connect to" : "no pi-speech-receiver"}, and this install has none for ${uname || "its system"}: install pi-speech there`,
         );
       }
-      const size = statSync(binary).size;
+      // The binary and the shared libraries beside it (Linux x64 carries sherpa-onnx's and ONNX Runtime's),
+      // installed together in ~/.local/lib/pi-speech-receiver, the binary linked from ~/.local/bin: it finds
+      // the libraries beside its real path.
+      const files = [binary, ...libraries(binary)];
+      const size = files.reduce((n, f) => n + statSync(f).size, 0);
       const mb = Math.round(size / 1e6);
       const ok = await prompts.confirm(
         `${dest} has ${path ? "an older pi-speech-receiver" : "no pi-speech-receiver"}. Install ${opts.version ? `version ${opts.version} ` : ""}for ${platform} in ~/.local/bin there (${mb} MB)?`,
       );
       if (!ok) throw new RemoteError(`not connected: ${dest} needs pi-speech-receiver`);
       prompts.progress(`… installing pi-speech-receiver on ${dest} (${mb} MB)`);
+      const home = `$HOME/.local/lib/${RECEIVER}`;
+      for (const file of files) {
+        const name = basename(file);
+        const mode = file === binary ? 755 : 644;
+        const put = await sh(
+          `mkdir -p "${home}" && cat > "${home}/${name}.new" && chmod ${mode} "${home}/${name}.new" && mv -f "${home}/${name}.new" "${home}/${name}"`,
+          createReadStream(file),
+        );
+        if (put.code !== 0)
+          throw new RemoteError(`cannot install pi-speech-receiver on ${dest}: ${sshWhy(put.stderr)}`);
+      }
       const target = `$HOME/.local/bin/${RECEIVER}`;
-      const put = await sh(
-        `mkdir -p "$HOME/.local/bin" && cat > "${target}.new" && chmod 755 "${target}.new" && mv -f "${target}.new" "${target}" && echo "${target}"`,
-        createReadStream(binary),
+      const link = await sh(
+        `mkdir -p "$HOME/.local/bin" && ln -sf "${home}/${basename(binary)}" "${target}" && echo "${target}"`,
       );
-      if (put.code !== 0) throw new RemoteError(`cannot install pi-speech-receiver on ${dest}: ${sshWhy(put.stderr)}`);
-      path = put.stdout.trim().split(/\r?\n/).at(-1);
+      if (link.code !== 0)
+        throw new RemoteError(`cannot install pi-speech-receiver on ${dest}: ${sshWhy(link.stderr)}`);
+      path = link.stdout.trim().split(/\r?\n/).at(-1);
       if (!path) throw new RemoteError(`cannot install pi-speech-receiver on ${dest}`);
     }
 
@@ -387,4 +402,17 @@ async function hostKeyFingerprints(host: string, port: string, env: NodeJS.Proce
     });
     c.stdin.end(scan);
   });
+}
+
+/** The shared libraries beside a bundled receiver binary (none for a statically linked one). */
+export function libraries(binary: string): string[] {
+  const dir = dirname(binary);
+  try {
+    return readdirSync(dir)
+      .filter((f) => /\.(so(\.\d+)*|dylib|dll)$/.test(f))
+      .sort()
+      .map((f) => join(dir, f));
+  } catch {
+    return [];
+  }
 }

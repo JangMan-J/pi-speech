@@ -18,6 +18,13 @@ concurrency:
   group: publish
   cancel-in-progress: false
 
+# sherpa-onnx's CUDA 13 bundle, whose shared libraries the Linux x64 receiver links (and carries);
+# it must be the version the receiver's sherpa-onnx crate is (Cargo.lock), and the bundle the GPU
+# runtime entry of receiver/src/models/catalog.rs names.
+env:
+  GPU_BUNDLE: sherpa-onnx-v2.0.1-cuda-13.x-cudnn-9.x-onnxruntime1.28.2-linux-x64-gpu
+  GPU_BUNDLE_SHA256: 40ca5c7730a349258f23e9a7bf5c3cbf69f13c498cc50387e8f9f06924a554f8
+
 jobs:
   check:
     uses: ./.github/workflows/ci.yml
@@ -25,7 +32,10 @@ jobs:
   # The receiver for each target, built on a native runner of that system and processor. No
   # caches: a release build starts from the lock file alone. sherpa-onnx-sys's build script
   # downloads sherpa-onnx's static libraries (on Windows the static-MT archive, matching
-  # receiver/.cargo/config.toml's +crt-static).
+  # receiver/.cargo/config.toml's +crt-static). Linux x64 links the shared libraries of sherpa-onnx's
+  # CUDA 13 bundle instead (the `shared` feature), and carries its three core libraries beside the
+  # binary: it runs on the CPU as the others do, and on an NVIDIA GPU once the user downloads that
+  # bundle (with ONNX Runtime's CUDA provider) as the GPU runtime.
   build:
     name: Receiver for ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
@@ -37,7 +47,7 @@ jobs:
         # runs only on a glibc at least as new as the one it was built against, so the older runner
         # reaches more systems. ci.yml's receiver job only tests, so it stays on ubuntu-latest.
         include:
-          - { target: linux-x64, runner: ubuntu-22.04, arch: X64 }
+          - { target: linux-x64, runner: ubuntu-22.04, arch: X64, shared: true }
           - { target: linux-arm64, runner: ubuntu-22.04-arm, arch: ARM64 }
           - { target: darwin-arm64, runner: macos-latest, arch: ARM64 }
           - { target: darwin-x64, runner: macos-15-intel, arch: X64 }
@@ -59,8 +69,22 @@ jobs:
       - name: Install the ALSA development library (the audio engine links it)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Fetch sherpa-onnx's CUDA bundle (its shared libraries)
+        if: matrix.shared
+        run: |
+          curl -fsSL --retry 3 "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/$GPU_BUNDLE.tar.bz2" -o gpu.tar.bz2
+          echo "$GPU_BUNDLE_SHA256  gpu.tar.bz2" | sha256sum -c -
+          tar -xjf gpu.tar.bz2
+          echo "SHERPA_ONNX_LIB_DIR=$PWD/$GPU_BUNDLE/lib" >> "$GITHUB_ENV"
       - name: Build the release binary
-        run: cargo build --release --locked
+        run: cargo build --release --locked ${{ matrix.shared && '--no-default-features --features shared' || '' }}
+      - name: Put the shared libraries beside the binary
+        if: matrix.shared
+        run: |
+          for lib in libsherpa-onnx-c-api.so libonnxruntime.so libonnxruntime_providers_shared.so; do
+            cp "$SHERPA_ONNX_LIB_DIR/$lib" target/release/
+          done
+          readelf -d target/release/pi-speech-receiver | grep -q 'RUNPATH.*\$ORIGIN'
       - name: Smoke-test the release binary (models list prints JSON lines)
         run: |
           bin=target/release/pi-speech-receiver
@@ -96,6 +120,7 @@ jobs:
           path: |
             receiver/target/release/pi-speech-receiver
             receiver/target/release/pi-speech-receiver.exe
+            receiver/target/release/*.so
           if-no-files-found: error
           retention-days: 7
 
@@ -138,7 +163,7 @@ jobs:
             exe=pi-speech-receiver
             [ "${target%%-*}" = win32 ] && exe=pi-speech-receiver.exe
             mkdir -p "bundle/$target"
-            cp "artifacts/receiver-$target/$exe" "bundle/$target/$exe"
+            cp "artifacts/receiver-$target/"* "bundle/$target/"
           done
       - name: Bundle every platform's binary into the package
         run: node npm/platforms.mjs bundle --binaries-dir bundle

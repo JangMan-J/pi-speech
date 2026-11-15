@@ -34,6 +34,12 @@ function fakeBinary(): string {
     `#!${process.execPath}
 const [, , cmd, sub, id] = process.argv;
 const out = (v) => process.stdout.write(JSON.stringify(v) + "\\n");
+if (cmd === "gpu") {
+  const usable = process.env.FAKE_GPU === "yes";
+  out({ driver: usable, cuda: usable ? 13 : null, cudnn: usable, runtime: usable ? "gpu-runtime-cuda13" : null,
+        downloaded: usable, lib: usable ? "/fake/gpu/lib" : null, usable, why: usable ? null : "no NVIDIA driver" });
+  process.exit(0);
+}
 if (cmd === "transcribe" && sub === "--serve") {
   // One process for many requests: it says how many it loaded and which process it is.
   const fs = require("node:fs"), path = require("node:path");
@@ -46,8 +52,10 @@ if (cmd === "transcribe" && sub === "--serve") {
     if (r.load) return out({ loaded: true });
     if (r.model === "slow") await new Promise((res) => setTimeout(res, 5000));
     const bytes = fs.readFileSync(r.audio).length;
+    const on = process.env.PI_SPEECH_PROVIDER ? " on " + process.env.PI_SPEECH_PROVIDER + " " +
+      (process.env.LD_LIBRARY_PATH || "").split(":")[0] : "";
     out({ text: "heard " + r.model + " " + path.extname(r.audio) + " " + bytes + (r.language ? " " + r.language : "") +
-      " loads " + loads + " pid " + process.pid });
+      on + " loads " + loads + " pid " + process.pid });
   });
   return;
 }
@@ -295,6 +303,28 @@ describe.skipIf(WINDOWS)("the transcription worker", () => {
     const after = await local.transcribe("whisper-small", Buffer.from("RIFF"), "wav");
     expect(pidOf(after)).not.toBe(pidOf(again));
     local.close();
+  });
+
+  it("runs on the GPU when it is chosen and usable, else on the CPU; a change of device restarts the worker", async () => {
+    const env = { PI_SPEECH_BINARY: fakeBinary(), PATH: process.env.PATH };
+    const gpu = new LocalModels({ ...env, FAKE_GPU: "yes" });
+    const cpu = await gpu.transcribe("whisper-small", Buffer.from("RIFF"), "wav");
+    expect(cpu).not.toMatch(/ on /);
+    gpu.setDevice("gpu");
+    const on = await gpu.transcribe("whisper-small", Buffer.from("RIFF"), "wav");
+    expect(on).toMatch(/ on cuda \/fake\/gpu\/lib loads 1/);
+    expect(pidOf(on)).not.toBe(pidOf(cpu));
+    expect(await gpu.gpu()).toMatchObject({ usable: true, runtime: "gpu-runtime-cuda13" });
+    gpu.setDevice("cpu");
+    expect(await gpu.transcribe("whisper-small", Buffer.from("RIFF"), "wav")).not.toMatch(/ on /);
+    gpu.close();
+
+    // Chosen but not usable (no driver): the CPU, and the reason
+    const none = new LocalModels({ ...env, FAKE_GPU: "no" });
+    none.setDevice("gpu");
+    expect(await none.transcribe("whisper-small", Buffer.from("RIFF"), "wav")).not.toMatch(/ on /);
+    expect(await none.gpu()).toMatchObject({ usable: false, why: "no NVIDIA driver" });
+    none.close();
   });
 
   it("ends after a while without requests", async () => {

@@ -26,6 +26,7 @@ describe("the settings file", () => {
       readAloud: { length: "minimum", truncate: 0 },
       speechSource: "provider",
       transcriptionSource: "provider",
+      localDevice: "cpu",
       playOn: "remote",
       recordOn: "remote",
       modelsOn: "remote",

@@ -124,7 +124,13 @@ pub fn is_ready(root: &Path, entry: &Entry, lexicon: Option<&Lexicon>) -> bool {
 
 /// The bytes of `entry`'s interrupted download, if any.
 pub fn partial_bytes(root: &Path, entry: &Entry) -> u64 {
-    fs::metadata(part_path(root, entry)).map_or(0, |m| m.len())
+    let part = part_path(root, entry);
+    match fs::metadata(&part) {
+        // A model of separate files keeps them in a directory.
+        Ok(m) if m.is_dir() => disk_bytes(&part),
+        Ok(m) => m.len(),
+        Err(_) => 0,
+    }
 }
 
 /// Leftover unpacking directories of `entry`.
@@ -216,6 +222,7 @@ mod tests {
             url: "https://x/v.tar.bz2".into(),
             sha256: "00".into(),
             dir: "v".into(),
+            files: Vec::new(),
         };
         let lexicon = Lexicon {
             name: "lexicon-en-us.txt".into(),

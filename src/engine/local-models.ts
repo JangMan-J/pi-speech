@@ -14,7 +14,8 @@ import { type BinaryChoice, findBinary } from "./binary";
 import { childEnv, type Env } from "./env";
 import { TranscribeWorker } from "./transcribe-worker";
 
-export type ModelKind = "transcription" | "speech";
+/** What a catalogue entry is: a model of each direction, or a runtime (the GPU runtime) the models run with. */
+export type ModelKind = "transcription" | "speech" | "runtime";
 
 /** A catalogue entry with its state in the model cache, as `models list` prints it. */
 export interface LocalModel {
@@ -341,6 +342,52 @@ export async function transcribeLocal(
   }
 }
 
+/** What `pi-speech-receiver gpu` says. */
+export interface GpuInfo {
+  driver: boolean;
+  /** The CUDA runtime's major version, or null. */
+  cuda: number | null;
+  cudnn: boolean;
+  /** The catalogue id of the GPU runtime that fits, or null. */
+  runtime: string | null;
+  downloaded: boolean;
+  /** The GPU runtime's library directory. */
+  lib: string | null;
+  usable: boolean;
+  /** Why the GPU cannot be used yet, when it cannot. */
+  why: string | null;
+}
+
+/** Ask the binary what this machine has for the GPU. */
+export async function probeGpu(binary: string, env: NodeJS.ProcessEnv): Promise<GpuInfo> {
+  const child = spawn(binary, ["gpu"], { env, stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+  let out = "";
+  child.stdout?.setEncoding("utf8");
+  child.stdout?.on("data", (s: string) => {
+    out += s;
+  });
+  const code = await new Promise<number | null>((resolve, reject) => {
+    child.once("error", (e) => reject(new LocalModelsError(`cannot run ${binary}: ${e.message}`)));
+    child.once("close", resolve);
+  });
+  try {
+    if (code !== 0) throw new Error();
+    return JSON.parse(out.trim().split("\n").at(-1) ?? "") as GpuInfo;
+  } catch {
+    // An older receiver without `gpu`.
+    return {
+      driver: false,
+      cuda: null,
+      cudnn: false,
+      runtime: null,
+      downloaded: false,
+      lib: null,
+      usable: false,
+      why: "this pi-speech-receiver cannot run models on a GPU",
+    };
+  }
+}
+
 /** What a download or delete says while Run models on is the Remote machine. */
 export function remoteOnly(what: string, id: string): string {
   return `Run models on is Remote machine: ${what} ${id} there with pi-speech-receiver models ${what} ${id}, or set Run models on to This machine (/speech, SETTINGS, Bridge connection)`;
@@ -357,6 +404,12 @@ export class LocalModels {
 
   /** The running `transcribe --serve`, which keeps the last model loaded between transcriptions. */
   private readonly worker: TranscribeWorker;
+  /** Where transcription runs; see `setDevice`. */
+  private device: "cpu" | "gpu" = "cpu";
+  /** What the worker runs with beyond the usual environment (the GPU runtime's), as it was started. */
+  private deviceEnv: NodeJS.ProcessEnv = {};
+  /** The last GPU probe, while it said usable (a usable GPU stays so; an unusable one is asked again). */
+  private gpuInfo?: GpuInfo;
 
   constructor(
     private readonly env: Env,
@@ -364,8 +417,42 @@ export class LocalModels {
   ) {
     this.worker = new TranscribeWorker(
       () => this.binary(),
-      () => this.childEnv,
+      () => ({ ...this.childEnv, ...this.deviceEnv }),
     );
+  }
+
+  /** Run on-device transcription on the CPU or an NVIDIA GPU from the next transcription on. */
+  setDevice(device: "cpu" | "gpu"): void {
+    if (device === this.device) return;
+    this.device = device;
+    this.gpuInfo = undefined;
+  }
+
+  /**
+   * What this machine has for the GPU (`pi-speech-receiver gpu`): the driver, CUDA and cuDNN, and the GPU runtime
+   * that fits them, whether it is downloaded, and why the GPU cannot be used yet.
+   */
+  async gpu(): Promise<GpuInfo> {
+    if (this.gpuInfo?.usable) return this.gpuInfo;
+    const info = await probeGpu(this.binary(), this.childEnv);
+    if (info.usable) this.gpuInfo = info;
+    return info;
+  }
+
+  /** The environment the chosen device needs; restarts the worker when it changes. GPU unusable: the CPU. */
+  private async applyDevice(): Promise<void> {
+    let env: NodeJS.ProcessEnv = {};
+    if (this.device === "gpu") {
+      const info = await this.gpu().catch(() => undefined);
+      if (info?.usable && info.lib) {
+        const prior = this.childEnv.LD_LIBRARY_PATH;
+        env = { LD_LIBRARY_PATH: prior ? `${info.lib}:${prior}` : info.lib, PI_SPEECH_PROVIDER: "cuda" };
+      }
+    }
+    if (JSON.stringify(env) !== JSON.stringify(this.deviceEnv)) {
+      this.worker.close();
+      this.deviceEnv = env;
+    }
   }
 
   /**
@@ -379,7 +466,8 @@ export class LocalModels {
     } catch {
       return;
     }
-    this.worker.load(id, language && language !== "auto" ? language : undefined);
+    const lang = language && language !== "auto" ? language : undefined;
+    void this.applyDevice().then(() => this.worker.load(id, lang));
   }
 
   /** End the transcription worker, giving back the memory of the model it holds. */
@@ -439,6 +527,7 @@ export class LocalModels {
     const lang = language && language !== "auto" ? language : undefined;
     if (remote) return remote.transcribe(id, readFileSync(file), ext as "wav" | "mp3", signal, lang);
     this.binary();
+    await this.applyDevice();
     return this.worker.transcribe(id, file, lang, signal);
   }
 
@@ -461,6 +550,7 @@ export class LocalModels {
       const file = join(dir, `audio.${format}`);
       writeFileSync(file, audio, { mode: 0o600 });
       this.binary();
+      await this.applyDevice();
       return await this.worker.transcribe(id, file, lang, signal);
     } finally {
       rmSync(dir, { recursive: true, force: true });

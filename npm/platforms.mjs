@@ -8,8 +8,10 @@
 //       The targets, one per line (linux-x64, ...).
 //   node npm/platforms.mjs bundle --binaries-dir <dir> [--out <dir>]
 //       Copy each target's binary from <dir>/<target>/<binary-file> into <out>/bin/<target>/,
-//       emptying <out>/bin first. Default <out> is the package root. Fails on a missing binary.
-import { chmodSync, copyFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
+//       with the shared libraries beside it there (Linux x64: sherpa-onnx's and ONNX Runtime's,
+//       which the binary finds through its $ORIGIN rpath), emptying <out>/bin first. Default <out>
+//       is the package root. Fails on a missing binary, or a missing library a target needs.
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
@@ -26,6 +28,11 @@ export const TARGETS = [
   { os: "darwin", cpu: "x64" },
   { os: "win32", cpu: "x64" },
 ].map((t) => ({ ...t, target: `${t.os}-${t.cpu}` }));
+
+/** The shared libraries a target's binary links, which go beside it (none: linked statically). */
+export const LIBRARIES = {
+  "linux-x64": ["libsherpa-onnx-c-api.so", "libonnxruntime.so", "libonnxruntime_providers_shared.so"],
+};
 
 export function findTarget(target) {
   const t = TARGETS.find((x) => x.target === target);
@@ -56,6 +63,15 @@ export function bundleBinaries({ binariesDir, out = ROOT }) {
     copyFileSync(src, dest);
     chmodSync(dest, 0o755);
     copied.push(dest);
+    const libs = LIBRARIES[target] ?? [];
+    const there = readdirSync(join(binariesDir, target));
+    for (const lib of libs) {
+      if (!there.includes(lib)) throw new Error(`no ${lib} beside ${src}`);
+      const to = join(bin, target, lib);
+      copyFileSync(join(binariesDir, target, lib), to);
+      chmodSync(to, 0o644);
+      copied.push(to);
+    }
   }
   return copied;
 }

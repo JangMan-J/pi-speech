@@ -75,7 +75,8 @@ export type SettingName =
   | "tools"
   | "dictation-output"
   | "tts-source"
-  | "stt-source";
+  | "stt-source"
+  | "stt-device";
 export const SETTING_NAMES: SettingName[] = [
   "tts-model",
   "voice",
@@ -85,6 +86,7 @@ export const SETTING_NAMES: SettingName[] = [
   "dictation-output",
   "tts-source",
   "stt-source",
+  "stt-device",
 ];
 
 /** What speaking says while the Speech source is Local and no local speech model is chosen. */
@@ -208,6 +210,7 @@ export class Speech {
       () => this.local.remote(),
     );
     this.settings = this.store.load();
+    this.local.setDevice(this.settings.localDevice);
   }
 
   get historyDir(): string {
@@ -219,6 +222,7 @@ export class Speech {
   /** Reload the saved settings and start loading the catalog. */
   start(): void {
     this.settings = this.store.load();
+    this.local.setDevice(this.settings.localDevice);
     this.xai.forget();
     this.loading = this.load();
     this.resetEndpoints();
@@ -589,6 +593,18 @@ export class Speech {
         if (!SOURCES.includes(value as Source))
           throw new Error(`${name} must be provider or local, not ${value || "empty"}`);
         return this.setSource(name === "tts-source" ? "speech" : "transcription", value as Source);
+      }
+      case "stt-device": {
+        if (value !== "cpu" && value !== "gpu")
+          throw new Error(`stt-device must be cpu or gpu, not ${value || "empty"}`);
+        s.localDevice = value;
+        this.local.setDevice(value);
+        this.save();
+        if (value === "cpu") return "Transcription device: CPU";
+        const gpu = await this.local.gpu().catch((e) => ({ usable: false, why: errorMessage(e) }));
+        return gpu.usable
+          ? "Transcription device: GPU"
+          : `Transcription device: GPU (on the CPU until then: ${gpu.why})`;
       }
       case "dictation-output": {
         const cmd = value.trim();

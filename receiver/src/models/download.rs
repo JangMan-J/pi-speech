@@ -8,6 +8,10 @@
 //! 3. It is unpacked into `.unpack-<dir>-<random>` and the model directory is renamed into
 //!    place, so a model directory in the cache is always complete. The part is deleted last.
 //!
+//! A model published as separate files (`Entry::files`) is fetched file by file into the
+//! directory `<dir>.part/`, each checked against its own SHA-256 as it arrives (and resumed the
+//! same way), and the directory is renamed into place once all are there.
+//!
 //! A stop (the `stop` flag) leaves the `.part` as it is, to be resumed by the next download.
 //!
 //! Two downloads of the same model may run at once (in other processes: two Pi sessions sharing
@@ -22,7 +26,7 @@
 //! lexicon at the same time, so a fetch holds `<name>.lock` locked in the same way.
 
 use super::cache;
-use super::catalog::{Entry, Lexicon};
+use super::catalog::{plain_relative, Entry, Lexicon};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
@@ -128,6 +132,11 @@ pub fn download(
     for leftover in cache::unpack_leftovers(root, entry) {
         let _ = cache::remove(&leftover);
     }
+    if !entry.files.is_empty() {
+        let path = fetch_files(entry, root, &part, allow_http, stop, emit)?;
+        emit(Event::Done { path: path.clone() });
+        return Ok(path);
+    }
     let source = Source::archive(entry);
     fetch(&source, &part, allow_http, stop, &mut |done, total| {
         emit(Event::Progress { done, total })
@@ -149,6 +158,72 @@ pub fn download(
     let _ = fs::remove_file(&part);
     emit(Event::Done { path: path.clone() });
     Ok(path)
+}
+
+/// Fetch the files of a model published as separate files into the directory `part`, then
+/// rename it into place.
+fn fetch_files(
+    entry: &Entry,
+    root: &Path,
+    part: &Path,
+    allow_http: bool,
+    stop: &AtomicBool,
+    emit: &mut dyn FnMut(Event),
+) -> Result<PathBuf, Failure> {
+    if part.is_file() {
+        // An archive's part, from a catalogue of another time.
+        let _ = fs::remove_file(part);
+    }
+    let mut before = 0;
+    for f in &entry.files {
+        if !plain_relative(&f.name) {
+            return Err(Failure::Failed(format!(
+                "{}: the file name {:?} leaves the model's directory",
+                entry.id, f.name
+            )));
+        }
+        if !allow_http && !f.url.starts_with("https://") {
+            return Err(Failure::Failed(format!(
+                "refusing to download {} over plain HTTP: {}",
+                entry.id, f.url
+            )));
+        }
+        let dest = part.join(&f.name);
+        if let Some(dir) = dest.parent() {
+            fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        }
+        let source = Source {
+            what: entry.id.clone(),
+            file: format!("{} of {}", f.name, entry.id),
+            url: &f.url,
+            size: f.size,
+            sha256: &f.sha256,
+        };
+        fetch(&source, &dest, allow_http, stop, &mut |done, _| {
+            emit(Event::Progress {
+                done: before + done,
+                total: entry.size,
+            })
+        })
+        .map_err(|e| match e {
+            Failure::Stopped { done } => Failure::Stopped {
+                done: before + done,
+            },
+            e => e,
+        })?;
+        before += f.size;
+    }
+    emit(Event::Verifying);
+    let target = cache::model_path(root, entry);
+    match fs::rename(part, &target) {
+        Ok(()) => Ok(target),
+        Err(_) if target.is_dir() => Ok(target),
+        Err(e) => Err(Failure::Failed(format!(
+            "cannot move {} into place at {}: {e}",
+            entry.id,
+            target.display()
+        ))),
+    }
 }
 
 /// Download the shared `lexicon` into the cache at `root` unless it is there; returns its path.
@@ -855,6 +930,7 @@ mod tests {
             url,
             sha256,
             dir: "m-dir".into(),
+            files: Vec::new(),
         }
     }
 

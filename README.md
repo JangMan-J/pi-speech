@@ -92,9 +92,33 @@ language themselves.
 Local transcription goes through one running `pi-speech-receiver transcribe --serve`, which keeps the last
 model loaded for ten minutes after its last use, and dictation starts loading the model as soon as recording
 starts, so the wait after speaking is only the transcription itself: Parakeet 0.6b takes about 0.7 s for an
-8-second sentence once loaded, Moonshine base 0.3 s, Cohere 1.8 s. `PI_SPEECH_PROVIDER=cuda` runs the models on
-an NVIDIA GPU on a receiver built against sherpa-onnx's CUDA libraries (not the published one); with these int8
-models it was no faster than the CPU in our measurements, so it is not built by default.
+8-second sentence once loaded, Moonshine base 0.3 s, Cohere 1.8 s.
+
+**GPU (Linux x64, NVIDIA).** Local transcription can run on an NVIDIA GPU: `/speech --set stt-device gpu`
+(back with `cpu`). It needs the NVIDIA driver, CUDA 13 or 12 and cuDNN 9 installed on the system (pi-speech
+does not ship them), and the GPU runtime, downloaded like a model: `gpu-runtime-cuda13` (255 MB) or
+`gpu-runtime-cuda12` (394 MB), sherpa-onnx's ONNX Runtime with its CUDA provider. `pi-speech-receiver gpu`
+says what the system has, which runtime fits, and what is missing; until all of it is there, transcription
+runs on the CPU. The same receiver runs on the CPU without any of it: on Linux x64 it carries sherpa-onnx's
+and ONNX Runtime's shared libraries beside it (39 MB in all), and the GPU runtime only adds the CUDA provider.
+
+The GPU pays off with the full-precision models (`… (fp32, for GPU)`, `… (fp16, for GPU)`, Canary 1B v2);
+with the int8 ones it is no faster than the CPU. Measured on an RTX 4090 Laptop against 8 threads of an
+i9-14900HX, with the model loaded, for 8 and 25 seconds of speech:
+
+| Model                                 | CPU           | GPU            |
+| ------------------------------------- | ------------- | -------------- |
+| `parakeet-tdt-0.6b-v3-fp32` (2.5 GB)  | 0.8 s, 1.9 s  | 0.06 s, 0.17 s |
+| `parakeet-tdt-0.6b-v2-fp16` (1.1 GB)  | 0.65 s, 1.4 s | 0.05 s, 0.15 s |
+| `nemotron-3.5-asr-0.6b-fp32` (2.5 GB) | 3.0 s, 9.3 s  | 0.34 s, 0.97 s |
+| `canary-1b-v2` (3.4 GB)               | 2.7 s, 10 s   | 0.34 s, 1.05 s |
+| `canary-180m-flash-fp32` (717 MB)     | 1.3 s, 5.3 s  | 0.19 s, 0.68 s |
+| `parakeet-tdt-0.6b-v3-int8`           | 0.8 s, 2.0 s  | 0.8 s, 2.0 s   |
+
+Some of these are published as separate files on Hugging Face rather than one archive; the catalogue names
+each file with its size and SHA-256 at a fixed commit, and a download fetches and checks them one by one (and
+resumes them) as it does an archive. Canary 1B v2 carries both fp16 and int8 files: the GPU runs the first,
+the CPU the second.
 
 The transcription models, and the time each took to load and transcribe an 8-second English sentence on an
 i9-14900HX (CPU only, 8 threads), the first time (most of it is loading the model):

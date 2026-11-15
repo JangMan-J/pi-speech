@@ -127,6 +127,8 @@ export interface Settings {
   localSpeechVoice?: string;
   /** The on-device transcription model. */
   localTranscriptionModel?: string;
+  /** Where on-device transcription runs on This machine: the CPU, or an NVIDIA GPU (with the GPU runtime downloaded). */
+  localDevice: Device;
   /** With the bridge in use: where audio plays. */
   playOn: Machine;
   /** With the bridge in use: where dictation records. */
@@ -143,6 +145,9 @@ export interface Settings {
   osdStyle: OsdStyle;
 }
 
+/** Where on-device models run: the CPU, or an NVIDIA GPU. */
+export type Device = "cpu" | "gpu";
+
 export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
   speechModel: "google/gemini-3.8-flash-tts",
   voice: "Kore",
@@ -156,6 +161,7 @@ export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
   readAloud: DEFAULT_READ_ALOUD,
   speechSource: "provider",
   transcriptionSource: "provider",
+  localDevice: "cpu",
   playOn: "remote",
   recordOn: "remote",
   modelsOn: "remote",
@@ -296,6 +302,7 @@ export class SettingsFile {
       s.readAloud = readAloudFrom(raw.readAloud);
       if (isSource(raw.speechSource)) s.speechSource = raw.speechSource;
       if (isSource(raw.transcriptionSource)) s.transcriptionSource = raw.transcriptionSource;
+      if (raw.localDevice === "gpu" || raw.localDevice === "cpu") s.localDevice = raw.localDevice;
       const localSpeech = str(raw.localSpeechModel);
       if (localSpeech) s.localSpeechModel = localSpeech;
       const localVoice = str(raw.localSpeechVoice);
@@ -369,6 +376,7 @@ export class SettingsFile {
       ...(s.localSpeechModel ? { localSpeechModel: s.localSpeechModel } : {}),
       ...(s.localSpeechVoice ? { localSpeechVoice: s.localSpeechVoice } : {}),
       ...(s.localTranscriptionModel ? { localTranscriptionModel: s.localTranscriptionModel } : {}),
+      ...(s.localDevice !== "cpu" ? { localDevice: s.localDevice } : {}),
       ...(s.optionKeyHintShown ? { optionKeyHintShown: true } : {}),
       ...(s.bridgeAddress ? { bridgeAddress: s.bridgeAddress } : {}),
       ...(s.remoteHost ? { remoteHost: s.remoteHost } : {}),

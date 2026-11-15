@@ -312,7 +312,8 @@ pub fn resolve_model_dir(arg: &str) -> Result<PathBuf, String> {
     };
     if entry.kind != Kind::Transcription {
         return Err(format!(
-            "{arg} is a speech model, not a transcription model"
+            "{arg} is a {} model, not a transcription model",
+            entry.kind.as_str()
         ));
     }
     let root = cache::models_dir()?;

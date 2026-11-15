@@ -1,6 +1,6 @@
 use pi_speech_receiver::audio::{play, record};
 use pi_speech_receiver::server::{self, Config, Server, DEFAULT_PORT};
-use pi_speech_receiver::{lease, models, shared, signals, speak, ssh, token, transcribe};
+use pi_speech_receiver::{gpu, lease, models, shared, signals, speak, ssh, token, transcribe};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -111,6 +111,7 @@ fn main() -> ExitCode {
         Some("transcribe") => return transcribe::main(&args[1..]),
         Some("speak") => return speak::main(&args[1..]),
         Some("models") => return models::main(&args[1..]),
+        Some("gpu") => return gpu::main(&args[1..]),
         Some("ssh") => return ssh::ssh_main(&args[1..]),
         Some("pair") => return ssh::pair_main(&args[1..]),
         Some("shared") => return shared::shared_main(&args[1..]),

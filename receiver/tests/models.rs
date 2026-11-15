@@ -644,6 +644,7 @@ fn plain_http_is_refused_unless_the_catalogue_is_a_test_one() {
         url: "http://127.0.0.1:1/m.tar.bz2".into(),
         sha256: "00".into(),
         dir: "m".into(),
+        files: Vec::new(),
     };
     let stop = AtomicBool::new(false);
     match download::download(&entry, &root, false, &stop, &mut |_| {}) {
@@ -666,4 +667,74 @@ fn a_model_cache_that_cannot_be_found_is_named() {
         .unwrap();
     assert_eq!(o.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&o.stderr).contains("cannot find the model cache"));
+}
+
+#[test]
+fn a_model_of_separate_files_is_fetched_file_by_file_checked_and_resumed() {
+    let data = noise(200_000, 3);
+    // The first request is cut short: the next download resumes that file.
+    let server = Server::start(data.clone(), vec![Mode::CutAfter(50_000)]);
+    let s = Setup::new("files", &server.url(), &data, None);
+    let base = format!("http://127.0.0.1:{}", server.port);
+    let entry = json!([{
+        "id": "test-files", "kind": "transcription", "name": "Test files", "languages": ["en"],
+        "size": 2 * data.len(), "url": format!("{base}/tree"), "dir": "test-files",
+        "files": [
+            {"name": "encoder.onnx", "url": format!("{base}/encoder.onnx"), "size": data.len(),
+             "sha256": sha256(&data)},
+            {"name": "tokenizer/vocab.json", "url": format!("{base}/vocab.json"),
+             "size": data.len(), "sha256": sha256(&data)}
+        ]
+    }]);
+    std::fs::write(&s.catalog, entry.to_string()).unwrap();
+
+    let (out, lines) = s.run(&["download", "test-files"]);
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "the cut connection fails it: {lines:?}"
+    );
+    let part = s.cache.join("test-files.part");
+    assert!(part.is_dir());
+    assert_eq!(
+        std::fs::metadata(part.join("encoder.onnx")).unwrap().len(),
+        50_000
+    );
+    let (_, listed) = s.run(&["list"]);
+    assert_eq!(listed[0]["partial"], 50_000);
+
+    let (out, lines) = s.run(&["download", "test-files"]);
+    assert_eq!(out.status.code(), Some(0), "{lines:?}");
+    let ev = events(&lines);
+    assert_eq!(&ev[ev.len() - 2..], ["verifying", "done"], "{ev:?}");
+    let last = lines
+        .iter()
+        .rev()
+        .find(|l| l["event"] == "progress")
+        .unwrap();
+    assert_eq!(last["done"].as_u64(), Some(2 * data.len() as u64));
+    let model = s.cache.join("test-files");
+    assert_eq!(std::fs::read(model.join("encoder.onnx")).unwrap(), data);
+    assert_eq!(
+        std::fs::read(model.join("tokenizer/vocab.json")).unwrap(),
+        data
+    );
+    assert!(!part.exists());
+    // the resumed file asked for the rest
+    assert!(
+        server.ranges().contains(&Some("bytes=50000-".into())),
+        "{:?}",
+        server.ranges()
+    );
+
+    // A name that leaves the model's directory is refused when the catalogue is read.
+    let bad = json!([{
+        "id": "bad", "kind": "transcription", "name": "Bad", "languages": ["en"], "size": 1,
+        "url": "x", "dir": "bad",
+        "files": [{"name": "../escape", "url": "http://127.0.0.1:1/x", "size": 1, "sha256": "00"}]
+    }]);
+    std::fs::write(&s.catalog, bad.to_string()).unwrap();
+    let (out, _) = s.run(&["list"]);
+    assert_ne!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("plain relative path"));
 }

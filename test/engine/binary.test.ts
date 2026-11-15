@@ -2,7 +2,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { binaryFile, bundleBinaries, TARGETS } from "../../npm/platforms.mjs";
+import { binaryFile, bundleBinaries, LIBRARIES, TARGETS } from "../../npm/platforms.mjs";
 import { findBinary } from "../../src/engine/binary";
 
 const onWindows = process.platform === "win32";
@@ -99,12 +99,17 @@ describe("the bundled binaries", () => {
     }
     const out = join(dir, "pkg");
     mkdirSync(out, { recursive: true });
+    // Linux x64 links sherpa-onnx's shared libraries: without them beside the binary, no package.
+    expect(() => bundleBinaries({ binariesDir: binaries, out })).toThrow(/no libsherpa-onnx-c-api\.so beside/);
+    for (const lib of LIBRARIES["linux-x64"]) writeFileSync(join(binaries, "linux-x64", lib), lib);
     const copied = bundleBinaries({ binariesDir: binaries, out });
-    expect(copied).toHaveLength(TARGETS.length);
+    expect(copied).toHaveLength(TARGETS.length + LIBRARIES["linux-x64"].length);
     for (const { target } of TARGETS) {
       const file = binaryFile(target);
       expect(readFileSync(join(out, "bin", target, file), "utf8")).toBe(target);
     }
+    for (const lib of LIBRARIES["linux-x64"])
+      expect(readFileSync(join(out, "bin", "linux-x64", lib), "utf8")).toBe(lib);
     expect(() => bundleBinaries({ binariesDir: join(dir, "empty"), out: join(dir, "x") })).toThrow(/no binary at/);
   });
 });
