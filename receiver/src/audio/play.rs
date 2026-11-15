@@ -35,7 +35,7 @@ pub const TAIL_MARGIN: Duration = Duration::from_millis(80);
 pub const STALL: Duration = Duration::from_secs(2);
 pub const STALLED: &str = "the audio device stopped responding";
 /// How often the waiting thread looks for callbacks and updates the spectrum meter.
-const WATCH: Duration = Duration::from_millis(40);
+const WATCH: Duration = Duration::from_millis(100);
 
 /// What to play.
 #[derive(Clone, Debug, PartialEq, Eq)]
