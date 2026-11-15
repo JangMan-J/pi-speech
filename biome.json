@@ -6,7 +6,15 @@
     "useIgnoreFile": true
   },
   "files": {
-    "includes": ["**", "!e2e", "!scripts/init-package.mjs", "!scripts/smoke-pack.mjs", "!GLOSSARY.md", "!VECTORS"]
+    "includes": [
+      "**",
+      "!e2e",
+      "!scripts/init-package.mjs",
+      "!scripts/smoke-pack.mjs",
+      "!GLOSSARY.md",
+      "!VECTORS",
+      "!src/pi/frame.ts"
+    ]
   },
   "assist": { "actions": { "source": { "organizeImports": "on" } } },
   "linter": {

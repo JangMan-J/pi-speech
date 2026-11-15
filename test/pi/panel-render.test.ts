@@ -1,6 +1,13 @@
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it } from "vitest";
-import type { Hint, PanelRow, PanelView, PickerItem, PickerView } from "../../src/engine/panel";
+import {
+  type Hint,
+  type PanelRow,
+  type PanelView,
+  type PickerItem,
+  type PickerView,
+  TABS,
+} from "../../src/engine/panel";
 import { type PanelStyle, PLAIN, renderPanel } from "../../src/pi/panel-render";
 
 /** The main view as in the agreed mockup. */
@@ -32,6 +39,9 @@ function view(over: Partial<PanelView> = {}): PanelView {
   return {
     title: "Speech",
     state: "",
+    tab: "main",
+    tabs: TABS,
+    keys: { speak: "Alt+S", dictate: "Alt+Z" },
     menu: "main",
     headings: HEADINGS,
     rows,
@@ -57,6 +67,9 @@ function hotkeys(over: Partial<PanelView> = {}): PanelView {
   return {
     title: "Speech",
     state: "",
+    tab: "main",
+    tabs: TABS,
+    keys: { speak: "Alt+S", dictate: "Alt+Z" },
     menu: "hotkeys",
     crumb: "Hotkeys",
     rows: hotkeyRows,
@@ -73,6 +86,9 @@ function hotkeys(over: Partial<PanelView> = {}): PanelView {
 const bridge = (note: string, alert = false): PanelView => ({
   title: "Speech",
   state: "",
+  tab: "bridge",
+  tabs: TABS,
+  keys: { speak: "Alt+S", dictate: "Alt+Z" },
   menu: "bridge",
   crumb: "Bridge connection",
   rows: [{ id: "bridgeMode", label: "Bridge", value: "auto", note, short: "✗ receiver unreachable", alert }],

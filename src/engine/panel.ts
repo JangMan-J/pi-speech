@@ -96,6 +96,44 @@ export type SectionId = "speak" | "listen" | "settings" | "direction";
 /** What the panel shows: the main view, or one of its submenus. */
 export type MenuId = "main" | "hotkeys" | "bridge" | "readAloud";
 
+/** The panel's tabs, in order; Tab and Shift+Tab step through them. */
+export type TabId = "main" | "readAloud" | "speechModel" | "voice" | "transcription" | "output" | "hotkeys" | "bridge";
+export const TABS: ReadonlyArray<{ id: TabId; label: string }> = [
+  { id: "main", label: "Main" },
+  { id: "readAloud", label: "Read aloud" },
+  { id: "speechModel", label: "Speech model" },
+  { id: "voice", label: "Voice" },
+  { id: "transcription", label: "Transcription model" },
+  { id: "output", label: "Dictation output" },
+  { id: "hotkeys", label: "Hotkeys" },
+  { id: "bridge", label: "Bridge" },
+];
+
+/**
+ * The panel's keys, as pi-tui key ids. sort, detail, pageUp and pageDown are KEYS of src/pi/frame.ts, written out
+ * because the engine imports nothing of Pi (test/pi checks they match); the rest are the panel's own.
+ * Typing goes to the text field, so on a tab that has one these are Ctrl chords. Hotkeys and Bridge have no text
+ * field and keep their bare letters (k, r, h, s, t; x).
+ */
+export const PANEL_KEYS = {
+  /** A model list's next order. */
+  sort: ["ctrl+s"],
+  /** The highlighted model's full description, in a floating pane (drawn by the Pi side). */
+  detail: ["ctrl+d"],
+  pageUp: ["shift+up", "pageUp"],
+  pageDown: ["shift+down", "pageDown"],
+  /** Play a sample of the highlighted voice. Proposed, not yet confirmed by the user: change it here only. */
+  sample: ["ctrl+p"],
+  /** Main: replay the last message, the spoken history, stop, transcribe a file. */
+  replay: ["ctrl+o"],
+  history: ["ctrl+l"],
+  stop: ["ctrl+n"],
+  transcribe: ["ctrl+t"],
+  /** A list of on-device models: download, delete (pressed twice). */
+  download: ["ctrl+o"],
+  delete: ["ctrl+t"],
+} as const;
+
 export interface PanelRow {
   id: RowId;
   /** The section of a main-view row; a submenu's rows have none. */
@@ -195,6 +233,18 @@ export interface PanelView {
   crumb?: string;
   /** The main view: the heading of each section, with its key as Pi has it bound (`SPEAK (Alt+S)`). */
   headings?: Partial<Record<SectionId, string>>;
+  /** The active tab. */
+  tab: TabId;
+  /** Every tab, in order, for the tab line. */
+  tabs: ReadonlyArray<{ id: TabId; label: string }>;
+  /** The Speak and Dictate keys as Pi has them bound (`Alt+S`), for the right of the key bar. */
+  keys: { speak: string; dictate: string };
+  /**
+   * Connect asks for a password (`secret`) or a yes-or-no answer (`confirm`): the Pi side draws it in a floating
+   * pane over the panel and sends that pane's keys to the panel. `value` is the typed text (the Pi side shows a
+   * secret as dots).
+   */
+  login?: { prompt: string; secret: boolean; confirm: boolean; value: string; cursor: number };
   rows: PanelRow[];
   selected: number;
   picker?: PickerView;
@@ -807,6 +857,9 @@ export class Panel {
       rows,
       selected: home.kind === "list" ? this.selected : home.selected,
       hints: this.hints(),
+      tab: "main",
+      tabs: TABS,
+      keys: { speak: keyLabel(this.bound.speak), dictate: keyLabel(this.bound.dictate) },
     };
     if (home.kind === "list") {
       const focused = this.mode.kind === "input" && this.mode.purpose === "speak";
