@@ -134,6 +134,7 @@ struct Shared {
     /// The largest latency the device reported, and its longest period, in ns.
     latency: AtomicU64,
     period: AtomicU64,
+    #[allow(dead_code)]
     tap: SampleTap,
 }
 
