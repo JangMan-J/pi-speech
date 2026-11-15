@@ -229,9 +229,9 @@ Enter on Speech model or Transcription model opens the model browser:
 ```
 Speech › Speech model ────────────────────────────────────────────────────────────────────
 Find: eleven                                      sort provider · show tags   3 of 38 models
-▸ ✓ elevenlabs/eleven-v4-turbo  ~$0.032/min  tags · 90+ langs · fast · 21 voices
-    elevenlabs/eleven-v3        ~$0.064/min  tags · 70+ langs · 21 voices
-    elevenlabs/eleven-v4        ~$0.064/min  tags · 90+ langs · 21 voices
+▸ ✓ elevenlabs/eleven-v4-turbo  ~$0.032/min  OpenRouter  21 voices
+    elevenlabs/eleven-v3        ~$0.064/min  OpenRouter  21 voices
+    elevenlabs/eleven-v4        ~$0.064/min  OpenRouter  21 voices
 Eleven v4 Turbo is a low-latency text-to-speech model from ElevenLabs. It keeps Eleven v4's…
 Enter pick · Tab sort · Shift+Tab show · type to filter · Esc back
 ```
@@ -240,10 +240,13 @@ Enter pick · Tab sort · Shift+Tab show · type to filter · Esc back
   together), `features` (the models that offer the most first), `newest`, `name`. The order is saved and
   holds for both model lists.
 - **Shift+Tab** shows only the models with one feature, then the next, then all again.
+- A row is the model, its price, who serves it (OpenRouter, OpenAI, xAI, or an endpoint of yours) and, for a
+  speech model, how many voices it has. A transcription model's row is its price and who serves it.
 - **Typing** searches the names, ids and features of what is shown (`tags`, `fast`, `eleven`).
 - The line under the list is what the catalog says about the highlighted model.
 
-The features are read from OpenRouter's catalog entry of each model: its (short) description, its id and its
+The features (not shown in the rows: sort and filter by them, and type them to search) are read from
+OpenRouter's catalog entry of each model: its (short) description, its id and its
 price. A feature that is not shown is not stated there; it is not known to be missing.
 
 | Feature      | Meaning                                                                              |

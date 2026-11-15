@@ -293,7 +293,7 @@ describe("the panel in Pi's terminal UI", () => {
     expect(engine.speech.settings.modelSort).toBe("provider");
     c.handleInput("\x1b[Z"); // Shift+Tab
     expect(screen()).toMatch(/sort provider · show tags {3}1 of 3 models/);
-    expect(screen()).toMatch(/▸ ✓ google\/gemini-3\.8-flash-tts +~\$0\.03\/min {2}multilingual {2}2 voices/);
+    expect(screen()).toMatch(/▸ ✓ google\/gemini-3\.8-flash-tts +~\$0\.03\/min {2}OpenRouter {2}2 voices/);
     expect(screen()).toMatch(/Gemini 3\.8 Flash TTS is a text-to-speech model from Google\./);
     c.handleInput("\x1b");
     c.handleInput("\x1b");

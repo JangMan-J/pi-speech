@@ -58,28 +58,14 @@ describe("model features from the catalog", () => {
     expect(featureLine({})).toBe("");
   });
 
-  it("the language column: google and qwen read multilingual, other unlabeled models read English", () => {
-    const lang = (m: Parameters<typeof modelColumns>[1]) => modelColumns("tts", m)[0];
-    // google and qwen always read multilingual, even with no stated language
-    expect(lang({ id: "google/gemini-3.8-flash-tts" })).toBe("multilingual");
-    expect(lang({ id: "qwen/qwen-audio-3.0-tts-plus" })).toBe("multilingual");
-    // another provider with nothing stated falls back to English
-    expect(lang({ id: "deepgram/flux-tts" })).toBe("English");
-    expect(lang({ id: "elevenlabs/eleven-flash-v2" })).toBe("English");
-    // a stated language or count on a non-google/qwen model still wins
-    expect(lang({ id: "elevenlabs/eleven-flash-v2.5", languages: "32 langs" })).toBe("32 langs");
-    expect(lang({ id: "x/y", features: ["multilingual"] })).toBe("multilingual");
-    // the voices column is unchanged
-    expect(modelColumns("tts", { id: "google/x", voices: Array(30).fill("v") })[1]).toBe("30 voices");
-    // a provider with a single voice reads in the singular
-    expect(modelColumns("tts", { id: "x/y", voices: ["only"] })[1]).toBe("1 voice");
-    // a tts model with no known voice count defaults to "1 voice" rather than a blank entry
-    expect(modelColumns("tts", { id: "fish-audio/x" })[1]).toBe("1 voice");
-    expect(modelColumns("tts", { id: "fish-audio/x", voices: [] })[1]).toBe("1 voice");
-    // a transcription row aggregates to its two most telling capabilities, the rest left to the description
-    expect(
-      modelColumns("stt", { id: "d/n", features: ["timestamps", "speakers", "autodetect", "translate", "fast"] })[1],
-    ).toBe("timestamps · speakers");
+  it("the columns after the price: the provider, then for a speech model its number of voices", () => {
+    expect(modelColumns("tts", { voices: Array(30).fill("v") }, "OpenRouter")).toEqual(["OpenRouter", "30 voices"]);
+    // a single voice reads in the singular; an unknown count is one voice, not a blank
+    expect(modelColumns("tts", { voices: ["only"] }, "OpenAI")).toEqual(["OpenAI", "1 voice"]);
+    expect(modelColumns("tts", {}, "OpenRouter")).toEqual(["OpenRouter", "1 voice"]);
+    expect(modelColumns("tts", { voices: [] }, "OpenRouter")).toEqual(["OpenRouter", "1 voice"]);
+    // a transcription model: the provider alone
+    expect(modelColumns("stt", {}, "Groq")).toEqual(["Groq"]);
   });
 
   it("names the vendor from the catalog name, else from the id", () => {

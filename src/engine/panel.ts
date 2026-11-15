@@ -1147,7 +1147,8 @@ export class Panel {
     const kind = kindOf(p.row);
     const items = [...shown].sort(MODEL_ORDER[s.modelSort]).map((m): PickerItem => {
       const note = m.id === XAI_MODEL ? "xAI login" : featureLine(m);
-      const cols = m.id === XAI_MODEL ? ["xAI login"] : modelColumns(kind, m);
+      // xAI lists its voices once asked: their number is not known here.
+      const cols = m.id === XAI_MODEL ? ["xAI", ""] : modelColumns(kind, m, this.speech.providerName(m.id));
       return {
         id: m.id,
         label: modelLabel(m.id),

@@ -133,7 +133,7 @@ describe("a chat model as the transcription model", () => {
     panel.handle({ key: "enter" });
     await panel.idle();
     const row = () => panel.view().picker?.items.find((i) => i.id === "google/gemini-3.8-flash");
-    expect(row()).toMatchObject({ price: "~$0.0023/min", cols: ["multilingual", "chat · fast"] });
+    expect(row()).toMatchObject({ price: "~$0.0023/min", cols: ["OpenRouter"] });
     expect(panel.view().picker?.items).toHaveLength(3);
     panel.handle({ key: "backtab" });
     await panel.idle();

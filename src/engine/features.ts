@@ -89,35 +89,15 @@ export function featureLine(m: { features?: string[]; languages?: string; voices
 }
 
 /**
- * The aligned columns a model row shows after its price: its language, then (for tts) its voices or (for stt)
- * what it can do. The language is the specific one when a model is trained on a single language, else the
- * count ("90+ langs"), else blank — so a row with no stated language leaves that column empty rather than
- * breaking the table.
+ * The aligned columns a model row shows after its price: who serves it (OpenRouter, OpenAI, xAI, an endpoint of
+ * yours), then for a speech model how many voices it has. What else a model offers is in its description, under
+ * the list, and typing finds it (tags, fast, ...).
  */
-export function modelColumns(
-  kind: ModelKind,
-  m: { id?: string; vendor?: string; features?: string[]; languages?: string; voices?: string[] },
-): string[] {
-  const language = languageLabel(m);
-  if (kind === "tts") {
-    // Every model in the list can speak, so it has at least one voice; an unknown count reads "1 voice".
-    const n = m.voices?.length || 1;
-    return [language, `${n} voice${n === 1 ? "" : "s"}`];
-  }
-  // The two most telling capabilities; the rest are left to the model's description below the list.
-  const can = (m.features ?? []).filter((f) => f !== "multilingual" && f !== "free").slice(0, 2);
-  return [language, can.join(" · ")];
-}
-
-/**
- * The language column of a model row. Google and qwen speak many languages, so they always read
- * "multilingual"; any other model the catalog does not describe reads "English", its usual single language. A
- * stated language or count (e.g. "90+ langs") on a non-google/qwen model always wins.
- */
-function languageLabel(m: { id?: string; vendor?: string; features?: string[]; languages?: string }): string {
-  const vendor = (m.vendor ?? (m.id ? vendorOf(m.id) : "")).toLowerCase();
-  if (vendor === "google" || vendor === "qwen") return "multilingual";
-  return m.languages ?? (m.features?.includes("multilingual") ? "multilingual" : "English");
+export function modelColumns(kind: ModelKind, m: { voices?: string[] }, provider: string): string[] {
+  if (kind === "stt") return [provider];
+  // Every model in the list can speak, so it has at least one voice; an unknown count reads "1 voice".
+  const n = m.voices?.length || 1;
+  return [provider, `${n} voice${n === 1 ? "" : "s"}`];
 }
 
 /** The vendor of a model: the part of its catalog name before the colon, else the first part of its id. */
