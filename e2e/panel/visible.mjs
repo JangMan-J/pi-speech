@@ -1,319 +1,91 @@
-// Visible acceptance: the /speech panel, redesign 01 layout. The main view holds only settings, under
-// SPEAK (Alt+S), LISTEN (Alt+Z) and SETTINGS; models and voices show only their names (details in the pickers);
-// Hotkeys runs every action and changes the keys of Speak and Dictate (leaving Hotkeys reloads Pi to bind them).
+// Real-terminal acceptance of the shared speech frame and its actions.
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { check, finish, ROOT, setup } from '../lib/lib.mjs';
-import { openPanelPi, readSettings, sleep } from '../lib/panel.mjs';
-
-/** The main view as agreed, with this suite's defaults, the first row selected. */
-const MAIN = [
-  'SPEAK (Alt+S)',
-  '  ▸ Read aloud options   Off ›',
-  '    Speech source        Provider',
-  '    Speech model         google/gemini-3.8-flash-tts ›',
-  '    Voice                Kore ›',
-  'LISTEN (Alt+Z)',
-  '    Transcription source Provider',
-  '    Transcription model  openai/whisper-large-v3-turbo ›',
-  '    Dictation language   auto',
-  '    Dictation output     Pi ›',
-  'SETTINGS',
-  '    Hotkeys ›',
-  '    Bridge connection ›',
-];
-const HOTKEYS = [
-  '  ▸ Speak…             Alt+S',
-  '    Dictate            Alt+Z',
-  '    Replay last        r',
-  '    History…           h',
-  '    Stop               s',
-  '    Transcribe file…   t',
-];
-const LABELS = ['Read aloud options', 'Speech source', 'Speech model', 'Voice', 'Transcription source', 'Transcription model', 'Dictation language', 'Dictation output', 'Hotkeys', 'Bridge connection'];
-
-/** The dock: from its header line to its bottom rule, trailing spaces gone, the one-column margin removed. */
-function dock(lines) {
-  const start = lines.findIndex((l) => /^ ?Speak(?:er)? ─|^ ?Speech(?: › [^─]+)? ─/.test(l));
-  if (start < 0) return [];
-  const out = [];
-  for (let i = start; i < lines.length; i++) {
-    out.push(lines[i].trimEnd());
-    if (i > start && /^ ?─+$/.test(lines[i].trimEnd())) break;
-  }
-  const margin = out[0].startsWith(' ') ? 1 : 0;
-  return out.map((l) => l.slice(margin));
-}
-const rowOf = (d, label) => d.find((l) => l.replace(/^[\s▸]+/, '').startsWith(label));
-const isSelected = (d, label) => (rowOf(d, label) ?? '').includes('▸ ' + label);
-const hintOf = (d) => [...d].reverse().find((l) => /Esc/.test(l)) ?? '';
-async function goTo(t, label) {
-  for (let i = 0; i < 12 && !isSelected(dock(t.lines()), label); i++) await t.key('Down');
-  return isSelected(dock(t.lines()), label);
-}
-
+import { openPanelPi, readSettings, sleep, capture, selectRow } from '../lib/panel.mjs';
 const ctx = await setup({ xai: true });
 let t;
+const shot = () => capture(t).join('\n');
+const saved = () => readSettings(ctx);
 try {
-  // 1. the agreed layout at 80, 100 and 160 columns; nothing wider than the terminal
   for (const cols of [80, 100, 160]) {
-    t = await openPanelPi(ctx, { cols, rows: 40 });
-    await t.open();
-    const lines = t.lines();
-    const d = dock(lines);
-    const w = Math.min(cols - 1, 96);
-    check(d[0] === 'Speech ' + '─'.repeat(w - 7), `${cols} columns: the header is the title and the top rule`, d[0]);
-    check(JSON.stringify(d.slice(1, 14)) === JSON.stringify(MAIN), `${cols} columns: the main view matches the agreed mockup`, d.slice(1, 14));
-    check(lines.every((l) => [...l].length <= cols), `${cols} columns: no line is wider than the terminal`, lines.filter((l) => [...l].length > cols));
-    check(!/\$|\/min|tags|langs|multilingual|voices/.test(d.join('\n')), `${cols} columns: no price, feature or language in the main view`);
-    await t.key('Escape');
-    t.close();
+    t = await openPanelPi(ctx, { cols, rows: 40 }); await t.open();
+    const d = capture(t);
+    check(d.length === 19 && /^─ Speech ─/.test(d[0]), `${cols}: shared 19-line frame`);
+    check(/Main.*Read aloud.*Speech model.*Voice/.test(d[1]) && /Speak: >/.test(d[3]), `${cols}: tabs and Speak field`);
+    check(d.slice(5,15).length === 10 && /Read aloud options/.test(d[5]) && /Spectrum OSD/.test(d[14]), `${cols}: ten settings rows`);
+    check(t.lines().every(l => [...l].length <= cols), `${cols}: fits terminal`);
+    check(!/SPEAK \(|LISTEN \(|SETTINGS/.test(d.join('\n')), `${cols}: no obsolete headings`);
+    await t.key('Escape'); t.close();
   }
-  // The built receiver lists the on-device models; its model cache is private to this run, with whisper-small
-  // looking downloaded (its directory exists). Nothing is ever downloaded here.
   const modelsDir = path.join(ctx.work, 'models');
-  const receiverEnv = { PI_SPEECH_BINARY: process.env.RECEIVER_BIN, PI_SPEECH_MODELS_DIR: modelsDir };
-  const catalogue = execFileSync(process.env.RECEIVER_BIN, ['models', 'list'], { encoding: 'utf8', env: { ...process.env, ...receiverEnv } })
-    .trim().split('\n').map((l) => JSON.parse(l));
-  fs.mkdirSync(catalogue.find((m) => m.id === 'whisper-small').path, { recursive: true });
-  t = await openPanelPi(ctx, { cols: 100, rows: 40, env: receiverEnv });
-  await t.open();
-  let d = dock(t.lines());
-
-  // 2. colour and emphasis (cells of the real screen)
-  const title = t.find('Speech ─');
-  const tc = t.cell(title.x, title.y);
-  check(tc.bold === true && tc.fg !== 'default', 'the title is bold and in an accent colour', tc);
-  const head = t.find('SPEAK (Alt+S)');
-  check(t.cell(head.x, head.y).dim === true, 'the section headings are dim');
-  const lab = t.find('Voice');
-  check(t.cell(lab.x, lab.y).dim === true, 'labels are dim');
-  const val = t.find('Kore');
-  check(t.cell(val.x, val.y).dim !== true, 'values are not dim');
-  const sel = t.find('Off');
-  const sc = t.cell(sel.x, sel.y);
-  check(sc.bold === true && sc.inverse === true, 'the selected row is reversed and bold across its value', sc);
-
-  // 3. moving and changing in place
-  await t.key('Up');
-  check(isSelected(dock(t.lines()), 'Bridge connection'), 'Up from the first row wraps to the last');
-  await t.key('Down');
-  check(/Enter what is read and how/.test(hintOf(dock(t.lines()))), 'on Read aloud options the hint says Enter opens it', hintOf(dock(t.lines())));
-  await t.key('Enter'); await sleep(200);
-  d = dock(t.lines());
-  check(/^Speech › Read aloud options ─+$/.test(d[0] ?? ''), 'Enter opens Read aloud options', d[0]);
-  check(JSON.stringify(d.slice(1, 5)) === JSON.stringify([
-    '  ▸ Read               Off',
-    '    Summarized by      Same model ›',
-    '    Length             Minimum ~15 s',
-    '    Truncate at        Off',
-  ]), 'it has Read, Summarized by, Length and Truncate at', d.slice(1, 5));
-  check(d.some((l) => /Off: nothing is read aloud\./.test(l)), 'one line says what the highlighted row does', d.slice(-5));
-  await t.key('Right');
-  d = dock(t.lines());
-  check(/Read\s+Summary$/.test(rowOf(d, 'Read') ?? '') && d.some((l) => /Reads the model's spoken summary of its reply\./.test(l)), 'Right cycles Read to Summary in place, and the line follows', d.slice(1, 8));
-  await t.key('Down');
-  check(dock(t.lines()).some((l) => /Same model, same reply\. No extra request\./.test(l)), 'on Summarized by the line says there is no extra request');
-  await t.key('Down'); await t.key('Enter');
-  d = dock(t.lines());
-  check(/Length\s+Abridged ~30 s$/.test(rowOf(d, 'Length') ?? '') && d.some((l) => /Best effort: about 30 s\./.test(l)), 'Enter cycles Length; best effort, it says', d.slice(1, 8));
-  await t.key('Down'); await t.key('Right', 2);
-  d = dock(t.lines());
-  check(/Truncate at\s+30 s$/.test(rowOf(d, 'Truncate at') ?? '') && d.some((l) => /Stops at 30 s, at a sentence end\./.test(l)), 'Truncate at cycles to 30 s and says where reading stops', d.slice(1, 8));
-  check(readSettings(ctx).readAloud?.length === 'abridged' && readSettings(ctx).readAloud?.truncate === 30, 'Length and Truncate at are saved', readSettings(ctx).readAloud);
-  await t.key('Left', 2); await t.key('Up'); await t.key('Left');
-  await t.key('Escape');
-  check(/Read aloud options\s+Summary ›$/.test(rowOf(dock(t.lines()), 'Read aloud options') ?? ''), 'Esc goes back; the row shows Summary');
-  await t.key('Enter'); await t.key('Left'); await t.key('Escape');
-  check(/Read aloud options\s+Off ›$/.test(rowOf(dock(t.lines()), 'Read aloud options') ?? ''), 'Read set back to Off');
-  // Speech source Local: the local speech models are listed, and with none chosen the Speech model row asks for one
-  await goTo(t, 'Speech source');
-  check(/←→ Provider · Local/.test(hintOf(dock(t.lines()))), 'on Speech source the hint names Provider and Local', hintOf(dock(t.lines())));
-  await t.key('Right'); await sleep(300);
-  d = dock(t.lines());
-  check(/Speech source\s+Local$/.test(rowOf(d, 'Speech source') ?? '') && d.some((l) => /✓ Speech source: Local/.test(l)) && !d.some((l) => /not available yet/.test(l)), 'Right sets Speech source to Local', d.slice(-6));
-  check(/Speech model\s+none · ✗ choose a model ›$/.test(rowOf(d, 'Speech model') ?? ''), 'the Speech model row asks for a model', rowOf(d, 'Speech model'));
-  check(/Transcription source\s+Provider$/.test(rowOf(d, 'Transcription source') ?? '') && readSettings(ctx).speechSource === 'local' && readSettings(ctx).transcriptionSource === undefined, 'Speech source is saved; Transcription source stays Provider', readSettings(ctx));
-  await goTo(t, 'Speech model');
+  const env = { PI_SPEECH_BINARY: process.env.RECEIVER_BIN, PI_SPEECH_MODELS_DIR: modelsDir };
+  const catalog = execFileSync(process.env.RECEIVER_BIN, ['models','list'], {encoding:'utf8',env:{...process.env,...env}}).trim().split('\n').map(JSON.parse);
+  fs.mkdirSync(catalog.find(m => m.id === 'whisper-small').path,{recursive:true});
+  t = await openPanelPi(ctx,{cols:100,rows:40,env}); await t.open();
+  await t.key('Down'); shot();
+  const title = t.find('Speech');
+  check(t.cell(title.x,title.y).bold && t.cell(title.x,title.y).fg !== 'default','accent bold title');
+  const off = t.find('Off');
+  const label = t.find('Read aloud options');
+  check(t.cell(off.x,off.y).bold && t.cell(label.x,label.y).bold && t.cell(label.x,label.y).fg !== 'default','selected label accented and value bold');
+  await t.key('Up',2); check(/Spectrum OSD/.test(shot()) && t.lines().some(l => /^▶ Spectrum/.test(l)), 'Up wraps to last row');
+  await t.key('Down',2); await t.key('Enter');
+  check(/Read\s+Off/.test(shot()),'Enter opens Read aloud tab');
+  await t.key('Right'); await t.key('Down',2); await t.key('Enter'); await t.key('Down'); await t.key('Right',2);
+  check(/Truncate at\s+30 s/.test(shot()) && saved().readAloud?.length === 'abridged' && saved().readAloud?.truncate === 30,'read options cycle and persist');
+  await t.key('Up',3); await t.key('Left'); await t.key('Escape');
+  await selectRow(t,'Speech source'); await t.key('Right');
+  check(/Speech source\s+Local/.test(shot()) && saved().speechSource === 'local','speech source cycles and saves independently');
+  await selectRow(t,'Speech model'); await t.key('Enter'); await t.until(s=>/kokoro-multi-lang/.test(s));
+  check(/kokoro-multi-lang.*MB.*not downloaded/.test(shot()),'local speech models show size and state');
+  await t.key('Escape'); await selectRow(t,'Speech source'); await t.key('Left');
+  await selectRow(t,'Transcription source'); await t.key('Right'); await selectRow(t,'Transcription model'); await t.key('Enter'); await t.until(s=>/whisper-small/.test(s));
+  let s = shot();
+  check(/whisper-small.*MB.*downloaded/.test(s) && /parakeet.*MB.*not downloaded/.test(s),'local transcription sizes and states');
+  check(/Ctrl\+O download.*Ctrl\+T delete/.test(s),'local list uses chord actions');
+  await t.key('Enter'); check(/not downloaded.*Enter downloads/.test(shot()),'undownloaded selection offers download');
+  await t.key('Down'); await t.key('ctrl+o');
+  check(/whisper-small is already downloaded/.test(shot()) && !fs.readdirSync(modelsDir).some(f=>/parakeet/.test(f)), 'Ctrl+O reports already downloaded without fetching');
   await t.key('Enter');
-  await t.until((s) => /kokoro-multi-lang/.test(s), 5000);
-  let lines = t.lines();
-  check(lines.some((l) => /kokoro-multi-lang-v1\.1-int8\s+\d+(\.\d)? MB\s+not downloaded/.test(l)) && !lines.some((l) => /whisper-small/.test(l)), 'the Local speech model list shows the speech models with size and state', lines.slice(-14));
-  await t.key('Escape');
-  await goTo(t, 'Speech source');
-  await t.key('Left');
-  check(/Speech model\s+google\/gemini-3\.8-flash-tts ›$/.test(rowOf(dock(t.lines()), 'Speech model') ?? ''), 'back to Provider, the provider model shows again');
-
-  // Transcription source Local: on-device models with size and state; one not downloaded is offered, not fetched
-  await goTo(t, 'Transcription source');
-  await t.key('Right'); await sleep(300);
-  check(readSettings(ctx).transcriptionSource === 'local' && readSettings(ctx).speechSource === undefined, 'Transcription source Local is saved on its own', readSettings(ctx));
-  await goTo(t, 'Transcription model');
-  await t.key('Enter');
-  await t.until((s) => /whisper-small/.test(s), 5000);
-  lines = t.lines();
-  check(lines.some((l) => /whisper-small\s+\d+ MB\s+downloaded/.test(l)) && lines.some((l) => /parakeet-tdt-0\.6b-v3-int8\s+\d+ MB\s+not downloaded/.test(l)), 'the Local transcription list shows each model with its size and whether it is downloaded', lines.slice(-14));
-  check(/Enter pick · d download · x delete · Esc back/.test(hintOf(dock(lines))), 'its hint names d and x', hintOf(dock(lines)));
-  await t.key('Enter'); await sleep(300);
-  check(t.lines().some((l) => /! parakeet-tdt-0\.6b-v3-int8 is not downloaded \(\d+ MB\) · Enter downloads it/.test(l)), 'choosing a model not downloaded offers the download with its size', t.lines().slice(-6));
-  await t.key('Down');
-  await t.key('Enter'); await sleep(300);
-  d = dock(t.lines());
-  check(/Transcription model\s+whisper-small ›$/.test(rowOf(d, 'Transcription model') ?? '') && readSettings(ctx).localTranscriptionModel === 'whisper-small', 'a downloaded model is chosen at once and saved', [rowOf(d, 'Transcription model'), readSettings(ctx)]);
-  check(!fs.readdirSync(modelsDir).some((f) => /parakeet/.test(f)), 'nothing was downloaded');
-  await goTo(t, 'Transcription source');
-  await t.key('Left');
-  check(/Transcription model\s+openai\/whisper-large-v3-turbo ›$/.test(rowOf(dock(t.lines()), 'Transcription model') ?? ''), 'back to Provider, the provider model shows again');
-
-  // 4. the voice picker: the details live here, not in the main view
-  check(await goTo(t, 'Voice'), 'the selection reaches Voice');
-  await t.key('Enter'); await sleep(300);
-  lines = t.lines();
-  check(lines.some((l) => /Speech › Voice/.test(l)) && lines.some((l) => /Find:.*\b\d+ voices/.test(l)), 'Enter on Voice opens the voice picker', lines.slice(-12));
-  t.type('kore'); await sleep(400);
-  check(t.lines().some((l) => /✓ Kore\b/.test(l)), 'the picker marks the current voice', t.lines().slice(-12));
-  for (let i = 0; i < 4; i++) await t.key('Backspace');
-  t.type('leda'); await sleep(400);
-  await t.key('Enter'); await sleep(400);
-  d = dock(t.lines());
-  check(/Voice\s+Leda ›$/.test(rowOf(d, 'Voice') ?? '') && readSettings(ctx).voice === 'Leda', 'picking a voice saves it; the row shows only its name', [rowOf(d, 'Voice'), readSettings(ctx).voice]);
-
-  // 5. the model picker: prices and features
-  check(await goTo(t, 'Speech model'), 'the selection reaches Speech model');
-  await t.key('Enter'); await sleep(300);
-  lines = t.lines();
-  check(lines.some((l) => /Find:/.test(l) && /sort price · show all/.test(l)), 'the model picker has its Find line with sort and show', lines.slice(-14));
-  check(lines.filter((l) => /^\s*[▸✓\s]*[\w.-]+\/[\w.:-]+\s+~?\$[\d.]+\/min/.test(l)).length >= 6, 'prices and features appear in the model picker', lines.slice(-14));
-  await t.key('Escape');
-  check(await goTo(t, 'Transcription model'), 'the selection reaches Transcription model');
-  await t.key('Enter'); await sleep(300);
-  check(t.lines().some((l) => /Speech › Transcription model/.test(l)), 'the transcription picker is titled Transcription model');
-  await t.key('Escape');
-
-  // 6. Bridge connection: a submenu with the bridge mode
-  check(await goTo(t, 'Bridge connection'), 'the selection reaches Bridge connection');
-  await t.key('Enter'); await sleep(300);
-  d = dock(t.lines());
-  check(/^Speech › Bridge connection ─+$/.test(d[0] ?? ''), 'Enter opens Bridge connection', d[0]);
-  check(/▸ Bridge\s+auto · on over SSH · plays on This machine$/.test(d[1] ?? ''), 'it shows the bridge mode and where audio plays', d[1]);
-  check(/^ {4}Remote machine\s+127\.0\.0\.1:47613 · ssh forward$/.test(d[2] ?? ''), 'Remote machine shows the bridge address, read-only: the ssh forward when nothing else is set', d[2]);
-  await sleep(1200);
-  d = dock(t.lines());
-  check(/^ {4}Pairing\s+✗ Re-pair · .+ ›$/.test(d[3] ?? ''), 'without a receiver, Pairing is ✗ Re-pair ›', d[3]);
-  await t.key('Down', 2); await sleep(200);
-  check(/Enter address, pair · Esc back/.test(hintOf(dock(t.lines()))), 'its hint offers the address and pairing', hintOf(dock(t.lines())));
-  await t.key('Enter'); await sleep(300);
-  check(/Address/.test(dock(t.lines()).join('\n')) && /receiver's address/.test(dock(t.lines()).join('\n')), 'Enter on Pairing opens the address field and says what it takes', dock(t.lines()));
-  await t.key('Escape'); await sleep(200);
-  await t.key('Up', 2); await sleep(200);
-  await t.key('Right'); await sleep(1200);
-  check(readSettings(ctx).bridge === 'on' || /unreachable|✗/.test(dock(t.lines()).join('\n')), 'Right cycles the mode (or says why it cannot)', dock(t.lines()).slice(0, 6));
-  await t.key('Left'); await sleep(600);
-  // DIRECTION: without the bridge in use (auto, no SSH), every row is This machine and does not change
-  d = dock(t.lines());
-  const heading = d.indexOf('DIRECTION');
-  check(heading > 0 && d.indexOf(rowOf(d, 'Pairing')) === heading - 1, 'DIRECTION is a heading under Pairing', d);
-  check(['Play audio on', 'Record audio on', 'Run models on'].every((l, i) => new RegExp(`^ {4}${l}\\s+This machine · no bridge in use$`).test(d[heading + 1 + i] ?? '')), 'its three rows show This machine without the bridge', d.slice(heading, heading + 4));
-  check(await goTo(t, 'Play audio on'), 'the selection reaches Play audio on');
-  await t.key('Enter'); await sleep(300);
-  d = dock(t.lines());
-  check(/This machine/.test(rowOf(d, 'Play audio on') ?? '') && d.some((l) => /Without the bridge in use/.test(l)), 'Enter does not change it; the status line says why', d.slice(-5));
-  check(readSettings(ctx).playOn === undefined, 'nothing is saved');
-  await t.key('Escape');
-  check(isSelected(dock(t.lines()), 'Bridge connection'), 'Esc returns to the main view on its row');
-
-  // 7. Hotkeys: every action, with its key, runnable
-  await t.key('Up');
-  await t.key('Enter'); await sleep(300);
-  d = dock(t.lines());
-  check(/^Speech › Hotkeys ─+$/.test(d[0] ?? ''), 'Enter on Hotkeys opens it', d[0]);
-  check(JSON.stringify(d.slice(1, 7)) === JSON.stringify(HOTKEYS), 'Hotkeys lists the actions with their keys as agreed', d.slice(1, 7));
-  check(hintOf(d).trim() === 'Enter run · k change key · Esc back', 'its hint names Enter, k and Esc', hintOf(d));
-  // Speak…
-  const n0 = ctx.speechRequests().length;
-  await t.key('Enter');
-  t.type('panel hello'); await sleep(200);
-  check(/^Speak ─/.test(dock(t.lines())[0] ?? ''), 'Speak… opens the composer');
-  await t.key('Enter');
-  t.type('second panel message');
-  await t.key('Enter'); await sleep(1500);
-  const spoken = ctx.speechRequests().slice(n0).map((r) => r.body?.input);
-  check(spoken.includes('panel hello') && spoken.includes('second panel message'), 'two Enters speak two messages', spoken);
-  await t.key('Escape');
-  check(/^Speech › Hotkeys/.test(dock(t.lines())[0] ?? ''), 'Esc returns to Hotkeys');
-  // Replay last
-  let played = ctx.playerLog().length;
-  await t.key('Down', 2);
-  await t.key('Enter'); await sleep(1500);
-  check(ctx.playerLog().length === played + 1, 'Replay last plays the last message again', [ctx.playerLog().length, played]);
-  // History…
-  await t.key('Down');
-  await t.key('Enter'); await sleep(400);
-  lines = t.lines();
-  check(lines.some((l) => /Speech › History/.test(l)) && lines.some((l) => /2 messages/.test(l)), 'History… opens the history with both messages', lines.slice(-10));
-  played = ctx.playerLog().length;
-  await t.key('Down'); await t.key('Enter'); await sleep(1500);
-  check(ctx.playerLog().length === played + 1 && ctx.played(-1)?.equals(ctx.savedAudio(ctx.history().find((f) => /panel-hello/.test(f)))), 'Enter replays an earlier message from its file', ctx.playerLog().slice(-2));
-  await t.key('Escape');
-  check(/^Speech › Hotkeys/.test(dock(t.lines())[0] ?? ''), 'Esc from the history returns to Hotkeys');
-  // Stop
-  await t.key('Down');
-  await t.key('Enter'); await sleep(500);
-  check(dock(t.lines()).some((l) => /Stopped|Nothing was playing/.test(l)), 'Stop runs and says what it did', dock(t.lines()).slice(-5));
-  // Transcribe file…
-  ctx.or.setTranscript('words from a file');
-  await t.key('Down');
-  await t.key('Enter'); await sleep(300);
-  d = dock(t.lines());
-  const ti = d.findIndex((l) => /Transcribe file…/.test(l));
-  check(ti > 0 && /Audio file/.test(d[ti + 1] ?? ''), 'Transcribe file… asks for the audio file under its row', d);
-  t.type(path.join(ROOT, 'e2e/fixtures/quick-brown-fox.wav'));
-  await t.key('Enter');
-  check(await t.until((s) => /words from a file/.test(s) && !/Hotkeys/.test(s), 8000), 'the transcript goes into the editor and the dock closes', t.lines().slice(-8));
-  t.close();
-
-  // 8. Dictate from Hotkeys closes the panel and starts dictation
-  t = await openPanelPi(ctx, { cols: 100, rows: 40 });
-  await t.open();
-  await goTo(t, 'Hotkeys');
-  await t.key('Enter');
-  await t.key('Down');
-  await t.key('Enter'); await sleep(1200);
-  lines = t.lines();
-  check(!lines.some((l) => /Speech › Hotkeys/.test(l)) && lines.some((l) => /REC|microphone|record|Dictation/i.test(l)), 'Dictate closes the panel and starts dictation', lines.slice(-8));
-  t.close();
-
-  // 9. k changes the key of Speak: saved at once; leaving Hotkeys reloads Pi silently and binds it
-  t = await openPanelPi(ctx, { cols: 100, rows: 40 });
-  await t.open();
-  await goTo(t, 'Hotkeys');
-  await t.key('Enter');
-  t.type('k'); await sleep(300);
-  check(/▸ Speak…\s+press a key…/.test(dock(t.lines())[1] ?? ''), 'k waits for the new key', dock(t.lines())[1]);
-  await t.key('alt+d'); await sleep(400);
-  d = dock(t.lines());
-  check(readSettings(ctx).hotkeys?.speak === 'alt+d', 'the new key is saved in the settings file', readSettings(ctx).hotkeys);
-  check(/Speak…\s+Alt\+D$/.test(d[1] ?? ''), 'the row shows the new key, with nothing waiting beside it', d[1]);
-  check(d.some((l) => /✓ Speak is Alt\+D$/.test(l)) && !d.some((l) => /reload/.test(l)), 'the status line confirms the key and mentions no /reload', d.slice(-5));
-  await t.key('Escape'); await sleep(3000);
-  lines = t.lines();
-  // Pi's own reload prints its "Reloaded keybindings, extensions, …" status line; pi-speech adds no message.
-  const reloaded = lines.some((l) => /Reloaded keybindings, extensions/.test(l));
-  const ours = lines.filter((l) => /\/reload|Alt\+D|Speak is|Speech:/.test(l));
-  check(dock(lines).length === 0 && reloaded && ours.length === 0, 'leaving Hotkeys closes the dock and reloads Pi without /reload typed, with no message of its own', [dock(lines), reloaded, ours]);
-  await t.key('alt+d'); await sleep(600);
-  check(/^Speak ─/.test(dock(t.lines())[0] ?? ''), 'Alt+D opens the speak composer at once', t.lines().slice(-8));
-  await t.key('Escape'); await sleep(300);
-  await t.key('alt+s'); await sleep(600);
-  check(!/^Speak ─/.test(dock(t.lines())[0] ?? ''), 'and Alt+S no longer does', t.lines().slice(-8));
-  t.type('/speech'); await sleep(400); await t.key('Enter'); await sleep(800);
-  check(dock(t.lines()).includes('SPEAK (Alt+D)'), 'the SPEAK heading carries the new key', dock(t.lines()).slice(0, 3));
-  await t.key('Escape');
-  t.close();
-} finally {
-  try { t?.close(); } catch {}
-  await ctx.close();
-  ctx.cleanup();
-}
+  check(/whisper-small/.test(shot()) && saved().localTranscriptionModel === 'whisper-small','downloaded model selection saves');
+  check(!fs.readdirSync(modelsDir).some(f=>/parakeet/.test(f)),'offer did not download');
+  await selectRow(t,'Transcription source'); await t.key('Left');
+  await selectRow(t,'Voice'); await t.key('Enter'); t.type('leda'); await sleep(400);
+  check(/Search: > leda/i.test(shot()),'voice tab filters'); await t.key('Enter');
+  check(saved().voice === 'Leda' && /Voice\s+Leda/.test(shot()),'voice choice persists');
+  await selectRow(t,'Speech model'); await t.key('Enter');
+  check(/Price ▲/.test(shot()),'model list has price sort'); await t.key('ctrl+s');
+  check(/Provider ▲/.test(shot()),'Ctrl+S sorts'); await t.key('ctrl+d');
+  check(/any key closes/.test(shot()) && /text-to-speech model/.test(t.screen()),'detail overlay renders full description'); await t.key('Escape'); await t.key('Escape');
+  // Main's field speaks repeatedly; Ctrl chords run replay/history/stop/transcribe.
+  t.type('panel hello'); await t.key('Enter'); await sleep(1500);
+  t.type('second panel message'); await t.key('Enter'); await sleep(1500);
+  check(/Speech/.test(shot()) && ctx.speechRequests().some(r=>r.body?.input === 'panel hello') && ctx.speechRequests().some(r=>r.body?.input === 'second panel message'),'Main field speaks two messages');
+  let played = ctx.playerLog().length; await t.key('ctrl+o'); await sleep(1500);
+  check(/Speech/.test(shot()) && ctx.playerLog().length === played+1,'Ctrl+O replays');
+  await t.key('ctrl+l'); check(/panel hello|panel-hello/.test(shot()),'Ctrl+L opens history');
+  played = ctx.playerLog().length; await t.key('Down'); await t.key('Enter'); await sleep(1500);
+  check(/Speech/.test(shot()) && ctx.playerLog().length === played+1 && ctx.played(-1)?.equals(ctx.savedAudio(ctx.history().find(f=>/panel-hello/.test(f)))),'history Enter replays earlier saved audio');
+  await t.key('Escape'); await t.key('ctrl+n'); check(/Stopped|Nothing was playing/.test(shot()),'Ctrl+N stops');
+  ctx.or.setTranscript('words from a file'); await t.key('ctrl+t'); check(/Audio file/.test(shot()),'Ctrl+T asks for audio path');
+  t.type(path.join(ROOT,'e2e/fixtures/quick-brown-fox.wav')); await t.key('Enter'); await t.until(s=>/words from a file/.test(s));
+  capture(t); check(t.lines().some(l=>/words from a file/.test(l)) && !t.find('─ Speech'),'transcription closes panel and enters editor'); t.close();
+  t = await openPanelPi(ctx,{cols:100,rows:40,env}); await t.open(); await t.key('Tab',6);
+  check(/Speak….*Alt\+S/.test(shot()) && /Push-to-talk/.test(shot()),'Hotkeys has three actions');
+  t.type('k'); await t.key('alt+d'); check(/Alt\+D/.test(shot()) && saved().hotkeys?.speak === 'alt+d','custom Speak key saves');
+  await t.key('Escape'); await sleep(3000); await t.key('alt+d');
+  check(/Speak: >/.test(shot()),'Alt+D opens panel immediately');
+  await selectRow(t,'Spectrum OSD'); await t.key('Left');
+  check(/Spectrum OSD\s+Off/.test(shot()) && saved().osdStyle === 'off', 'OSD cycles off and saves');
+  await t.key('Tab',6); await t.key('Down'); await t.key('Enter'); await sleep(500);
+  capture(t); check(!t.find('─ Speech') && /REC|record|Dictation/i.test(t.screen()), 'Hotkeys Dictate starts recording and closes panel');
+  await t.key('alt+d');
+  // The Pi adapter suppresses the title badge whenever the footer owns the live state
+  // (adapter.ts shownElsewhere), even with the spectrum disabled. Do not duplicate it.
+  const recording = capture(t);
+  check(/^─ Speech ─/.test(recording[0] ?? '') && !/REC/.test(recording[0]) && /● REC/.test(t.screen()), 'recording state remains visible in footer while title badge is suppressed');
+  await t.key('Escape'); await t.key('alt+z'); t.close();
+} finally { try { t?.close(); } catch {} await ctx.close(); ctx.cleanup(); }
 finish();

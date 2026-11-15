@@ -80,10 +80,10 @@ lists the models of the bundled `pi-speech-receiver` with their size and whether
    Main │ Read aloud │ Speech model │ Voice │ Transcription model │ Dictation output  >>
 ────────────────────────────────────────────────────────────────────────────────────────────────
   Search: >
-  Model                                  Size       State           Languages
-▶ parakeet-tdt-0.6b-v3-int8 ●              487 MB     downloaded      25 langs
-  whisper-small                          639 MB     not downloaded  99 langs
-  sense-voice-int8                        163 MB     not downloaded  5 langs
+  Model                                    Size           State  Languages
+▶ parakeet-tdt-0.6b-v3-int8 ●            487 MB      downloaded   25 langs
+  whisper-small                          639 MB  not downloaded   99 langs
+  sense-voice-int8                       163 MB  not downloaded    5 langs
 
 
 

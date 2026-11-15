@@ -8,6 +8,21 @@ import { fileURLToPath } from 'node:url';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** Capture before assertions; the frame has inner rules, so never stop at the first rule. */
+export function capture(t) {
+  const lines = t.lines();
+  console.log('\nSCREEN\n' + lines.join('\n'));
+  const start = lines.findIndex((l) => /^─ Speech /.test(l));
+  return start < 0 ? [] : lines.slice(start, start + 19).map((l) => l.trimEnd());
+}
+export async function selectRow(t, label) {
+  for (let i = 0; i < 12; i++) {
+    if (t.lines().some((l) => new RegExp('^[▶▸] ' + label).test(l))) return true;
+    await t.key('Down');
+  }
+  return false;
+}
+
 export async function openPanelPi(ctx, { cols = 110, rows = 34, env: extra = {}, unset = ['SSH_CONNECTION', 'SSH_TTY', 'PI_SPEECH_LOCAL_MIC'] } = {}) {
   const session = 'pi-speech-panel-' + crypto.randomBytes(4).toString('hex');
   const env = {
