@@ -1,27 +1,26 @@
 #!/usr/bin/env node
-// Pack the package as the publish job does (its optionalDependencies stamped in by
-// npm/platforms.mjs), pack a platform package for this machine, install both into a scratch
-// project as `pi install npm:` would, and check two things:
-//   1. findBinary, run from the installed package, finds the binary in the platform package;
+// Pack the package as the publish job does (every platform's binary bundled into bin/<os>-<cpu>/),
+// install it into a scratch project as `pi install npm:` would, and check two things:
+//   1. findBinary, run from the installed package, finds bin/<platform>-<arch>/;
 //   2. Pi's real extension loader loads the extension.
 // This catches a broken `files` list, a missing runtime dependency, an import that only resolves
-// inside the repo, or a platform package npm does not install or whose binary lost its mode.
+// inside the repo, or a bundled binary that lost its executable mode.
 //
-// The platform package carries PI_SPEECH_SMOKE_BINARY, else receiver/target/release's binary,
-// else a stand-in script. With a real binary it also runs `models list`.
+// The bundled binaries are stand-ins (or this machine's real release binary via
+// PI_SPEECH_SMOKE_BINARY, else receiver/target/release's); with the real binary it also runs
+// `models list`.
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { BINARY_NAME, buildPlatformPackage, findTarget, platformName, stamp } from "../npm/platforms.mjs";
+import { binaryFile, bundleBinaries, TARGETS } from "../npm/platforms.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 const target = `${process.platform}-${process.arch}`;
-findTarget(target); // fails on a machine no platform package is built for
-const exeName = process.platform === "win32" ? `${BINARY_NAME}.exe` : BINARY_NAME;
+const exeName = binaryFile(target);
 
 const scratch = mkdtempSync(join(tmpdir(), "pi-package-smoke-"));
 try {
@@ -34,41 +33,41 @@ try {
     });
   const pack = (dir, dest) => join(dest, npm(["pack", "--silent", "--pack-destination", dest], dir).trim().split("\n").pop());
 
-  // The main package, with the manifest the publish job publishes.
+  // A binary per target: this machine's real release binary when there is one, else a stand-in.
+  const realBinary = [process.env.PI_SPEECH_SMOKE_BINARY, join(root, "receiver", "target", "release", exeName)].find(
+    (p) => p && existsSync(p),
+  );
+  const binaries = join(scratch, "binaries");
+  for (const { target: t } of TARGETS) {
+    const file = binaryFile(t);
+    const dir = join(binaries, t);
+    mkdirSync(dir, { recursive: true });
+    if (t === target && realBinary) {
+      execFileSync("cp", ["-p", realBinary, join(dir, file)], { shell: process.platform === "win32" });
+    } else {
+      writeFileSync(join(dir, file), "#!/bin/sh\nexit 0\n");
+    }
+  }
+
+  // The package as the publish job packs it: the root's files, plus bin/ bundled in.
   const packed = pack(root, scratch);
   const stage = join(scratch, "stage");
   mkdirSync(stage);
   execFileSync("tar", ["-xzf", packed, "-C", stage]);
-  const stagedManifest = join(stage, "package", "package.json");
-  writeFileSync(stagedManifest, `${JSON.stringify(stamp(JSON.parse(readFileSync(stagedManifest, "utf8"))), null, 2)}\n`);
+  const pkgDir = join(stage, "package");
+  bundleBinaries({ binariesDir: binaries, out: pkgDir });
   mkdirSync(join(scratch, "main"));
-  const mainTarball = pack(join(stage, "package"), join(scratch, "main"));
-
-  // The platform package for this machine.
-  const built = [process.env.PI_SPEECH_SMOKE_BINARY, join(root, "receiver", "target", "release", exeName)].find(
-    (p) => p && existsSync(p),
-  );
-  let binary = built;
-  if (!binary) {
-    binary = join(scratch, "stand-in", exeName);
-    mkdirSync(dirname(binary));
-    writeFileSync(binary, "#!/bin/sh\nexit 0\n");
-  }
-  const platform = buildPlatformPackage({ target, binary, out: join(scratch, "platform"), manifest });
-  mkdirSync(join(scratch, "platform-tarball"));
-  const platformTarball = pack(platform.dir, join(scratch, "platform-tarball"));
+  const mainTarball = pack(pkgDir, join(scratch, "main"));
 
   const project = join(scratch, "project");
   mkdirSync(project);
   writeFileSync(join(project, "package.json"), JSON.stringify({ name: "smoke", private: true }));
-  // The other platform packages are optional: npm skips them (wrong system, or not on the registry).
-  npm(["install", "--no-audit", "--no-fund", "--omit=dev", "--ignore-scripts", mainTarball, platformTarball], project);
+  npm(["install", "--no-audit", "--no-fund", "--omit=dev", "--ignore-scripts", mainTarball], project);
   const installed = join(project, "node_modules", manifest.name);
-  const platformDir = join(project, "node_modules", platformName(manifest.name, target));
-  if (!existsSync(platformDir)) throw new Error(`npm did not install ${platform.name}`);
+  if (!existsSync(installed)) throw new Error(`npm did not install ${manifest.name}`);
 
   // The Pi under test is the one this repo develops against.
-  const piName = dir => { try { return JSON.parse(readFileSync(join(dir, "package.json"), "utf8")).name; } catch { return undefined; } };
+  const piName = (dir) => { try { return JSON.parse(readFileSync(join(dir, "package.json"), "utf8")).name; } catch { return undefined; } };
   let piDir = dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent")));
   while (piName(piDir) !== "@earendil-works/pi-coding-agent") {
     if (dirname(piDir) === piDir) throw new Error("Cannot find the installed @earendil-works/pi-coding-agent");
@@ -76,35 +75,35 @@ try {
   }
   const { loadExtensions, createExtensionRuntime } = await import(pathToFileURL(join(piDir, "dist/core/extensions/loader.js")).href);
 
-  // 1. The installed extension finds the binary in the installed platform package.
+  // 1. The installed extension finds its own bundled binary.
   const { createJiti } = createRequire(join(piDir, "package.json"))("jiti");
   const { findBinary } = await createJiti(import.meta.url, { moduleCache: false }).import(join(installed, "src", "engine", "binary.ts"));
   const choice = findBinary({});
-  const expected = join(platformDir, "bin", exeName);
+  const expected = join(installed, "bin", target, exeName);
   if (!choice.ok || choice.from !== "package" || resolve(choice.path) !== resolve(expected)) {
-    throw new Error(`findBinary did not take the platform package's binary (${expected}): ${JSON.stringify(choice)}`);
+    throw new Error(`findBinary did not take the bundled binary (${expected}): ${JSON.stringify(choice)}`);
   }
   let binaryNote = "a stand-in binary";
-  if (built) {
+  if (realBinary) {
     const lines = execFileSync(choice.path, ["models", "list"], { encoding: "utf8" }).trim().split(/\r?\n/);
     for (const line of lines) JSON.parse(line);
     binaryNote = `its binary (models list: ${lines.length} JSON lines)`;
   }
-  console.log(`${platform.name}@${platform.version}: installed beside ${manifest.name}; findBinary takes ${binaryNote} at ${relative(project, choice.path)}`);
+  console.log(`${manifest.name}@${manifest.version}: installed with ${TARGETS.length} bundled binaries; findBinary takes ${binaryNote} at ${relative(project, choice.path)}`);
 
   // 2. Pi loads the extension.
 
   const runtime = createExtensionRuntime();
-  const entries = manifest.pi.extensions.map(entry => resolve(installed, entry));
+  const entries = manifest.pi.extensions.map((entry) => resolve(installed, entry));
   const loaded = await loadExtensions(entries, installed, undefined, runtime);
   if (loaded.errors.length) throw new Error(`Pi could not load the packed extension:\n${JSON.stringify(loaded.errors, null, 2)}`);
 
   const registered = {
-    tools: loaded.extensions.flatMap(extension => [...extension.tools.keys()]),
-    commands: loaded.extensions.flatMap(extension => [...extension.commands.keys()]),
-    providers: runtime.pendingNativeProviderRegistrations.map(registration => registration.provider.id),
+    tools: loaded.extensions.flatMap((extension) => [...extension.tools.keys()]),
+    commands: loaded.extensions.flatMap((extension) => [...extension.commands.keys()]),
+    providers: runtime.pendingNativeProviderRegistrations.map((registration) => registration.provider.id),
   };
-  if (!Object.values(registered).some(list => list.length)) throw new Error("The packed extension loaded but registered no tools, commands, or providers");
+  if (!Object.values(registered).some((list) => list.length)) throw new Error("The packed extension loaded but registered no tools, commands, or providers");
   const summary = Object.entries(registered).filter(([, list]) => list.length).map(([kind, list]) => `${kind} ${list.join(", ")}`).join("; ");
   console.log(`${manifest.name}@${manifest.version}: packed tarball loads in Pi ${JSON.parse(readFileSync(join(piDir, "package.json"), "utf8")).version}; ${summary}`);
 } finally {

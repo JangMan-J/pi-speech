@@ -119,8 +119,8 @@ Landed and pushed on `portable-3` (CI green on Linux, macOS, Windows at `575b27b
   receiver for the session, `-R 127.0.0.1:47613:...`, passes the exit code) and `pair <host>`; `probeBridge` in
   `src/bridge/client.ts`. Panel rows: Bridge, Remote machine (read-only, from PI_SPEECH_BRIDGE_URL), Pairing
   (`✓ Connected to <addr>:<port> · N ms` / `✗ Re-pair ›` explaining how to pair). README setup uses `ssh`.
-- 10 platform packages: `npm/platforms.mjs`; optionalDependencies stamped at publish, not committed. First release
-  needs a version bump (0.1.0 is on npm) and `npm run bootstrap:npm` once (5 trusted publishers, user's 2FA).
+- 10 one package, five binaries: `npm/platforms.mjs` bundles every system's `pi-speech-receiver` into
+  `bin/<os>-<cpu>/`; `findBinary` picks this machine's at runtime. A release is a version bump + tag push, no bootstrap.
 - Mac fixes: a real input giving only exact zeros is an error (checked on the Mac over ssh with the `575b27b`
   binary); `models download` help says it stops when stdin closes; test stand-ins use `#!${process.execPath}`
   (CI runs tests with node off PATH).
@@ -160,7 +160,7 @@ on a dialog (kill the processes instead); stock Terminal sends Ω/ß for Option+
 
 ## Waiting on the user
 
-- Merging PR #5; the first release (version bump, bootstrap:npm 2FA).
+- Merging PR #5; the first release (version bump, tag push).
 
 ## Test rigs (on agent-jail)
 

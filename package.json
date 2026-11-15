@@ -29,6 +29,7 @@
   "files": [
     "index.ts",
     "src",
+    "bin",
     "receiver/src",
     "receiver/Cargo.toml",
     "receiver/Cargo.lock",
@@ -47,8 +48,7 @@
     "lint": "biome check .",
     "check": "npm run typecheck && npm run lint && npm test",
     "smoke:pack": "node scripts/smoke-pack.mjs",
-    "init-package": "node scripts/init-package.mjs",
-    "bootstrap:npm": "bash scripts/npm-bootstrap.sh"
+    "init-package": "node scripts/init-package.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

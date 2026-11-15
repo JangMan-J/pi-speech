@@ -1,14 +1,13 @@
 /**
  * The bundled binary (`pi-speech-receiver`, built from receiver/): it plays a Stream (`play`) and records
  * the microphone (`record`) on this machine with its own audio engine, so no other audio program is needed.
- * Found, in order:
+ * Every system's binary is packed in this package under `bin/<platform>-<arch>/`; the one for this machine is
+ * picked at runtime. Found, in order:
  *   1. `PI_SPEECH_BINARY`: an explicit path (or a name looked up on PATH); when set it must be an executable.
- *   2. The packaged location: the platform package `@jangmanj/pi-speech-<platform>-<arch>` (its `bin/`), or
- *      `bin/<platform>-<arch>/` and `bin/` in this package.
+ *   2. The packaged location: `bin/<platform>-<arch>/`, then `bin/` in this package.
  *   3. In a checkout: `receiver/target/release`, then `receiver/target/debug`.
  */
 
-import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type Env, findExecutable } from "./env";
@@ -26,25 +25,10 @@ export interface BinaryOptions {
   arch?: string;
   /** The package root (the directory holding package.json and receiver/). */
   root?: string;
-  /** The directory of an installed npm package, or undefined when it is not installed. */
-  packageDir?: (name: string) => string | undefined;
 }
 
 /** This package's root: src/engine/ is two levels below it. */
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
-
-function installedPackage(name: string): string | undefined {
-  try {
-    return dirname(createRequire(join(ROOT, "package.json")).resolve(`${name}/package.json`));
-  } catch {
-    return undefined;
-  }
-}
-
-/** The platform package that carries this machine's binary. */
-export function platformPackage(platform: NodeJS.Platform = process.platform, arch: string = process.arch): string {
-  return `@jangmanj/pi-speech-${platform}-${arch}`;
-}
 
 /** Where the bundled binary is, or why there is none; see the module comment for the order. */
 export function findBinary(env: Env, opts: BinaryOptions = {}): BinaryChoice {
@@ -61,13 +45,7 @@ export function findBinary(env: Env, opts: BinaryOptions = {}): BinaryChoice {
       ? { ok: true, path, from: "env" }
       : { ok: false, reason: `${BINARY_ENV} (${custom}) is not an executable`, chosen: true };
   }
-  const pkg = (opts.packageDir ?? installedPackage)(platformPackage(platform, arch));
-  const packaged = [
-    ...(pkg ? [join(pkg, "bin", file)] : []),
-    join(root, "bin", `${platform}-${arch}`, file),
-    join(root, "bin", file),
-  ];
-  for (const p of packaged) {
+  for (const p of [join(root, "bin", `${platform}-${arch}`, file), join(root, "bin", file)]) {
     const path = at(p);
     if (path) return { ok: true, path, from: "package" };
   }

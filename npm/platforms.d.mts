@@ -12,22 +12,7 @@ export interface Target {
   target: string;
 }
 
-export interface Manifest {
-  name: string;
-  version: string;
-  optionalDependencies?: Record<string, string>;
-  [key: string]: unknown;
-}
-
 export const TARGETS: Target[];
-export function platformName(mainName: string, target: string): string;
 export function findTarget(target: string): Target;
-export function optionalDependencies(mainName: string, version: string): Record<string, string>;
-export function stamp<M extends Manifest>(manifest: M): M & { optionalDependencies: Record<string, string> };
-export function stampProblem(manifest: Manifest): string | undefined;
-export function buildPlatformPackage(opts: { target: string; binary: string; out: string; manifest?: Manifest }): {
-  dir: string;
-  name: string;
-  version: string;
-  binary: string;
-};
+export function binaryFile(target: string): string;
+export function bundleBinaries(opts: { binariesDir: string; out?: string }): string[];
