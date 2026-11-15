@@ -177,8 +177,10 @@ machine's models, and download and delete them there (d, x, or Enter on one not 
 
 The Remote machine need not be where you sit. To run the models on another machine (a faster one, or a server)
 while Pi, your speakers and your microphone stay here: run `pi-speech-receiver --listen <its-address>:47613
---network` there (a Tailscale address), set Bridge to on and pair with that address under Bridge connection,
-then set Play audio on and Record audio on to This machine and Run models on to Remote machine.
+--network` there (a Tailscale address), then in Bridge connection open Pairing (turning Bridge on with no token
+goes there too), type that address, and type the code its receiver shows on its terminal. Paired from a session
+on this machine, the bridge goes on with Play audio on and Record audio on set to This machine and Run models on
+to Remote machine; the DIRECTION rows change that.
 Without the bridge the rows show This machine and do not change. A choice that cannot work, such as recording
 on This machine over SSH with no microphone there, fails with a message that names the row to change.
 

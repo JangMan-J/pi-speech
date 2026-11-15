@@ -774,6 +774,35 @@ describe("the panel view model: Bridge connection's Remote machine and Pairing",
     expect(readFileSync(tokenFile, "utf8").trim()).toBe(token);
     expect(settingsOf(p.work).bridgeAddress).toBe("100.64.0.2:47613");
     expect(p.row("Remote machine")).toMatchObject({ value: "100.64.0.2:47613", note: "set in Pairing" });
+    // Paired from this machine (not over SSH) while the bridge was not in use: the bridge goes on, with the
+    // audio here and the models there.
+    await vi.waitFor(() => expect(p.panel.view().status?.text).toMatch(/Bridge on: models run there/));
+    expect(settingsOf(p.work)).toMatchObject({ bridge: "on", playOn: "this", recordOn: "this" });
+    expect(p.engine.speech.settings.modelsOn).toBe("remote");
+  });
+
+  it("Bridge on with no token of this machine goes to Pairing, saying to pair first", async () => {
+    const p = open(
+      {},
+      {
+        before: (e) => {
+          e.probeBridge = refused;
+          // As Routes.choose says it when no token file exists.
+          e.setBridge = async () => {
+            throw new Error(
+              "The bridge was not selected (audio stays local): no bridge token: set PI_SPEECH_BRIDGE_TOKEN, or put it in /x/bridge.token (ENOENT)",
+            );
+          };
+        },
+      },
+    );
+    await p.goTo("Bridge");
+    await p.press("right");
+    await vi.waitFor(() => expect(p.panel.view().input).toMatchObject({ label: "Address", under: "pairing" }));
+    expect(p.panel.view().status).toMatchObject({ tone: "info", text: expect.stringMatching(/^Pair first/) });
+    expect(p.row("Bridge")?.value).toBe("auto");
+    await p.press("escape");
+    expect(p.panel.view().menu).toBe("bridge");
   });
 
   it("probes when it opens and again while it is open, and stops when it is left", async () => {
