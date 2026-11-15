@@ -402,6 +402,11 @@ fn open_on_host(host: &cpal::Host, direction: Direction) -> Result<Option<Device
     };
     if let Ok(devices) = devices {
         for device in devices {
+            // ALSA's `null` device opens fine and throws everything away: a playback on it
+            // would succeed in silence.
+            if device.id().is_ok_and(|id| discards(id.id())) {
+                continue;
+            }
             if let Ok(sup) = default_config(&device, direction) {
                 return Ok(Some(cpal_device(device, sup, direction)));
             }
@@ -411,6 +416,11 @@ fn open_on_host(host: &cpal::Host, direction: Direction) -> Result<Option<Device
         Some(e) => Err(e),
         None => Ok(None),
     }
+}
+
+/// Whether a device of this id discards what it plays and records silence (ALSA `null`).
+fn discards(id: &str) -> bool {
+    id == "null" || id.starts_with("null:")
 }
 
 fn open_system_device(direction: Direction) -> Result<Device, String> {
@@ -697,6 +707,15 @@ mod tests {
             use std::os::windows::ffi::OsStringExt;
             let lone_surrogate = std::ffi::OsString::from_wide(&[0xD800]);
             assert!(mode_of(Some(&lone_surrogate)).is_err());
+        }
+    }
+
+    #[test]
+    fn the_fallback_never_takes_a_device_that_discards_the_audio() {
+        assert!(discards("null"));
+        assert!(discards("null:CARD=0"));
+        for real in ["default", "pipewire", "pulse", "hw:CARD=NVidia,DEV=3", "nullsink"] {
+            assert!(!discards(real), "{real}");
         }
     }
 
