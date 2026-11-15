@@ -4,8 +4,7 @@
  * same engine operations as the `/speech --` actions. The Pi adapter draws the view model and feeds the keys;
  * nothing here knows about terminals.
  *
- * The main view holds only settings, under SPEAK (with the Speak key), LISTEN (with the Dictate key) and
- * SETTINGS; a model or a voice shows only its name there (prices, features and languages are in the pickers).
+ * Eight tabs organize Main, Read aloud, models, Voice, Dictation output, Hotkeys and Bridge; a model or a voice shows only its name there (prices, features and languages are in the pickers).
  * Values cycle in place; rows that list things open a picker; Hotkeys and Bridge connection are submenus.
  * Hotkeys holds every action, runnable, and changes the keys of Speak and Dictate.
  */
@@ -167,7 +166,7 @@ export interface PickerItem {
 
 export interface PickerView {
   title: string;
-  /** A model list: how it is ordered (Tab changes it): `price`, `provider`, `newest`, `name`. */
+  /** A model list: how it is ordered (Ctrl+S changes it): `price`, `provider`, `newest`, `name`. */
   sort?: string;
   /** A model list: what the catalog says about the highlighted model; empty when it says nothing. */
   detail?: string;
@@ -231,7 +230,7 @@ export interface PanelView {
   menu: MenuId;
   /** A submenu: its title, after the panel's (`Speech › Hotkeys`). */
   crumb?: string;
-  /** The main view: the heading of each section, with its key as Pi has it bound (`SPEAK (Alt+S)`). */
+  /** @deprecated removed after the merge; never produced by the engine. */
   headings?: Partial<Record<SectionId, string>>;
   /** The active tab. */
   tab: TabId;
@@ -268,7 +267,7 @@ export type NamedKey =
   | "delete"
   | "home"
   | "end"
-  /** Shift+Tab, the feature filter of a model list. */
+  /** Shift+Tab, the previous tab. */
   | "backtab"
   /** The Speak hotkey (Alt+S unless changed): the speak composer. */
   | "speak"
@@ -458,7 +457,6 @@ const MAIN: RowBase[] = [
   { id: "transcription", section: "listen", label: "Transcription model", opens: true },
   { id: "language", section: "listen", label: "Dictation language" },
   { id: "output", section: "listen", label: "Dictation output", opens: true },
-  { id: "hotkeys", section: "settings", label: "Hotkeys", opens: true },
   { id: "bridge", section: "settings", label: "Bridge connection", opens: true },
   { id: "osdStyle", section: "settings", label: "Spectrum OSD" },
 ];
@@ -561,8 +559,6 @@ const OSD_WORDS: Record<OsdStyle, string> = {
   off: "Off",
 };
 
-const PICKER_ROWS: ListRow[] = ["speechModel", "transcription", "voice"];
-const isPickerRow = (id: RowId): id is ListRow => (PICKER_ROWS as RowId[]).includes(id);
 const isModelRow = (row: PickerRow): row is "speechModel" | "transcription" =>
   row === "speechModel" || row === "transcription";
 const kindOf = (row: "speechModel" | "transcription"): ModelKind => (row === "speechModel" ? "tts" : "stt");
@@ -814,6 +810,7 @@ export class Panel {
 
   /** Close the panel from outside (e.g. a PTT hotkey pressed while browsing settings). */
   close(): void {
+    if (this.hotkeysChanged()) this.rebind = true;
     this.deps.close();
   }
 
@@ -857,7 +854,7 @@ export class Panel {
       rows,
       selected: home.kind === "list" ? this.selected : home.selected,
       hints: this.hints(),
-      tab: "main",
+      tab: this.tab(),
       tabs: TABS,
       keys: { speak: keyLabel(this.bound.speak), dictate: keyLabel(this.bound.dictate) },
     };
@@ -872,14 +869,8 @@ export class Panel {
         focused,
       };
       if (focused) view.selected = -1;
-      view.headings = {
-        speak: `SPEAK (${keyLabel(this.bound.speak)})`,
-        listen: `LISTEN (${keyLabel(this.bound.dictate)})`,
-        settings: "SETTINGS",
-      };
     } else {
       view.crumb = MENUS[home.menu].title;
-      if (home.menu === "bridge") view.headings = { direction: "DIRECTION" };
     }
     if (this.status) view.status = this.status;
     else if (home.kind === "menu" && home.menu === "readAloud" && this.mode === home) {
@@ -923,11 +914,10 @@ export class Panel {
           view.input = input("Connect to", CONNECT_HINT, "remoteMachine");
           break;
         case "secret":
-          view.input = { ...input(m.label, "Enter signs in · Esc cancels", "remoteMachine"), secret: true };
+          view.login = { prompt: m.label, secret: true, confirm: false, value: m.edit.value, cursor: m.edit.cursor };
           break;
         case "confirm":
-          view.input = input("", "Enter yes · Esc no", "remoteMachine");
-          view.status = { tone: "warning", text: `? ${m.question}` };
+          view.login = { prompt: m.question, secret: false, confirm: true, value: m.edit.value, cursor: m.edit.cursor };
           break;
         case "pairCode":
           view.input = input(`Code from ${m.address}`, CODE_HINT, "pairing");
@@ -935,7 +925,52 @@ export class Panel {
       }
       if (m.back.kind === "picker") view.picker = this.pickerView(m.back.picker);
     }
+    const locked =
+      this.isCapturingHotkey() ||
+      (this.mode.kind === "input" && (this.mode.purpose === "secret" || this.mode.purpose === "confirm"));
+    if (!locked)
+      view.hints.splice(Math.max(0, view.hints.length - 1), 0, { key: "Tab", action: "tabs", optional: true });
+    if (view.picker?.detail && this.mode.kind === "picker" && isModelRow(this.mode.picker.row))
+      view.hints.splice(Math.max(0, view.hints.length - 1), 0, {
+        key: keyLabel(PANEL_KEYS.detail[0]),
+        action: "details",
+        optional: true,
+      });
+    if (view.tab === "output") {
+      view.rows = [];
+      view.selected = -1;
+    }
     return view;
+  }
+
+  private tab(mode: Mode = this.mode): TabId {
+    if (mode.kind === "menu") return mode.menu;
+    if (mode.kind === "picker")
+      return mode.picker.row === "history"
+        ? "main"
+        : mode.picker.row === "summarizer"
+          ? "readAloud"
+          : (mode.picker.row as TabId);
+    if (mode.kind === "input") {
+      if (mode.purpose === "output") return "output";
+      if (["connect", "pairAddress", "pairCode", "secret", "confirm"].includes(mode.purpose))
+        return this.tab(mode.back);
+    }
+    return "main";
+  }
+
+  private arrive(tab: TabId): void {
+    if (this.tab() === "hotkeys" && this.hotkeysChanged()) {
+      this.close();
+      return;
+    }
+    const row = MAIN.findIndex((r) => r.id === tab);
+    if (row >= 0) this.selected = row;
+    this.mode = { kind: "list" };
+    if (tab === "main") return;
+    if (tab === "output") this.askOutput();
+    else if (tab === "speechModel" || tab === "voice" || tab === "transcription") this.openPicker(tab);
+    else this.activate(tab);
   }
 
   private row(base: RowBase, home: { kind: "list" } | MenuMode = this.home()): PanelRow {
@@ -1281,9 +1316,18 @@ export class Panel {
                     ? "yes"
                     : "set";
       if (m.purpose === "confirm") return [{ key: "Enter", action }, esc("no")];
-      if (m.purpose === "speak") return [{ key: "Enter", action }, { key: "↓", action: "settings" }, esc("close")];
+      if (m.purpose === "speak")
+        return [
+          { key: "Enter", action },
+          ...["replay", "history", "stop", "transcribe"].map((a) => ({
+            key: keyLabel(PANEL_KEYS[a as "replay"][0]),
+            action: a,
+            optional: true,
+          })),
+          esc("close"),
+        ];
       if (m.purpose === "connect" && m.hosts.length)
-        return [{ key: "Enter", action }, { key: "Tab", action: "your ssh Hosts" }, esc("back")];
+        return [{ key: "Enter", action }, { key: "↑↓", action: "your ssh Hosts" }, esc("back")];
       return [{ key: "Enter", action }, esc("back")];
     }
     if (m.kind === "picker") {
@@ -1293,12 +1337,12 @@ export class Panel {
         if (this.pickerItems(p).length === 0) return [esc("back")];
         return [
           { key: "Enter", action: "pick" },
-          { key: "d", action: "download" },
-          { key: "x", action: "delete" },
+          { key: "Ctrl+O", action: "download" },
+          { key: "Ctrl+T", action: "delete" },
           esc("back"),
         ];
       }
-      const sorting: Hint[] = isModelRow(p.row) ? [{ key: "Tab", action: "sort", optional: true }] : [];
+      const sorting: Hint[] = isModelRow(p.row) ? [{ key: "Ctrl+S", action: "sort", optional: true }] : [];
       if (this.pickerItems(p).length === 0) {
         return p.edit.value ? [{ key: "Backspace", action: "" }, ...sorting, esc("back")] : [...sorting, esc("back")];
       }
@@ -1312,8 +1356,8 @@ export class Panel {
     const home = this.home();
     if (home.kind === "menu") return this.menuHints(home);
     // The panel's own keys, on every row of the main view; given up first when the line is narrow.
-    const letters: Hint[] = (Object.entries(LETTERS) as Array<[RowId, string]>).map(([id, key]) => ({
-      key,
+    const letters: Hint[] = (Object.entries(LETTERS) as Array<[RowId, string]>).map(([id]) => ({
+      key: keyLabel(PANEL_KEYS[id as "replay"][0]),
       action: LETTER_WORDS[id] ?? id,
       optional: true,
     }));
@@ -1394,9 +1438,9 @@ export class Panel {
 
   private voiceKeys(): Hint[] {
     // A local voice has no language to set.
-    if (this.speech.settings.speechSource === "local") return [{ key: "Tab", action: "sample", optional: true }];
+    if (this.speech.settings.speechSource === "local") return [{ key: "Ctrl+P", action: "sample", optional: true }];
     return [
-      { key: "Tab", action: "sample", optional: true },
+      { key: "Ctrl+P", action: "sample", optional: true },
       { key: "F2", action: "language", optional: true },
     ];
   }
@@ -1408,13 +1452,42 @@ export class Panel {
     try {
       const m = this.mode;
       if (m.kind === "menu" && m.capture) this.capture(m, m.capture, k);
-      else if ("combo" in k) return;
+      else if (this.chord(k)) {
+      } else if ("combo" in k) return;
       else if ("text" in k) this.text(k.text, k.paste === true);
       else this.named(k.key);
     } catch (err) {
       this.setStatus("error", `✗ ${errorMessage(err)}`);
     }
     this.changed();
+  }
+
+  private chord(k: PanelKey): boolean {
+    const id = "combo" in k ? k.combo : "key" in k ? k.id : undefined;
+    if (!id || !Object.values(PANEL_KEYS).some((keys) => (keys as readonly string[]).includes(id))) return false;
+    const matches = (name: keyof typeof PANEL_KEYS) => (PANEL_KEYS[name] as readonly string[]).includes(id);
+    const m = this.mode;
+    if (m.kind === "picker") {
+      const p = m.picker;
+      const item = this.pickerItems(p)[p.selected];
+      if (matches("pageUp") || matches("pageDown"))
+        p.selected = Math.max(0, Math.min(this.pickerItems(p).length - 1, p.selected + (matches("pageUp") ? -10 : 10)));
+      else if (matches("sort") && isModelRow(p.row) && !p.local) this.nextSort(p);
+      else if (matches("sample") && p.row === "voice" && item) this.sample(item.id);
+      else if (matches("download") && p.local && item) this.downloadKey(item.id);
+      else if (matches("delete") && p.local && item) this.deleteKey(item.id);
+      return true;
+    }
+    if (m.kind === "list" || (m.kind === "input" && m.purpose === "speak")) {
+      for (const action of ["replay", "history", "stop", "transcribe"] as const)
+        if (matches(action)) {
+          this.activate(action);
+          return true;
+        }
+      if (matches("sample") && MAIN[this.selected].id === "voice")
+        this.sample(this.localVoice()?.voice ?? this.speech.settings.voice);
+    }
+    return true;
   }
 
   private named(key: NamedKey): void {
@@ -1428,13 +1501,18 @@ export class Panel {
       return;
     }
     const m = this.mode;
+    if (key === "tab" || key === "backtab") {
+      if (m.kind === "input" && (m.purpose === "secret" || m.purpose === "confirm")) return;
+      this.arrive(TABS[(TABS.findIndex((t) => t.id === this.tab()) + (key === "tab" ? 1 : 7)) % 8].id);
+      return;
+    }
     if (m.kind === "input" && m.purpose === "speak") {
       // The Speak line is the main view's first entry: the arrows go on to the rows, Esc closes.
       if (key === "down" || key === "up") {
         this.mode = { kind: "list" };
         this.selected = key === "down" ? 0 : MAIN.length - 1;
       } else if (key === "enter") this.submit(m);
-      else if (key === "escape") this.deps.close();
+      else if (key === "escape") this.close();
       else m.edit.edit(key);
       return;
     }
@@ -1444,10 +1522,11 @@ export class Panel {
         this.mode = m.back;
         if (m.purpose === "secret") m.resolve(undefined);
         if (m.purpose === "confirm") m.resolve(false);
-      } else if (key === "tab" && m.purpose === "connect" && m.hosts.length) {
-        // Tab steps through the Hosts of ~/.ssh/config.
+      } else if ((key === "up" || key === "down") && m.purpose === "connect" && m.hosts.length) {
+        // Arrows step through the Hosts of ~/.ssh/config.
+        if (key === "up") m.next = (m.next - 1 + m.hosts.length) % m.hosts.length;
         m.edit = new LineEdit(m.hosts[m.next % m.hosts.length]);
-        m.next++;
+        if (key === "down") m.next++;
       } else if (m.purpose !== "confirm") m.edit.edit(key);
       return;
     }
@@ -1465,13 +1544,6 @@ export class Panel {
         this.offer = undefined;
         this.deleting = undefined;
         this.mode = m.back;
-      } else if (p.local && key === "tab") {
-        // A local list has no sort.
-      } else if (key === "tab") {
-        if (p.row === "voice" && highlighted) this.sample(highlighted.id);
-        else if (isModelRow(p.row)) this.nextSort(p);
-      } else if (key === "backtab") {
-        // Nothing: no filter by feature any more.
       } else if (key === "language") {
         if (p.row === "voice" && highlighted && !this.localVoice()) this.askLanguage(highlighted.id);
       } else {
@@ -1493,7 +1565,7 @@ export class Panel {
         // Leaving Hotkeys with a changed key closes the panel, and the host reloads Pi to bind it.
         if (m.menu === "hotkeys" && this.hotkeysChanged()) {
           this.rebind = true;
-          this.deps.close();
+          this.close();
         } else this.mode = { kind: "list" };
       }
       return;
@@ -1513,21 +1585,20 @@ export class Panel {
         this.step(id, key === "left" ? -1 : 1);
         return;
       case "enter":
-        this.activate(id);
-        return;
-      case "tab":
-        if (id === "voice") this.sample(this.localVoice()?.voice ?? this.speech.settings.voice);
+        if (["readAloud", "speechModel", "voice", "transcription", "output", "bridge"].includes(id))
+          this.arrive(id as TabId);
+        else this.activate(id);
         return;
       case "language":
         if (id === "voice" && !this.localVoice()) this.askLanguage(this.speech.settings.voice);
         return;
       case "escape":
-        this.deps.close();
+        this.close();
         return;
     }
   }
 
-  /** Typed text: into an input or a picker's filter; on a picker row it opens the picker with it typed. */
+  /** Typed text: into an input or a picker's filter; on Main it focuses the Speak line. */
   private text(text: string, paste: boolean): void {
     const m = this.mode;
     if (m.kind === "input") {
@@ -1543,21 +1614,13 @@ export class Panel {
       }
     }
     if (m.kind === "picker") {
-      // In a list of on-device models, d downloads and x deletes the highlighted one.
-      if (m.picker.local && !paste && (text === "d" || text === "x")) {
-        const item = this.pickerItems(m.picker)[m.picker.selected];
-        if (item) {
-          if (text === "d") this.downloadKey(item.id);
-          else this.deleteKey(item.id);
-        }
-        return;
-      }
       m.picker.edit.insert(text);
       m.picker.selected = 0;
       return;
     }
-    if (m.kind === "list" && isPickerRow(MAIN[this.selected].id)) {
-      this.openPicker(MAIN[this.selected].id as ListRow, text);
+    if (m.kind === "list") {
+      this.openSpeaker();
+      this.speakEdit.insert(text);
       return;
     }
     if (paste) return;
@@ -1928,7 +1991,7 @@ export class Panel {
     this.startDownload(model);
   }
 
-  /** x in a local list: x once asks, x again deletes the highlighted model. */
+  /** Ctrl+T in a local list: once asks, twice deletes the highlighted model. */
   private deleteKey(id: string): void {
     const model = this.localModels?.find((x) => x.id === id);
     if (!model) return;
@@ -1943,7 +2006,7 @@ export class Panel {
     }
     if (this.deleting !== id) {
       this.deleting = id;
-      this.setStatus("warning", `! x again deletes ${id} (${formatSize(model.size)})`);
+      this.setStatus("warning", `! Ctrl+T again deletes ${id} (${formatSize(model.size)})`);
       return;
     }
     this.deleting = undefined;
@@ -2389,7 +2452,7 @@ export class Panel {
         .then((text) => {
           const transcript = text.trim();
           if (!transcript) throw new Error("no speech was recognized in the audio file");
-          if (this.mode === m) this.deps.close();
+          if (this.mode === m) this.close();
           this.deps.ui.paste(transcript);
         })
         .catch((err) => this.setStatus("error", `✗ ${errorMessage(err)}`))
@@ -2488,7 +2551,7 @@ export class Panel {
       void this.engine.dictation.toggle(ui).catch((err) => ui.notify(errorMessage(err), "error"));
       return;
     }
-    this.deps.close();
+    this.close();
     void this.engine.dictation.toggle(this.deps.ui).catch((err) => this.deps.ui.notify(errorMessage(err), "error"));
   }
 
