@@ -816,7 +816,11 @@ export class Panel {
       case "readMode":
         return { ...base, value: READ_WORDS[this.engine.readAloud.mode] };
       case "summarizer":
-        return { ...base, value: s.readAloud.summarizer ?? SAME_MODEL_LABEL };
+        if (s.readAloud.summarizer) return { ...base, value: s.readAloud.summarizer };
+        // Streaming never shows Same model: it cannot use it, and no model of the user's was there to take.
+        return this.engine.readAloud.mode === "streaming"
+          ? { ...base, value: "none", note: "✗ choose a model", alert: true }
+          : { ...base, value: SAME_MODEL_LABEL };
       case "summaryLength":
         return { ...base, value: LENGTH_WORDS[s.readAloud.length] };
       case "truncate":
@@ -1505,7 +1509,7 @@ export class Panel {
   private step(id: RowId, dir: 1 | -1): void {
     // Read aloud options change in place; the line under them says what the new value does.
     if (id === "readMode") {
-      this.engine.readAloud.mode = cycle(READ_MODES, this.engine.readAloud.mode, dir);
+      this.engine.setReadMode(cycle(READ_MODES, this.engine.readAloud.mode, dir));
       this.clearStatus();
     } else if (id === "summaryLength") {
       this.engine.setReadAloudOptions({ length: cycle(SUMMARY_LENGTHS, this.speech.settings.readAloud.length, dir) });

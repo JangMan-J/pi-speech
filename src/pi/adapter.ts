@@ -364,6 +364,7 @@ export function registerPi(
 
   // Read-aloud: the user's Pi models summarize when chosen (one extra request per reply).
   engine.readAloud.models = () => (latest ? piModels(latest) : []);
+  engine.readAloud.currentModel = () => (latest?.model ? `${latest.model.provider}/${latest.model.id}` : undefined);
   engine.readAloud.summarize = (ref, prompt, signal) => {
     if (!latest) return Promise.reject(new Error("Pi's models are not available yet"));
     return summarizeWith(latest, ref, prompt, signal);

@@ -158,6 +158,18 @@ export class ReadAloud {
   summarize?: Summarize;
   /** The user's Pi models (`provider/id`), for the Summarized by picker; set by the adapter. */
   models: () => string[] = () => [];
+  /** The Pi model of the session now (`provider/id`), if any; set by the adapter. */
+  currentModel: () => string | undefined = () => undefined;
+
+  /**
+   * The model Streaming takes when none is chosen: the session's model (asked in a request of its own, which is
+   * all Streaming needs), else the first of the user's models; undefined when there are none.
+   */
+  defaultSummarizer(): string | undefined {
+    const models = this.models();
+    const current = this.currentModel();
+    return current && models.includes(current) ? current : models[0];
+  }
   /** The summary taken from the marked block of this run's reply. */
   private taken?: string;
   /** Streaming: reasoning blocks awaiting their spoken summary, the newest merged into the tail when full. */

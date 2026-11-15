@@ -212,7 +212,7 @@ export class Surface {
   setReadAloud(on: boolean | ReadMode, ui: SurfaceUi): void {
     const r = this.engine.readAloud;
     if (typeof on === "boolean") r.enabled = on;
-    else r.mode = on;
+    else this.engine.setReadMode(on);
     const what: Record<ReadMode, string> = {
       off: "off",
       summary: "summarized (a spoken summary of the reply is read when the run ends)",

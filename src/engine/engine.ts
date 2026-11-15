@@ -25,7 +25,7 @@ import { Indicator } from "./indicator";
 import type { LocalModels } from "./local-models";
 import type { SpeechCatalog } from "./openrouter";
 import { Player } from "./player";
-import { type Notify, ReadAloud, type ReadAloudOptions } from "./read-aloud";
+import { type Notify, ReadAloud, type ReadAloudOptions, type ReadMode } from "./read-aloud";
 import { DIRECTION_LABELS, type Notice, Routes } from "./routes";
 import { type BridgeMode, type DirectionSetting, type Machine, SettingsFile } from "./settings";
 import { Speech } from "./speech";
@@ -223,6 +223,18 @@ export class Engine {
     const overridden = !!this.env.PI_SPEECH_BRIDGE_TOKEN?.trim();
     const probe = await probeBridge({ ...target, token });
     return { probe, file, overridden };
+  }
+
+  /**
+   * Set what read-aloud reads. Streaming cannot use Same model (the reply's own model is busy until the run
+   * ends), so choosing it without a separate model chooses one: the session's model, else the first of the
+   * user's. Saved like any Summarized by choice, so it stays when Summarized is chosen again.
+   */
+  setReadMode(mode: ReadMode): void {
+    this.readAloud.mode = mode;
+    if (mode !== "streaming" || this.speech.settings.readAloud.summarizer) return;
+    const model = this.readAloud.defaultSummarizer();
+    if (model) this.setReadAloudOptions({ summarizer: model });
   }
 
   /** Change read-aloud's options and save them. */

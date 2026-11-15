@@ -291,6 +291,39 @@ describe("the panel view model: keys in the main view", () => {
     expect(p.notes).toEqual([]);
   });
 
+  it("Streaming never keeps Same model: it takes the session's model, else the first; Summarized keeps that", async () => {
+    const p = open(
+      {},
+      {
+        before: (e) => {
+          e.readAloud.models = () => ["anthropic/claude-haiku", "openai/gpt-mini"];
+          e.readAloud.currentModel = () => "openai/gpt-mini";
+        },
+      },
+    );
+    await p.press("enter");
+    expect(p.row("Summarized by")?.value).toBe("Same model");
+    await p.press("right", "right"); // Summarized, then Streaming
+    expect(p.engine.readAloud.mode).toBe("streaming");
+    expect(p.row("Summarized by")?.value).toBe("openai/gpt-mini");
+    expect(p.engine.speech.settings.readAloud.summarizer).toBe("openai/gpt-mini");
+    await p.press("left"); // back to Summarized: the chosen model stays
+    expect(p.row("Summarized by")?.value).toBe("openai/gpt-mini");
+
+    // Not the session's model when it is not one of the user's: the first of theirs.
+    p.engine.setReadAloudOptions({ summarizer: undefined });
+    p.engine.readAloud.currentModel = () => "local/unlisted";
+    p.engine.setReadMode("streaming");
+    expect(p.engine.speech.settings.readAloud.summarizer).toBe("anthropic/claude-haiku");
+  });
+
+  it("Streaming with no Pi model to take shows none, as a problem, never Same model", async () => {
+    const p = open({}, { before: (e) => (e.readAloud.models = () => []) });
+    p.engine.setReadMode("streaming");
+    await p.press("enter");
+    expect(p.row("Summarized by")).toMatchObject({ value: "none", note: "✗ choose a model", alert: true });
+  });
+
   it("Length and Truncate at cycle in place, are saved, and their lines say what they promise", async () => {
     const p = open();
     await p.press("enter", "down", "down");
