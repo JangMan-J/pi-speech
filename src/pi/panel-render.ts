@@ -134,13 +134,6 @@ function wrapLines(text: string, first: number, rest: number, max: number): stri
   return out;
 }
 
-function spread(left: string, right: string, w: number, styleLeft = same, styleRight = same): string {
-  const r = cut(right, w);
-  const room = w - width(r) - (r ? 1 : 0);
-  const l = cut(left, Math.max(0, room));
-  return styleLeft(l) + spaces(w - width(l) - width(r)) + (r ? styleRight(r) : "");
-}
-
 /** The live state: the recording dot in the error colour (as in the footer), speaking in the accent. */
 function stateStyle(state: string, s: PanelStyle): (t: string) => string {
   if (state.startsWith("●")) return (t) => (t.startsWith("●") ? s.error("●") + t.slice(1) : t);
@@ -418,22 +411,12 @@ function pickerTable(
   return lines;
 }
 
-/** Whether the list shows less than everything: a query, or a feature that every shown model has. */
-const narrowed = (p: PickerView) => p.query.trim() !== "";
-
-/** The count on the Find line: `39 models`, `6 of 39 models` while filtering; nothing while loading. */
-function countOf(p: PickerView): string {
-  if (p.loading) return "";
-  // One of a thing reads in the singular: "1 voice", "1 model", "1 message".
-  const noun = p.total === 1 ? p.noun.replace(/s$/, "") : p.noun;
-  return narrowed(p) ? `${p.items.length} of ${p.total} ${noun}` : `${p.total} ${noun}`;
-}
-
 function pickerLines(p: PickerView, w: number, s: PanelStyle, rows: number): Line[] {
-  const count = countOf(p);
   const label = "Find: ";
-  const right = count;
-  const styledRight = s.dim(count);
+  // A model list says how it is ordered on the right; where the highlighted item is, and how many there are,
+  // is at the bottom right.
+  const right = p.sort ? `Sort: ${p.sort}` : "";
+  const styledRight = p.sort ? `${s.dim("Sort:")} ${p.sort}` : "";
   const room = w - width(label) - width(right) - 2;
   const query = field(p.query, p.cursor, "", Math.max(1, room), s);
   const gap = Math.max(1, w - width(label) - query.width - width(right));
@@ -449,18 +432,11 @@ function pickerLines(p: PickerView, w: number, s: PanelStyle, rows: number): Lin
   }
   // A steady height: the panel does not jump while the list is filtered.
   while (out.length < 1 + height) out.push(optional(1));
-  // Under a model list: what the catalog says about the highlighted model, three lines at most, with how the
-  // list is ordered on the right of the first. All three are kept even when empty, so the panel does not jump.
+  // Under a model list: what the catalog says about the highlighted model, three lines at most. All three are
+  // kept even when empty, so the panel does not jump.
   if (p.detail !== undefined) {
-    const sort = p.sort ? `Sort: ${p.sort}` : "";
-    const lines = wrapLines(p.detail, w - (sort ? width(sort) + 2 : 0), w, DETAIL_LINES);
-    out.push(
-      optional(
-        5,
-        spread(lines[0] ?? "", sort, w, s.dim, (t) => t),
-      ),
-    );
-    for (let i = 1; i < DETAIL_LINES; i++) out.push(optional(5, lines[i] ? s.dim(lines[i]) : ""));
+    const lines = wrapLines(p.detail, w, w, DETAIL_LINES);
+    for (let i = 0; i < DETAIL_LINES; i++) out.push(optional(5, lines[i] ? s.dim(lines[i]) : ""));
   }
   return out;
 }

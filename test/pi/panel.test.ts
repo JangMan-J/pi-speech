@@ -287,13 +287,14 @@ describe("the panel in Pi's terminal UI", () => {
     c.handleInput("\x1b[B"); // down: Speech source
     c.handleInput("\x1b[B"); // down: Speech model
     c.handleInput("\r");
-    await vi.waitFor(() => expect(screen()).toMatch(/Find: +3 models/));
-    expect(screen()).toMatch(/Sort: price/);
+    await vi.waitFor(() => expect(screen()).toMatch(/kokoro/));
+    expect(screen()).toMatch(/Find: +Sort: price/);
     c.handleInput("\t");
     expect(screen()).toMatch(/Sort: provider/);
     expect(engine.speech.settings.modelSort).toBe("provider");
     c.handleInput("gemini");
-    expect(screen()).toMatch(/Find: gemini +1 of 3 models/);
+    expect(screen()).toMatch(/Find: gemini +Sort: provider/);
+    expect(screen()).toMatch(/ 1\/1$/m);
     expect(screen()).toMatch(/▸ ✓ google\/gemini-3\.8-flash-tts +~\$0\.03\/min {2}OpenRouter {2}2 voices/);
     expect(screen()).toMatch(/Gemini 3\.8 Flash TTS is a text-to-speech model from Google\./);
     c.handleInput("\x1b");
