@@ -15,7 +15,7 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { binaryFile, bundleBinaries, TARGETS } from "../npm/platforms.mjs";
+import { binaryFile, bundleBinaries, LIBRARIES, TARGETS } from "../npm/platforms.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
@@ -47,6 +47,8 @@ try {
     } else {
       writeFileSync(join(dir, file), "#!/bin/sh\nexit 0\n");
     }
+    // The shared libraries a target carries beside its binary (stand-ins; the real ones come from the release build).
+    for (const lib of LIBRARIES[t] ?? []) writeFileSync(join(dir, lib), "");
   }
 
   // The package as the publish job packs it: the root's files, plus bin/ bundled in.

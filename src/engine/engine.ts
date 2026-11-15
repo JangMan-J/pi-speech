@@ -381,6 +381,6 @@ export class Engine {
     await this.dictation.cancel();
     await this.player.stop();
     await this.disconnectRemote(false);
-    this.speech.local.close();
+    this.speech.closeWorkers();
   }
 }

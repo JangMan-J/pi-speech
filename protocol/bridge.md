@@ -283,7 +283,18 @@ pi-speech-receiver [--listen 127.0.0.1:47613 [--network]] [--token-file PATH]
 ```
 pi-speech-receiver speak <model-dir>|<model-id> [--voice <name-or-number>] [--speed <x>] [--lang <code>]
 pi-speech-receiver speak <model-dir>|<model-id> --list-voices
+pi-speech-receiver speak --serve
 ```
+
+`speak --serve` stays running and keeps the last voice model loaded (the extension's local speech goes through
+one, so that only the first utterance waits for the model, about 2 s). Requests are JSON lines on stdin:
+`{"id":<n>,"model","text","voice","speed","lang"}` (all but `id`, `model` and `text` optional),
+`{"id":<n>,"model","load":true}`, and `{"cancel":<n>}`, which stops request `n` at its next piece of audio and
+does nothing to another. Answers are frames on stdout, one at a time and in request order: a kind byte, a 4-byte
+little-endian length, and that many bytes; `J` a JSON event with the request's `id` (`format`, then `done`,
+`stopped` or `error`; `loaded` for a load), `A` PCM of the request whose `format` came last. It exits when stdin
+closes. `transcribe --serve` is its counterpart for transcription (JSON lines both ways: see
+`receiver/src/transcribe.rs`).
 
 Local speech (Kokoro, Kitten, Piper, Supertonic, Pocket TTS) on the machine that runs the binary; not
 an HTTP endpoint.

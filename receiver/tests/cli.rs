@@ -11,7 +11,9 @@ use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 use support::*;
 
 const BIN: &str = env!("CARGO_BIN_EXE_pi-speech-receiver");
@@ -670,6 +672,7 @@ fn a_signal_during_a_built_in_playback_and_recording_stops_both_and_removes_the_
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[cfg(unix)]
 /// Start a PCM Stream (with `extra` fields in its request) and upload `seconds` of audio on
 /// a thread of its own; its id, and the uploader.
 fn streaming(addr: SocketAddr, extra: &str, seconds: f64) -> (String, std::thread::JoinHandle<()>) {

@@ -675,6 +675,12 @@ export class Speech {
     return { model, voice: voice || this.settings.localSpeechVoice || "" };
   }
 
+  /** End the running local workers (transcription and speech), giving back their models' memory. */
+  closeWorkers(): void {
+    this.local.close();
+    this.localSpeech.close();
+  }
+
   /** Get transcription ready for audio to come: a local model is loaded while the user speaks. */
   prepareTranscription(language?: string): void {
     if (this.settings.transcriptionSource !== "local") return;

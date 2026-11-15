@@ -224,7 +224,8 @@ export function fakeReceiver(dir: string): { path: string; log: string } {
     `#!${process.execPath}
 const fs = require("node:fs");
 const [, , cmd, sub, id] = process.argv;
-fs.appendFileSync(${JSON.stringify(log)}, process.argv.slice(2).join(" ") + "\\n");
+// A running worker (--serve) logs each request instead, as the one-shot command it stands for.
+if (process.argv[3] !== "--serve") fs.appendFileSync(${JSON.stringify(log)}, process.argv.slice(2).join(" ") + "\\n");
 const out = (v) => process.stdout.write(JSON.stringify(v) + "\\n");
 const state = ${JSON.stringify(state)};
 const have = JSON.parse(fs.readFileSync(state, "utf8"));
@@ -251,6 +252,60 @@ if (cmd === "transcribe") {
   fs.readFileSync(id);
   process.stdout.write("local words from " + sub + "\\n");
   process.exit(0);
+}
+if (cmd === "speak" && sub === "--serve") {
+  // The running worker: framed answers (kind byte, length, body) to JSON requests, as the binary does.
+  fs.writeFileSync(${JSON.stringify(join(dir, "speak.pid"))}, String(process.pid));
+  const frame = (kind, body) => {
+    const head = Buffer.alloc(5);
+    head.write(kind, 0, "latin1");
+    head.writeUInt32LE(body.length, 1);
+    process.stdout.write(Buffer.concat([head, body]));
+  };
+  const ev = (v) => frame("J", Buffer.from(JSON.stringify(v)));
+  const VOICES = ["af_alloy", "af_sol", "bm_lewis"];
+  let cancelled = -1;
+  const queue = [];
+  let busy = false;
+  const next = () => {
+    if (busy || !queue.length) return;
+    busy = true;
+    const r = queue.shift();
+    const done = () => { busy = false; next(); };
+    const now = JSON.parse(fs.readFileSync(state, "utf8"));
+    if (!now.includes(r.model)) {
+      ev({ id: r.id, event: "error", message: "the model " + r.model + " is not downloaded; download it with \`pi-speech-receiver models download " + r.model + "\`" });
+      return done();
+    }
+    if (r.load) { ev({ id: r.id, event: "loaded" }); return done(); }
+    if (r.voice && !VOICES.includes(r.voice)) {
+      ev({ id: r.id, event: "error", message: "unknown voice " + JSON.stringify(r.voice) + "; the voices are " + VOICES.join(", ") });
+      return done();
+    }
+    fs.appendFileSync(${JSON.stringify(join(dir, "speak.log"))}, JSON.stringify(r.text) + "\\n");
+    fs.appendFileSync(${JSON.stringify(join(dir, "speak-requests.log"))}, JSON.stringify(r) + "\\n");
+    // Logged as the one-shot command would be: speak <model> [--voice <v>]
+    fs.appendFileSync(${JSON.stringify(log)}, "speak " + r.model + (r.voice ? " --voice " + r.voice : "") + "\\n");
+    ev({ id: r.id, event: "format", rate: 24000, channels: 1 });
+    const sentences = r.text.split(/(?<=[.!?])\\s+/).filter((x) => x.trim());
+    frame("A", Buffer.alloc(4800, 1));
+    if (r.text.includes("hold")) {
+      const t = setInterval(() => {
+        if (cancelled === r.id) { clearInterval(t); ev({ id: r.id, event: "stopped" }); done(); }
+      }, 10);
+      return;
+    }
+    for (let i = 1; i < sentences.length; i++) frame("A", Buffer.alloc(4800, 1));
+    ev({ id: r.id, event: "done" });
+    done();
+  };
+  require("node:readline").createInterface({ input: process.stdin }).on("line", (line) => {
+    const r = JSON.parse(line);
+    if (typeof r.cancel === "number") { cancelled = r.cancel; return; }
+    queue.push(r);
+    next();
+  });
+  return;
 }
 if (cmd === "speak") {
   fs.writeFileSync(${JSON.stringify(join(dir, "speak.pid"))}, String(process.pid));

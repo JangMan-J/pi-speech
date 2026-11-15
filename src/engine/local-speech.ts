@@ -207,6 +207,256 @@ export function speakLocal(
   );
 }
 
+/** How long the speech worker, and the voice model in it, stays after its last request: ten minutes. */
+export const SPEECH_WORKER_IDLE_MS = 10 * 60 * 1000;
+
+interface Turn {
+  id: number;
+  onEvent(ev: Record<string, unknown>): void;
+  onAudio(chunk: Buffer): void;
+  /** The worker went away. */
+  onGone(err: Error): void;
+}
+
+/**
+ * A running `pi-speech-receiver speak --serve`: it keeps the last voice model loaded, so that only the first
+ * utterance pays for loading it (about 2 s). Utterances go one at a time, in order; each answers with a `format`
+ * event, its audio as it is generated, and `done`, `stopped` or `error`. Stopping one (abort, or leaving its chunks
+ * early) sends a cancel and keeps the process and the model. The process ends after `idleMs` without a request,
+ * on `close()`, or when it fails; the next request starts another.
+ */
+export class SpeechWorker {
+  private child?: ChildProcess;
+  private nextId = 1;
+  private turn?: Turn;
+  private queue: Promise<unknown> = Promise.resolve();
+  private idle?: ReturnType<typeof setTimeout>;
+  private buffer = Buffer.alloc(0);
+  private stderr = "";
+
+  constructor(
+    private readonly binary: () => string,
+    private readonly env: () => NodeJS.ProcessEnv,
+    private readonly idleMs = SPEECH_WORKER_IDLE_MS,
+  ) {}
+
+  /** Load voice model `id` now. Never rejects. */
+  load(id: string): void {
+    const run = this.queue.then(
+      () =>
+        new Promise<void>((resolve) => {
+          this.request(
+            { model: id, load: true },
+            {
+              onEvent: (ev) => {
+                if (ev.event === "loaded" || ev.event === "error") resolve();
+              },
+              onAudio: () => {},
+              onGone: () => resolve(),
+            },
+          );
+        }),
+    );
+    this.queue = run.catch(() => {});
+  }
+
+  /** Speak `text` with voice model `id`; as `speakLocal`, but through the running worker. */
+  speak(id: string, text: string, options: LocalSpeechOptions & { lang?: string } = {}): Promise<AudioStream> {
+    const { signal } = options;
+    if (signal?.aborted) return Promise.reject(signal.reason);
+    // The turn ends (and the next may start) when this utterance is done, stopped or failed.
+    let release!: () => void;
+    const ended = new Promise<void>((r) => {
+      release = r;
+    });
+    const started = this.queue.then(() => this.start(id, text, options, release));
+    this.queue = started.then(() => ended).catch(() => {});
+    return started;
+  }
+
+  /** End the process; what is being spoken fails. */
+  close(): void {
+    this.stop(new LocalSpeechError("the speech worker was closed"));
+  }
+
+  private start(
+    id: string,
+    text: string,
+    options: LocalSpeechOptions & { lang?: string },
+    release: () => void,
+  ): Promise<AudioStream> {
+    const { signal } = options;
+    if (signal?.aborted) {
+      release();
+      return Promise.reject(signal.reason);
+    }
+    const chunks: Buffer[] = [];
+    let wake: (() => void) | undefined;
+    let end: { error?: Error } | undefined;
+    let id_ = 0;
+    const finish = (error?: Error) => {
+      if (end) return;
+      end = { error };
+      signal?.removeEventListener("abort", onAbort);
+      release();
+      wake?.();
+    };
+    const cancel = () => {
+      if (!end && this.child) this.child.stdin?.write(`${JSON.stringify({ cancel: id_ })}\n`);
+    };
+    const onAbort = () => cancel();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    return new Promise<AudioStream>((resolve, reject) => {
+      let formatted = false;
+      id_ = this.request(
+        {
+          model: id,
+          text,
+          ...(options.voice ? { voice: options.voice } : {}),
+          ...(options.speed !== undefined && options.speed !== 1 ? { speed: options.speed } : {}),
+          ...(options.lang ? { lang: options.lang } : {}),
+        },
+        {
+          onEvent: (ev) => {
+            if (ev.event === "format" && typeof ev.rate === "number" && ev.rate > 0) {
+              formatted = true;
+              const channels = typeof ev.channels === "number" && ev.channels > 0 ? ev.channels : 1;
+              resolve({ format: { codec: "pcm", rate: ev.rate, channels }, chunks: read() });
+            } else if (ev.event === "done") finish();
+            else if (ev.event === "stopped") finish(signal?.aborted ? signal.reason : new LocalSpeechError("stopped"));
+            else if (ev.event === "error") {
+              const err = new LocalSpeechError(typeof ev.message === "string" ? ev.message : "speaking failed");
+              finish(err);
+              if (!formatted) reject(signal?.aborted ? signal.reason : err);
+            }
+          },
+          onAudio: (chunk) => {
+            chunks.push(chunk);
+            wake?.();
+          },
+          onGone: (err) => {
+            finish(err);
+            if (!formatted) reject(signal?.aborted ? signal.reason : err);
+          },
+        },
+      );
+    });
+
+    async function* read(): AsyncGenerator<Uint8Array> {
+      try {
+        for (;;) {
+          const chunk = chunks.shift();
+          if (chunk) {
+            yield chunk;
+            continue;
+          }
+          if (end) {
+            if (end.error) throw end.error;
+            return;
+          }
+          await new Promise<void>((r) => {
+            wake = r;
+          });
+          wake = undefined;
+        }
+      } finally {
+        // Left early (or aborted): stop it there.
+        cancel();
+      }
+    }
+  }
+
+  /** Send a request, answered through `turn`; returns its id. */
+  private request(body: Record<string, unknown>, turn: Omit<Turn, "id">): number {
+    if (this.idle) clearTimeout(this.idle);
+    const id = this.nextId++;
+    let child: ChildProcess;
+    try {
+      child = this.child ?? this.spawn();
+    } catch (e) {
+      turn.onGone(e instanceof Error ? e : new LocalSpeechError(String(e)));
+      return id;
+    }
+    const wrapped: Turn = {
+      id,
+      ...turn,
+      onEvent: (ev) => {
+        turn.onEvent(ev);
+        if (["done", "stopped", "error", "loaded"].includes(String(ev.event))) {
+          this.turn = undefined;
+          this.idle = setTimeout(() => this.close(), this.idleMs);
+          this.idle.unref?.();
+        }
+      },
+    };
+    this.turn = wrapped;
+    child.stdin?.write(`${JSON.stringify({ id, ...body })}\n`);
+    return id;
+  }
+
+  private spawn(): ChildProcess {
+    const binary = this.binary();
+    const child = spawn(binary, ["speak", "--serve"], {
+      env: this.env(),
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    this.child = child;
+    this.buffer = Buffer.alloc(0);
+    this.stderr = "";
+    child.stdin?.on("error", () => {});
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (s: string) => {
+      this.stderr = (this.stderr + s).slice(-4000);
+    });
+    child.stdout?.on("data", (data: Buffer) => {
+      if (this.child !== child) return;
+      this.buffer = Buffer.concat([this.buffer, data]);
+      while (this.buffer.length >= 5) {
+        const n = this.buffer.readUInt32LE(1);
+        if (this.buffer.length < 5 + n) break;
+        const kind = this.buffer[0];
+        const body = this.buffer.subarray(5, 5 + n);
+        this.buffer = this.buffer.subarray(5 + n);
+        const turn = this.turn;
+        if (kind === 0x41 /* A */) turn?.onAudio(Buffer.from(body));
+        else if (kind === 0x4a /* J */) {
+          let ev: Record<string, unknown>;
+          try {
+            ev = JSON.parse(body.toString("utf8"));
+          } catch {
+            continue;
+          }
+          if (turn && (ev.id === undefined || ev.id === turn.id)) turn.onEvent(ev);
+        }
+      }
+    });
+    const ended = (why: string) => {
+      if (this.child !== child) return;
+      const last = this.stderr
+        .trim()
+        .split("\n")
+        .at(-1)
+        ?.replace(/^pi-speech-receiver: /, "");
+      this.stop(new LocalSpeechError(last || why), false);
+    };
+    child.once("error", (e) => ended(`cannot run ${binary}: ${e.message}`));
+    child.once("exit", (code, sig) => ended(`the speech worker ended (${sig ?? code})`));
+    return child;
+  }
+
+  private stop(err: Error, kill = true): void {
+    const child = this.child;
+    this.child = undefined;
+    if (this.idle) clearTimeout(this.idle);
+    this.idle = undefined;
+    if (kill && child && child.exitCode === null) child.kill();
+    const turn = this.turn;
+    this.turn = undefined;
+    turn?.onGone(err);
+  }
+}
+
 /**
  * Local speech as a speech provider: the model is a downloaded voice model's id, the voice a voice name or number
  * of it (empty: its first). It needs no credential and transcribes nothing.
@@ -214,13 +464,34 @@ export function speakLocal(
 export class LocalSpeechProvider implements SpeechProvider {
   readonly name = "Local speech";
 
+  /** The running `speak --serve`, which keeps the last voice model loaded between utterances. */
+  private readonly worker: SpeechWorker;
+
   constructor(
     /** The binary's path; throws why there is none. */
     private readonly binary: () => string,
     private readonly env: () => NodeJS.ProcessEnv = () => process.env,
     /** The Remote machine's models when they run there (Run models on), else undefined. */
     private readonly remote: () => BridgeModels | undefined = () => undefined,
-  ) {}
+  ) {
+    this.worker = new SpeechWorker(binary, env);
+  }
+
+  /** Load voice model `id` now, on This machine, so the next utterance does not wait for it. */
+  preload(id: string): void {
+    if (this.remote()) return;
+    try {
+      this.binary();
+    } catch {
+      return;
+    }
+    this.worker.load(id);
+  }
+
+  /** End the speech worker, giving back the memory of the voice model it holds. */
+  close(): void {
+    this.worker.close();
+  }
 
   async ensureCredential(): Promise<void> {}
 
@@ -234,7 +505,9 @@ export class LocalSpeechProvider implements SpeechProvider {
   async synthesizeStream(req: SynthesisRequest): Promise<AudioStream> {
     const remote = this.remote();
     if (remote) return remote.speak(req.model, req.text, { voice: req.voice, signal: req.signal });
-    return speakLocal(this.binary(), req.model, req.text, { voice: req.voice, signal: req.signal, env: this.env() });
+    this.binary();
+    const lang = req.language && req.language !== "auto" ? req.language : undefined;
+    return this.worker.speak(req.model, req.text, { voice: req.voice, signal: req.signal, lang });
   }
 
   async synthesize(req: SynthesisRequest): Promise<SynthesizedAudio> {

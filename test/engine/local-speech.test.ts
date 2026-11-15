@@ -34,6 +34,26 @@ const [, , cmd, id, ...rest] = process.argv;
 fs.writeFileSync(${JSON.stringify(pid)}, String(process.pid));
 const ev = (v) => process.stderr.write(JSON.stringify(v) + "\\n");
 if (cmd !== "speak") process.exit(2);
+if (id === "--serve") {
+  // The running worker: framed answers (kind byte, length, body); model "ok" speaks [1,2,3,4] then [5,6].
+  const frame = (kind, body) => {
+    const head = Buffer.alloc(5);
+    head.write(kind, 0, "latin1");
+    head.writeUInt32LE(body.length, 1);
+    process.stdout.write(Buffer.concat([head, body]));
+  };
+  const json = (v) => frame("J", Buffer.from(JSON.stringify(v)));
+  require("node:readline").createInterface({ input: process.stdin }).on("line", (line) => {
+    const r = JSON.parse(line);
+    if (r.cancel !== undefined) return;
+    fs.writeFileSync(${JSON.stringify(log)}, JSON.stringify({ args: [cmd, r.model], text: r.text, request: r }));
+    if (r.model === "missing") return json({ id: r.id, event: "error", message: "the model missing is not downloaded" });
+    json({ id: r.id, event: "format", rate: 22050, channels: 1 });
+    frame("A", Buffer.from([1, 2, 3, 4]));
+    setTimeout(() => { frame("A", Buffer.from([5, 6])); json({ id: r.id, event: "done" }); }, 50);
+  });
+  return;
+}
 if (id === "missing") { ev({ event: "error", message: "the model missing is not downloaded; download it with \`pi-speech-receiver models download missing\`" }); process.exit(1); }
 if (id === "noise") { process.stderr.write("pi-speech-receiver: something odd\\n"); process.exit(3); }
 if (rest.includes("--list-voices")) {
@@ -162,6 +182,22 @@ describe.skipIf(!STAND_IN_BINARY)("LocalSpeechProvider", () => {
     expect(wav.readUInt32LE(24)).toBe(22050);
     expect([...wav.subarray(44)]).toEqual([1, 2, 3, 4, 5, 6]);
     await expect(provider.transcribe()).rejects.toThrow(/does not transcribe/);
+  });
+
+  it("speaks through one running worker, with the language of the text when one is named", async () => {
+    const bin = fakeSpeak();
+    const provider = new LocalSpeechProvider(() => bin);
+    const request = () => JSON.parse(readFileSync(join(dir, "log.json"), "utf8")).request;
+    await provider.synthesize({ text: "Hallo.", model: "ok", voice: "M2", language: "de" });
+    expect(request()).toMatchObject({ model: "ok", text: "Hallo.", voice: "M2", lang: "de" });
+    const pid = readFileSync(join(dir, "pid"), "utf8");
+    await provider.synthesize({ text: "Hi.", model: "ok", voice: "", language: "auto" });
+    expect(request().lang).toBeUndefined();
+    expect(readFileSync(join(dir, "pid"), "utf8")).toBe(pid);
+    await expect(provider.synthesize({ text: "Hi.", model: "missing", voice: "", language: "auto" })).rejects.toThrow(
+      /not downloaded/,
+    );
+    provider.close();
   });
 
   it("lists a model's voices from speak --list-voices, and says why it cannot", async () => {

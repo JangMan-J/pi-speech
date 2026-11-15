@@ -92,7 +92,9 @@ language themselves.
 Local transcription goes through one running `pi-speech-receiver transcribe --serve`, which keeps the last
 model loaded for ten minutes after its last use, and dictation starts loading the model as soon as recording
 starts, so the wait after speaking is only the transcription itself: Parakeet 0.6b takes about 0.7 s for an
-8-second sentence once loaded, Moonshine base 0.3 s, Cohere 1.8 s.
+8-second sentence once loaded, Moonshine base 0.3 s, Cohere 1.8 s. Local speech does the same through one
+running `pi-speech-receiver speak --serve`: the first utterance waits for the voice model (about 2 s), the next
+ones do not (a Piper voice starts in about 60 ms), and stopping one keeps the model.
 
 **GPU (Linux x64, NVIDIA).** Local transcription can run on an NVIDIA GPU: `/speech --set stt-device gpu`
 (back with `cpu`). It needs the NVIDIA driver, CUDA 13 or 12 and cuDNN 9 installed on the system (pi-speech

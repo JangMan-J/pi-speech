@@ -17,6 +17,22 @@
 //!
 //! A catalogue id (`models list`) names a downloaded speech model in the model cache (with the
 //! lexicon it needs, for a Piper or Kitten voice).
+//!
+//! `speak --serve` stays running and keeps the last voice model it used loaded, so that only the
+//! first utterance pays for loading it (about 2 s for most models). Requests are JSON lines on
+//! standard input, read on their own thread so that a cancel can arrive while one is spoken:
+//!
+//! - `{"id":<n>,"model":"<id or dir>","text":"…","voice":"…","speed":1,"lang":"de"}`: speak it
+//!   (`voice`, `speed` and `lang` optional);
+//! - `{"id":<n>,"model":"…","load":true}`: load the model now;
+//! - `{"cancel":<n>}`: stop request `n` at the next piece of audio (the model stays loaded); a
+//!   cancel of a request already answered does nothing.
+//!
+//! Answers go to standard output as frames, each one byte of kind, its length (4 bytes, little
+//! endian), and that many bytes: `J`, a JSON event with the request's `id` (`format` with `rate`
+//! and `channels`, then `done`, `stopped` or `error` with `message`; `loaded` for a load); `A`,
+//! audio of the request whose `format` came last (signed 16-bit little-endian PCM). Requests are
+//! answered one at a time, in order. It exits when standard input closes, or its reader goes.
 
 use crate::engines::synthesize::{self, pcm16, voice_number, Synthesizer};
 use crate::models::cache;
@@ -259,7 +275,141 @@ fn speak(model: &str, voice: Option<&str>, speed: f32, lang: Option<&str>) -> Re
     Ok(())
 }
 
+/// The kept voice model of `serve`: its directory and the loaded model.
+type Kept = Option<(PathBuf, Synthesizer)>;
+
+/// The frames of `serve` on standard output.
+struct Frames(io::Stdout);
+
+impl Frames {
+    fn send(&self, kind: u8, payload: &[u8]) {
+        let mut out = self.0.lock();
+        let len = u32::try_from(payload.len())
+            .unwrap_or(u32::MAX)
+            .to_le_bytes();
+        let ok = out
+            .write_all(&[kind])
+            .and_then(|()| out.write_all(&len))
+            .and_then(|()| out.write_all(payload))
+            .and_then(|()| out.flush());
+        if ok.is_err() {
+            // Nobody reads the answers any more.
+            exit_now(0);
+        }
+    }
+
+    fn event(&self, v: Value) {
+        self.send(b'J', v.to_string().as_bytes());
+    }
+}
+
+/// The voice model `model` names, loaded (the kept one when it is that one).
+fn synthesizer<'a>(kept: &'a mut Kept, model: &str) -> Result<&'a Synthesizer, String> {
+    let dir = resolve_voice_dir(model)?;
+    if !kept.as_ref().is_some_and(|(d, _)| *d == dir) {
+        *kept = None;
+        let found = synthesize::detect(&dir)?;
+        *kept = Some((dir, Synthesizer::load(&found)?));
+    }
+    Ok(&kept.as_ref().expect("kept above").1)
+}
+
+/// One request of `serve`, answered.
+fn answer(
+    kept: &mut Kept,
+    req: &Value,
+    frames: &Arc<Frames>,
+    cancel: &Arc<std::sync::atomic::AtomicI64>,
+) {
+    let id = req.get("id").and_then(Value::as_i64).unwrap_or(-1);
+    let s = |k: &str| req.get(k).and_then(Value::as_str).filter(|v| !v.is_empty());
+    let fail = |m: String| frames.event(json!({"id": id, "event": "error", "message": m}));
+    let Some(model) = s("model") else {
+        return fail("the request names no model".into());
+    };
+    if req.get("load").and_then(Value::as_bool) == Some(true) {
+        match synthesizer(kept, model) {
+            Ok(_) => frames.event(json!({"id": id, "event": "loaded"})),
+            Err(e) => fail(e),
+        }
+        return;
+    }
+    let text = s("text").map(str::trim).unwrap_or("");
+    if text.is_empty() {
+        return fail("nothing to say: the text is empty".into());
+    }
+    let speed = req.get("speed").and_then(Value::as_f64).unwrap_or(1.0) as f32;
+    if !(MIN_SPEED..=MAX_SPEED).contains(&speed) {
+        return fail(format!("speed must be from {MIN_SPEED} to {MAX_SPEED}"));
+    }
+    let lang = s("lang");
+    let synth = match synthesizer(kept, model) {
+        Ok(s) => s,
+        Err(e) => return fail(e),
+    };
+    let sid = match s("voice") {
+        Some(v) => match voice_number(synth.voices(), v) {
+            Ok(n) => n,
+            Err(e) => return fail(e),
+        },
+        None => 0,
+    };
+    frames.event(json!({"id": id, "event": "format", "rate": synth.sample_rate(), "channels": 1}));
+    let stopped = Arc::new(AtomicBool::new(false));
+    let (f, c, st) = (frames.clone(), cancel.clone(), stopped.clone());
+    let result = synth.generate(text, sid, speed, lang, move |samples| {
+        if c.load(Ordering::SeqCst) == id {
+            st.store(true, Ordering::SeqCst);
+            return false;
+        }
+        if !samples.is_empty() {
+            f.send(b'A', &pcm16(samples));
+        }
+        true
+    });
+    match result {
+        _ if stopped.load(Ordering::SeqCst) => frames.event(json!({"id": id, "event": "stopped"})),
+        Ok(()) => frames.event(json!({"id": id, "event": "done"})),
+        Err(e) => fail(e),
+    }
+}
+
+/// `speak --serve`: requests on standard input, frames on standard output.
+pub fn serve() -> ExitCode {
+    use std::io::BufRead;
+    use std::sync::atomic::AtomicI64;
+    let frames = Arc::new(Frames(io::stdout()));
+    let cancel = Arc::new(AtomicI64::new(-1));
+    let (tx, rx) = std::sync::mpsc::channel::<Value>();
+    let c = cancel.clone();
+    let reader = crate::proc::start_thread("speak-requests", move || {
+        for line in io::stdin().lock().lines() {
+            let Ok(line) = line else { break };
+            let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if let Some(n) = v.get("cancel").and_then(Value::as_i64) {
+                c.store(n, Ordering::SeqCst);
+            } else if tx.send(v).is_err() {
+                break;
+            }
+        }
+    });
+    if let Err(e) = reader {
+        frames.event(json!({"event": "error", "message": format!("cannot read requests: {e}")}));
+        return ExitCode::from(1);
+    }
+    let mut kept: Kept = None;
+    for req in rx {
+        answer(&mut kept, &req, &frames, &cancel);
+    }
+    ExitCode::SUCCESS
+}
+
 pub fn main(args: &[String]) -> ExitCode {
+    if matches!(args, [a] if a == "--serve") {
+        return serve();
+    }
     let command = match parse_args(args) {
         Ok(Command::Help) => {
             println!("usage: {USAGE}\n\n{HELP_NOTE}");

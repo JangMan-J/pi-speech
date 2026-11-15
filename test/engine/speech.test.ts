@@ -100,7 +100,7 @@ describe.skipIf(!STAND_IN_BINARY)("Speech source Local", () => {
     expect(speechRequests(requests)).toEqual([]);
   });
 
-  it("stopping the player kills the speak process and keeps nothing", async () => {
+  it("stopping the player stops the utterance and keeps nothing; the worker and its model stay for the next", async () => {
     fakeOpenRouter();
     const { engine, local, work, pid } = await localEngine();
     const spoken = engine.speech.speak("Please hold. This never ends.");
@@ -112,8 +112,13 @@ describe.skipIf(!STAND_IN_BINARY)("Speech source Local", () => {
     await engine.player.stop();
     const r = await spoken;
     expect(r.stopped).toBe(true);
-    await until(() => !alive(p));
     expect(existsSync(join(work, "history")) ? readdirSync(join(work, "history")) : []).toEqual([]);
+    // the same worker speaks the next one: the model was not dropped
+    await engine.speech.speak("Hello again.");
+    expect(pid()).toBe(p);
+    expect(alive(p)).toBe(true);
+    engine.speech.closeWorkers();
+    await until(() => !alive(p));
   });
 
   it("a model that is not downloaded fails plainly, naming the download, without the provider", async () => {
