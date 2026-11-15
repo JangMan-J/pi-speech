@@ -151,6 +151,27 @@ impl ProcCtl {
         s.stop_requested || s.exited
     }
 
+    /// Ask the child to fade out and then stop ([`signals::FADE`](crate::signals::FADE)),
+    /// without waiting for it; it counts as stopped, not failed, when it exits. Where there
+    /// is no such signal (Windows), it is stopped at once. False when it had exited or a
+    /// stop was asked for already.
+    pub fn fade_out(&self) -> bool {
+        #[cfg(unix)]
+        {
+            let mut s = lock(&self.st);
+            if s.exited || s.stop_requested {
+                return false;
+            }
+            s.stop_requested = true;
+            unsafe { libc::kill(self.pid, crate::signals::FADE) };
+            true
+        }
+        #[cfg(not(unix))]
+        {
+            self.stop()
+        }
+    }
+
     /// Stop the child and wait for it to be gone. True when it was still running.
     pub fn stop(&self) -> bool {
         self.stop_within(STOP_GRACE, None)

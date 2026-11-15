@@ -20,7 +20,7 @@ use crate::signals;
 use crate::stream::{MAX_RATE, MIN_RATE};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{fence, AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -137,6 +137,14 @@ struct Shared {
     latency: AtomicU64,
     period: AtomicU64,
     tap: SampleTap,
+    /// Fade the start in over this long, in ns (0: no fade).
+    fade_in: AtomicU64,
+    /// Set by a soft stop: fade out over this long, in ns, then stop (0: none asked).
+    fade_out: AtomicU64,
+    /// The signal the soft stop came with, the playback's end once the fade is done.
+    fade_signal: AtomicI32,
+    /// The fade out has reached silence: the waiting thread ends the playback.
+    faded: AtomicBool,
 }
 
 impl Shared {
@@ -180,6 +188,11 @@ impl Shared {
                 } else {
                     meter.decay();
                 }
+            }
+            if self.faded.load(Ordering::Acquire) {
+                let sig = self.fade_signal.load(Ordering::Relaxed);
+                self.end_locked(&mut end, End::Stopped(sig));
+                break;
             }
             let now = self.callbacks.load(Ordering::Relaxed);
             if now != seen {
@@ -258,6 +271,51 @@ struct Tap {
     ring: Consumer,
     shared: Arc<Shared>,
     format: Format,
+    /// Frames of audio played so far, for the fade in.
+    played: u64,
+    /// Frames since a soft stop asked for the fade out.
+    fading: u64,
+}
+
+/// Fade the `n` samples of audio at the start of `out`: in, over the first frames of the
+/// playback (`played` counts them); out, once a soft stop asked, until silence (`fading`
+/// counts those frames), and then the playback ends. The fade out counts the device's time,
+/// so it ends even while no audio comes.
+fn fade(s: &Shared, format: Format, played: &mut u64, fading: &mut u64, out: &mut [f32], n: usize) {
+    let ch = format.channels;
+    let fade_in = frames_in(s.fade_in.load(Ordering::Relaxed), format.rate);
+    let fade_out = frames_in(s.fade_out.load(Ordering::Relaxed), format.rate);
+    if fade_in == 0 && fade_out == 0 {
+        *played += (n / ch) as u64;
+        return;
+    }
+    for frame in out[..n].chunks_exact_mut(ch) {
+        let mut gain = 1.0f32;
+        if *played < fade_in {
+            gain *= *played as f32 / fade_in as f32;
+        }
+        if fade_out > 0 {
+            gain *= 1.0 - (*fading as f32 / fade_out as f32).min(1.0);
+            *fading += 1;
+        }
+        *played += 1;
+        if gain < 1.0 {
+            frame.iter_mut().for_each(|x| *x *= gain);
+        }
+    }
+    if fade_out > 0 {
+        // The rest of the period (silence while the input stalls) counts too.
+        *fading += ((out.len() - n) / ch) as u64;
+        if *fading >= fade_out && !s.faded.swap(true, Ordering::AcqRel) {
+            let _end = s.lock_end();
+            s.done.notify_all();
+        }
+    }
+}
+
+/// `ns` of audio at `rate`, in frames.
+fn frames_in(ns: u64, rate: u32) -> u64 {
+    (ns as u128 * rate as u128 / 1_000_000_000) as u64
 }
 
 impl Tap {
@@ -276,6 +334,7 @@ impl Tap {
         } else {
             self.ring.pop(out)
         };
+        fade(s, self.format, &mut self.played, &mut self.fading, out, n);
         if n > 0 {
             s.tap.try_push_interleaved(&out[..n], self.format.channels);
         }
@@ -305,6 +364,30 @@ pub struct Player {
 impl Player {
     pub fn new() -> Player {
         Player::default()
+    }
+
+    /// Fade the start of the playback in over `d`.
+    pub fn fade_in(&self, d: Duration) {
+        self.shared
+            .fade_in
+            .store(d.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// Something any thread may call, any number of times, to fade the playback out over
+    /// `d` and then stop it, as by signal `sig`. The fade runs on the device's time, so it
+    /// ends even while no input comes.
+    pub fn fader(&self, d: Duration) -> impl Fn(i32) + Send + 'static {
+        let s = Arc::clone(&self.shared);
+        move |sig| {
+            s.fade_signal.store(sig, Ordering::Relaxed);
+            // The first ask decides the length; a second does not restart the fade.
+            let _ = s.fade_out.compare_exchange(
+                0,
+                d.as_nanos().max(1) as u64,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+        }
     }
 
     /// Something any thread may call to stop the playback at once, as by signal `sig`.
@@ -337,6 +420,8 @@ impl Player {
             ring: consumer,
             shared: Arc::clone(&shared),
             format,
+            played: 0,
+            fading: 0,
         };
         let f = Arc::clone(&shared);
         let device = output.start(
@@ -410,6 +495,20 @@ where
     Ok(())
 }
 
+/// Fade the start of a playback in over this many milliseconds (unset: no fade).
+pub const FADE_IN_ENV: &str = "PI_SPEECH_FADE_IN_MS";
+/// How long [`signals::FADE`] fades a playback out before it stops, in milliseconds.
+pub const FADE_OUT_ENV: &str = "PI_SPEECH_FADE_OUT_MS";
+pub const DEFAULT_FADE_OUT: Duration = Duration::from_millis(500);
+/// The longest fade either way.
+pub const MAX_FADE: Duration = Duration::from_secs(5);
+
+/// A duration in milliseconds from `name`, at most [`MAX_FADE`]; none when unset or not a number.
+fn env_ms(name: &str) -> Option<Duration> {
+    let ms: u64 = std::env::var(name).ok()?.trim().parse().ok()?;
+    Some(Duration::from_millis(ms).min(MAX_FADE))
+}
+
 /// `pi-speech-receiver play ...`
 pub fn main(args: &[String]) -> ExitCode {
     let source = match Source::parse(args) {
@@ -418,7 +517,23 @@ pub fn main(args: &[String]) -> ExitCode {
     };
     // Before the device is opened, which can take a while: a signal meanwhile still stops.
     let player = Player::new();
-    if let Err(e) = signals::on_first(player.stopper()) {
+    if let Some(d) = env_ms(FADE_IN_ENV) {
+        player.fade_in(d);
+    }
+    let fade = player.fader(env_ms(FADE_OUT_ENV).unwrap_or(DEFAULT_FADE_OUT));
+    let mut stop = Some(player.stopper());
+    // [`signals::FADE`] fades out, then stops; SIGINT and SIGTERM stop at once, even mid-fade.
+    let handled = signals::on_each(move |sig| {
+        if sig == signals::FADE {
+            fade(sig);
+            return true;
+        }
+        if let Some(stop) = stop.take() {
+            stop(sig);
+        }
+        false
+    });
+    if let Err(e) = handled {
         return fail(&format!("cannot handle signals: {e}"), 1);
     }
     let output = match Output::open_default() {
@@ -487,6 +602,8 @@ mod tests {
             ring: c,
             shared: Arc::clone(&shared),
             format: FORMAT,
+            played: 0,
+            fading: 0,
         };
         (shared, feeder, tap)
     }
@@ -654,6 +771,83 @@ mod tests {
         let r = player.play_from(Output::null(), || panic!("the input was opened"));
         assert_eq!(r, Ok(Outcome::Stopped(15)));
         assert!(t.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn the_start_fades_in() {
+        let (s, mut feeder, mut tap) = pair();
+        s.fade_in.store(10_000_000, Ordering::Relaxed); // 10 ms: 10 frames at 1000 Hz
+        assert!(feeder.push(&[1.0; 20]));
+        let mut out = [9.0; 20];
+        tap.fill(&mut out, Duration::ZERO);
+        assert_eq!(out[0], 0.0);
+        assert!((out[5] - 0.5).abs() < 1e-6, "{out:?}");
+        assert!(out[1..10].windows(2).all(|w| w[0] < w[1]), "{out:?}");
+        assert_eq!(out[10..], [1.0; 10]);
+    }
+
+    #[test]
+    fn a_soft_stop_fades_out_on_the_device_time_and_then_stops() {
+        let (s, mut feeder, mut tap) = pair();
+        assert!(feeder.push(&[1.0; 400]));
+        let fade = Player {
+            shared: Arc::clone(&s),
+        }
+        .fader(Duration::from_millis(100)); // 100 frames at 1000 Hz
+        fade(signals::FADE);
+        let mut out = [0.0; 50];
+        tap.fill(&mut out, Duration::ZERO);
+        assert_eq!(out[0], 1.0);
+        assert!(out.windows(2).all(|w| w[0] > w[1]), "{out:?}");
+        assert!(!s.faded.load(Ordering::Relaxed));
+        // The input stalls: the fade still runs on the device's time and ends.
+        let mut rest = [0.0; 60];
+        tap.ring.pop(&mut [0.0; 400]);
+        tap.fill(&mut rest, Duration::ZERO);
+        assert!(s.faded.load(Ordering::Relaxed));
+        assert!(matches!(
+            s.wait_drained(STALL, FORMAT.rate),
+            Some(End::Stopped(sig)) if sig == signals::FADE
+        ));
+    }
+
+    #[test]
+    fn a_hard_stop_during_a_fade_still_stops_at_once() {
+        let player = Player::new();
+        let (fade, stop) = (player.fader(Duration::from_secs(5)), player.stopper());
+        let (r, took) = {
+            let t = Instant::now();
+            let h = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                fade(signals::FADE);
+                std::thread::sleep(Duration::from_millis(100));
+                stop(15);
+            });
+            let r = player.play_from(Output::null(), pcm_source(10.0));
+            h.join().unwrap();
+            (r, t.elapsed())
+        };
+        assert_eq!(r, Ok(Outcome::Stopped(15)));
+        assert!(took < Duration::from_secs(1), "{took:?}");
+    }
+
+    #[test]
+    fn a_faded_playback_on_the_null_device_ends_about_one_fade_after_the_ask() {
+        let player = Player::new();
+        let fade = player.fader(Duration::from_millis(300));
+        let t = Instant::now();
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            fade(signals::FADE);
+        });
+        let r = player.play_from(Output::null(), pcm_source(10.0));
+        h.join().unwrap();
+        let took = t.elapsed();
+        assert_eq!(r, Ok(Outcome::Stopped(signals::FADE)));
+        assert!(
+            took >= Duration::from_millis(480) && took < Duration::from_millis(1200),
+            "{took:?}"
+        );
     }
 
     #[test]

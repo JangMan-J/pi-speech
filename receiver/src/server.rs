@@ -1,6 +1,6 @@
 //! The playback bridge: endpoints, playback and recording state.
 
-use crate::audio::spectrum;
+use crate::audio::{play, spectrum};
 use crate::front::{self, Ready};
 use crate::http::{answer_nonblocking, json_str, BodyFault, Conn, Framing, Request, Response};
 use crate::pair::{self, Notice, Pairing};
@@ -612,6 +612,14 @@ impl Program {
     }
 }
 
+/// `?fade` (or `fade=1`): fade the playback out, then stop it, instead of stopping it at once.
+fn wants_fade(query: Option<&str>) -> bool {
+    query.is_some_and(|q| {
+        q.split('&')
+            .any(|p| p == "fade" || p == "fade=1" || p == "fade=true")
+    })
+}
+
 fn query_wait(query: Option<&str>) -> Result<f64, ()> {
     let Some(q) = query else { return Ok(0.0) };
     for pair in q.split('&') {
@@ -695,6 +703,9 @@ impl Shared {
                 Ok(w) => self.get_play(id, w),
                 Err(()) => Response::error(400, "wait must be a number of seconds"),
             },
+            ("POST", ["v1", "play", id, "cancel"]) if wants_fade(req.query.as_deref()) => {
+                self.fade_play(id)
+            }
             ("POST", ["v1", "play", id, "cancel"]) => self.cancel_play(id),
             ("POST", ["v1", "stop"]) => {
                 let client = match client_of(req) {
@@ -818,8 +829,9 @@ impl Shared {
         if let Err(e) = read {
             return Response::error(400, &format!("unusable Stream request: {}", e.describe()));
         }
-        match Format::parse(&body) {
-            Ok(format) => self.start_stream(format, client),
+        let fade = Format::parse(&body).and_then(|f| Ok((f, stream::fade_ms(&body)?)));
+        match fade {
+            Ok((format, fade_ms)) => self.start_stream(format, client, fade_ms),
             Err(e) => Response::error(400, &e),
         }
     }
@@ -851,8 +863,14 @@ impl Shared {
         self.pairing.answer(&body, &self.cfg.token)
     }
 
-    /// Start a Stream player for `client`; it replaces what that client plays, and only that.
-    fn start_stream(self: &Arc<Self>, format: Format, client: Option<String>) -> Response {
+    /// Start a Stream player for `client`; it replaces what that client plays, and only that:
+    /// at once, or with `fade_ms` a crossfade (the old one fades out while this one fades in).
+    fn start_stream(
+        self: &Arc<Self>,
+        format: Format,
+        client: Option<String>,
+        fade_ms: u64,
+    ) -> Response {
         let _p = lock(&self.play_lock);
         if self.down.load(Ordering::SeqCst) {
             return Response::error(503, "the receiver is shutting down");
@@ -867,13 +885,21 @@ impl Shared {
             Ok(id) => id,
             Err(e) => return Response::error(503, &format!("no random source: {e}")),
         };
-        self.stop_playing(|p| p.client == client);
+        if fade_ms > 0 && program.builtin {
+            self.fade_playing(|p| p.client == client);
+        } else {
+            self.stop_playing(|p| p.client == client);
+        }
         let levels = program
             .builtin
             .then(|| self.cfg.tmp_dir.join(format!("play-{id}.levels")));
         let mut cmd = program.command();
         if let Some(path) = &levels {
             cmd.env(spectrum::LEVELS_ENV, path);
+        }
+        if fade_ms > 0 && program.builtin {
+            cmd.env(play::FADE_IN_ENV, fade_ms.to_string());
+            cmd.env(play::FADE_OUT_ENV, fade_ms.to_string());
         }
         let sh = Arc::clone(self);
         let done_id = id.clone();
@@ -1045,6 +1071,19 @@ impl Shared {
 
     /// Stop the playbacks in progress that `which` picks and wait until they are marked.
     /// The caller holds `play_lock`. Returns how many were playing.
+    /// Ask the players `which` selects to fade out and stop; waits for none of them.
+    fn fade_playing(&self, which: impl Fn(&Play) -> bool) {
+        let ctls: Vec<Arc<ProcCtl>> = lock(&self.inner)
+            .plays
+            .iter()
+            .filter(|p| p.state == PlayState::Playing && which(p))
+            .map(|p| Arc::clone(&p.ctl))
+            .collect();
+        for ctl in ctls {
+            ctl.fade_out();
+        }
+    }
+
     fn stop_playing(&self, which: impl Fn(&Play) -> bool) -> usize {
         let (ids, ctls): (Vec<String>, Vec<Arc<ProcCtl>>) = lock(&self.inner)
             .plays
@@ -1084,6 +1123,17 @@ impl Shared {
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
+    }
+
+    /// `POST /v1/play/{id}/cancel?fade`: fade the playback out, then stop it; answers at once,
+    /// while it fades.
+    fn fade_play(&self, id: &str) -> Response {
+        let g = lock(&self.inner);
+        let Some(p) = g.plays.iter().find(|p| p.id == id) else {
+            return Response::error(404, "unknown playback id");
+        };
+        p.ctl.fade_out();
+        p.json()
     }
 
     fn cancel_play(&self, id: &str) -> Response {

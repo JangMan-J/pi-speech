@@ -1,4 +1,5 @@
-//! SIGINT and SIGTERM delivered on a pipe, so ordinary threads can wait for them.
+//! SIGINT and SIGTERM (and on Unix SIGUSR1, the fade) delivered on a pipe, so ordinary
+//! threads can wait for them.
 //!
 //! On Windows, which has no such signals, the console's control events take their place:
 //! Ctrl+C and Ctrl+Break arrive as SIGINT (2), and closing the console, logging off or
@@ -61,13 +62,13 @@ mod unix {
         Ok(())
     }
 
-    /// Route SIGINT and SIGTERM into a pipe; returns its read end. Each byte read is the
-    /// number of a signal received.
+    /// Route SIGINT, SIGTERM and SIGUSR1 ([`FADE`](super::FADE)) into a pipe; returns its read
+    /// end. Each byte read is the number of a signal received.
     pub fn pipe() -> io::Result<File> {
         let mut fds = [0 as libc::c_int; 2];
         cloexec_pipe(&mut fds)?;
         SIGNAL_PIPE.store(fds[1], Ordering::SeqCst);
-        for sig in [libc::SIGINT, libc::SIGTERM] {
+        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGUSR1] {
             let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
             sa.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as usize;
             sa.sa_flags = libc::SA_RESTART;
@@ -140,15 +141,39 @@ mod windows {
     }
 }
 
-/// Handle SIGINT and SIGTERM from now on: the first one calls `f` with its number, on a
-/// thread of its own.
+/// The signal that asks a playback to fade out and then stop (`play`; any other program
+/// stops on it as on SIGINT). Unix only: Windows has no such signal, so a stop there is
+/// never faded.
+#[cfg(unix)]
+pub const FADE: i32 = libc::SIGUSR1;
+#[cfg(not(unix))]
+pub const FADE: i32 = -1;
+
+/// Handle SIGINT and SIGTERM (and [`FADE`]) from now on: the first one calls `f` with its
+/// number, on a thread of its own.
 pub fn on_first(f: impl FnOnce(i32) + Send + 'static) -> io::Result<()> {
+    let mut f = Some(f);
+    on_each(move |sig| {
+        if let Some(f) = f.take() {
+            f(sig);
+        }
+        false
+    })
+}
+
+/// Handle SIGINT and SIGTERM (and [`FADE`]) from now on: each calls `f` with its number, on
+/// a thread of its own, until `f` returns false.
+pub fn on_each(mut f: impl FnMut(i32) -> bool + Send + 'static) -> io::Result<()> {
     let mut signals = pipe()?;
     start_thread("signals", move || {
         let mut b = [0u8; 1];
         loop {
             match signals.read(&mut b) {
-                Ok(1) => return f(b[0] as i32),
+                Ok(1) => {
+                    if !f(b[0] as i32) {
+                        return;
+                    }
+                }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 _ => return,
             }

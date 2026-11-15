@@ -27,8 +27,8 @@ impl Format {
         }
         let get = |k: &str| fields.iter().find(|(name, _)| name == k).map(|(_, v)| v);
         let allowed: &[&str] = match get("format") {
-            Some(Value::Str(f)) if f == "pcm" => &["format", "rate", "channels"],
-            Some(Value::Str(f)) if f == "mp3" || f == "wav" => &["format"],
+            Some(Value::Str(f)) if f == "pcm" => &["format", "rate", "channels", "fade_ms"],
+            Some(Value::Str(f)) if f == "mp3" || f == "wav" => &["format", "fade_ms"],
             _ => return Err("format must be \"pcm\", \"mp3\" or \"wav\"".to_string()),
         };
         if let Some((k, _)) = fields.iter().find(|(k, _)| !allowed.contains(&k.as_str())) {
@@ -52,6 +52,26 @@ impl Format {
             _ => return Err("channels must be 1 or 2".to_string()),
         };
         Ok(Format::Pcm { rate, channels })
+    }
+}
+
+/// The longest crossfade a Stream request may ask for, in milliseconds.
+pub const MAX_FADE_MS: u64 = 5000;
+
+/// The `fade_ms` of a `POST /v1/play/stream` body: crossfade from what this client plays
+/// now into the new Stream over this long (0: replace it at once). Call after
+/// [`Format::parse`] accepted the body.
+pub fn fade_ms(body: &[u8]) -> Result<u64, String> {
+    let fields = std::str::from_utf8(body)
+        .ok()
+        .and_then(flat_object)
+        .unwrap_or_default();
+    match fields.iter().find(|(k, _)| k == "fade_ms").map(|(_, v)| v) {
+        None => Ok(0),
+        Some(Value::Int(ms)) if *ms <= MAX_FADE_MS => Ok(*ms),
+        _ => Err(format!(
+            "fade_ms must be a whole number of milliseconds up to {MAX_FADE_MS}"
+        )),
     }
 }
 
@@ -207,6 +227,17 @@ mod tests {
 
     fn parse(s: &str) -> Result<Format, String> {
         Format::parse(s.as_bytes())
+    }
+
+    #[test]
+    fn a_stream_may_ask_for_a_crossfade() {
+        let body = br#"{"format": "pcm", "rate": 24000, "channels": 1, "fade_ms": 500}"#;
+        assert!(Format::parse(body).is_ok());
+        assert_eq!(fade_ms(body), Ok(500));
+        assert_eq!(fade_ms(br#"{"format": "mp3"}"#), Ok(0));
+        assert!(Format::parse(br#"{"format": "mp3", "fade_ms": 250}"#).is_ok());
+        assert!(fade_ms(br#"{"format": "mp3", "fade_ms": 9000}"#).is_err());
+        assert!(fade_ms(br#"{"format": "mp3", "fade_ms": "soon"}"#).is_err());
     }
 
     #[test]

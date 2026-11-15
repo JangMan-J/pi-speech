@@ -99,7 +99,10 @@ Starts a player that reads a Stream from its input, without any audio yet.
 - Body: JSON `{"format": "pcm", "rate": <Hz>, "channels": 1 | 2}` for raw signed 16-bit
   little-endian PCM, or `{"format": "mp3"}` or `{"format": "wav"}` for a file of that
   format sent as it is produced. A rate outside 8000..=192000 or another format gets
-  `400`.
+  `400`. Any of them may add `"fade_ms": <0..=5000>`: the built-in player fades this
+  playback's start in over that long, and the playback it replaces fades out over that
+  long instead of stopping at once (a crossfade). A receiver from before this field
+  answers `400`; the client then asks again without it.
 - Optional header `X-Pi-Speech-Kind: message | sample` (default `message`).
 - A new play request (of either kind) stops the playback in progress of the same client
   (`X-Pi-Speech-Client`, see "Clients"); that playback becomes `cancelled`. Other
@@ -147,6 +150,10 @@ and `POST /v1/stop` apply to it.
 ### `POST /v1/play/<id>/cancel` and `POST /v1/stop`
 
 Stop that playback (or, for `POST /v1/stop`, what plays now) and mark it `cancelled`.
+`POST /v1/play/<id>/cancel?fade` fades it out first (over its `fade_ms`, else 500 ms),
+answering at once with its state while it fades (`playing`); it then becomes `cancelled`.
+On Windows, and with a configured Stream player, it stops at once. A receiver from before
+this ignores `?fade` and stops it at once.
 `200 {"id": "...", "state": "cancelled"}`. A playback that had already ended keeps
 its final state, and the answer reports that state. `POST /v1/stop` with
 `X-Pi-Speech-Client` stops that client's playbacks only, without it every playback, and

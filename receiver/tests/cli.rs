@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use support::*;
 
 const BIN: &str = env!("CARGO_BIN_EXE_pi-speech-receiver");
@@ -668,6 +668,69 @@ fn a_signal_during_a_built_in_playback_and_recording_stops_both_and_removes_the_
     assert!(temp_entries(&dir).is_empty());
     drop(up);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Start a PCM Stream (with `extra` fields in its request) and upload `seconds` of audio on
+/// a thread of its own; its id, and the uploader.
+fn streaming(addr: SocketAddr, extra: &str, seconds: f64) -> (String, std::thread::JoinHandle<()>) {
+    let body = format!(r#"{{"format": "pcm", "rate": 24000, "channels": 1{extra}}}"#);
+    let rep = request(
+        addr,
+        "POST",
+        "/v1/play/stream",
+        Some(TOKEN),
+        &[],
+        body.as_bytes(),
+        None,
+    );
+    assert_eq!(rep.status, 202, "{}", rep.text());
+    let id = json_field(&rep.text(), "id").unwrap();
+    let up_id = id.clone();
+    let audio = pcm(seconds);
+    let uploader = std::thread::spawn(move || {
+        let mut up = Upload::chunked(addr, &up_id, TOKEN);
+        for piece in audio.chunks(4800) {
+            up.chunk(piece);
+        }
+        let _ = up.end();
+    });
+    (id, uploader)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_faded_cancel_fades_the_built_in_player_out_and_ends_it_as_cancelled() {
+    let dir = scratch("cli-fade");
+    let mut r = self_contained(&dir, &[]);
+    let (id, uploader) = streaming(r.addr, "", 5.0);
+    std::thread::sleep(Duration::from_millis(600));
+    let t = Instant::now();
+    let rep = call(r.addr, "POST", &format!("/v1/play/{id}/cancel?fade"));
+    assert_eq!(rep.status, 200, "{}", rep.text());
+    assert!(
+        t.elapsed() < Duration::from_millis(300),
+        "answers while it fades"
+    );
+    assert_eq!(final_state(r.addr, &id), "cancelled");
+    let took = t.elapsed();
+    assert!(
+        took >= Duration::from_millis(400),
+        "faded, not cut: {took:?}"
+    );
+    uploader.join().unwrap();
+
+    // A new Stream asking for a crossfade fades the one it replaces out, and its own start in.
+    let (first, up1) = streaming(r.addr, "", 5.0);
+    std::thread::sleep(Duration::from_millis(600));
+    let (second, up2) = streaming(r.addr, r#", "fade_ms": 300"#, 0.5);
+    assert_eq!(final_state(r.addr, &first), "cancelled");
+    assert_eq!(final_state(r.addr, &second), "completed");
+    up1.join().unwrap();
+    up2.join().unwrap();
+
+    terminate(&r.child);
+    assert_eq!(exit_code_within(&mut r.child, 8), Some(0));
+    std::fs::remove_dir_all(dir).ok();
 }
 
 #[test]

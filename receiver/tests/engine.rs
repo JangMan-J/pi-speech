@@ -112,6 +112,27 @@ fn sigint_or_sigterm_stops_a_playback_at_once() {
     }
 }
 
+/// SIGUSR1 fades a playback out over PI_SPEECH_FADE_OUT_MS, then stops it.
+#[cfg(unix)]
+#[test]
+fn sigusr1_fades_a_playback_out_and_then_stops_it() {
+    let mut cmd = engine(&["play", "s16le", "24000", "1"]);
+    cmd.env("PI_SPEECH_FADE_OUT_MS", "400");
+    let mut child = cmd.spawn().unwrap();
+    let writer = feed(child.stdin.take().unwrap(), pcm(10.0));
+    std::thread::sleep(Duration::from_millis(500));
+    let t = Instant::now();
+    signal(&child, libc::SIGUSR1);
+    let status = wait_within(&mut child, Duration::from_secs(5)).expect("did not stop");
+    let took = t.elapsed();
+    assert!(
+        took >= Duration::from_millis(380) && took < Duration::from_millis(1500),
+        "{took:?}"
+    );
+    assert_eq!(status.code(), Some(128 + libc::SIGUSR1));
+    writer.join().unwrap();
+}
+
 /// A 16-bit PCM WAV whose sizes say "open-ended", as xAI writes them.
 fn open_wav(seconds: f64) -> Vec<u8> {
     let rate = 22050u32;
