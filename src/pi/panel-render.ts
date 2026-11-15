@@ -15,7 +15,16 @@
  */
 
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import type { Hint, InputView, PanelRow, PanelView, PickerItem, PickerView, StatusTone } from "../engine/panel";
+import type {
+  Hint,
+  InputView,
+  PanelRow,
+  PanelView,
+  PickerItem,
+  PickerView,
+  SpeakLine,
+  StatusTone,
+} from "../engine/panel";
 
 export interface PanelStyle {
   accent(text: string): string;
@@ -272,11 +281,27 @@ function inputLine(input: InputView, w: number, s: PanelStyle): string {
  * alone. The headings give way first on a short terminal.
  */
 const BODY = "  ";
+/** The main view's Speak line: its marker when the cursor is on it, the label, then the message field. */
+function speakLine(speak: SpeakLine, w: number, s: PanelStyle): string {
+  const label = "Speak  ";
+  const mark = speak.focused ? s.accent(MARKER) : NO_MARKER;
+  const room = w - MARKER.length - width(label);
+  if (room < 4) return mark + cut(label.trim(), w - MARKER.length);
+  const text = speak.focused
+    ? field(speak.value, speak.cursor, speak.placeholder, room, s).text
+    : speak.value
+      ? cut(speak.value, room)
+      : // Where the focused field draws it, after its cursor cell.
+        s.dim(cut(`  ${speak.placeholder}`, room));
+  return mark + (speak.focused ? s.bold(label) : label) + text;
+}
+
 function homeLines(view: PanelView, w: number, s: PanelStyle): Line[] {
   const cw = Math.max(0, w - BODY.length);
   const drawn = rowTexts(view.rows, view.selected, cw, s);
   const input = view.input;
   const out: Line[] = [];
+  if (view.speak) out.push(keep(BODY + speakLine(view.speak, cw, s)));
   let section: string | undefined;
   view.rows.forEach((row, i) => {
     const heading = row.section && view.headings?.[row.section];
@@ -446,7 +471,7 @@ export function renderPanel(view: PanelView, total: number, s: PanelStyle = PLAI
     // Header, filter, the slot and the hints stay; the rows get what is left.
     const fixed = 3 + slot.filter((l) => l.drop === undefined).length;
     body.push(...pickerLines(view.picker, w, s, Math.min(PICKER_ROWS, Math.max(3, height - fixed))));
-  } else if (!view.composer) {
+  } else {
     body.push(...homeLines(view, w, s));
   }
 

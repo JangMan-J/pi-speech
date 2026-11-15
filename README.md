@@ -30,17 +30,19 @@ engine; `PI_SPEECH_BINARY` names another). Without the binary it uses one of `pa
 
 ## `/speech`
 
-**`/speech`** opens the dock: a compact panel in the place of Pi's editor (nothing floats over the
-conversation). The main view holds only settings, under three headings: SPEAK and LISTEN carry the key that
-opens the speak composer and the key that dictates, as Pi has them bound; SETTINGS holds two submenus. A row
+**`/speech`** (or the Speak key, Alt+S) opens the dock: a compact panel in the place of Pi's editor (nothing
+floats over the conversation). Its first entry is the **Speak** line, where the cursor starts: type a message
+and press Enter to speak it. Below it are the settings, under three headings: SPEAK and LISTEN carry the Speak
+key and the key that dictates, as Pi has them bound; SETTINGS holds the submenus. A row
 shows only its current value: a model or a voice by its name (its price, features and languages are in its
 picker). The header is also the top rule, and shows what speech is doing (`▶ speaking`, `● REC 0:03`,
 `… transcribing`) while it happens.
 
 ```
 Speech ──────────────────────────────────────────────────────────────── ▶ speaking
+  ▸ Speak    type a message · Enter speaks it
 SPEAK (Alt+S)
-  ▸ Read aloud options   Off ›
+    Read aloud options   Off ›
     Speech source        Provider
     Speech model         x-ai/grok-voice-tts-1.0 ›
     Voice                eve ›
@@ -54,7 +56,7 @@ SETTINGS
     Bridge connection ›
 
   ✓ Voice: eve
-  Enter what is read and how · Esc close
+  Enter speak · ↓ settings · Esc close
 ```
 
 Values change in place with Enter or ←→ and are saved at once; a row ending in `›` opens a picker (models,
@@ -128,16 +130,14 @@ Speech › Read aloud options ────────────────�
 
 Read, Length and Truncate at change in place with Enter, Space or ←→; Summarized by opens its picker.
 
-**Hotkeys ›** lists every action with its key; Enter runs the highlighted one:
+**Hotkeys ›** holds the actions with keys of their own, which work anywhere in Pi; Enter runs the highlighted
+one:
 
 ```
 Speech › Hotkeys ─────────────────────────────────────────────────────────────────
   ▸ Speak…             Alt+S
     Dictate            Alt+Z
-    Replay last        r
-    History…           h
-    Stop               s
-    Transcribe file…   t
+    Push-to-talk       off · hold to dictate (Kitty key-release)
 
   Enter run · k change key · Esc back
 ```
@@ -197,20 +197,21 @@ on This machine over SSH with no microphone there, fails with a message that nam
 | `←` `→`         | Change the value in place (the read-aloud options, the bridge mode); saved at once                              |
 | `Enter`         | Change the value in place; open the picker, field or submenu of a row ending in `›`; in Hotkeys, run the action |
 | `k`             | In Hotkeys, on Speak… or Dictate: set a new key (bound when you leave Hotkeys, which reloads Pi)                |
-| `r` `h` `s` `t` | Replay last, History…, Stop, Transcribe file…: in Hotkeys, and on the main view's other rows                    |
-| Speak key       | The speak composer (Alt+S unless changed), also from outside the dock                                           |
+| `r` `h` `s` `t` | Replay last, History…, Stop, Transcribe file…: on the main view's rows (shown on its hint line)                 |
+| Speak key       | The Speak line (Alt+S unless changed): opens the dock on it from anywhere in Pi, and goes back to it inside     |
 | Dictate key     | Dictate (Alt+Z unless changed): closes the dock and starts (or stops) dictation                                 |
 | `Tab`           | On Voice, play a sample of the current voice                                                                    |
 | `F2`            | On Voice, set its language (`ja`, `pt-BR`, …, or `auto` to remove the override)                                 |
 | any character   | On Speech model, Voice, Transcription model: open the list with it typed                                        |
 | `Esc`           | Back one level; from the main view, close the dock                                                              |
 
-**Speak…** (or the Speak key from anywhere) opens the composer: type a message and press Enter. It is spoken,
-the field clears, and the composer stays ready for the next message; a new message replaces the audio that is
-playing. Esc returns to where it was opened, or closes the composer when the Speak key opened it. When the
-speech model takes inline delivery tags, the composer says so (`[tags] direct this model`). **History…** lists
+On the **Speak** line, type a message and press Enter: it is spoken, the line clears, and it stays ready for the
+next message; a new message replaces the audio that is playing. ↓ moves on to the settings (a half-typed
+message is kept), ↑ from the first row comes back, and Esc closes the dock. When the speech model takes inline
+delivery tags, the line says so (`[tags] direct this model`). The main view's own keys are on its hint line:
+`r` replays the last message, `h` opens **History**, `s` stops, `t` transcribes a file. History lists
 the spoken messages still on disk, the newest first; Enter replays one from its file, without a new request,
-and the list stays open. **Transcribe file…** asks for an audio file; its transcript goes into the editor and
+and the list stays open. Transcribe asks for an audio file; its transcript goes into the editor and
 the dock closes. The agent tools (`speech_synthesize`, `speech_transcribe`) are turned on and off with
 `/speech --set tools on|off`.
 **Dictation language** is the language you speak (`ja`, `pt-BR`, or `auto`): it goes with every dictation and

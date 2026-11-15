@@ -359,12 +359,17 @@ describe("drawing an input", () => {
     expect(widest(lines)).toBeLessThanOrEqual(50);
   });
 
-  it("the speak composer hides the rows", () => {
-    const input = { label: "", value: "", cursor: 0, placeholder: "type a message" };
-    const lines = renderPanel(view({ title: "Speak", composer: true, input }), 80);
-    expect(lines[0]).toMatch(/^Speak ─+$/);
-    expect(row(lines, "Voice")).toBeUndefined();
-    expect(lines.some((l) => /type a message/.test(l))).toBe(true);
+  it("the Speak line is the main view's first entry, above the headings, marked when the cursor is on it", () => {
+    const speak = { value: "", cursor: 0, placeholder: "type a message · Enter speaks it", focused: true };
+    const lines = renderPanel(view({ speak, selected: -1 }), 80);
+    const at = lines.findIndex((l) => /Speak {2}/.test(l));
+    expect(lines[at]).toMatch(/^ {2}▸ Speak +type a message · Enter speaks it/);
+    expect(at).toBeLessThan(lines.findIndex((l) => l.startsWith("SPEAK")));
+    expect(row(lines, "Voice")).toBeDefined();
+    expect(lines.some((l) => /▸ Read/.test(l))).toBe(false);
+    // Unfocused, it keeps what was typed, without the marker.
+    const typed = renderPanel(view({ speak: { ...speak, value: "half a thought", focused: false } }), 80);
+    expect(typed.find((l) => /Speak {2}/.test(l))).toMatch(/^ {4}Speak {2}half a thought$/);
   });
 });
 

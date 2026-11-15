@@ -128,7 +128,7 @@ const KEPT_ROWS = 3;
 /**
  * Open the panel in the place of Pi's editor; settles when it closes, with true when it closed on leaving
  * Hotkeys with a changed key (Pi must load the extension again to bind it). `track` hears the panel while it
- * is open. With `speak` it opens on the speak composer, and Esc closes it.
+ * is open. It opens with the cursor on the Speak line, its first entry.
  */
 export function openPanel(
   ctx: ExtensionContext,
@@ -161,7 +161,9 @@ export function openPanel(
     const keys = new KeyDecoder(hotkeys);
     track(panel);
     panel.open();
-    if (speak) panel.openSpeaker(true);
+    // Its first entry is the Speak line, whether opened with the Speak key or /speech.
+    void speak;
+    panel.openSpeaker();
     return {
       render(width: number): string[] {
         try {

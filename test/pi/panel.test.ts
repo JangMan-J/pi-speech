@@ -86,21 +86,22 @@ describe("the panel in Pi's terminal UI", () => {
     await done;
   });
 
-  it("Alt+S opens a persistent speak composer, not the settings list", async () => {
+  it("Alt+S opens /speech with the cursor on its Speak line; Enter speaks, again and again", async () => {
     const requests = fakeOpenRouter();
     const f = tuiPi();
     registerPi(f.pi, makeEngine().engine, { NO_COLOR: "1" });
     await f.emit("session_start");
     const done = f.shortcuts.get("alt+s").handler(f.ctx);
-    expect(stripVTControlCharacters(f.screen())).toContain("Speak");
-    expect(f.screen()).not.toMatch(/Speech model|Hotkeys/);
+    const screen = () => stripVTControlCharacters(f.screen());
+    expect(screen()).toMatch(/▸ Speak {2}/);
+    expect(screen()).toMatch(/Speech model/);
     f.overlay.component.handleInput("first message");
     f.overlay.component.handleInput("\r");
     f.overlay.component.handleInput("second message");
     f.overlay.component.handleInput("\r");
     await vi.waitFor(() => expect(requests.filter((r) => r.body?.input)).toHaveLength(2));
     expect(requests.filter((r) => r.body?.input).map((r) => r.body.input)).toEqual(["first message", "second message"]);
-    expect(f.screen()).not.toMatch(/Speech model|Hotkeys/);
+    expect(screen()).toMatch(/▸ Speak {2}/);
     f.overlay.component.handleInput("\x1b");
     await done;
   });
@@ -116,8 +117,9 @@ describe("the panel in Pi's terminal UI", () => {
     const done = f.commands.get("speech").handler("", f.ctx);
     await vi.waitFor(() => expect(engine.speech.settings.voice).toBe("eve"));
     const MOCKUP = [
+      "  ▸ Speak    type a message · Enter speaks it",
       "SPEAK (Alt+S)",
-      "  ▸ Read aloud options   Off ›",
+      "    Read aloud options   Off ›",
       "    Speech source        Provider",
       "    Speech model         x-ai/grok-voice-tts-1.0 ›",
       "    Voice                eve ›",
@@ -140,8 +142,8 @@ describe("the panel in Pi's terminal UI", () => {
       expect(Math.max(...raw.map((l) => visibleWidth(l))), `width ${width}`).toBeLessThanOrEqual(width);
       const lines = raw.map((l) => stripVTControlCharacters(l).trimEnd());
       expect(lines[0]).toBe(` Speech ${"─".repeat(w - 7)}`);
-      expect(lines.slice(1, 15)).toEqual(MOCKUP.map((l) => ` ${l}`));
-      expect(lines.slice(15)).toEqual(["", "", "   Enter what is read and how · Esc close", ` ${"─".repeat(w)}`]);
+      expect(lines.slice(1, 16)).toEqual(MOCKUP.map((l) => ` ${l}`));
+      expect(lines.slice(16)).toEqual(["", "", "   Enter speak · ↓ settings · Esc close", ` ${"─".repeat(w)}`]);
     }
     f.overlay.component.handleInput("\x1b");
     await done;
@@ -156,7 +158,8 @@ describe("the panel in Pi's terminal UI", () => {
     expect([...f.shortcuts.keys()].sort()).toEqual(["alt+s", "alt+z"]);
     const done = f.commands.get("speech").handler("", f.ctx);
     const c = f.overlay.component;
-    for (let i = 0; i < 8; i++) c.handleInput("\x1b[B");
+    // From the Speak line, the first entry, down to Hotkeys.
+    for (let i = 0; i < 9; i++) c.handleInput("\x1b[B");
     c.handleInput("\r");
     const screen = (width: number) =>
       f.overlay.component.render(width).map((l: string) => stripVTControlCharacters(l).trimEnd());
@@ -166,16 +169,12 @@ describe("the panel in Pi's terminal UI", () => {
         width,
       );
       expect(lines[0]).toMatch(/^ Speech › Hotkeys ─+$/);
-      expect(lines.slice(1, 8)).toEqual([
+      expect(lines.slice(1, 4)).toEqual([
         "   ▸ Speak…             Alt+S",
         "     Dictate            Alt+Z",
         "     Push-to-talk       off · hold to dictate (Kitty key-release)",
-        "     Replay last        r",
-        "     History…           h",
-        "     Stop               s",
-        "     Transcribe file…   t",
       ]);
-      expect(lines[10]).toBe("   Enter run · k change key · Esc back");
+      expect(lines[6]).toBe("   Enter run · k change key · Esc back");
     }
     // k, then the new key: Alt+D from a legacy terminal, as ESC d
     c.handleInput("k");
@@ -202,8 +201,9 @@ describe("the panel in Pi's terminal UI", () => {
     expect([...g.shortcuts.keys()].sort()).toEqual(["alt+d", "alt+z"]);
     const reopened = g.commands.get("speech").handler("", g.ctx);
     expect(stripVTControlCharacters(g.screen())).toContain("SPEAK (Alt+D)");
-    g.overlay.component.handleInput("\x1bd");
-    expect(stripVTControlCharacters(g.screen())).toMatch(/^ Speak ─/);
+    g.overlay.component.handleInput("\x1b[B"); // off the Speak line
+    g.overlay.component.handleInput("\x1bd"); // the Speak key, Alt+D now: back on it
+    expect(stripVTControlCharacters(g.screen())).toMatch(/▸ Speak {2}/);
     g.overlay.component.handleInput("\x1b");
     g.overlay.component.handleInput("\x1b");
     await reopened;
@@ -216,7 +216,8 @@ describe("the panel in Pi's terminal UI", () => {
     await f.emit("session_start");
     const done = f.commands.get("speech").handler("", f.ctx);
     const c = f.overlay.component;
-    for (let i = 0; i < 8; i++) c.handleInput("\x1b[B");
+    // From the Speak line, the first entry, down to Hotkeys.
+    for (let i = 0; i < 9; i++) c.handleInput("\x1b[B");
     c.handleInput("\r");
     c.handleInput("k");
     c.handleInput("\x1b");
@@ -237,7 +238,8 @@ describe("the panel in Pi's terminal UI", () => {
     f.ctx.idle = false;
     const done = f.commands.get("speech").handler("", f.ctx);
     const c = f.overlay.component;
-    for (let i = 0; i < 8; i++) c.handleInput("\x1b[B");
+    // From the Speak line, the first entry, down to Hotkeys.
+    for (let i = 0; i < 9; i++) c.handleInput("\x1b[B");
     c.handleInput("\r");
     c.handleInput("k");
     c.handleInput("\x1bd");
@@ -281,6 +283,7 @@ describe("the panel in Pi's terminal UI", () => {
     const done = f.commands.get("speech").handler("", f.ctx);
     const c = f.overlay.component;
     const screen = () => stripVTControlCharacters(f.screen(120));
+    c.handleInput("\x1b[B"); // off the Speak line: Read aloud options
     c.handleInput("\x1b[B"); // down: Speech source
     c.handleInput("\x1b[B"); // down: Speech model
     c.handleInput("\r");
@@ -305,8 +308,9 @@ describe("the panel in Pi's terminal UI", () => {
     const done = f.commands.get("speech").handler("", f.ctx);
     const text = f.screen();
     expect(text).not.toMatch(/<accent>|<dim>/);
-    expect(text).toContain("▸ ");
-    expect(text).toContain("\x1b[7m\x1b[1m▸ \x1b[1mRead aloud options");
+    expect(text).toContain("▸ \x1b[1mSpeak  ");
+    f.overlay.component.handleInput("\x1b[B"); // the first row
+    expect(f.screen()).toContain("\x1b[7m\x1b[1m▸ \x1b[1mRead aloud options");
     f.overlay.component.handleInput("\x1b");
     await done;
     const coloured = panelStyle(theme, {});
@@ -325,6 +329,7 @@ describe("the panel in Pi's terminal UI", () => {
     await f.emit("session_start");
     const done = f.commands.get("speech").handler("", f.ctx);
     const c = f.overlay.component;
+    c.handleInput("\x1b[B"); // off the Speak line
     c.handleInput("\r"); // Read aloud options
     c.handleInput("\x1b[C"); // right: Read Summarized
     expect(engine.readAloud.mode).toBe("summary");
@@ -333,7 +338,8 @@ describe("the panel in Pi's terminal UI", () => {
     );
     c.handleInput("\x1b"); // back to the main view
     expect(stripVTControlCharacters(f.screen())).toMatch(/Read aloud options\s+Summarized ›/);
-    c.handleInput("\x1b[A"); // up: wraps to Spectrum OSD
+    c.handleInput("\x1b[A"); // up: the Speak line
+    c.handleInput("\x1b[A"); // up: on round to Spectrum OSD
     c.handleInput("\x1b[A"); // up: Bridge connection
     c.handleInput("\r");
     // On this machine, Bridge connection is Remote machine (Connect) and DIRECTION.
@@ -368,13 +374,13 @@ describe("the panel in Pi's terminal UI", () => {
   it("fits a short terminal: never more lines than rows", async () => {
     fakeOpenRouter();
     const f = tuiPi();
-    f.overlay.rows = 16;
+    f.overlay.rows = 17;
     registerPi(f.pi, makeEngine().engine, {});
     await f.emit("session_start");
     const done = f.commands.get("speech").handler("", f.ctx);
     const lines: string[] = f.overlay.component.render(100);
     // Pi's footer keeps its rows
-    expect(lines.length).toBeLessThanOrEqual(13);
+    expect(lines.length).toBeLessThanOrEqual(14);
     expect(lines.join("\n")).toMatch(/Speech[\s\S]*Spectrum OSD[\s\S]*Esc close/);
     f.overlay.component.handleInput("\x1b");
     await done;

@@ -541,7 +541,7 @@ export function registerPi(
   });
 
   pi.registerShortcut(hotkeys.speak as KeyId, {
-    description: "Speak messages: Enter speaks and clears the composer, ready for the next; Esc closes",
+    description: "Open /speech with the cursor on its Speak line: type a message, Enter speaks it",
     handler: async (ctx) => {
       attach(ctx);
       await open(ctx, true);

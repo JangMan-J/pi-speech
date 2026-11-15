@@ -151,6 +151,15 @@ export interface PickerView {
   empty: string;
 }
 
+/** The Speak line of the main view. */
+export interface SpeakLine {
+  value: string;
+  cursor: number;
+  placeholder: string;
+  /** The cursor is on it (no row is). */
+  focused: boolean;
+}
+
 export interface InputView {
   label: string;
   value: string;
@@ -192,8 +201,8 @@ export interface PanelView {
   selected: number;
   picker?: PickerView;
   input?: InputView;
-  /** A dedicated repeated-speaking composer; the settings and picker rows are hidden. */
-  composer?: boolean;
+  /** The main view's first entry, above the headings: type a message and Enter speaks it. */
+  speak?: SpeakLine;
   status?: Status;
   /** The keys that work in the current focus; Esc is always last. */
   hints: Hint[];
@@ -371,7 +380,7 @@ type Mode =
   | { kind: "list" }
   | MenuMode
   | { kind: "picker"; picker: PickerState; back: Mode }
-  | { kind: "input"; purpose: "speak"; edit: LineEdit; back: Mode; standalone?: boolean }
+  | { kind: "input"; purpose: "speak"; edit: LineEdit; back: Mode }
   | { kind: "input"; purpose: "language"; voice: string; edit: LineEdit; back: Mode }
   | { kind: "input"; purpose: "transcribe" | "dictation" | "output"; edit: LineEdit; back: Mode }
   /** Pairing's first step: the receiver's address. */
@@ -413,10 +422,6 @@ const HOTKEYS: RowBase[] = [
   { id: "speak", label: "Speak…" },
   { id: "dictate", label: "Dictate" },
   { id: "ptt", label: "Push-to-talk" },
-  { id: "replay", label: "Replay last" },
-  { id: "history", label: "History…" },
-  { id: "stop", label: "Stop" },
-  { id: "transcribe", label: "Transcribe file…" },
 ];
 
 /** The bridge mode, the Remote machine's address, and Pairing: whether its receiver answers, and the address to use. */
@@ -494,6 +499,13 @@ const CYCLES: ReadonlySet<RowId> = new Set<RowId>([
 
 /** The keys of the actions that only work inside the panel. */
 const LETTERS: Partial<Record<RowId, string>> = { replay: "r", history: "h", stop: "s", transcribe: "t" };
+/** What each of those keys does, on the main view's hint line. */
+const LETTER_WORDS: Partial<Record<RowId, string>> = {
+  replay: "replay",
+  history: "history",
+  stop: "stop",
+  transcribe: "transcribe",
+};
 const HOTKEY_NAMES: Record<HotkeyName, string> = { speak: "Speak", dictate: "Dictate", ptt: "Push-to-talk" };
 const OSD_WORDS: Record<OsdStyle, string> = {
   braille: "Braille",
@@ -673,6 +685,8 @@ export class Panel {
     return this.engine.downloads.current;
   }
   private unlistenDownloads?: () => void;
+  /** The Speak line's text, kept while the cursor is on the rows. */
+  private readonly speakEdit = new LineEdit();
   /** Answers a question Connect waits on, as declined, when the panel closes. */
   private pendingPrompt?: () => void;
 
@@ -763,9 +777,9 @@ export class Panel {
     this.dictate();
   }
 
-  /** Open the repeated-speaking composer. Standalone mode closes on Esc instead of returning to settings. */
-  openSpeaker(standalone = false): void {
-    this.mode = { kind: "input", purpose: "speak", edit: new LineEdit(), back: this.home(), standalone };
+  /** Put the cursor on the main view's Speak line (its text is kept while the cursor is elsewhere). */
+  openSpeaker(): void {
+    this.mode = { kind: "input", purpose: "speak", edit: this.speakEdit, back: { kind: "list" } };
     this.changed();
   }
 
@@ -800,6 +814,16 @@ export class Panel {
       hints: this.hints(),
     };
     if (home.kind === "list") {
+      const focused = this.mode.kind === "input" && this.mode.purpose === "speak";
+      view.speak = {
+        value: this.speakEdit.value,
+        cursor: this.speakEdit.cursor,
+        placeholder: this.takesTags()
+          ? "type a message · Enter speaks · [tags] direct this model"
+          : "type a message · Enter speaks it",
+        focused,
+      };
+      if (focused) view.selected = -1;
       view.headings = {
         speak: `SPEAK (${keyLabel(this.bound.speak)})`,
         listen: `LISTEN (${keyLabel(this.bound.dictate)})`,
@@ -827,17 +851,7 @@ export class Panel {
       });
       switch (m.purpose) {
         case "speak":
-          view.title = "Speak";
-          view.composer = true;
-          delete view.crumb;
-          delete view.headings;
-          view.input = input(
-            "",
-            this.takesTags()
-              ? "type a message · Enter speaks · [tags] direct this model"
-              : "type a message · Enter speaks · keep typing",
-          );
-          break;
+          break; // the Speak line, below
         case "language":
           view.input = input(`Language of ${m.voice}`, LANGUAGE_HINT, m.back.kind === "list" ? "voice" : undefined);
           break;
@@ -1212,9 +1226,10 @@ export class Panel {
                     ? "yes"
                     : "set";
       if (m.purpose === "confirm") return [{ key: "Enter", action }, esc("no")];
+      if (m.purpose === "speak") return [{ key: "Enter", action }, { key: "↓", action: "settings" }, esc("close")];
       if (m.purpose === "connect" && m.hosts.length)
         return [{ key: "Enter", action }, { key: "Tab", action: "your ssh Hosts" }, esc("back")];
-      return [{ key: "Enter", action }, esc(m.purpose === "speak" && m.standalone ? "close" : "back")];
+      return [{ key: "Enter", action }, esc("back")];
     }
     if (m.kind === "picker") {
       const p = m.picker;
@@ -1246,7 +1261,18 @@ export class Panel {
     }
     const home = this.home();
     if (home.kind === "menu") return this.menuHints(home);
+    // The panel's own keys, on every row of the main view; given up first when the line is narrow.
+    const letters: Hint[] = (Object.entries(LETTERS) as Array<[RowId, string]>).map(([id, key]) => ({
+      key,
+      action: LETTER_WORDS[id] ?? id,
+      optional: true,
+    }));
     const close = esc("close");
+    return [...this.rowHints(close), ...letters].sort((a, b) => Number(a === close) - Number(b === close));
+  }
+
+  /** The hints of the highlighted row of the main view. */
+  private rowHints(close: Hint): Hint[] {
     switch (MAIN[this.selected].id) {
       case "readAloud":
         return [{ key: "Enter", action: "what is read and how" }, close];
@@ -1264,9 +1290,9 @@ export class Panel {
       case "osdStyle":
         return [{ key: "←→", action: OSD_STYLES.map((s) => OSD_WORDS[s]).join(" · ") }, close];
       case "hotkeys":
-        return [{ key: "Enter", action: "run actions, change keys" }, close];
+        return [{ key: "Enter", action: "Speak, Dictate, Push-to-talk keys" }, close];
       default:
-        return [{ key: "Enter", action: "where audio plays" }, close];
+        return [{ key: "Enter", action: "the Remote machine, and what runs there" }, close];
     }
   }
 
@@ -1352,15 +1378,22 @@ export class Panel {
       return;
     }
     const m = this.mode;
+    if (m.kind === "input" && m.purpose === "speak") {
+      // The Speak line is the main view's first entry: the arrows go on to the rows, Esc closes.
+      if (key === "down" || key === "up") {
+        this.mode = { kind: "list" };
+        this.selected = key === "down" ? 0 : MAIN.length - 1;
+      } else if (key === "enter") this.submit(m);
+      else if (key === "escape") this.deps.close();
+      else m.edit.edit(key);
+      return;
+    }
     if (m.kind === "input") {
       if (key === "enter") this.submit(m);
       else if (key === "escape") {
-        if (m.purpose === "speak" && m.standalone) this.deps.close();
-        else {
-          this.mode = m.back;
-          if (m.purpose === "secret") m.resolve(undefined);
-          if (m.purpose === "confirm") m.resolve(false);
-        }
+        this.mode = m.back;
+        if (m.purpose === "secret") m.resolve(undefined);
+        if (m.purpose === "confirm") m.resolve(false);
       } else if (key === "tab" && m.purpose === "connect" && m.hosts.length) {
         // Tab steps through the Hosts of ~/.ssh/config.
         m.edit = new LineEdit(m.hosts[m.next % m.hosts.length]);
@@ -1418,9 +1451,13 @@ export class Panel {
     const id = MAIN[this.selected].id;
     switch (key) {
       case "up":
-      case "down":
-        this.selected = (this.selected + (key === "up" ? MAIN.length - 1 : 1)) % MAIN.length;
+      case "down": {
+        // Past the first row up, or the last row down: the Speak line.
+        const next = this.selected + (key === "up" ? -1 : 1);
+        if (next < 0 || next >= MAIN.length) this.openSpeaker();
+        else this.selected = next;
         return;
+      }
       case "left":
       case "right":
         this.step(id, key === "left" ? -1 : 1);
@@ -1476,9 +1513,7 @@ export class Panel {
     if (paste) return;
     const ch = [...text][0];
     if (m.kind === "menu" && m.menu === "hotkeys" && ch === "k") {
-      const id = HOTKEYS[m.selected].id;
-      if (id === "speak" || id === "dictate" || id === "ptt") m.capture = id;
-      else this.setStatus("info", "Only Speak, Dictate and Push-to-talk have keys of their own to change");
+      m.capture = HOTKEYS[m.selected].id as HotkeyName;
       return;
     }
     if (
