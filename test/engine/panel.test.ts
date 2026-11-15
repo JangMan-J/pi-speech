@@ -137,7 +137,7 @@ const settingsOf = (work: string) =>
   JSON.parse(readFileSync(join(work, "agent", "pi-speech", "settings.json"), "utf8"));
 
 describe("the panel view model: the main view", () => {
-  it("has the title, no state when nothing happens, and SPEAK, LISTEN and SETTINGS with their keys", async () => {
+  it("has the title, no state when nothing happens, and the ten main rows", async () => {
     const p = open();
     await p.panel.idle();
     const v = p.panel.view();
@@ -146,9 +146,6 @@ describe("the panel view model: the main view", () => {
     expect(v.crumb).toBeUndefined();
     expect(v.state).toBe("");
     expect(v.rows.map((r) => r.label)).toEqual(ROWS);
-    expect(v.rows.filter((r) => r.section === "speak").map((r) => r.label)).toEqual(ROWS.slice(0, 4));
-    expect(v.rows.filter((r) => r.section === "listen").map((r) => r.label)).toEqual(ROWS.slice(4, 8));
-    expect(v.rows.filter((r) => r.section === "settings").map((r) => r.label)).toEqual(ROWS.slice(8));
     expect(v.selected).toBe(0);
     expect(Object.fromEntries(v.rows.map((r) => [r.label, r.value]))).toEqual({
       "Read aloud options": "Off",
@@ -194,7 +191,7 @@ describe("the panel view model: the main view", () => {
     for (const label of ["Speech model", "Voice", "Transcription model"]) {
       const r = p.row(label);
       expect(r?.note, label).toBeUndefined();
-      expect(Object.keys(r ?? {}).sort(), label).toEqual(["id", "label", "opens", "section", "value"]);
+      expect(Object.keys(r ?? {}).sort(), label).toEqual(["id", "label", "opens", "value"]);
     }
     expect(p.row("Speech model")?.value).toBe("hexgrad/kokoro-82m");
     expect(p.row("Voice")?.value).toBe("jf_alpha");
@@ -279,7 +276,7 @@ describe("the panel view model: keys in the main view", () => {
       ["Truncate at", "Off", false],
     ]);
     expect(v.status).toEqual({ tone: "info", text: "Off: nothing is read aloud." });
-    expect(p.hint()).toBe("←→ Off · Summarized · Streaming · Esc back");
+    expect(p.hint()).toBe("←→ Off · Summarized · Streaming · Esc Main");
     await p.press("escape");
     expect(p.panel.view().menu).toBe("main");
     expect(p.selectedLabel()).toBe("Read aloud options");
@@ -359,7 +356,7 @@ describe("the panel view model: keys in the main view", () => {
     const p = open();
     await p.press("enter", "down", "down");
     expect(p.panel.view().status?.text).toBe("Best effort: about 15 s.");
-    expect(p.hint()).toBe("←→ Minimum · Abridged · Full · Esc back");
+    expect(p.hint()).toBe("←→ Minimum · Abridged · Full · Esc Main");
     await p.press("right");
     expect(p.row("Length")?.value).toBe("Abridged ~30 s");
     expect(p.panel.view().status?.text).toBe("Best effort: about 30 s.");
@@ -367,7 +364,7 @@ describe("the panel view model: keys in the main view", () => {
     expect(p.row("Length")?.value).toBe("Full ~60 s");
     await p.press("down");
     expect(p.panel.view().status?.text).toBe("Off: length not guaranteed.");
-    expect(p.hint()).toBe("←→ Off · 15 s · 30 s · 60 s · 120 s · Esc back");
+    expect(p.hint()).toBe("←→ Off · 15 s · 30 s · 60 s · 120 s · Esc Main");
     await p.press("right", "right");
     expect(p.row("Truncate at")?.value).toBe("30 s");
     expect(p.panel.view().status?.text).toBe("Stops at 30 s, at a sentence end.");
@@ -382,10 +379,11 @@ describe("the panel view model: keys in the main view", () => {
     p.engine.readAloud.models = () => ["anthropic/claude-haiku", "openai/gpt-mini"];
     await p.press("enter", "down");
     expect(p.panel.view().status?.text).toBe("Same model, same reply. No extra request.");
-    expect(p.hint()).toBe("Enter choose a model · Esc back");
+    expect(p.hint()).toBe("Enter choose a model · Esc Main");
     await p.press("right");
     expect(p.panel.view().picker).toBeUndefined();
     await p.press("enter");
+    expect(p.hint()).toBe("Enter pick · type to filter · Esc back");
     const picker = p.panel.view().picker;
     expect(picker?.title).toBe("Summarized by");
     expect(picker?.items.map((i) => [i.label, i.current])).toEqual([
@@ -595,7 +593,7 @@ describe("the panel view model: Bridge connection", () => {
     expect(v).toMatchObject({ menu: "bridge", crumb: "Bridge connection", selected: 0 });
     expect(v.rows.map((r) => r.label)).toEqual(["Remote machine", "Play audio on", "Record audio on", "Run models on"]);
     expect(p.row("Remote machine")).toMatchObject({ value: "not connected", note: "Enter connects", opens: true });
-    expect(p.hint()).toBe("Enter connect · Esc back");
+    expect(p.hint()).toBe("Enter connect · Esc Main");
     await p.press("escape");
     expect(p.panel.view().menu).toBe("main");
     expect(p.selectedLabel()).toBe("Bridge connection");
@@ -608,7 +606,7 @@ describe("the panel view model: Bridge connection", () => {
     await p.press("enter");
     expect(p.panel.view().rows.map((r) => r.label)).toEqual(BRIDGE_ROWS);
     expect(p.row("Bridge")?.value).toBe("auto");
-    expect(p.hint()).toBe("←→ auto · on · off · Esc back");
+    expect(p.hint()).toBe("←→ auto · on · off · Esc Main");
     await p.press("right");
     expect(p.row("Bridge")?.value).toBe("on");
     await p.press("enter");
@@ -798,13 +796,12 @@ describe("the panel view model: Bridge connection's DIRECTION", () => {
   it("over SSH each row cycles This machine | Remote machine and is saved; a choice that needs this host's microphone warns", async () => {
     const p = open({ SSH_CONNECTION: "1 2 3 4" });
     await p.goTo("Record audio on");
-    expect(
-      p.panel
-        .view()
-        .rows.filter((r) => r.section === "direction")
-        .map((r) => r.value),
-    ).toEqual(["Remote machine", "Remote machine", "Remote machine"]);
-    expect(p.hint()).toBe("←→ This machine · Remote machine · Esc back");
+    expect(BRIDGE_ROWS.slice(3).map((l) => p.row(l)?.value)).toEqual([
+      "Remote machine",
+      "Remote machine",
+      "Remote machine",
+    ]);
+    expect(p.hint()).toBe("←→ This machine · Remote machine · Esc Main");
     await p.press("right");
     expect(p.row("Record audio on")?.value).toBe("This machine");
     expect(p.panel.view().status).toMatchObject({ tone: "warning", text: expect.stringMatching(/needs a microphone/) });
@@ -840,11 +837,11 @@ describe("the panel view model: Bridge connection's Remote machine and Pairing (
     expect(p.row("Remote machine")?.opens).toBeFalsy();
     expect(p.row("Pairing")).toMatchObject({ value: "✓ Connected to 127.0.0.1:47613 · 52 ms", opens: true });
     await p.goTo("Remote machine");
-    expect(p.hint()).toBe("Enter where it comes from · Esc back");
+    expect(p.hint()).toBe("Enter where it comes from · Esc Main");
     await p.press("enter");
     expect(p.panel.view().status).toMatchObject({ tone: "info", text: expect.stringMatching(/PI_SPEECH_BRIDGE_URL/) });
     await p.goTo("Pairing");
-    expect(p.hint()).toBe("Enter address, pair · Esc back");
+    expect(p.hint()).toBe("Enter address, pair · Esc Main");
   });
 
   it("names the address PI_SPEECH_BRIDGE_URL gives", async () => {
@@ -981,12 +978,12 @@ describe("the panel view model: Hotkeys", () => {
       ["Dictate", "Alt+Z"],
       ["Push-to-talk", "off"],
     ]);
-    expect(p.hint()).toBe("Enter run · k change key · Esc back");
+    expect(p.hint()).toBe("Enter run · k change key · Esc Main");
     await p.press("down");
-    expect(p.hint()).toBe("Enter run · k change key · Esc back");
+    expect(p.hint()).toBe("Enter run · k change key · Esc Main");
     await p.press("down");
     expect(p.selectedLabel()).toBe("Push-to-talk");
-    expect(p.hint()).toBe("k set key · Esc back");
+    expect(p.hint()).toBe("k set key · Esc Main");
     await p.press("escape");
     expect(p.panel.view().menu).toBe("main");
     expect(p.panel.view().tab).toBe("main");
@@ -1233,7 +1230,7 @@ describe("the panel view model: Hotkeys", () => {
     await p.press({ combo: "f8" });
     expect(p.row("Push-to-talk")?.value).toBe("F8");
     expect(p.engine.speech.settings.hotkeys.ptt).toBe("f8");
-    expect(p.hint()).toBe("k set key · Backspace clear · Esc back");
+    expect(p.hint()).toBe("k set key · Backspace clear · Esc Main");
     // Leaving Hotkeys after changing PTT alone does not require a Pi reload.
     await p.press("escape");
     expect(p.panel.rebind).toBe(false);

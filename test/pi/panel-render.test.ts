@@ -211,12 +211,42 @@ describe("renderPanel in the shared 19-line frame", () => {
     );
     expect(visibleWidth(wide[17])).toBe(108); // ends NOTE_GAP (2) cols before the edge
 
+    // Optional hints give way first so Speak/Dictate hotkeys stay on the right (including on Main at 120 cols).
+    const mainHints: Hint[] = [
+      { key: "Enter", action: "speak" },
+      { key: "Ctrl+O", action: "replay", optional: true },
+      { key: "Ctrl+L", action: "history", optional: true },
+      { key: "Ctrl+N", action: "stop", optional: true },
+      { key: "Ctrl+T", action: "transcribe", optional: true },
+      { key: "Tab", action: "tabs", optional: true },
+      { key: "Esc", action: "close" },
+    ];
+    expect(renderPanel(fixture({ hints: mainHints }), 120)[17]).toMatch(
+      /^ {2}Enter speak · Ctrl\+O replay · Ctrl\+L history · Ctrl\+N stop · Esc close {2,}Alt\+S speak · Alt\+Z dictate$/,
+    );
+
     const medium = renderPanel(fixture({ hints }), 80);
-    expect(medium[17]).not.toContain("Alt+S speak");
-    expect(medium[17]).toBe("  Enter pick · Ctrl+P sample · F2 language · type to filter · Esc back");
+    expect(medium[17]).toMatch(/^ {2}Enter pick · type to filter · Esc back {2,}Alt\+S speak · Alt\+Z dictate$/);
+
+    const narrowForNote = renderPanel(fixture({ hints }), 70);
+    expect(narrowForNote[17]).not.toContain("Alt+S speak");
+    expect(narrowForNote[17]).toBe("  Enter pick · Ctrl+P sample · F2 language · type to filter · Esc back");
 
     expect(renderPanel(fixture({ hints }), 60)[17]).toBe("  Enter pick · Ctrl+P sample · type to filter · Esc back");
     expect(renderPanel(fixture({ hints }), 45)[17]).toBe("  Enter pick · type to filter · Esc back");
+
+    // An input-only tab (Dictation output) with no rows draws neither a Setting/Value header nor (0/0).
+    const outputTab = renderPanel(
+      fixture({
+        tab: "output",
+        rows: [],
+        selected: -1,
+        input: { label: "Dictation output", value: "", cursor: 0, placeholder: "a command" },
+      }),
+      100,
+    );
+    expect(outputTab[4]).toBe("");
+    expect(outputTab[15]).toBe("");
   });
 
   it("returns one narrow-terminal line below MIN_WIDTH and never exceeds termWidth", () => {

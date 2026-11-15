@@ -86,12 +86,6 @@ export type RowId =
   | "summaryLength"
   | "truncate";
 
-/**
- * The sections of the main view (turning text into speech, speech into text, and the rest), and Bridge
- * connection's DIRECTION.
- */
-export type SectionId = "speak" | "listen" | "settings" | "direction";
-
 /** What the panel shows: the main view, or one of its submenus. */
 export type MenuId = "main" | "hotkeys" | "bridge" | "readAloud";
 
@@ -135,8 +129,6 @@ export const PANEL_KEYS = {
 
 export interface PanelRow {
   id: RowId;
-  /** The section of a main-view row; a submenu's rows have none. */
-  section?: SectionId;
   label: string;
   /** The current value, as shown (the xai model as xAI Grok, a key as Alt+S); none for a submenu row. */
   value?: string;
@@ -230,8 +222,6 @@ export interface PanelView {
   menu: MenuId;
   /** A submenu: its title, after the panel's (`Speech › Hotkeys`). */
   crumb?: string;
-  /** @deprecated removed after the merge; never produced by the engine. */
-  headings?: Partial<Record<SectionId, string>>;
   /** The active tab. */
   tab: TabId;
   /** Every tab, in order, for the tab line. */
@@ -248,7 +238,7 @@ export interface PanelView {
   selected: number;
   picker?: PickerView;
   input?: InputView;
-  /** The main view's first entry, above the headings: type a message and Enter speaks it. */
+  /** The main view's first entry, above the rows: type a message and Enter speaks it. */
   speak?: SpeakLine;
   status?: Status;
   /** The keys that work in the current focus; Esc is always last. */
@@ -446,19 +436,19 @@ type Mode =
   /** A yes-or-no question Connect asks (Enter yes, Esc no). */
   | { kind: "input"; purpose: "confirm"; question: string; edit: LineEdit; back: Mode; resolve: (v: boolean) => void };
 
-type RowBase = Pick<PanelRow, "id" | "section" | "label" | "opens">;
+type RowBase = Pick<PanelRow, "id" | "label" | "opens">;
 
 const MAIN: RowBase[] = [
-  { id: "readAloud", section: "speak", label: "Read aloud options", opens: true },
-  { id: "speechSource", section: "speak", label: "Speech source" },
-  { id: "speechModel", section: "speak", label: "Speech model", opens: true },
-  { id: "voice", section: "speak", label: "Voice", opens: true },
-  { id: "transcriptionSource", section: "listen", label: "Transcription source" },
-  { id: "transcription", section: "listen", label: "Transcription model", opens: true },
-  { id: "language", section: "listen", label: "Dictation language" },
-  { id: "output", section: "listen", label: "Dictation output", opens: true },
-  { id: "bridge", section: "settings", label: "Bridge connection", opens: true },
-  { id: "osdStyle", section: "settings", label: "Spectrum OSD" },
+  { id: "readAloud", label: "Read aloud options", opens: true },
+  { id: "speechSource", label: "Speech source" },
+  { id: "speechModel", label: "Speech model", opens: true },
+  { id: "voice", label: "Voice", opens: true },
+  { id: "transcriptionSource", label: "Transcription source" },
+  { id: "transcription", label: "Transcription model", opens: true },
+  { id: "language", label: "Dictation language" },
+  { id: "output", label: "Dictation output", opens: true },
+  { id: "bridge", label: "Bridge connection", opens: true },
+  { id: "osdStyle", label: "Spectrum OSD" },
 ];
 
 /** Every action, with its key; Enter runs it. */
@@ -473,9 +463,9 @@ const BRIDGE: RowBase[] = [
   { id: "bridgeMode", label: "Bridge" },
   { id: "remoteMachine", label: "Remote machine" },
   { id: "pairing", label: "Pairing" },
-  { id: "playOn", section: "direction", label: "Play audio on" },
-  { id: "recordOn", section: "direction", label: "Record audio on" },
-  { id: "modelsOn", section: "direction", label: "Run models on" },
+  { id: "playOn", label: "Play audio on" },
+  { id: "recordOn", label: "Record audio on" },
+  { id: "modelsOn", label: "Run models on" },
 ];
 const MACHINE_WORDS: Record<Machine, string> = { this: "This machine", remote: "Remote machine" };
 const isDirectionRow = (id: RowId): id is DirectionSetting => (DIRECTIONS as readonly RowId[]).includes(id);
@@ -1391,7 +1381,7 @@ export class Panel {
   }
 
   private menuHints(m: MenuMode): Hint[] {
-    const back: Hint = { key: "Esc", action: "back" };
+    const back: Hint = { key: "Esc", action: "Main" };
     if (m.capture) {
       if (m.capture === "ptt") {
         return [

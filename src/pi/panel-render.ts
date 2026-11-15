@@ -303,7 +303,8 @@ const windowStart = (selected: number, count: number) =>
   Math.max(0, Math.min(Math.max(0, selected) - Math.floor(FRAME_ROWS / 2), count - FRAME_ROWS));
 
 function renderForm(view: PanelView, w: number, s: PanelStyle): { header: string; rows: string[] } {
-  const maxLabel = view.rows.length ? Math.max(...view.rows.map((r) => width(r.label) + 2)) : MIN_LABEL;
+  if (!view.rows.length) return { header: "", rows: [] };
+  const maxLabel = Math.max(...view.rows.map((r) => width(r.label) + 2));
   const labelW = Math.min(Math.max(8, w - 10), Math.max(MIN_LABEL, maxLabel));
   const room = Math.max(0, w - CURSOR.length - labelW);
   const header = `  ${s.accent(pad("Setting", labelW))}${s.accent("Value")}`;
@@ -476,13 +477,13 @@ function renderStatus(view: PanelView, w: number, s: PanelStyle): string {
     return s.dim(cutText(detail ? `${lead}${SEP}${detail}` : lead, w));
   }
   const n = view.rows.length;
+  if (!n) return "";
   const at = view.selected >= 0 && view.selected < n ? view.selected : -1;
   const label = at >= 0 ? view.rows[at].label : "";
   return s.dim(cutText(`  (${at >= 0 ? at + 1 : 0}/${n})${label ? ` ${label}` : ""}`, w));
 }
 
 function renderKeys(view: PanelView, w: number, s: PanelStyle): string {
-  const left = `  ${hintLine(view.hints, Math.max(0, w - 2), s)}`;
   const note = [
     view.keys.speak ? `${view.keys.speak} speak` : "",
     view.keys.dictate ? `${view.keys.dictate} dictate` : "",
@@ -490,10 +491,16 @@ function renderKeys(view: PanelView, w: number, s: PanelStyle): string {
     .filter(Boolean)
     .join(SEP);
   if (note) {
-    const both = spread(left, s.dim(note), w, frameMeasure);
-    if (both) return both;
+    const noteRoom = width(note) + 4;
+    const required = view.hints.filter((h) => !h.optional);
+    const requiredW = width(required.map((h) => (h.action ? `${h.key} ${h.action}` : h.key)).join(SEP));
+    if (2 + requiredW + noteRoom <= w) {
+      const left = `  ${hintLine(view.hints, w - 2 - noteRoom, s)}`;
+      const both = spread(left, s.dim(note), w, frameMeasure);
+      if (both) return both;
+    }
   }
-  return left;
+  return `  ${hintLine(view.hints, Math.max(0, w - 2), s)}`;
 }
 
 /**

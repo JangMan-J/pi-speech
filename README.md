@@ -284,28 +284,28 @@ not downloaded), with progress.
 Without the bridge the rows show This machine and do not change. A choice that cannot work, such as recording
 on This machine over SSH with no microphone there, fails with a message that names the row to change.
 
-| Key                         | In the panel                                                                                          |
-| --------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `↑` `↓`                     | Move row by row (they wrap); in Connect, step through the Hosts of `~/.ssh/config`                  |
-| `←` `→`                     | Change the value in place (the read-aloud options, the bridge mode); saved at once                  |
-| `Enter`                     | Speak the message; change a value; open a Main row's own tab; in Hotkeys, run the action            |
-| `Tab` / `Shift+Tab`         | Next / previous tab                                                                                   |
-| `Ctrl+O`                    | On Main, replay the last message; in an on-device model list, download the highlighted model         |
-| `Ctrl+L`                    | On Main, open the spoken history                                                                      |
-| `Ctrl+N`                    | On Main, stop                                                                                         |
-| `Ctrl+T`                    | On Main, transcribe a file; in an on-device model list, delete the highlighted model (press twice)   |
-| `Ctrl+P`                    | On Voice, sample the current voice; in the voice list, sample the highlighted voice                  |
-| `Ctrl+S`                    | In a model list, change the sort order                                                                |
-| `Ctrl+D`                    | In a model list, open the highlighted model's full description                                      |
-| `Shift+↑` `Shift+↓`         | In a model list, move 10 rows (PageUp and PageDown do the same)                                     |
-| `k`                         | In Hotkeys, change the highlighted key (bound when you leave Hotkeys, which reloads Pi)              |
-| `r` `h` `s` `t`             | In Hotkeys: replay last, history, stop, transcribe a file                                           |
-| `x`                         | On Bridge's Remote machine, disconnect and forget it                                                 |
-| Speak key                   | The Speak line (Alt+S unless changed): opens the panel on it from anywhere in Pi, and goes back to it inside |
-| Dictate key                 | Dictate (Alt+Z unless changed): closes the panel and starts (or stops) dictation                     |
-| `F2`                        | On Voice, set its language (`ja`, `pt-BR`, …, or `auto` to remove the override)                     |
-| any character               | On Main, type the Speak message; in a model list, type into the filter                              |
-| `Esc`                       | Return to Main; on Main, close the panel                                                             |
+| Key                 | In the panel                                                                                                 |
+| ------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `↑` `↓`             | Move row by row (they wrap); in Connect, step through the Hosts of `~/.ssh/config`                           |
+| `←` `→`             | Change the value in place (the read-aloud options, the bridge mode); saved at once                           |
+| `Enter`             | Speak the message; change a value; open a Main row's own tab; in Hotkeys, run the action                     |
+| `Tab` / `Shift+Tab` | Next / previous tab                                                                                          |
+| `Ctrl+O`            | On Main, replay the last message; in an on-device model list, download the highlighted model                 |
+| `Ctrl+L`            | On Main, open the spoken history                                                                             |
+| `Ctrl+N`            | On Main, stop                                                                                                |
+| `Ctrl+T`            | On Main, transcribe a file; in an on-device model list, delete the highlighted model (press twice)           |
+| `Ctrl+P`            | On Voice, sample the current voice; in the voice list, sample the highlighted voice                          |
+| `Ctrl+S`            | In a model list, change the sort order                                                                       |
+| `Ctrl+D`            | In a model list, open the highlighted model's full description                                               |
+| `Shift+↑` `Shift+↓` | In a model list, move 10 rows (PageUp and PageDown do the same)                                              |
+| `k`                 | In Hotkeys, change the highlighted key (bound when you leave Hotkeys, which reloads Pi)                      |
+| `r` `h` `s` `t`     | In Hotkeys: replay last, history, stop, transcribe a file                                                    |
+| `x`                 | On Bridge's Remote machine, disconnect and forget it                                                         |
+| Speak key           | The Speak line (Alt+S unless changed): opens the panel on it from anywhere in Pi, and goes back to it inside |
+| Dictate key         | Dictate (Alt+Z unless changed): closes the panel and starts (or stops) dictation                             |
+| `F2`                | On Voice, set its language (`ja`, `pt-BR`, …, or `auto` to remove the override)                              |
+| any character       | On Main, type the Speak message; in a model list, type into the filter                                       |
+| `Esc`               | Return to Main; on Main, close the panel                                                                     |
 
 On Main's **Speak** line, type a message and press Enter: it is spoken, the line clears, and it stays ready for
 the next message; a new message replaces the audio that is playing. Typing anywhere on Main goes to this line.
