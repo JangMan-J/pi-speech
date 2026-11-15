@@ -34,6 +34,8 @@ pub const TAIL_MARGIN: Duration = Duration::from_millis(80);
 /// drain, before the playback fails.
 pub const STALL: Duration = Duration::from_secs(2);
 pub const STALLED: &str = "the audio device stopped responding";
+/// The longest the feeder waits for room before it looks again.
+const ROOM_RECHECK: Duration = Duration::from_millis(10);
 /// How often the waiting thread looks for callbacks and updates the spectrum meter.
 const WATCH: Duration = Duration::from_millis(40);
 
@@ -234,9 +236,12 @@ impl Feeder {
         // Paired with the fence in `Tap::fill`: either the callback sees `wants_room` and
         // wakes us, or we see the room it made and do not wait.
         fence(Ordering::SeqCst);
+        // Waits a period at most before it looks again: a wakeup the callback's notify misses (seen on
+        // Apple silicon, where the ring was empty to the callback and full to this thread) then costs one
+        // period, never the playback. This thread is not real-time, so looking again costs nothing.
         let _end = s
             .room
-            .wait_while(end, |_| {
+            .wait_timeout_while(end, ROOM_RECHECK, |_| {
                 self.ring.free() == 0 && !s.ended.load(Ordering::Acquire)
             })
             .unwrap_or_else(|e| e.into_inner());
