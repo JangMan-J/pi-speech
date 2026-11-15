@@ -41,8 +41,20 @@ echo "$*" >> {d}/calls.log
 echo $$ > {d}/pid
 case "$1" in
   models)
-    echo '{{"id":"parakeet","kind":"transcription","downloaded":true}}'
-    echo 'not json';;
+    case "$2" in
+      download)
+        [ "$3" = parakeet ] || {{ echo '{{"event":"error","id":"'"$3"'","message":"no model named '"$3"'"}}'; exit 1; }}
+        echo '{{"event":"progress","id":"parakeet","done":0,"total":100}}'
+        echo '{{"event":"progress","id":"parakeet","done":100,"total":100}}'
+        [ -e {d}/slow ] && {{ read -r _ ; echo '{{"event":"stopped","id":"parakeet","done":100,"total":100}}'; exit 0; }}
+        echo '{{"event":"unpacking","id":"parakeet"}}'
+        echo '{{"event":"done","id":"parakeet","path":"/cache/parakeet"}}';;
+      delete)
+        echo '{{"event":"deleted","id":"'"$3"'","freed":4096}}';;
+      *)
+        echo '{{"id":"parakeet","kind":"transcription","downloaded":true}}'
+        echo 'not json';;
+    esac;;
   transcribe)
     [ "$2" = parakeet ] || {{ echo "pi-speech-receiver: $2 is not downloaded" >&2; exit 1; }}
     echo "$3" > {d}/audio-path
@@ -381,4 +393,76 @@ fn real_models_speak_and_transcribe_over_the_bridge() {
     let text = json_field(&rep.text(), "text").unwrap().to_lowercase();
     eprintln!("heard: {text}");
     assert!(text.contains("weather"), "{text}");
+}
+
+#[test]
+fn a_download_streams_its_events_and_a_delete_says_what_it_freed() {
+    let r = Rig::new(1 << 20);
+    let rep = r.call("POST", "/v1/models/download?model=parakeet", &[], b"");
+    assert_eq!(rep.status, 200, "{}", rep.text());
+    assert!(rep.head.contains("application/x-ndjson"), "{}", rep.head);
+    let body = String::from_utf8(dechunk(&rep.body).expect("the stream ended properly")).unwrap();
+    let events: Vec<String> = body
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["event"].to_string())
+        .collect();
+    assert_eq!(
+        events,
+        [
+            r#""progress""#,
+            r#""progress""#,
+            r#""unpacking""#,
+            r#""done""#
+        ]
+    );
+
+    let rep = r.call("POST", "/v1/models/download?model=nonesuch", &[], b"");
+    assert_eq!(rep.status, 200);
+    assert!(
+        rep.text().contains("no model named nonesuch"),
+        "{}",
+        rep.text()
+    );
+    assert_eq!(
+        r.call("POST", "/v1/models/download?model=--x", &[], b"")
+            .status,
+        400
+    );
+
+    let rep = r.call("POST", "/v1/models/delete?model=parakeet", &[], b"");
+    assert_eq!(rep.status, 200, "{}", rep.text());
+    let v: serde_json::Value = serde_json::from_str(&rep.text()).unwrap();
+    assert_eq!(v["freed"], 4096);
+}
+
+#[test]
+fn one_download_at_a_time_and_a_client_that_leaves_stops_it() {
+    let r = Rig::new(1 << 20);
+    fs::write(r.dir.join("slow"), "").unwrap();
+    // A client that reads the first events and leaves.
+    let mut s = TcpStream::connect(r.addr).unwrap();
+    write!(
+        s,
+        "POST /v1/models/download?model=parakeet HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {TOKEN}\r\nContent-Length: 0\r\n\r\n"
+    )
+    .unwrap();
+    let mut first = [0u8; 64];
+    let _ = s.read(&mut first).unwrap();
+    assert_eq!(
+        r.call("POST", "/v1/models/download?model=parakeet", &[], b"")
+            .status,
+        409
+    );
+    assert_eq!(
+        r.call("POST", "/v1/models/delete?model=parakeet", &[], b"")
+            .status,
+        409
+    );
+    drop(s);
+    // The stand-in sees its input close (it stopped) and the next download may start.
+    fs::remove_file(r.dir.join("slow")).unwrap();
+    assert!(wait_until(Duration::from_secs(5), || r
+        .call("POST", "/v1/models/download?model=parakeet", &[], b"")
+        .status
+        == 200));
 }

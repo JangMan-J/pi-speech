@@ -226,6 +226,21 @@ connection while it waits leaves the queue. Listing models and voices is not a r
 `200 {"models": [...]}`: the objects `pi-speech-receiver models list` prints, one per model
 (see "Subcommand notes: `models`"), `lexicon` included.
 
+#### `POST /v1/models/download?model=<id>`
+
+Downloads a model into this machine's cache, as `pi-speech-receiver models download <id>`
+does. `200` with `Content-Type: application/x-ndjson`: a chunked body of the download's
+events as they come, one JSON object a line, as that command prints them (`progress`,
+`verifying`, `unpacking`), ending with `done`, `stopped` or `error`. A client that closes
+its connection stops the download, which keeps what has arrived for the next one to resume.
+One download at a time: another while one runs gets `409`. A receiver from before this
+answers `404`.
+
+#### `POST /v1/models/delete?model=<id>`
+
+Deletes a model and any interrupted download of it. `200 {"id": "...", "freed": <bytes>}`;
+`409` while a download runs; `422` with the reason when it fails.
+
 #### `GET /v1/voices?model=<id>`
 
 `200 {"voices": [{"name": "af_maple", "number": 0}, ...]}`: the voices of a downloaded speech model.

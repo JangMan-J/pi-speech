@@ -1,6 +1,6 @@
 //! Local models run here for a Pi on the other end of the bridge (protocol/bridge.md,
-//! "Running local models"): `GET /v1/models`, `GET /v1/voices`, `POST /v1/transcribe` and
-//! `POST /v1/speak`. Each runs this program's own `models list`, `speak` or `transcribe`
+//! "Running local models"): `GET /v1/models`, `GET /v1/voices`, `POST /v1/transcribe`,
+//! `POST /v1/speak`, and `POST /v1/models/download` and `/delete` to manage them. Each runs this program's own `models list`, `speak` or `transcribe`
 //! (or the program named by `PI_SPEECH_RECEIVER_MODELS`) as a child, as the extension does
 //! on its own machine. One transcription or speech runs at a time; the others wait their
 //! turn in a bounded queue, which a client that goes away leaves.
@@ -32,12 +32,13 @@ const QUEUE_POLL: Duration = Duration::from_millis(100);
 const FULL: &str = "too many model runs are waiting on this machine; try again when they are done";
 
 /// The one model job (a transcription or a speech) that may run, its child, and the jobs
-/// waiting for it in turn.
+/// waiting for it in turn; and whether a model download runs (one at a time).
 #[derive(Default)]
 pub struct Jobs {
     queue: Mutex<Queue>,
     turn: Condvar,
     child: Mutex<Option<Arc<Mutex<Child>>>>,
+    downloading: AtomicBool,
 }
 
 #[derive(Default)]
@@ -593,6 +594,116 @@ pub fn speak(ctx: &Ctx, conn: &mut Conn, req: &Request) -> Response {
         conn.break_off();
     }
     Response::sent()
+}
+
+/// `POST /v1/models/download?model=<id>`: download a model here. The answer streams the
+/// download's events as they come, one JSON object a line (`application/x-ndjson`), as
+/// `models download` prints them; it ends after `done`, `stopped` or `error`. A client that
+/// goes away stops it, keeping what has arrived for the next download to resume. One at a
+/// time: another while one runs is `409`.
+pub fn download(ctx: &Ctx, conn: &mut Conn, req: &Request) -> Response {
+    let model = match model_id(query_param(req.query.as_deref(), "model").as_deref()) {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
+    if ctx.jobs.downloading.swap(true, Ordering::SeqCst) {
+        return Response::error(409, "a model is downloading on this machine; one at a time");
+    }
+    struct Release<'a>(&'a AtomicBool);
+    impl Drop for Release<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+    let _release = Release(&ctx.jobs.downloading);
+    let mut cmd = command(ctx.program, &["models", "download", &model]);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return cannot_run(ctx.program, &e),
+    };
+    // Closing its input stops the download; dropping it does that.
+    let mut stdin = child.stdin.take();
+    let stderr = drain(child.stderr.take());
+    if conn.begin_chunked("application/x-ndjson", &[]).is_err() {
+        drop(stdin.take());
+        let _ = child.wait();
+        return Response::sent();
+    }
+    let mut finished = false;
+    if let Some(out) = child.stdout.take() {
+        for line in BufReader::new(out).lines() {
+            let Ok(line) = line else { break };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let ended = serde_json::from_str::<Value>(line)
+                .is_ok_and(|v| matches!(v["event"].as_str(), Some("done" | "stopped" | "error")));
+            if ctx.down.load(Ordering::SeqCst)
+                || conn.write_chunk(format!("{line}\n").as_bytes()).is_err()
+            {
+                // The client went away (or the receiver shuts down): stop the download.
+                drop(stdin.take());
+                break;
+            }
+            finished |= ended;
+        }
+    }
+    drop(stdin.take());
+    let status = child.wait();
+    let noise = String::from_utf8_lossy(&stderr.join().unwrap_or_default()).to_string();
+    if !finished {
+        // It ended without saying how: say it, in its own words when it gave any.
+        let message = why(&noise, "the download stopped");
+        let ok = status.as_ref().is_ok_and(|s| s.success());
+        let line = if ok {
+            json!({ "event": "stopped", "id": model })
+        } else {
+            json!({ "event": "error", "id": model, "message": message })
+        };
+        let _ = conn.write_chunk(format!("{line}\n").as_bytes());
+    }
+    let _ = conn.end_chunked();
+    Response::sent()
+}
+
+/// `POST /v1/models/delete?model=<id>`: delete a model here, and any interrupted download
+/// of it. `200 {"id": ..., "freed": <bytes>}`; a model being downloaded is `409`.
+pub fn delete(ctx: &Ctx, req: &Request) -> Response {
+    let program = ctx.program;
+    let model = match model_id(query_param(req.query.as_deref(), "model").as_deref()) {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
+    if ctx.jobs.downloading.load(Ordering::SeqCst) {
+        return Response::error(
+            409,
+            "a model is downloading on this machine; delete it once that is done",
+        );
+    }
+    let out = match command(program, &["models", "delete", &model]).output() {
+        Ok(o) => o,
+        Err(e) => return cannot_run(program, &e),
+    };
+    let deleted = objects(&out.stdout)
+        .into_iter()
+        .find(|v| v["event"] == "deleted");
+    match deleted {
+        Some(v) if out.status.success() => Response::json(
+            200,
+            json!({ "id": model, "freed": v["freed"].as_u64().unwrap_or(0) }).to_string(),
+        ),
+        _ => Response::error(
+            422,
+            &why(
+                &String::from_utf8_lossy(&out.stderr),
+                "the model was not deleted",
+            ),
+        ),
+    }
 }
 
 #[cfg(test)]

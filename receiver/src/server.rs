@@ -723,6 +723,12 @@ impl Shared {
             ("POST", ["v1", "record", id, "stop"]) => self.stop_recording(id),
             ("POST", ["v1", "record", id, "cancel"]) => self.cancel_recording(id),
             ("GET", ["v1", "models"]) => self.with_models(remote_models::list),
+            ("POST", ["v1", "models", "download"]) => {
+                self.with_models(|p| remote_models::download(&self.models_ctx(p), conn, req))
+            }
+            ("POST", ["v1", "models", "delete"]) => {
+                self.with_models(|p| remote_models::delete(&self.models_ctx(p), req))
+            }
             ("GET", ["v1", "voices"]) => self.with_models(|p| remote_models::voices(p, req)),
             ("POST", ["v1", "transcribe"]) => {
                 self.with_models(|p| remote_models::transcribe(&self.models_ctx(p), conn, req))
