@@ -109,6 +109,16 @@ const pad = (text: string, w: number) => text + " ".repeat(Math.max(0, w - width
 const spaces = (n: number) => " ".repeat(Math.max(0, n));
 
 /** `left` and `right` on one line of width `w`; the left side gives way. Both are styled after measuring. */
+/** `text` in two lines at most: the first `first` cells wide, the second `rest`; broken at a space, cut with … */
+function twoLines(text: string, first: number, rest: number): [string, string] {
+  const t = text.replace(/\s+/g, " ").trim();
+  if (width(t) <= first) return [t, ""];
+  let at = first;
+  while (at > 0 && t[at] !== " ") at--;
+  if (at < first / 2) at = first; // no space near the end: break mid-word
+  return [t.slice(0, at).trimEnd(), cut(t.slice(at).trimStart(), rest)];
+}
+
 function spread(left: string, right: string, w: number, styleLeft = same, styleRight = same): string {
   const r = cut(right, w);
   const room = w - width(r) - (r ? 1 : 0);
@@ -384,7 +394,7 @@ function pickerTable(
 }
 
 /** Whether the list shows less than everything: a query, or a feature that every shown model has. */
-const narrowed = (p: PickerView) => p.query.trim() !== "" || (p.show !== undefined && p.show !== "all");
+const narrowed = (p: PickerView) => p.query.trim() !== "";
 
 /** The count on the Find line: `39 models`, `6 of 39 models` while filtering; nothing while loading. */
 function countOf(p: PickerView): string {
@@ -397,13 +407,11 @@ function countOf(p: PickerView): string {
 function pickerLines(p: PickerView, w: number, s: PanelStyle, rows: number): Line[] {
   const count = countOf(p);
   const label = "Find: ";
-  // A model list says how it is ordered and what it shows; on a narrow panel that gives way to the count.
-  const order = p.sort ? `sort ${p.sort} · show ${p.show ?? "all"}` : "";
+  // A model list says how it is ordered; on a narrow panel that gives way to the count.
+  const order = p.sort ? `sort ${p.sort}` : "";
   const ordered = order !== "" && width(label) + 12 + width(order) + 3 + width(count) + 2 <= w;
   const right = ordered ? `${order}${spaces(3)}${count}` : count;
-  const styledRight = ordered
-    ? `${s.dim("sort")} ${p.sort} ${s.dim("· show")} ${p.show ?? "all"}${spaces(3)}${s.dim(count)}`
-    : s.dim(count);
+  const styledRight = ordered ? `${s.dim("sort")} ${p.sort}${spaces(3)}${s.dim(count)}` : s.dim(count);
   const room = w - width(label) - width(right) - 2;
   const query = field(p.query, p.cursor, "", Math.max(1, room), s);
   const gap = Math.max(1, w - width(label) - query.width - width(right));
@@ -417,13 +425,18 @@ function pickerLines(p: PickerView, w: number, s: PanelStyle, rows: number): Lin
     const start = Math.max(0, Math.min(p.selected - Math.floor(height / 2), n - height));
     const end = Math.min(n, start + height);
     for (const line of pickerTable(p.items, start, end, p.selected, w, s, p.keepColumns)) out.push(keep(line));
-    if (n > height) where = `${start > 0 ? "↑" : " "} ${start + 1}–${end} of ${n} ${end < n ? "↓" : " "}`;
+    // Where the highlighted item is in a list longer than the rows: 3/56.
+    if (n > height) where = `${p.selected + 1}/${n}`;
   }
   // A steady height: the panel does not jump while the list is filtered.
   while (out.length < 1 + height) out.push(optional(1));
-  // Under the list: what the catalog says about the highlighted model, and where a long list is.
+  // Under the list: what the catalog says about the highlighted model (two lines at most), and where a long
+  // list is, on the right of the first.
   if (p.detail !== undefined || p.total > height) {
-    out.push(optional(5, spread(p.detail ?? "", where, w, s.dim, s.dim)));
+    const [first, second] = twoLines(p.detail ?? "", w - (where ? width(where) + 2 : 0), w);
+    out.push(optional(5, spread(first, where, w, s.dim, s.dim)));
+    // Kept even when empty, so the panel does not jump from one model to the next.
+    if (p.detail !== undefined) out.push(optional(5, second ? s.dim(second) : ""));
   }
   return out;
 }

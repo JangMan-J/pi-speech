@@ -135,10 +135,8 @@ describe("a chat model as the transcription model", () => {
     const row = () => panel.view().picker?.items.find((i) => i.id === "google/gemini-3.8-flash");
     expect(row()).toMatchObject({ price: "~$0.0023/min", cols: ["OpenRouter"] });
     expect(panel.view().picker?.items).toHaveLength(3);
-    panel.handle({ key: "backtab" });
+    panel.handle({ key: "down" });
     await panel.idle();
-    expect(panel.view().picker?.show).toBe("chat");
-    expect(panel.view().picker?.items.map((i) => i.id)).toEqual(["google/gemini-3.8-flash"]);
     expect(panel.view().picker?.detail).toMatch(/^A chat model asked to transcribe/);
   });
 });

@@ -15,7 +15,7 @@ import { type BridgeHealth, type BridgeProbe, bridgeTarget, displayUrl, PairingE
 import type { VoiceLanguage } from "../voice-language/index";
 import type { Engine } from "./engine";
 import { errorMessage } from "./env";
-import { FEATURES, featureLine, type ModelKind, modelColumns, vendorOf } from "./features";
+import { featureLine, type ModelKind, modelColumns, vendorOf } from "./features";
 import type { HistoryMessage } from "./history";
 import { type DownloadProgress, formatSize, type LocalModel } from "./local-models";
 import type { ModelOption, SpeechCatalog } from "./openrouter";
@@ -129,10 +129,8 @@ export interface PickerItem {
 
 export interface PickerView {
   title: string;
-  /** A model list: how it is ordered (Tab changes it): `price`, `provider`, `features`, `newest`, `name`. */
+  /** A model list: how it is ordered (Tab changes it): `price`, `provider`, `newest`, `name`. */
   sort?: string;
-  /** A model list: the feature every shown model has (Shift+Tab changes it), or `all`. */
-  show?: string;
   /** A model list: what the catalog says about the highlighted model; empty when it says nothing. */
   detail?: string;
   /** What the items are, for the count: `models`, `voices`, `messages`. */
@@ -364,8 +362,6 @@ interface PickerState {
   ids?: string[];
   /** The history: its messages, in the order of `ids`. */
   messages?: HistoryMessage[];
-  /** A model list: the feature every shown model has, or `all`. */
-  show: string;
   edit: LineEdit;
   selected: number;
   /** A model list of on-device models (the source of its direction is Local). */
@@ -613,7 +609,6 @@ const byPrice = (a: ModelOption, b: ModelOption) => cmp(priceRank(a), priceRank(
 const MODEL_ORDER: Record<ModelSort, (a: ModelOption, b: ModelOption) => number> = {
   price: byPrice,
   provider: (a, b) => vendor(a).localeCompare(vendor(b), undefined, { sensitivity: "base" }) || byPrice(a, b),
-  features: (a, b) => cmp(b.features?.length ?? 0, a.features?.length ?? 0) || byPrice(a, b),
   newest: (a, b) => cmp(b.created ?? 0, a.created ?? 0) || byName(a, b),
   name: byName,
 };
@@ -1143,7 +1138,7 @@ export class Panel {
     }
     const current = p.row === "speechModel" ? s.speechModel : s.transcriptionModel;
     const options = this.modelOptions({ ...p, row: p.row });
-    const shown = p.show === "all" ? options : options.filter((m) => m.features?.includes(p.show));
+    const shown = options;
     const kind = kindOf(p.row);
     const items = [...shown].sort(MODEL_ORDER[s.modelSort]).map((m): PickerItem => {
       const note = m.id === XAI_MODEL ? "xAI login" : featureLine(m);
@@ -1197,7 +1192,6 @@ export class Panel {
       const id = items[selected]?.id;
       const m = this.modelOptions({ ...p, row: p.row }).find((x) => x.id === id);
       view.sort = this.speech.settings.modelSort;
-      view.show = p.show;
       view.detail =
         id === XAI_MODEL ? "Speech through your xAI login in Pi; xAI publishes no price." : (m?.description ?? "");
     }
@@ -1246,12 +1240,7 @@ export class Panel {
           esc("back"),
         ];
       }
-      const sorting: Hint[] = isModelRow(p.row)
-        ? [
-            { key: "Tab", action: "sort", optional: true },
-            { key: "Shift+Tab", action: "show", optional: true },
-          ]
-        : [];
+      const sorting: Hint[] = isModelRow(p.row) ? [{ key: "Tab", action: "sort", optional: true }] : [];
       if (this.pickerItems(p).length === 0) {
         return p.edit.value ? [{ key: "Backspace", action: "" }, ...sorting, esc("back")] : [...sorting, esc("back")];
       }
@@ -1418,13 +1407,13 @@ export class Panel {
         this.offer = undefined;
         this.deleting = undefined;
         this.mode = m.back;
-      } else if (p.local && (key === "tab" || key === "backtab")) {
-        // A local list has no sort or feature filter.
+      } else if (p.local && key === "tab") {
+        // A local list has no sort.
       } else if (key === "tab") {
         if (p.row === "voice" && highlighted) this.sample(highlighted.id);
         else if (isModelRow(p.row)) this.nextSort(p);
       } else if (key === "backtab") {
-        if (isModelRow(p.row)) this.nextShow({ ...p, row: p.row }, p);
+        // Nothing: no filter by feature any more.
       } else if (key === "language") {
         if (p.row === "voice" && highlighted && !this.localVoice()) this.askLanguage(highlighted.id);
       } else {
@@ -1780,17 +1769,9 @@ export class Panel {
     p.selected = 0;
   }
 
-  /** Shift+Tab in a model list: show only the models with the next feature that any of them has, then all. */
-  private nextShow(models: PickerState & { row: "speechModel" | "transcription" }, p: PickerState): void {
-    const offered = this.modelOptions(models);
-    const shows = ["all", ...FEATURES[kindOf(models.row)].filter((f) => offered.some((m) => m.features?.includes(f)))];
-    p.show = shows[(shows.indexOf(p.show) + 1) % shows.length];
-    p.selected = 0;
-  }
-
   /** Open a picker, with `typed` already in its filter; the selection starts at the top. */
   private openPicker(row: PickerRow, typed = ""): void {
-    const p: PickerState = { row, edit: new LineEdit(typed), selected: 0, show: "all" };
+    const p: PickerState = { row, edit: new LineEdit(typed), selected: 0 };
     const back = this.home();
     this.mode = { kind: "picker", picker: p, back };
     if (row === "history") {

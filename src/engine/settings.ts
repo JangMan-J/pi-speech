@@ -35,8 +35,9 @@ export type Source = "provider" | "local";
 export const SOURCES: Source[] = ["provider", "local"];
 
 /** How the model lists of the panel are ordered. */
-export type ModelSort = "price" | "provider" | "features" | "newest" | "name";
-export const MODEL_SORTS: ModelSort[] = ["price", "provider", "features", "newest", "name"];
+export type ModelSort = "price" | "provider" | "newest" | "name";
+/** A saved order no longer offered (features) falls back to price. */
+export const MODEL_SORTS: ModelSort[] = ["price", "provider", "newest", "name"];
 
 /** How the live audio spectrum OSD above the editor is drawn (`off` hides it). */
 export type OsdStyle = "braille" | "bars" | "mirror" | "line" | "off";

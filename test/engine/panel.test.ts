@@ -562,7 +562,7 @@ describe("the panel view model: keys in the main view", () => {
     expect(p.hint()).toBe("Backspace · Esc back");
     await p.press("escape", "up");
     await p.press("enter");
-    expect(p.hint()).toBe("Enter pick · Tab sort · Shift+Tab show · type to filter · Esc back");
+    expect(p.hint()).toBe("Enter pick · Tab sort · type to filter · Esc back");
     await p.engine.speech.set("tts-model", "hexgrad/kokoro-82m");
     let release!: () => void;
     p.engine.speech.voicesFor = () =>
@@ -1350,7 +1350,7 @@ describe("the panel view model: pickers", () => {
     await p.goTo("Speech model");
     await p.press("enter");
     const picker = p.panel.view().picker;
-    expect(picker).toMatchObject({ title: "Speech model", sort: "price", show: "all", noun: "models", total: 4 });
+    expect(picker).toMatchObject({ title: "Speech model", sort: "price", noun: "models", total: 4 });
     expect(picker?.items.map((i) => i.id)).toEqual([
       "hexgrad/kokoro-82m",
       "x-ai/grok-voice-tts-1.0",
@@ -1444,16 +1444,13 @@ describe("matching in the pickers", () => {
 describe("the panel view model: browsing models", () => {
   const ids = (p: ReturnType<typeof open>) => p.panel.view().picker?.items.map((i) => i.id);
 
-  it("Tab changes the order: price, provider, features, newest, name; the choice is saved", async () => {
+  it("Tab changes the order: price, provider, newest, name; the choice is saved", async () => {
     const p = open();
     await p.goTo("Speech model");
     await p.press("enter");
     expect(ids(p)).toEqual(["hexgrad/kokoro-82m", "x-ai/grok-voice-tts-1.0", "google/gemini-3.8-flash-tts"]);
     await p.press("tab");
     expect(p.panel.view().picker?.sort).toBe("provider");
-    expect(ids(p)).toEqual(["google/gemini-3.8-flash-tts", "hexgrad/kokoro-82m", "x-ai/grok-voice-tts-1.0"]);
-    await p.press("tab");
-    expect(p.panel.view().picker?.sort).toBe("features");
     expect(ids(p)).toEqual(["google/gemini-3.8-flash-tts", "hexgrad/kokoro-82m", "x-ai/grok-voice-tts-1.0"]);
     await p.press("tab");
     expect(p.panel.view().picker?.sort).toBe("newest");
@@ -1470,22 +1467,13 @@ describe("the panel view model: browsing models", () => {
     expect(p.panel.view().picker?.sort).toBe("provider");
   });
 
-  it("Shift+Tab shows only the models with one feature, then the next, then all again", async () => {
+  it("Shift+Tab does nothing in a model list: there is no filter by feature", async () => {
     const p = open();
     await p.goTo("Speech model");
     await p.press("enter");
     await p.press("backtab");
-    expect(p.panel.view().picker).toMatchObject({ show: "tags", total: 3 });
-    expect(ids(p)).toEqual(["google/gemini-3.8-flash-tts"]);
-    await p.press("backtab");
-    expect(p.panel.view().picker?.show).toBe("multilingual");
-    expect(ids(p)).toEqual(["hexgrad/kokoro-82m", "x-ai/grok-voice-tts-1.0"]);
-    await p.press("backtab");
-    expect(p.panel.view().picker?.show).toBe("fast");
-    await p.press("backtab");
-    expect(p.panel.view().picker?.show).toBe("all");
     expect(ids(p)).toHaveLength(3);
-    expect(p.hint()).toBe("Enter pick · Tab sort · Shift+Tab show · type to filter · Esc back");
+    expect(p.hint()).toBe("Enter pick · Tab sort · type to filter · Esc back");
   });
 
   it("each model shows its features, and typing finds a model by one", async () => {

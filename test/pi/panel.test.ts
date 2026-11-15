@@ -274,7 +274,7 @@ describe("the panel in Pi's terminal UI", () => {
     await done;
   });
 
-  it("Tab and Shift+Tab sort and filter the model list from the keyboard", async () => {
+  it("Tab sorts the model list from the keyboard, and typing filters it", async () => {
     fakeOpenRouter();
     const f = tuiPi();
     const { engine } = makeEngine();
@@ -287,12 +287,12 @@ describe("the panel in Pi's terminal UI", () => {
     c.handleInput("\x1b[B"); // down: Speech source
     c.handleInput("\x1b[B"); // down: Speech model
     c.handleInput("\r");
-    await vi.waitFor(() => expect(screen()).toMatch(/sort price · show all {3}3 models/));
+    await vi.waitFor(() => expect(screen()).toMatch(/sort price {3}3 models/));
     c.handleInput("\t");
-    expect(screen()).toMatch(/sort provider · show all/);
+    expect(screen()).toMatch(/sort provider {3}3 models/);
     expect(engine.speech.settings.modelSort).toBe("provider");
-    c.handleInput("\x1b[Z"); // Shift+Tab
-    expect(screen()).toMatch(/sort provider · show tags {3}1 of 3 models/);
+    c.handleInput("gemini");
+    expect(screen()).toMatch(/sort provider {3}1 of 3 models/);
     expect(screen()).toMatch(/▸ ✓ google\/gemini-3\.8-flash-tts +~\$0\.03\/min {2}OpenRouter {2}2 voices/);
     expect(screen()).toMatch(/Gemini 3\.8 Flash TTS is a text-to-speech model from Google\./);
     c.handleInput("\x1b");

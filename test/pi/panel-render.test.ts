@@ -206,7 +206,7 @@ describe("drawing the main view", () => {
       note: "OpenRouter",
       current: i === 2,
     }));
-    const picker = pickerView({ items, total: 30, selected: 14, title: "Speech model", sort: "price", show: "all" });
+    const picker = pickerView({ items, total: 30, selected: 14, title: "Speech model", sort: "price" });
     for (let w = 1; w <= 170; w++) {
       for (const v of [
         view(),
@@ -415,11 +415,10 @@ describe("drawing the picker", () => {
     expect(hintLine(lines).trim()).toBe("Enter pick · Tab sample · F2 language · type to filter · Esc back");
   });
 
-  it("a model list says how it is ordered and what it shows, and counts the matches while filtering", () => {
+  it("a model list says how it is ordered, and counts the matches while filtering", () => {
     const p = pickerView({
       title: "Speech model",
       sort: "price",
-      show: "all",
       noun: "models",
       items: MODELS,
       total: 39,
@@ -427,20 +426,17 @@ describe("drawing the picker", () => {
     });
     const find = (v: PickerView, w = 110) => renderPanel(view({ picker: v }), w).find((l) => /Find:/.test(l)) ?? "";
     expect(renderPanel(view({ picker: p }), 110)[0]).toMatch(/^Speech › Speech model ─+$/);
-    expect(find(p)).toMatch(/^Find: \s+sort price · show all {3}39 models$/);
+    expect(find(p)).toMatch(/^Find: \s+sort price {3}39 models$/);
     expect(find(p)).toHaveLength(96);
     expect(find({ ...p, query: "vendor-1", cursor: 8, items: MODELS.slice(10, 16) })).toMatch(
-      /^Find: vendor-1\s+sort price · show all {3}6 of 39 models$/,
+      /^Find: vendor-1\s+sort price {3}6 of 39 models$/,
     );
-    // a feature filter narrows the list like a query does
-    expect(find({ ...p, sort: "provider", show: "tags", items: MODELS.slice(0, 13) })).toMatch(
-      /sort provider · show tags {3}13 of 39 models$/,
-    );
+    expect(find({ ...p, sort: "provider" })).toMatch(/sort provider {3}39 models$/);
     // on a narrow panel the order gives way; the count stays
-    expect(find(p, 44)).toMatch(/^Find: \s+39 models$/);
+    expect(find(p, 40)).toMatch(/^Find: \s+39 models$/);
     // the values are plain, their names dim
     const styledFind = styled(view({ picker: p }), 110).find((l) => /Find:/.test(untag(l))) ?? "";
-    expect(styledFind).toContain("<d>sort</d> price <d>· show</d> all");
+    expect(styledFind).toContain("<d>sort</d> price");
   });
 
   it("under a model list: what the catalog says about the highlighted model, cut to the width", () => {
@@ -449,21 +445,23 @@ describe("drawing the picker", () => {
     const p = pickerView({
       title: "Speech model",
       sort: "price",
-      show: "all",
       noun: "models",
       items: MODELS,
       total: 39,
     });
     const lines = renderPanel(view({ picker: { ...p, detail, selected: 0 } }), 110);
-    const foot = lines.find((l) => l.startsWith("Eleven v4 Turbo")) ?? "";
-    expect(foot).toMatch(/^Eleven v4 Turbo is a low-latency .*… {2,}1–8 of 39 ↓$/);
-    expect(foot).toHaveLength(96);
+    const at = lines.findIndex((l) => l.startsWith("Eleven v4 Turbo"));
+    // Two lines: the first broken at a space, with where the highlighted model is on its right.
+    expect(lines[at]).toMatch(
+      /^Eleven v4 Turbo is a low-latency text-to-speech model from ElevenLabs\. It keeps Eleven {2,}1\/39$/,
+    );
+    expect(lines[at]).toHaveLength(96);
+    expect(lines[at + 1]).toBe("v4's audio tags.");
     // a model the catalog says nothing about keeps the line, so the dock does not jump
     const three = MODELS.slice(0, 3);
     const short = pickerView({
       title: "Speech model",
       sort: "price",
-      show: "all",
       noun: "models",
       items: three,
       total: 3,
@@ -499,7 +497,7 @@ describe("drawing the picker", () => {
         current: false,
       },
     ];
-    const p = pickerView({ title: "Transcription", sort: "features", show: "all", noun: "models", items, total: 3 });
+    const p = pickerView({ title: "Transcription", sort: "price", noun: "models", items, total: 3 });
     const at96 = renderPanel(view({ picker: p }), 96);
     const qwen = at96.find((l) => l.includes("qwen3")) ?? "";
     const nemo = at96.find((l) => l.includes("nemotron")) ?? "";
@@ -522,22 +520,20 @@ describe("drawing the picker", () => {
     const p = pickerView({
       title: "Speech model",
       sort: "price",
-      show: "all",
       noun: "models",
       items: MODELS,
       total: 39,
     });
     const all = renderPanel(view({ picker: { ...p, detail: "" } }), 110);
-    const few = renderPanel(view({ picker: { ...p, detail: "", show: "tags", items: MODELS.slice(0, 2) } }), 110);
+    const few = renderPanel(view({ picker: { ...p, detail: "", items: MODELS.slice(0, 2) } }), 110);
     expect(few).toHaveLength(all.length);
-    expect(all).toHaveLength(15);
+    expect(all).toHaveLength(16);
   });
 
   it("models show the value, the price right-aligned in its column, then what they offer", () => {
     const p = pickerView({
       title: "Speech model",
       sort: "price",
-      show: "all",
       noun: "models",
       items: MODELS,
       total: 39,
@@ -570,7 +566,7 @@ describe("drawing the picker", () => {
         current: true,
       },
     ];
-    const p = pickerView({ title: "Transcription", sort: "price", show: "all", noun: "models", items, total: 2 });
+    const p = pickerView({ title: "Transcription", sort: "price", noun: "models", items, total: 2 });
     const lines = renderPanel(view({ picker: p }), 60);
     // every row is "multilingual", so that column is gone
     expect(lines.join("\n")).not.toMatch(/multilingual/);
@@ -610,7 +606,7 @@ describe("drawing the picker", () => {
         current: false,
       },
     ];
-    const p = pickerView({ title: "Speech model", sort: "price", show: "all", noun: "models", items, total: 3 });
+    const p = pickerView({ title: "Speech model", sort: "price", noun: "models", items, total: 3 });
     const lines = renderPanel(view({ picker: p }), 96);
     const one = lines.find((l) => l.includes("a/one")) ?? "";
     const two = lines.find((l) => l.includes("b/two")) ?? "";
@@ -625,23 +621,22 @@ describe("drawing the picker", () => {
     expect(widest(lines)).toBeLessThanOrEqual(96);
   });
 
-  it("a long list scrolls with the selection and shows where it is: ↑ 12–19 of 39 ↓", () => {
+  it("a long list scrolls with the selection and shows where it is: 16/39", () => {
     const p = pickerView({
       title: "Speech model",
       sort: "price",
-      show: "all",
       noun: "models",
       items: MODELS,
       total: 39,
     });
     const top = renderPanel(view({ picker: { ...p, selected: 0 } }), 110);
-    expect(top.some((l) => /\s1–8 of 39 ↓$/.test(l))).toBe(true);
+    expect(top.some((l) => /\s1\/39$/.test(l))).toBe(true);
     const mid = renderPanel(view({ picker: { ...p, selected: 15 } }), 110);
-    expect(mid.some((l) => /↑ 12–19 of 39 ↓$/.test(l))).toBe(true);
+    expect(mid.some((l) => /\s16\/39$/.test(l))).toBe(true);
     expect(mid.find((l) => l.includes("model-15"))).toMatch(/^▸/);
     expect(mid.filter((l) => /vendor-/.test(l))).toHaveLength(8);
     const end = renderPanel(view({ picker: { ...p, selected: 38 } }), 110);
-    expect(end.some((l) => /↑ 32–39 of 39\s*$/.test(l))).toBe(true);
+    expect(end.some((l) => /\s39\/39$/.test(l))).toBe(true);
     expect(end.find((l) => l.includes("xAI Grok"))).toMatch(/^▸ {3}xAI Grok +price unknown {2}xAI login$/);
   });
 
@@ -666,7 +661,6 @@ describe("drawing the picker", () => {
     const p = pickerView({
       title: "Speech model",
       sort: "price",
-      show: "all",
       noun: "models",
       items,
       total: 3,
@@ -799,7 +793,6 @@ describe("the picker as an aligned table", () => {
     const p = pickerView({
       title: "Speech model",
       sort: "price",
-      show: "all",
       noun: "models",
       items,
       total: 5,
