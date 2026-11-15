@@ -714,7 +714,13 @@ mod tests {
     fn the_fallback_never_takes_a_device_that_discards_the_audio() {
         assert!(discards("null"));
         assert!(discards("null:CARD=0"));
-        for real in ["default", "pipewire", "pulse", "hw:CARD=NVidia,DEV=3", "nullsink"] {
+        for real in [
+            "default",
+            "pipewire",
+            "pulse",
+            "hw:CARD=NVidia,DEV=3",
+            "nullsink",
+        ] {
             assert!(!discards(real), "{real}");
         }
     }
