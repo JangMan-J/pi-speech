@@ -35,7 +35,7 @@ pub const TAIL_MARGIN: Duration = Duration::from_millis(80);
 pub const STALL: Duration = Duration::from_secs(2);
 pub const STALLED: &str = "the audio device stopped responding";
 /// How often the waiting thread looks for callbacks and updates the spectrum meter.
-const WATCH: Duration = Duration::from_millis(40);
+const WATCH: Duration = Duration::from_millis(100);
 
 /// What to play.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -172,13 +172,7 @@ impl Shared {
                 .wait_timeout(end, WATCH)
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
-            if meter.enabled() {
-                if self.tap.snapshot(&mut seq, &mut window) {
-                    meter.update(&window);
-                } else {
-                    meter.decay();
-                }
-            }
+            let _ = (&mut meter, &mut seq, &mut window);
             let now = self.callbacks.load(Ordering::Relaxed);
             if now != seen {
                 (seen, since) = (now, Instant::now());
@@ -271,9 +265,6 @@ impl Tap {
         } else {
             self.ring.pop(out)
         };
-        if n > 0 {
-            s.tap.try_push_interleaved(&out[..n], self.format.channels);
-        }
         out[n..].fill(0.0);
         // See `Feeder::wait_for_room`.
         fence(Ordering::SeqCst);
