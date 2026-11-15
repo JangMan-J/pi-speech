@@ -278,15 +278,17 @@ pi-speech-receiver [--listen 127.0.0.1:47613 [--network]] [--token-file PATH]
 ### Subcommand notes: `speak`
 
 ```
-pi-speech-receiver speak <model-dir>|<model-id> [--voice <name-or-number>] [--speed <x>]
+pi-speech-receiver speak <model-dir>|<model-id> [--voice <name-or-number>] [--speed <x>] [--lang <code>]
 pi-speech-receiver speak <model-dir>|<model-id> --list-voices
 ```
 
-Local speech (Kokoro, Piper) on the machine that runs the binary; not an HTTP endpoint.
+Local speech (Kokoro, Kitten, Piper, Supertonic, Pocket TTS) on the machine that runs the binary; not
+an HTTP endpoint.
 
 - Input: the whole text on stdin, read to its end before synthesis starts.
-- stdout: raw signed 16-bit little-endian mono PCM at the model's own rate (Kokoro 24000 Hz,
-  Piper 22050 Hz; not resampled), written sentence by sentence as sherpa-onnx generates it.
+- stdout: raw signed 16-bit little-endian mono PCM at the model's own rate (Kokoro, Kitten and
+  Pocket TTS 24000 Hz, Piper 22050 Hz, Supertonic 44100 Hz; not resampled), written sentence by
+  sentence as sherpa-onnx generates it. Text with no letter or digit gives no audio (and `done`).
   Nothing else is written to stdout.
 - stderr: JSON lines `{"event": ...}`, in order: `{"event":"format","rate":<Hz>,"channels":1}`
   before the first byte of audio, then exactly one of `{"event":"done"}` (exit 0, all audio
@@ -299,11 +301,15 @@ Local speech (Kokoro, Piper) on the machine that runs the binary; not an HTTP en
 - SIGINT, SIGTERM, or the reader closing stdout stop it at once (`stopped`), even
   mid-sentence.
 - `--voice`: a voice name or number (default 0). `--speed`: 0.25 to 4, 1 normal.
-- `--list-voices`: `{"name":"af_maple","number":0}` lines on stdout, one per voice.
+- `--lang`: the language of the text, for a model that is told it: Supertonic, one of the
+  `languages` of its catalogue entry (default `en`). Another model refuses it (an `error`). `POST
+  /v1/speak` does not take a language yet: over the bridge Supertonic reads English.
+- `--list-voices`: `{"name":"af_maple","number":0}` lines on stdout, one per voice. A Pocket TTS
+  model's voices are the `.wav` reference clips in its `test_wavs/` directory, named by their stems.
 - Usage errors print the usage on stderr and exit 2.
-- A Piper voice needs a lexicon (sherpa-onnx 2.0 no longer runs espeak-ng): `lexicon*.txt` in
-  its directory, else the shared `lexicon-<lang>-<region>.txt` (for English voices
-  `lexicon-en-us.txt`) in the model cache beside it.
+- A Piper or Kitten voice needs a lexicon (sherpa-onnx 2.0 no longer runs espeak-ng):
+  `lexicon*.txt` in its directory, else the shared `lexicon-<lang>-<region>.txt` (for English
+  voices and Kitten `lexicon-en-us.txt`) in the model cache beside it.
 
 ### Subcommand notes: `models`
 
@@ -317,8 +323,8 @@ The local models of the catalogue and the per-user model cache. stdout: one JSON
   "languages": [...], "size", "downloaded", "partial", "path"}`, where `size` is the archive's bytes,
   `partial` the bytes of an interrupted download (0 if none) and `path` the model's directory
   in the cache, there or to be.
-  - `lexicon`: only on a voice that needs a shared lexicon (an English Piper voice; not
-    Kokoro, not a transcription model), `{"name": "lexicon-en-us.txt", "size": <bytes>,
+  - `lexicon`: only on a voice that needs a shared lexicon (an English Piper voice, Kitten; not
+    Kokoro, Supertonic or Pocket TTS, not a transcription model), `{"name": "lexicon-en-us.txt", "size": <bytes>,
     "downloaded": <bool>}`. `name` is the lexicon's file name, the last part of its URL, and the
     file of that name in the cache root, shared by every voice that names it. `downloaded` is
     whether that file is there. Such a voice's own `downloaded` is true only when its directory

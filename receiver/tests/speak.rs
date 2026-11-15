@@ -7,9 +7,9 @@
 //! PI_SPEECH_AUDIO_NULL=1 PI_SPEECH_TEST_MODELS=~/.cache/pi-speech/models cargo test --release --test speak -- --nocapture
 //! ```
 //!
-//! A Piper voice needs a lexicon (sherpa-onnx 2.0 no longer runs espeak-ng): `models download` of
-//! an English Piper voice puts `lexicon-en-us.txt` from sherpa-onnx's `tts-models` release in the
-//! model cache; in another directory, put it there by hand.
+//! A Piper or Kitten voice needs a lexicon (sherpa-onnx 2.0 no longer runs espeak-ng): `models
+//! download` of an English Piper or a Kitten voice puts `lexicon-en-us.txt` from sherpa-onnx's
+//! `tts-models` release in the model cache; in another directory, put it there by hand.
 
 mod support;
 

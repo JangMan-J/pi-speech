@@ -1,8 +1,10 @@
-//! `speak <model-dir|model-id> [--voice <name-or-number>] [--speed <x>]`: the text on standard
-//! input, spoken by a local voice model (Kokoro, Piper) run in-process, as audio on standard
-//! output while it is generated, sentence by sentence.
+//! `speak <model-dir|model-id> [--voice <name-or-number>] [--speed <x>] [--lang <code>]`: the
+//! text on standard input, spoken by a local voice model (Kokoro, Kitten, Piper, Supertonic,
+//! Pocket TTS) run in-process, as audio on standard output while it is generated, sentence by
+//! sentence.
 //!
-//! - Standard output: raw signed 16-bit little-endian mono PCM at the model's rate, nothing else.
+//! - Standard output: raw signed 16-bit little-endian mono PCM at the model's rate, nothing else
+//!   (none for text with no letter or digit).
 //! - Standard error: one JSON object per line. `{"event":"format","rate":<Hz>,"channels":1}`
 //!   before any audio; then `{"event":"done"}` (exit 0) once all of it is written, or
 //!   `{"event":"error","message"}` (exit 1). Other lines (from the model's libraries) may appear
@@ -10,9 +12,11 @@
 //! - SIGINT, SIGTERM, or the closing of standard output stop it at once:
 //!   `{"event":"stopped"}`, exit 1.
 //! - `--list-voices`: one line per voice on standard output, `{"name","number"}`.
+//! - `--lang`: the language of the text, for a model that is told it (Supertonic: `en`, `de`, …;
+//!   English when left out). Another model refuses it.
 //!
 //! A catalogue id (`models list`) names a downloaded speech model in the model cache (with the
-//! lexicon it needs, for a Piper voice).
+//! lexicon it needs, for a Piper or Kitten voice).
 
 use crate::engines::synthesize::{self, pcm16, voice_number, Synthesizer};
 use crate::models::cache;
@@ -25,12 +29,13 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-pub const USAGE: &str = "pi-speech-receiver speak <model-dir>|<model-id> [--voice <name-or-number>] [--speed <x>] [--list-voices]";
+pub const USAGE: &str = "pi-speech-receiver speak <model-dir>|<model-id> [--voice <name-or-number>] [--speed <x>] [--lang <code>] [--list-voices]";
 /// What `--help` adds to [`USAGE`].
 pub const HELP_NOTE: &str = "speak reads the text on standard input and writes raw signed 16-bit \
 little-endian mono PCM to standard output as it is generated; standard error carries JSON lines: \
 {\"event\":\"format\",\"rate\":<Hz>,\"channels\":1} before any audio, then {\"event\":\"done\"} or \
-{\"event\":\"error\",\"message\":...}. --list-voices prints {\"name\",\"number\"} lines.";
+{\"event\":\"error\",\"message\":...}. --list-voices prints {\"name\",\"number\"} lines. --lang \
+names the language of the text for a model told it (Supertonic; English by default).";
 
 /// The slowest and fastest speed taken.
 pub const MIN_SPEED: f32 = 0.25;
@@ -46,6 +51,8 @@ pub enum Command {
         model: String,
         voice: Option<String>,
         speed: f32,
+        /// The language of the text, for a model told it.
+        lang: Option<String>,
     },
 }
 
@@ -54,6 +61,7 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
     let mut model = None;
     let mut voice = None;
     let mut speed = None;
+    let mut lang = None;
     let mut list = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -71,6 +79,7 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
         match name {
             "-h" | "--help" if args.len() == 1 => return Ok(Command::Help),
             "--voice" if voice.is_none() => voice = Some(value()?),
+            "--lang" if lang.is_none() => lang = Some(value()?),
             "--speed" if speed.is_none() => {
                 let v = value()?;
                 let x: f32 = v
@@ -94,7 +103,7 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
     }
     let model = model.ok_or_else(usage)?;
     if list {
-        if voice.is_some() || speed.is_some() {
+        if voice.is_some() || speed.is_some() || lang.is_some() {
             return Err(usage());
         }
         return Ok(Command::ListVoices { model });
@@ -103,6 +112,7 @@ pub fn parse_args(args: &[String]) -> Result<Command, String> {
         model,
         voice,
         speed: speed.unwrap_or(1.0),
+        lang,
     })
 }
 
@@ -212,10 +222,11 @@ fn list_voices(model: &str) -> Result<(), String> {
         .map_err(|e| format!("cannot write the voices: {e}"))
 }
 
-fn speak(model: &str, voice: Option<&str>, speed: f32) -> Result<(), String> {
+fn speak(model: &str, voice: Option<&str>, speed: f32, lang: Option<&str>) -> Result<(), String> {
     // The cheap checks first: a wrong path fails before a large model is loaded.
     let dir = resolve_voice_dir(model)?;
     let found = synthesize::detect(&dir)?;
+    synthesize::pick_language(&found.languages(), lang, found.family())?;
     let mut text = String::new();
     io::stdin()
         .read_to_string(&mut text)
@@ -232,7 +243,7 @@ fn speak(model: &str, voice: Option<&str>, speed: f32) -> Result<(), String> {
     let closed = Arc::new(AtomicBool::new(false));
     let closed_cb = closed.clone();
     let mut out = io::stdout().lock();
-    synth.generate(text.trim(), sid, speed, move |samples| {
+    synth.generate(text.trim(), sid, speed, lang, move |samples| {
         if samples.is_empty() {
             return true;
         }
@@ -270,9 +281,11 @@ pub fn main(args: &[String]) -> ExitCode {
             model,
             voice,
             speed,
+            lang,
         } => {
             watch_stdout();
-            speak(&model, voice.as_deref(), speed).map(|()| event(&json!({"event": "done"})))
+            speak(&model, voice.as_deref(), speed, lang.as_deref())
+                .map(|()| event(&json!({"event": "done"})))
         }
         Command::Help => Ok(()),
     };
@@ -298,6 +311,7 @@ mod tests {
             model: model.into(),
             voice: voice.map(String::from),
             speed,
+            lang: None,
         }
     }
 
@@ -318,6 +332,15 @@ mod tests {
                 model: "piper".into()
             })
         );
+        assert_eq!(
+            parse_args(&args("supertonic --lang de --voice M1")),
+            Ok(Command::Speak {
+                model: "supertonic".into(),
+                voice: Some("M1".into()),
+                speed: 1.0,
+                lang: Some("de".into()),
+            })
+        );
         assert_eq!(parse_args(&args("--help")), Ok(Command::Help));
         assert_eq!(parse_args(&args("-h")), Ok(Command::Help));
     }
@@ -335,6 +358,9 @@ mod tests {
             "a --list-voices --voice 1",
             "a --help",
             "a --list-voices=yes",
+            "a --lang",
+            "a --lang de --lang fr",
+            "a --list-voices --lang de",
         ] {
             let e = parse_args(&args(bad)).unwrap_err();
             assert!(e.contains(&usage), "{bad:?}: {e}");

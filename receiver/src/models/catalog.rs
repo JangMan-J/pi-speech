@@ -6,8 +6,8 @@
 //! only such a catalogue may use plain `http://` URLs. An entry there may name a lexicon its voice
 //! needs: `"lexicon":{"url","size","sha256"}`.
 //!
-//! A Piper voice speaks through a lexicon (sherpa-onnx 2.0 has no espeak-ng), which its archive
-//! does not carry: such an entry names the shared lexicon, a file in the cache root that
+//! A Piper or Kitten voice speaks through a lexicon (sherpa-onnx 2.0 has no espeak-ng), which its
+//! archive does not carry: such an entry names the shared lexicon, a file in the cache root that
 //! `models download` fetches with the voice.
 
 use serde_json::Value;
@@ -230,7 +230,7 @@ struct Builtin {
     /// After `releases/download/`.
     path: &'static str,
     sha256: &'static str,
-    /// The lexicon the voice needs (a Piper voice).
+    /// The lexicon the voice needs (a Piper or Kitten voice).
     lexicon: Option<&'static BuiltinLexicon>,
 }
 
@@ -252,7 +252,7 @@ impl BuiltinLexicon {
     }
 }
 
-/// sherpa-onnx's English lexicon, the one its English Piper voices speak through.
+/// sherpa-onnx's English lexicon, the one its English Piper voices and Kitten speak through.
 const LEXICON_EN_US: BuiltinLexicon = BuiltinLexicon {
     path: "tts-models/lexicon-en-us.txt",
     size: 6_305_773,
@@ -357,6 +357,57 @@ const BUILTIN: &[Builtin] = &[
     // and so on, named by `synthesize::shared_lexicons`), or a phonemizer in the receiver, would
     // bring them back: e.g. `tts-models/vits-piper-de_DE-thorsten-medium.tar.bz2`, 67_214_254
     // bytes, SHA-256 50487d9c95fdf2191f31d2588569381063ba1591dcd4c7d4bdd30f12b2191714.
+    // Kitten speaks through the same English lexicon as Piper (its archives carry none).
+    Builtin {
+        id: "kitten-nano-en-v0.8-int8",
+        kind: Kind::Speech,
+        name: "Kitten nano v0.8 (int8)",
+        languages: "en",
+        size: 31_220_690,
+        path: "tts-models/kitten-nano-en-v0_8-int8.tar.bz2",
+        sha256: "6fa5be852612ce761094ba74ee6123b4fc4acfefa79bf64dc63acae4a83af2fd",
+        lexicon: Some(&LEXICON_EN_US),
+    },
+    Builtin {
+        id: "kitten-micro-en-v0.8",
+        kind: Kind::Speech,
+        name: "Kitten micro v0.8",
+        languages: "en",
+        size: 44_423_643,
+        path: "tts-models/kitten-micro-en-v0_8.tar.bz2",
+        sha256: "85faaea7511ca9d1d2f251fed0a4553bdf0d1ee046102fa60ddd8046c751f76f",
+        lexicon: Some(&LEXICON_EN_US),
+    },
+    Builtin {
+        id: "kitten-mini-en-v0.8",
+        kind: Kind::Speech,
+        name: "Kitten mini v0.8",
+        languages: "en",
+        size: 67_547_594,
+        path: "tts-models/kitten-mini-en-v0_8.tar.bz2",
+        sha256: "518f9b130320f690d5b5476df77bde4215fca67773cda16710318e5081234b9d",
+        lexicon: Some(&LEXICON_EN_US),
+    },
+    Builtin {
+        id: "supertonic-3-int8",
+        kind: Kind::Speech,
+        name: "Supertonic 3 (int8)",
+        languages: crate::engines::synthesize::SUPERTONIC_LANGUAGES,
+        size: 128_774_318,
+        path: "tts-models/sherpa-onnx-supertonic-3-tts-int8-2026-05-11.tar.bz2",
+        sha256: "82fa96f91c4ef8abaae3a14a3f4153facf88bed821d1f7331cec2700f432c427",
+        lexicon: None,
+    },
+    Builtin {
+        id: "pocket-tts-int8",
+        kind: Kind::Speech,
+        name: "Pocket TTS (int8)",
+        languages: "en",
+        size: 98_336_520,
+        path: "tts-models/sherpa-onnx-pocket-tts-int8-2026-01-26.tar.bz2",
+        sha256: "2f3b88823cbbb9bf0b2477ec8ae7b3fec417b3a87b6bb5f256dba66f2ad967cb",
+        lexicon: None,
+    },
 ];
 
 #[cfg(test)]
@@ -391,12 +442,18 @@ mod tests {
         }
         let kinds = |k| c.entries.iter().filter(|e| e.kind == k).count();
         assert_eq!(kinds(Kind::Transcription), 3);
-        assert_eq!(kinds(Kind::Speech), 3);
-        // Every Piper voice names the English lexicon; Kokoro carries its own.
+        assert_eq!(kinds(Kind::Speech), 8);
+        // Every Piper and Kitten voice names the English lexicon; Kokoro carries its own, and
+        // Supertonic and Pocket TTS need none.
         for e in c.entries.iter().filter(|e| e.kind == Kind::Speech) {
             let lexicon = c.lexicon(e);
-            if e.id.starts_with("piper-") {
-                assert!(e.id.starts_with("piper-en_"), "{}", e.id);
+            if e.id.starts_with("piper-") || e.id.starts_with("kitten-") {
+                assert!(
+                    e.id.starts_with("piper-en_") || e.id.starts_with("kitten-"),
+                    "{}",
+                    e.id
+                );
+                assert_eq!(e.languages, ["en"], "{}", e.id);
                 let l = lexicon.unwrap();
                 assert_eq!(l.name, "lexicon-en-us.txt");
                 assert_eq!(
@@ -418,6 +475,20 @@ mod tests {
             c.get("whisper-small").unwrap().dir,
             "sherpa-onnx-whisper-small"
         );
+        // The new voices unpack to the directories their archives are named by.
+        for (id, dir) in [
+            ("kitten-nano-en-v0.8-int8", "kitten-nano-en-v0_8-int8"),
+            ("kitten-micro-en-v0.8", "kitten-micro-en-v0_8"),
+            ("kitten-mini-en-v0.8", "kitten-mini-en-v0_8"),
+            (
+                "supertonic-3-int8",
+                "sherpa-onnx-supertonic-3-tts-int8-2026-05-11",
+            ),
+            ("pocket-tts-int8", "sherpa-onnx-pocket-tts-int8-2026-01-26"),
+        ] {
+            assert_eq!(c.get(id).unwrap().dir, dir);
+        }
+        assert_eq!(c.get("supertonic-3-int8").unwrap().languages.len(), 31);
     }
 
     #[test]

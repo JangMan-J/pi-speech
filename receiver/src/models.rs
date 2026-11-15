@@ -5,8 +5,9 @@
 //!   `{"id","kind":"transcription"|"speech","name","languages":[..],"size",
 //!   "downloaded":bool,"partial":bytes,"path"}` (`size` is the archive's bytes, `partial` the
 //!   bytes of an interrupted download, `path` where the model is or will be). A voice that needs
-//!   a shared lexicon (an English Piper voice) also has `"lexicon":{"name","size","downloaded"}`,
-//!   and is `downloaded` only when the lexicon is there too.
+//!   a shared lexicon (an English Piper or a Kitten voice) also has
+//!   `"lexicon":{"name","size","downloaded"}`, and is `downloaded` only when the lexicon is there
+//!   too.
 //! - `download <id>`: `{"event":"progress","id","done","total"}` as bytes arrive, then
 //!   `{"event":"verifying"}`, `{"event":"unpacking"}`; for a voice that needs a lexicon not yet
 //!   in the cache, `{"event":"progress","id","file":"<lexicon name>","done","total"}` as its
