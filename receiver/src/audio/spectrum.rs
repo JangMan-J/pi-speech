@@ -5,7 +5,7 @@ use std::f32::consts::{PI, TAU};
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 pub const LEVELS_ENV: &str = "PI_SPEECH_LEVELS_FILE";
 pub const BANDS: usize = 12;
@@ -16,62 +16,54 @@ const FREQS: [f32; BANDS] = [
     90.0, 140.0, 210.0, 310.0, 450.0, 660.0, 960.0, 1400.0, 2050.0, 3000.0, 4400.0, 6400.0,
 ];
 
-/// Fixed-size sample window filled by an audio callback via `try_lock` (never allocates,
-/// never waits).
+/// The latest [`WINDOW`] mono samples, written by an audio callback and read by the
+/// thread that runs the meter. Lock-free: a device callback must never wait for anyone,
+/// and a reader racing a writer at worst sees one torn window, which only blurs one frame
+/// of the meter. One writer at a time (the device's callback).
 pub struct SampleTap {
-    buf: Mutex<TapBuf>,
-}
-
-struct TapBuf {
-    samples: [f32; WINDOW],
-    pos: usize,
-    seq: u64,
+    samples: [AtomicU32; WINDOW],
+    pos: AtomicUsize,
+    seq: AtomicU64,
 }
 
 impl Default for SampleTap {
     fn default() -> Self {
         Self {
-            buf: Mutex::new(TapBuf {
-                samples: [0.0; WINDOW],
-                pos: 0,
-                seq: 0,
-            }),
+            samples: std::array::from_fn(|_| AtomicU32::new(0)),
+            pos: AtomicUsize::new(0),
+            seq: AtomicU64::new(0),
         }
     }
 }
 
 impl SampleTap {
-    /// Copy up to `WINDOW` interleaved samples (downmixed to mono) without blocking.
+    /// Add interleaved samples, downmixed to mono. Never blocks, never allocates.
     pub fn try_push_interleaved(&self, samples: &[f32], channels: usize) {
         if samples.is_empty() || channels == 0 {
             return;
         }
-        let Ok(mut g) = self.buf.try_lock() else {
-            return;
-        };
-        let mut pos = g.pos;
+        let mut pos = self.pos.load(Ordering::Relaxed);
         for frame in samples.chunks_exact(channels) {
             let sum: f32 = frame.iter().copied().sum();
-            g.samples[pos] = sum / channels as f32;
+            self.samples[pos].store((sum / channels as f32).to_bits(), Ordering::Relaxed);
             pos = (pos + 1) % WINDOW;
         }
-        g.pos = pos;
-        g.seq = g.seq.wrapping_add(1);
+        self.pos.store(pos, Ordering::Relaxed);
+        self.seq.fetch_add(1, Ordering::Release);
     }
 
-    /// Snapshot the latest `WINDOW` samples in chronological order, if new audio arrived
+    /// Copy the latest `WINDOW` samples in chronological order, if new audio arrived
     /// since `last_seq`.
     pub fn snapshot(&self, last_seq: &mut u64, out: &mut [f32; WINDOW]) -> bool {
-        let Ok(g) = self.buf.lock() else {
-            return false;
-        };
-        if g.seq == *last_seq {
+        let seq = self.seq.load(Ordering::Acquire);
+        if seq == *last_seq {
             return false;
         }
-        *last_seq = g.seq;
-        let tail = WINDOW - g.pos;
-        out[..tail].copy_from_slice(&g.samples[g.pos..]);
-        out[tail..].copy_from_slice(&g.samples[..g.pos]);
+        *last_seq = seq;
+        let pos = self.pos.load(Ordering::Relaxed);
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = f32::from_bits(self.samples[(pos + i) % WINDOW].load(Ordering::Relaxed));
+        }
         true
     }
 }
