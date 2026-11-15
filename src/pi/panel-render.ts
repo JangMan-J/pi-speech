@@ -109,14 +109,29 @@ const pad = (text: string, w: number) => text + " ".repeat(Math.max(0, w - width
 const spaces = (n: number) => " ".repeat(Math.max(0, n));
 
 /** `left` and `right` on one line of width `w`; the left side gives way. Both are styled after measuring. */
-/** `text` in two lines at most: the first `first` cells wide, the second `rest`; broken at a space, cut with … */
-function twoLines(text: string, first: number, rest: number): [string, string] {
-  const t = text.replace(/\s+/g, " ").trim();
-  if (width(t) <= first) return [t, ""];
-  let at = first;
-  while (at > 0 && t[at] !== " ") at--;
-  if (at < first / 2) at = first; // no space near the end: break mid-word
-  return [t.slice(0, at).trimEnd(), cut(t.slice(at).trimStart(), rest)];
+/** Lines of the description under a model list. */
+const DETAIL_LINES = 3;
+
+/**
+ * `text` in `max` lines at most: the first `first` cells wide, the others `rest`; broken at a space, the last
+ * cut with … when the text goes on.
+ */
+function wrapLines(text: string, first: number, rest: number, max: number): string[] {
+  let t = text.replace(/\s+/g, " ").trim();
+  const out: string[] = [];
+  while (t && out.length < max) {
+    const room = out.length ? rest : first;
+    if (out.length === max - 1 || width(t) <= room) {
+      out.push(cut(t, room));
+      break;
+    }
+    let at = room;
+    while (at > 0 && t[at] !== " ") at--;
+    if (at < room / 2) at = room; // no space near the end: break mid-word
+    out.push(t.slice(0, at).trimEnd());
+    t = t.slice(at).trimStart();
+  }
+  return out;
 }
 
 function spread(left: string, right: string, w: number, styleLeft = same, styleRight = same): string {
@@ -150,6 +165,16 @@ function toneStyle(tone: StatusTone, s: PanelStyle): (t: string) => string {
 }
 
 /** The hints that fit in `w`: optional ones give way first (the last first), then the first ones; Esc stays. */
+/** The hint line; in a list, where the highlighted item is on its right: 44/54. */
+function hintsWith(view: PanelView, w: number, s: PanelStyle): string {
+  const p = view.picker;
+  const at =
+    p && !p.loading && p.items.length ? `${Math.min(p.selected, p.items.length - 1) + 1}/${p.items.length}` : "";
+  if (!at) return hintLine(view.hints, w, s);
+  const hints = hintLine(view.hints, w - width(at) - 2, s);
+  return hints + spaces(Math.max(2, w - width(hints) - width(at))) + s.dim(at);
+}
+
 function hintLine(hints: Hint[], w: number, s: PanelStyle): string {
   const text = (hs: Hint[]) => hs.map((h) => (h.action ? `${h.key} ${h.action}` : h.key)).join(" · ");
   const kept = [...hints];
@@ -407,17 +432,13 @@ function countOf(p: PickerView): string {
 function pickerLines(p: PickerView, w: number, s: PanelStyle, rows: number): Line[] {
   const count = countOf(p);
   const label = "Find: ";
-  // A model list says how it is ordered; on a narrow panel that gives way to the count.
-  const order = p.sort ? `sort ${p.sort}` : "";
-  const ordered = order !== "" && width(label) + 12 + width(order) + 3 + width(count) + 2 <= w;
-  const right = ordered ? `${order}${spaces(3)}${count}` : count;
-  const styledRight = ordered ? `${s.dim("sort")} ${p.sort}${spaces(3)}${s.dim(count)}` : s.dim(count);
+  const right = count;
+  const styledRight = s.dim(count);
   const room = w - width(label) - width(right) - 2;
   const query = field(p.query, p.cursor, "", Math.max(1, room), s);
   const gap = Math.max(1, w - width(label) - query.width - width(right));
   const out: Line[] = [keep(s.dim(label) + query.text + spaces(gap) + styledRight)];
   const height = Math.max(1, Math.min(rows, p.total || 1));
-  let where = "";
   if (p.loading) out.push(keep(NO_MARKER + s.dim("loading…")));
   else if (p.items.length === 0) out.push(keep(NO_MARKER + s.dim(p.empty)));
   else {
@@ -425,18 +446,21 @@ function pickerLines(p: PickerView, w: number, s: PanelStyle, rows: number): Lin
     const start = Math.max(0, Math.min(p.selected - Math.floor(height / 2), n - height));
     const end = Math.min(n, start + height);
     for (const line of pickerTable(p.items, start, end, p.selected, w, s, p.keepColumns)) out.push(keep(line));
-    // Where the highlighted item is in a list longer than the rows: 3/56.
-    if (n > height) where = `${p.selected + 1}/${n}`;
   }
   // A steady height: the panel does not jump while the list is filtered.
   while (out.length < 1 + height) out.push(optional(1));
-  // Under the list: what the catalog says about the highlighted model (two lines at most), and where a long
-  // list is, on the right of the first.
-  if (p.detail !== undefined || p.total > height) {
-    const [first, second] = twoLines(p.detail ?? "", w - (where ? width(where) + 2 : 0), w);
-    out.push(optional(5, spread(first, where, w, s.dim, s.dim)));
-    // Kept even when empty, so the panel does not jump from one model to the next.
-    if (p.detail !== undefined) out.push(optional(5, second ? s.dim(second) : ""));
+  // Under a model list: what the catalog says about the highlighted model, three lines at most, with how the
+  // list is ordered on the right of the first. All three are kept even when empty, so the panel does not jump.
+  if (p.detail !== undefined) {
+    const sort = p.sort ? `Sort: ${p.sort}` : "";
+    const lines = wrapLines(p.detail, w - (sort ? width(sort) + 2 : 0), w, DETAIL_LINES);
+    out.push(
+      optional(
+        5,
+        spread(lines[0] ?? "", sort, w, s.dim, (t) => t),
+      ),
+    );
+    for (let i = 1; i < DETAIL_LINES; i++) out.push(optional(5, lines[i] ? s.dim(lines[i]) : ""));
   }
   return out;
 }
@@ -492,7 +516,7 @@ export function renderPanel(view: PanelView, total: number, s: PanelStyle = PLAI
     keep(headerLine(view, w, s)),
     ...body,
     ...slot,
-    keep(BODY + hintLine(view.hints, w - BODY.length, s)),
+    keep(BODY + hintsWith(view, w - BODY.length, s)),
     optional(4, s.dim("─".repeat(w))),
   ];
   for (let level = 1; lines.length > height && level <= 5; level++) {

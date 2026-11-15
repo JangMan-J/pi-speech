@@ -412,10 +412,11 @@ describe("drawing the picker", () => {
     expect(lines.find((l) => l.includes("Kore"))).toMatch(/✓ Kore {2}multilingual · documented/);
     expect(lines.find((l) => l.includes("Puck"))).toMatch(/^▸ {3}Puck {2}multilingual · documented/);
     expect(lines.some((l) => l.includes("Speech model"))).toBe(false);
-    expect(hintLine(lines).trim()).toBe("Enter pick · Tab sample · F2 language · type to filter · Esc back");
+    // where the highlighted item is, on the right of the hint line
+    expect(hintLine(lines).trim()).toMatch(/^Enter pick · Tab sample · F2 language · type to filter · Esc back +2\/2$/);
   });
 
-  it("a model list says how it is ordered, and counts the matches while filtering", () => {
+  it("a model list's Find line counts the models, and the matches while filtering", () => {
     const p = pickerView({
       title: "Speech model",
       sort: "price",
@@ -426,17 +427,12 @@ describe("drawing the picker", () => {
     });
     const find = (v: PickerView, w = 110) => renderPanel(view({ picker: v }), w).find((l) => /Find:/.test(l)) ?? "";
     expect(renderPanel(view({ picker: p }), 110)[0]).toMatch(/^Speech › Speech model ─+$/);
-    expect(find(p)).toMatch(/^Find: \s+sort price {3}39 models$/);
+    expect(find(p)).toMatch(/^Find: \s+39 models$/);
     expect(find(p)).toHaveLength(96);
     expect(find({ ...p, query: "vendor-1", cursor: 8, items: MODELS.slice(10, 16) })).toMatch(
-      /^Find: vendor-1\s+sort price {3}6 of 39 models$/,
+      /^Find: vendor-1\s+6 of 39 models$/,
     );
-    expect(find({ ...p, sort: "provider" })).toMatch(/sort provider {3}39 models$/);
-    // on a narrow panel the order gives way; the count stays
     expect(find(p, 40)).toMatch(/^Find: \s+39 models$/);
-    // the values are plain, their names dim
-    const styledFind = styled(view({ picker: p }), 110).find((l) => /Find:/.test(untag(l))) ?? "";
-    expect(styledFind).toContain("<d>sort</d> price");
   });
 
   it("under a model list: what the catalog says about the highlighted model, cut to the width", () => {
@@ -451,12 +447,15 @@ describe("drawing the picker", () => {
     });
     const lines = renderPanel(view({ picker: { ...p, detail, selected: 0 } }), 110);
     const at = lines.findIndex((l) => l.startsWith("Eleven v4 Turbo"));
-    // Two lines: the first broken at a space, with where the highlighted model is on its right.
+    // Up to three lines, broken at a space; how the list is ordered on the right of the first.
     expect(lines[at]).toMatch(
-      /^Eleven v4 Turbo is a low-latency text-to-speech model from ElevenLabs\. It keeps Eleven {2,}1\/39$/,
+      /^Eleven v4 Turbo is a low-latency text-to-speech model from ElevenLabs\. It keeps {2,}Sort: price$/,
     );
     expect(lines[at]).toHaveLength(96);
-    expect(lines[at + 1]).toBe("v4's audio tags.");
+    expect(lines[at + 1]).toBe("Eleven v4's audio tags.");
+    expect(lines[at + 2]).toBe("");
+    // where the highlighted model is: on the right of the hint line
+    expect(lines.at(-2)).toMatch(/ 1\/39$/);
     // a model the catalog says nothing about keeps the line, so the dock does not jump
     const three = MODELS.slice(0, 3);
     const short = pickerView({
@@ -527,7 +526,7 @@ describe("drawing the picker", () => {
     const all = renderPanel(view({ picker: { ...p, detail: "" } }), 110);
     const few = renderPanel(view({ picker: { ...p, detail: "", items: MODELS.slice(0, 2) } }), 110);
     expect(few).toHaveLength(all.length);
-    expect(all).toHaveLength(16);
+    expect(all).toHaveLength(17);
   });
 
   it("models show the value, the price right-aligned in its column, then what they offer", () => {
@@ -729,7 +728,10 @@ describe("drawing the picker", () => {
   });
 
   it("at narrow widths the hints give up Tab and F2 first and keep type to filter and Esc", () => {
-    const at = (w: number) => hintLine(renderPanel(view({ picker: pickerView(), hints: VOICE_HINTS }), w)).trim();
+    const at = (w: number) =>
+      hintLine(renderPanel(view({ picker: pickerView(), hints: VOICE_HINTS }), w))
+        .trim()
+        .replace(/ +\d+\/\d+$/, "");
     expect(at(84)).toBe("Enter pick · Tab sample · F2 language · type to filter · Esc back");
     expect(at(60)).toBe("Enter pick · Tab sample · type to filter · Esc back");
     expect(at(45)).toBe("Enter pick · type to filter · Esc back");
@@ -773,7 +775,7 @@ describe("drawing the picker", () => {
     expect(lines.length).toBeLessThanOrEqual(12);
     expect(lines.filter((l) => /voice-\d+/.test(l)).length).toBeGreaterThanOrEqual(3);
     expect(lines.find((l) => l.includes("voice-12"))).toMatch(/▸/);
-    expect(hintLine(lines)).toMatch(/Esc back$/);
+    expect(hintLine(lines)).toMatch(/Esc back +13\/30$/);
   });
 });
 
@@ -798,7 +800,9 @@ describe("the picker as an aligned table", () => {
       total: 5,
       selected: 0,
     });
-    const lines = renderPanel(view({ picker: p }), 45).filter((l) => l.includes("/") && !l.includes("Find"));
+    const lines = renderPanel(view({ picker: p }), 45).filter(
+      (l) => l.includes("/") && !l.includes("Find") && !/ \d+\/\d+$/.test(l),
+    );
     expect(lines).toHaveLength(5);
     expect(widest(lines)).toBeLessThanOrEqual(45);
     // the notes start in one column on every row
