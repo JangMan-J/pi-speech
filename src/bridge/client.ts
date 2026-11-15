@@ -11,7 +11,15 @@
  */
 
 import { randomBytes } from "node:crypto";
-import type { AudioInput, AudioOutput, PlayKind, PlayOutcome, PlayStart, Recording } from "../engine/audio";
+import type {
+  AudioInput,
+  AudioOutput,
+  PlayKind,
+  PlayOutcome,
+  PlayStart,
+  Recording,
+  StreamOptions,
+} from "../engine/audio";
 import type { AudioStream, StreamFormat } from "../engine/provider";
 
 export interface BridgeConfig {
@@ -387,7 +395,7 @@ export function createBridgeAudioFrom(getConfig: () => BridgeConfig, opts: { cli
   const output: AudioOutput = {
     name: "bridge",
 
-    async playStream(stream: AudioStream, kind: PlayKind): Promise<PlayStart> {
+    async playStream(stream: AudioStream, kind: PlayKind, opts: StreamOptions = {}): Promise<PlayStart> {
       try {
         const { base: at } = await target();
         // Asked again until it can: an old receiver may have been updated since.
@@ -395,11 +403,22 @@ export function createBridgeAudioFrom(getConfig: () => BridgeConfig, opts: { cli
           const h = await health();
           if (!h.ok) return { ok: false, reason: h.reason };
         }
-        const reply = await call("POST", "/v1/play/stream", {
-          body: Buffer.from(JSON.stringify(formatBody(stream.format))),
-          contentType: "application/json",
-          headers: { "X-Pi-Speech-Kind": kind },
-        });
+        const start = (fade: boolean) =>
+          call("POST", "/v1/play/stream", {
+            body: Buffer.from(
+              JSON.stringify({ ...formatBody(stream.format), ...(fade ? { fade_ms: opts.fadeMs } : {}) }),
+            ),
+            contentType: "application/json",
+            headers: { "X-Pi-Speech-Kind": kind },
+          });
+        let reply: Awaited<ReturnType<typeof start>>;
+        try {
+          reply = await start(!!opts.fadeMs);
+        } catch (err) {
+          // A receiver from before crossfades refuses the field: the same Stream, without the fade.
+          if (!opts.fadeMs || !/fade_ms/.test(message(err))) throw err;
+          reply = await start(false);
+        }
         const { id } = await json<{ id?: string }>(reply);
         if (!id) return { ok: false, reason: "the playback receiver did not return a playback id" };
         active.set(id, kind);
@@ -424,6 +443,14 @@ export function createBridgeAudioFrom(getConfig: () => BridgeConfig, opts: { cli
             }
             sending.abort();
             await Promise.race([done, new Promise((r) => setTimeout(r, 3000))]);
+          },
+          // The receiver fades it out, then stops it (one from before fades stops it at once); `done` follows.
+          async fadeOut() {
+            try {
+              await call("POST", `/v1/play/${encodeURIComponent(id)}/cancel?fade`);
+            } catch {
+              sending.abort();
+            }
           },
         };
       } catch (err) {

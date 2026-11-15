@@ -146,6 +146,8 @@ function keepVoice(voices: string[], current: string, preferred: string): string
 
 interface CallOptions {
   signal?: AbortSignal;
+  /** Crossfade from what plays now into this playback over this long (read-aloud's Streaming catch-up). */
+  fadeMs?: number;
 }
 
 /** How a voice language is known, for display. */
@@ -795,8 +797,8 @@ export class Speech {
       const saved = await this.history.save(text, audio.audio, audio.format);
       return this.spoken(saved, model, voiceName(voice), { ok: false, reason: "play was false" });
     }
-    const ticket = this.player.claim();
-    const r = await streamAndPlay(provider, req, this.player, "message", ticket);
+    const ticket = this.player.claim(opts.fadeMs);
+    const r = await streamAndPlay(provider, req, this.player, "message", ticket, opts.fadeMs);
     const shown = voiceName(voice);
     if (r.state === "stopped") return { files: [], model, voice: shown, stopped: true, notPlayed: REPLACED };
     const saved = await this.history.save(text, r.audio.audio, r.audio.format);
@@ -833,6 +835,7 @@ export class Speech {
         who: this.localSpeech.name,
         signal: opts.signal,
         text,
+        fadeMs: opts.fadeMs,
       });
       return this.readingResult(r, target.model, voiceName(target.voice));
     }
@@ -850,6 +853,7 @@ export class Speech {
       who: provider.name,
       signal: opts.signal,
       text,
+      fadeMs: opts.fadeMs,
     });
     return this.readingResult(r, model, voice);
   }

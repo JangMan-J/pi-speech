@@ -10,10 +10,10 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
-import type { AudioOutput, PlayKind, PlayOutcome, PlayStart } from "./audio";
+import type { AudioOutput, PlayKind, PlayOutcome, PlayStart, StreamOptions } from "./audio";
 import { type BinaryChoice, findBinary } from "./binary";
 import { childEnv, type Env, errorMessage, findExecutable } from "./env";
-import { LEVELS_ENV, levelsFile, readLevels, removeLevels } from "./levels";
+import { FADE_IN_ENV, FADE_OUT_ENV, LEVELS_ENV, levelsFile, readLevels, removeLevels } from "./levels";
 import type { AudioStream, PcmFormat, StreamFormat } from "./provider";
 
 /** Players of raw signed 16-bit little-endian PCM on stdin; each exits once its input has ended and played. */
@@ -87,6 +87,16 @@ export function chooseStreamPlayer(
   };
 }
 
+/** Send `sig` to the player itself (not its group). */
+function signal(c: ChildProcess, sig: NodeJS.Signals): void {
+  if (!c.pid || c.exitCode !== null || c.signalCode !== null) return;
+  try {
+    process.kill(c.pid, sig);
+  } catch {
+    /* already gone */
+  }
+}
+
 function kill(c: ChildProcess): void {
   if (!c.pid || c.exitCode !== null || c.signalCode !== null) return;
   try {
@@ -128,10 +138,10 @@ export class LocalOutput implements AudioOutput {
     return this.playing.size ? readLevels(this.levelsPath) : undefined;
   }
 
-  async playStream(stream: AudioStream, kind: PlayKind): Promise<PlayStart> {
+  async playStream(stream: AudioStream, kind: PlayKind, opts: StreamOptions = {}): Promise<PlayStart> {
     const choice = chooseStreamPlayer(this.env, stream.format, this.opts.binary);
     if (!choice.ok) return choice;
-    return this.launch(choice.name, choice.bin, choice.args, kind, stream.chunks);
+    return this.launch(choice.name, choice.bin, choice.args, kind, stream.chunks, opts.fadeMs);
   }
 
   async stop(kind?: PlayKind): Promise<void> {
@@ -149,6 +159,7 @@ export class LocalOutput implements AudioOutput {
     args: string[],
     kind: PlayKind,
     input: AsyncIterable<Uint8Array>,
+    fadeMs?: number,
   ): PlayStart {
     let child: ChildProcess;
     try {
@@ -159,7 +170,11 @@ export class LocalOutput implements AudioOutput {
         windowsHide: true,
         stdio: ["pipe", "ignore", "ignore"],
         // The bundled binary writes its spectrum levels there; other players ignore it.
-        env: { ...childEnv(this.env), [LEVELS_ENV]: this.levelsPath },
+        env: {
+          ...childEnv(this.env),
+          [LEVELS_ENV]: this.levelsPath,
+          ...(fadeMs ? { [FADE_IN_ENV]: String(fadeMs), [FADE_OUT_ENV]: String(fadeMs) } : {}),
+        },
       });
     } catch (err) {
       return { ok: false, reason: `cannot start ${name}: ${errorMessage(err)}` };
@@ -193,6 +208,13 @@ export class LocalOutput implements AudioOutput {
         this.stopped.add(child);
         kill(child);
         await Promise.race([done, new Promise((r) => setTimeout(r, 3000))]);
+      },
+      fadeOut: async (ms: number) => {
+        this.stopped.add(child);
+        // The bundled binary fades out on SIGUSR1 (over the length it was started with, else 500 ms) and
+        // then exits; other players, and Windows, which has no such signal, stop at once.
+        if (process.platform === "win32" || name !== "pi-speech-receiver" || ms <= 0) kill(child);
+        else signal(child, "SIGUSR1");
       },
     };
   }

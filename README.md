@@ -109,17 +109,24 @@ Speech › Read aloud options ────────────────�
 ```
 
 - **Read**: Off; Summarized (a spoken summary of the reply, read when the run ends); Streaming (a spoken summary
-  of each reasoning step, read as it is produced, through a separate Pi model). It starts Off in every session.
+  of the reasoning as it is produced, through a separate Pi model). It starts Off in every session.
+- **Streaming pacing**: it learns how the model thinks as the run goes (the time between thoughts, their length,
+  how long a summary takes). Each summary is sized to the time before the next thought, from 6 words up to the
+  Length setting: a fast, verbose thinker gets short summaries, a sparse one fuller ones. A short thought is held
+  for the next (about 1.5 times the usual gap, 1.5 to 8 s) and summarized with it, unless about 400 characters
+  have gathered or the run ends. A summary waits for the one speaking to finish; when narration falls behind it
+  crossfades instead (500 ms out, 500 ms in; through the bundled binary only, at once on Windows).
 - **Summarized by**: Same model (no extra request: the model ends its reply with the summary, which is read and
   then taken out of the reply, so you never see it and it is not kept in the session), or one of your Pi models
-  from a picker (one extra request to it per reply, with the reply). Streaming needs a separate model, so the
-  picker does not offer Same model there.
+  from a picker (one extra request to it per reply, with the reply). Streaming needs a separate model: the
+  picker does not offer Same model there, and choosing Streaming with Same model set picks the session's model
+  (or the first of yours) instead.
 - **Length**: Minimum ~15 s, Abridged ~30 s or Full ~60 s; the model is shown a placeholder of that many words
   (about 2.5 words a second), so the length is a best effort.
 - **Truncate at**: Off, 15, 30, 60 or 120 s; reading stops at the last sentence end before the limit, in every
   Read mode.
 
-Read, Length and Truncate at change in place with Enter or ←→; Summarized by opens its picker.
+Read, Length and Truncate at change in place with Enter, Space or ←→; Summarized by opens its picker.
 
 **Hotkeys ›** lists every action with its key; Enter runs the highlighted one:
 

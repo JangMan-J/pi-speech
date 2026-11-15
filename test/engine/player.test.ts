@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { AudioOutput, PlayKind, PlayOutcome, PlayStart } from "../../src/engine/audio";
+import type { AudioOutput, PlayKind, PlayOutcome, PlayStart, StreamOptions } from "../../src/engine/audio";
 import { Player, REPLACED } from "../../src/engine/player";
 import type { AudioStream } from "../../src/engine/provider";
 import { wrapPcmAsWav } from "../../src/engine/wav";
@@ -26,10 +26,10 @@ function fakeOutput(name = "fake") {
   let refuse: string | undefined;
   const output: AudioOutput = {
     name,
-    async playStream(stream: AudioStream, kind: PlayKind): Promise<PlayStart> {
+    async playStream(stream: AudioStream, kind: PlayKind, opts?: StreamOptions): Promise<PlayStart> {
       if (refuse) return { ok: false, reason: refuse };
       const tag = stream.file ?? "stream";
-      log.push(`play ${name} ${kind} ${tag}`);
+      log.push(`play ${name} ${kind} ${tag}${opts?.fadeMs ? ` fade-in ${opts.fadeMs}` : ""}`);
       const got = { format: stream.format, bytes: 0 };
       received.push(got);
       void (async () => {
@@ -47,6 +47,9 @@ function fakeOutput(name = "fake") {
         stop: async () => {
           log.push(`stop ${name} ${tag}`);
           end({ state: "cancelled" });
+        },
+        fadeOut: async (ms: number) => {
+          log.push(`fade-out ${name} ${tag} ${ms}`);
         },
       };
     },
@@ -68,6 +71,19 @@ function fakeOutput(name = "fake") {
 const tick = () => new Promise((r) => setTimeout(r, 0));
 
 describe("the player", () => {
+  it("a playback that asks for a crossfade fades out what it replaces; a plain one or a stop cuts it", async () => {
+    const f = fakeOutput();
+    const p = new Player(() => f.output);
+    await p.playStream(clip("a"), "message");
+    await p.playStream(clip("b"), "message", { ticket: p.claim(500), fadeMs: 500 });
+    expect(f.log).toEqual(["play fake message a", "fade-out fake a 500", "play fake message b fade-in 500"]);
+    await p.playStream(clip("c"), "message", { ticket: p.claim() });
+    expect(f.log.slice(3)).toEqual(["stop fake b", "play fake message c"]);
+    expect(p.replaceFade).toBeUndefined();
+    await p.stop();
+    expect(f.log).toContain("stop fake c");
+  });
+
   it("plays one thing at a time: a new playback replaces the one in progress", async () => {
     const f = fakeOutput();
     const p = new Player(() => f.output);

@@ -9,6 +9,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 export const LEVELS_ENV = "PI_SPEECH_LEVELS_FILE";
+/** The bundled binary fades a playback's start in over this many milliseconds. */
+export const FADE_IN_ENV = "PI_SPEECH_FADE_IN_MS";
+/** How long the bundled binary fades a playback out on SIGUSR1 before it stops, in milliseconds. */
+export const FADE_OUT_ENV = "PI_SPEECH_FADE_OUT_MS";
 export const BANDS = 12;
 
 /** The levels file of this process's playback or recording. */

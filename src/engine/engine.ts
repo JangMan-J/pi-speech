@@ -121,6 +121,7 @@ export class Engine {
       this.speech,
       (m, l) => this.notify(m, l),
       () => this.speech.settings.readAloud,
+      { speaking: () => this.player.playing },
     );
   }
 

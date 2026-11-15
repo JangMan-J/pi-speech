@@ -32,6 +32,8 @@ export async function streamAndPlay(
   player: Player,
   kind: PlayKind,
   ticket: number,
+  /** Crossfade from what plays now into this playback over this long. */
+  fadeMs?: number,
 ): Promise<StreamPlay> {
   const stale = player.signalFor(ticket);
   const caller = req.signal;
@@ -39,15 +41,21 @@ export async function streamAndPlay(
   const request = new AbortController();
   let started: PlayStart | undefined;
   let stopped = false;
-  /** Stop: cancel the request and the playback, unless the playback has ended by itself (`ended`). */
-  const stop = (ended = false) => {
+  /**
+   * Stop: cancel the request and the playback, unless the playback has ended by itself (`ended`); faded over
+   * `fadeMs` when given and the output can fade.
+   */
+  const stop = (ended = false, fadeMs?: number) => {
     if (stopped) return;
     stopped = true;
     request.abort();
-    if (started?.ok && !ended) void started.stop().catch(() => {});
+    if (!started?.ok || ended) return;
+    void (fadeMs && started.fadeOut ? started.fadeOut(fadeMs) : started.stop()).catch(() => {});
   };
   const onAbort = () => stop();
-  stale.addEventListener("abort", onAbort);
+  // A newer playback that asked for a crossfade fades this one out; a stop ends it at once.
+  const onStale = () => stop(false, player.replaceFade);
+  stale.addEventListener("abort", onStale);
   caller?.addEventListener("abort", onAbort);
   const failed = async (reason: string): Promise<never> => {
     request.abort(); // a response still coming (after a Stray) is not wanted
@@ -73,7 +81,11 @@ export async function streamAndPlay(
         kept.end();
       }
     })();
-    started = await player.playStream({ format: stream.format, chunks: kept.read() }, kind, { ticket, text: req.text });
+    started = await player.playStream({ format: stream.format, chunks: kept.read() }, kind, {
+      ticket,
+      text: req.text,
+      fadeMs,
+    });
     if (started.ok) {
       if (stopped) void started.stop().catch(() => {});
       void started.done.then((o) => {
@@ -91,7 +103,7 @@ export async function streamAndPlay(
     }
     return { state: "arrived", audio, started };
   } finally {
-    stale.removeEventListener("abort", onAbort);
+    stale.removeEventListener("abort", onStale);
     caller?.removeEventListener("abort", onAbort);
   }
 }

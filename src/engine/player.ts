@@ -30,6 +30,8 @@ export interface PlayOptions {
   cleanup?: () => void;
   /** The text the Stream speaks: its length sets how much audio the start buffer may hold. */
   text?: string;
+  /** Crossfade: fade the playback this one replaces out, and this one's start in, over this long. */
+  fadeMs?: number;
 }
 
 interface Current {
@@ -57,6 +59,8 @@ export class Player {
   private tickets = 0;
   /** Aborted when the newest ticket goes stale: a newer claim or a stop. */
   private claimed = new AbortController();
+  /** The crossfade the newest claim asked for, if any. */
+  private claimFade?: number;
   private lastFile?: string;
 
   constructor(
@@ -73,8 +77,12 @@ export class Player {
     return this.lastFile;
   }
 
-  /** Reserve the next playback; plays with older tickets are skipped. */
-  claim(): number {
+  /**
+   * Reserve the next playback; plays with older tickets are skipped, and one already playing ends: faded
+   * over `fadeMs` when given (a crossfade into this one), else at once.
+   */
+  claim(fadeMs?: number): number {
+    this.claimFade = fadeMs;
     const ticket = ++this.tickets;
     this.claimed.abort();
     this.claimed = new AbortController();
@@ -110,12 +118,12 @@ export class Player {
       return { ok: false, reason: REPLACED };
     }
     const output = this.output();
-    const replacing = await this.stopCurrent(false);
+    const replacing = await this.stopCurrent(false, opts.fadeMs);
     const expected = opts.text === undefined ? undefined : estimateSeconds(opts.text);
     const chunks = bufferStart(stream.chunks, stream.format, expected);
     let started: PlayStart;
     try {
-      started = await output.playStream({ ...stream, chunks }, kind);
+      started = await output.playStream({ ...stream, chunks }, kind, opts.fadeMs ? { fadeMs: opts.fadeMs } : undefined);
     } catch (err) {
       started = { ok: false, reason: errorMessage(err) };
     }
@@ -133,7 +141,7 @@ export class Player {
     }
     const entry: Current = { playback: started, kind };
     // Another play may have started while this one was starting; the newest wins.
-    await this.stopCurrent(false);
+    await this.stopCurrent(false, opts.fadeMs);
     this.current = entry;
     this.events.onChange?.(true);
     void started.done.then((outcome) => {
@@ -151,6 +159,11 @@ export class Player {
     return opts.ticket !== undefined && opts.ticket !== this.tickets;
   }
 
+  /** How a playback whose ticket just went stale ends: faded over this long, or at once (undefined). */
+  get replaceFade(): number | undefined {
+    return this.claimFade;
+  }
+
   /** Stop what plays and cancel plays still being prepared. Resolves true when something was playing. */
   async stop(): Promise<boolean> {
     const was = this.playing;
@@ -162,13 +175,17 @@ export class Player {
     return was;
   }
 
-  /** Stop the current playback; `announce` false when a new one takes its place at once. */
-  private async stopCurrent(announce = true): Promise<boolean> {
+  /**
+   * Stop the current playback; `announce` false when a new one takes its place at once. With `fadeMs` it
+   * fades out instead (where its output can fade), and this does not wait for it.
+   */
+  private async stopCurrent(announce = true, fadeMs?: number): Promise<boolean> {
     const c = this.current;
     if (!c) return false;
     this.current = undefined;
     if (announce) this.events.onChange?.(false);
-    await c.playback.stop().catch(() => {});
+    if (fadeMs && c.playback.fadeOut) await c.playback.fadeOut(fadeMs).catch(() => {});
+    else await c.playback.stop().catch(() => {});
     return true;
   }
 }

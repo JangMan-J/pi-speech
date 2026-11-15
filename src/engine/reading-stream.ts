@@ -36,6 +36,8 @@ export interface StreamReadingDeps {
   signal?: AbortSignal;
   /** The whole text, for the start buffer's estimate of the Reading's length. */
   text?: string;
+  /** Crossfade from what plays now into this Reading over this long. */
+  fadeMs?: number;
 }
 
 const sameFormat = (a: StreamFormat, b: StreamFormat) =>
@@ -63,7 +65,7 @@ interface Piece {
 
 /** Speak `d.pieces` as one Reading played as a Stream; see the module comment. */
 export async function streamReading(d: StreamReadingDeps): Promise<ReadingResult> {
-  const ticket = d.player.claim();
+  const ticket = d.player.claim(d.fadeMs);
   const stale = d.player.signalFor(ticket);
   if (stale.aborted || d.signal?.aborted) return { state: "stopped" };
   const halt = new AbortController();
@@ -84,12 +86,13 @@ export async function streamReading(d: StreamReadingDeps): Promise<ReadingResult
     return { format, resolve, audio: new ChunkBuffer(), request: new AbortController(), arrived, arrive };
   });
 
-  const stop = (ended = false) => {
+  const stop = (ended = false, fadeMs?: number) => {
     if (stopped) return;
     stopped = true;
     halt.abort();
     for (const p of pieces) p.request.abort();
-    if (started?.ok && !ended) void started.stop().catch(() => {});
+    if (!started?.ok || ended) return;
+    void (fadeMs && started.fadeOut ? started.fadeOut(fadeMs) : started.stop()).catch(() => {});
   };
   const fail = (reason: string) => {
     if (stopped) return;
@@ -97,7 +100,9 @@ export async function streamReading(d: StreamReadingDeps): Promise<ReadingResult
     stop();
   };
   const onAbort = () => stop();
-  stale.addEventListener("abort", onAbort);
+  // A newer playback that asked for a crossfade fades this one out; a stop ends it at once.
+  const onStale = () => stop(false, d.player.replaceFade);
+  stale.addEventListener("abort", onStale);
   d.signal?.addEventListener("abort", onAbort);
 
   let next = 0;
@@ -170,7 +175,11 @@ export async function streamReading(d: StreamReadingDeps): Promise<ReadingResult
       if (failure !== undefined) throw new ReadingFailed(failure);
       return { state: "stopped" };
     }
-    started = await d.player.playStream({ format: first, chunks: feed(first) }, "message", { ticket, text: d.text });
+    started = await d.player.playStream({ format: first, chunks: feed(first) }, "message", {
+      ticket,
+      text: d.text,
+      fadeMs: d.fadeMs,
+    });
     if (started.ok) {
       if (stopped) void started.stop().catch(() => {});
       void started.done.then((o) => {
@@ -206,7 +215,7 @@ export async function streamReading(d: StreamReadingDeps): Promise<ReadingResult
     if (started.ok) return { state: "saved", saved, player: started.player };
     return { state: "saved", saved, notPlayed: started.reason };
   } finally {
-    stale.removeEventListener("abort", onAbort);
+    stale.removeEventListener("abort", onStale);
     d.signal?.removeEventListener("abort", onAbort);
   }
 }

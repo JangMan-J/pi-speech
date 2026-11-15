@@ -198,53 +198,37 @@ describe("read-aloud summaries", () => {
 
 describe("streaming", () => {
   const flush = () => new Promise<void>((r) => setTimeout(r, 0));
+  /** Read-aloud whose narrator runs on a clock the test moves; thoughts long enough to be said at once. */
+  function streaming(options?: Partial<ReadAloudOptions>) {
+    const h = harness(undefined, { summarizer: "anthropic/claude-haiku", ...options });
+    return h;
+  }
+  const LONG = "I should read the logs first, then look at the config. ".repeat(10);
 
-  it("speaks a summary of each reasoning block as it arrives, in order", async () => {
-    const h = harness(undefined, { summarizer: "anthropic/claude-haiku", length: "abridged" });
+  it("summarizes the reasoning with the summarizer, its length shown as a placeholder, and speaks it", async () => {
+    const h = streaming({ length: "abridged" });
     const asked: Array<[string, string]> = [];
     h.r.summarize = async (model, prompt) => {
       asked.push([model, prompt]);
-      return `step ${asked.length}`;
+      return "Reading the logs.";
     };
     h.r.mode = "streaming";
-    h.r.onThinkingBlock("I should read the logs first.");
-    h.r.onThinkingBlock("Then I will patch the config.");
+    h.r.onThinkingBlock(LONG);
     await flush();
-    expect(asked).toEqual([
-      ["anthropic/claude-haiku", streamingPrompt("abridged", "I should read the logs first.")],
-      ["anthropic/claude-haiku", streamingPrompt("abridged", "Then I will patch the config.")],
-    ]);
-    expect(h.spoken).toEqual(["step 1", "step 2"]);
-  });
-
-  it("merges a new block into the last pending one instead of queueing without bound", async () => {
-    const h = harness(undefined, { summarizer: "anthropic/claude-haiku" });
-    const seen: string[] = [];
-    let release: () => void = () => {};
-    const gate = new Promise<void>((r) => (release = r));
-    h.r.summarize = async (_model, prompt) => {
-      if (seen.length === 0) await gate;
-      seen.push(prompt);
-      return "ok";
-    };
-    h.r.mode = "streaming";
-    h.r.onThinkingBlock("one");
-    h.r.onThinkingBlock("two");
-    h.r.onThinkingBlock("three");
-    h.r.onThinkingBlock("four");
-    await flush();
-    release();
-    await flush();
-    expect(seen).toHaveLength(3);
-    expect(seen[0]).toContain("<reasoning>\none\n</reasoning>");
-    expect(seen[1]).toContain("<reasoning>\ntwo\n</reasoning>");
-    expect(seen[2]).toContain("<reasoning>\nthree\n\nfour\n</reasoning>");
+    expect(asked).toHaveLength(1);
+    expect(asked[0][0]).toBe("anthropic/claude-haiku");
+    // Before the cadence is known, the summary may be as long as the Length setting: 75 words.
+    expect(asked[0][1]).toBe(streamingPrompt(75, LONG.trim()));
+    expect(asked[0][1]).toContain(loremWords(75));
+    expect(h.spoken).toEqual(["Reading the logs."]);
   });
 
   it("warns once when no separate Summarized by model is chosen", async () => {
     const h = harness();
     h.r.mode = "streaming";
-    h.r.onThinkingBlock("some reasoning");
+    h.r.onThinkingBlock(LONG);
+    await flush();
+    h.r.onThinkingBlock(LONG);
     await flush();
     expect(h.spoken).toEqual([]);
     expect(h.notes).toEqual([
@@ -255,26 +239,29 @@ describe("streaming", () => {
     ]);
   });
 
-  it("does nothing outside streaming mode, and does not read a final reply at run end", async () => {
-    const h = harness(undefined, { summarizer: "anthropic/claude-haiku" });
+  it("does nothing outside streaming mode; at run end it says what is held, never the reply", async () => {
+    const h = streaming();
     h.r.summarize = async () => "summary";
     h.r.mode = "summary";
-    h.r.onThinkingBlock("reasoning");
+    h.r.onThinkingBlock(LONG);
     await flush();
     expect(h.spoken).toEqual([]);
     h.r.mode = "streaming";
-    h.r.onThinkingBlock("reasoning");
+    h.r.onRunStart([]);
+    h.r.onThinkingBlock("A short thought.");
     await flush();
+    expect(h.spoken).toEqual([]); // held for the next
     await h.r.onRunEnd(reply("Final answer."));
+    await flush();
     expect(h.spoken).toEqual(["summary"]);
   });
 
   it("truncates each spoken summary to the Truncate at limit", async () => {
     const long = "A sentence with some words. ".repeat(20);
-    const h = harness(undefined, { summarizer: "anthropic/claude-haiku", truncate: 15 });
+    const h = streaming({ truncate: 15 });
     h.r.summarize = async () => long;
     h.r.mode = "streaming";
-    h.r.onThinkingBlock("reasoning");
+    h.r.onThinkingBlock(LONG);
     await flush();
     expect(h.spoken).toEqual([truncateToSeconds(long, 15).text]);
   });

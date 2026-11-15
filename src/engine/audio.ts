@@ -16,6 +16,16 @@ export interface Playback {
   done: Promise<PlayOutcome>;
   /** Stop this playback; it then ends as cancelled. */
   stop(): Promise<void>;
+  /**
+   * Fade this playback out over `ms`, then stop it (it ends as cancelled); resolves once asked, not once
+   * faded. Where the player cannot fade, it stops at once.
+   */
+  fadeOut?(ms: number): Promise<void>;
+}
+
+export interface StreamOptions {
+  /** Fade the start in over this long, and fade out the playback this one replaces (crossfade). */
+  fadeMs?: number;
 }
 
 export type PlayStart = ({ ok: true } & Playback) | { ok: false; reason: string };
@@ -26,7 +36,7 @@ export interface AudioOutput {
    * Start playing a Stream as its chunks arrive, without waiting for it to finish. Every playback is a Stream
    * (GLOSSARY.md), a saved message replayed included. Never throws: a failure to start is `{ ok: false }`.
    */
-  playStream(stream: AudioStream, kind: PlayKind): Promise<PlayStart>;
+  playStream(stream: AudioStream, kind: PlayKind, opts?: StreamOptions): Promise<PlayStart>;
   /** Stop what this output plays: everything, or only one kind. */
   stop(kind?: PlayKind): Promise<void>;
   /** The 12 spectrum bands (`0..100`) of what plays now; undefined when nothing does or it cannot tell. */

@@ -12,6 +12,7 @@
  */
 
 import { errorMessage } from "./env";
+import { FADE_MS, Narrator, type NarratorDeps } from "./narration";
 import { REPLACED } from "./player";
 import { finalAssistantText, speakable } from "./readable";
 import { ReadingFailed, readingFailedMessage } from "./reading";
@@ -72,8 +73,12 @@ function what(whose: "your" | "the"): string {
 }
 
 function lengthClause(length: SummaryLength): string {
-  const seconds = LENGTH_SECONDS[length];
-  const n = wordsFor(seconds);
+  return wordsClause(wordsFor(LENGTH_SECONDS[length]));
+}
+
+/** The length asked for, shown as a lorem-ipsum placeholder of `n` words: models match a shape better than a count. */
+function wordsClause(n: number): string {
+  const seconds = Math.max(1, Math.round(n / WORDS_PER_SECOND));
   return `Make it about as long as this ${n}-word placeholder (about ${seconds} seconds spoken): ${loremWords(n)}`;
 }
 
@@ -97,11 +102,11 @@ export function summaryPrompt(length: SummaryLength, reply: string): string {
   ].join("\n\n");
 }
 
-/** The one extra request for Streaming: a single reasoning block, asking for a spoken summary. */
-export function streamingPrompt(length: SummaryLength, block: string): string {
+/** The one extra request for Streaming: the reasoning gathered, asking for a spoken summary of about `words` words. */
+export function streamingPrompt(words: number, block: string): string {
   return (
     `Write a spoken summary of this reasoning step below, to be read aloud by text-to-speech, ${SPOKEN_STYLE} ` +
-    `${lengthClause(length)}\nAnswer with the summary only.\n\n<reasoning>\n${block}\n</reasoning>`
+    `${wordsClause(words)}\nAnswer with the summary only.\n\n<reasoning>\n${block}\n</reasoning>`
   );
 }
 
@@ -172,16 +177,32 @@ export class ReadAloud {
   }
   /** The summary taken from the marked block of this run's reply. */
   private taken?: string;
-  /** Streaming: reasoning blocks awaiting their spoken summary, the newest merged into the tail when full. */
-  private queue: string[] = [];
-  /** Streaming: one summary is being requested or spoken now. */
-  private narrating = false;
+  /** Streaming: paces the summaries of the reasoning to how the model thinks. */
+  private readonly narrator: Narrator;
+  /** Streaming has warned this run that it has no model to summarize with. */
+  private warned = false;
 
   constructor(
     private readonly speech: Pick<Speech, "say">,
     private readonly notify: Notify,
     private readonly options: () => ReadAloudOptions = () => DEFAULT_READ_ALOUD,
-  ) {}
+    /** Something plays now; and the clock and timers, replaceable for tests. */
+    narration: Partial<Pick<NarratorDeps, "speaking" | "now" | "after">> = {},
+  ) {
+    this.narrator = new Narrator({
+      now: narration.now ?? (() => Date.now()),
+      after:
+        narration.after ??
+        ((ms, fn) => {
+          const t = setTimeout(fn, ms);
+          return () => clearTimeout(t);
+        }),
+      speaking: narration.speaking ?? (() => false),
+      maxWords: () => wordsFor(LENGTH_SECONDS[this.options().length]),
+      summarize: (text, words, signal) => this.narrationSummary(text, words, signal),
+      speak: (text, fade, signal) => this.narrate(text, fade, signal),
+    });
+  }
 
   /** On: reading a spoken summary of the reply, unless Streaming is chosen. */
   get enabled(): boolean {
@@ -209,7 +230,8 @@ export class ReadAloud {
    */
   onRunStart(guidelines: string[]): string[] {
     this.taken = undefined;
-    this.queue = [];
+    this.narrator.reset();
+    this.warned = false;
     for (let i = guidelines.length - 1; i >= 0; i--) {
       if (guidelines[i].startsWith(GUIDELINE_PREFIX)) guidelines.splice(i, 1);
     }
@@ -247,6 +269,7 @@ export class ReadAloud {
     const mode = this.mode;
     const taken = this.taken;
     this.taken = undefined;
+    if (mode === "streaming") this.narrator.end();
     if (mode !== "summary") return;
     const opts = this.options();
     const summary = await this.summary(messages, taken, opts, signal);
@@ -265,59 +288,48 @@ export class ReadAloud {
     }
   }
 
-  /** Streaming: a reasoning block finished streaming; queue its spoken summary when the mode says so. */
+  /** Streaming: a reasoning block finished streaming; the narrator decides when its summary is made. */
   onThinkingBlock(block: string, signal?: AbortSignal): void {
     if (this.mode !== "streaming") return;
-    const text = block.trim();
-    if (!text) return;
-    // Stay near live: instead of growing without bound, merge into the last pending block.
-    if (this.queue.length >= 2) this.queue[this.queue.length - 1] += `\n\n${text}`;
-    else this.queue.push(text);
-    void this.drain(signal);
+    this.narrator.thought(block, signal);
   }
 
-  /** Speak one spoken summary per queued block, in order, until the queue is empty. */
-  private async drain(signal?: AbortSignal): Promise<void> {
-    if (this.narrating) return;
-    this.narrating = true;
-    try {
-      while (this.queue.length) {
-        const block = this.queue.shift() as string;
-        const opts = this.options();
-        if (!opts.summarizer || !this.summarize) {
-          this.queue.length = 0;
-          this.notify(
-            "Streaming needs a separate Summarized by model (Same model cannot summarize mid-run)",
-            "warning",
-          );
-          return;
-        }
-        let spoken: string;
-        try {
-          const answer = await this.summarize(opts.summarizer, streamingPrompt(opts.length, block), signal);
-          const marked = splitSummary(answer).summary;
-          spoken = speakable((marked ?? answer).trim());
-        } catch (err) {
-          if (signal?.aborted) return;
-          this.notify(`Streaming: the summary by ${opts.summarizer} failed: ${errorMessage(err)}`, "error");
-          continue;
-        }
-        if (!spoken) continue;
-        if (opts.truncate) spoken = truncateToSeconds(spoken, opts.truncate).text;
-        try {
-          const r = await this.speech.say(spoken, { signal });
-          if (!r.stopped && !r.player && r.notPlayed !== REPLACED) {
-            this.notify(`Streaming could not play: ${r.notPlayed ?? "unknown reason"}`, "error");
-          }
-        } catch (err) {
-          if (signal?.aborted) return;
-          if (err instanceof ReadingFailed) {
-            this.notify(readingFailedMessage("Streaming", "reasoning", err.reason), "error");
-          } else this.notify(`Streaming failed: ${errorMessage(err)}`, "error");
-        }
+  /** Streaming: the spoken summary of reasoning gathered, about `words` long; undefined when none. */
+  private async narrationSummary(text: string, words: number, signal?: AbortSignal): Promise<string | undefined> {
+    const opts = this.options();
+    if (!opts.summarizer || !this.summarize) {
+      if (!this.warned) {
+        this.warned = true;
+        this.notify("Streaming needs a separate Summarized by model (Same model cannot summarize mid-run)", "warning");
       }
-    } finally {
-      this.narrating = false;
+      return undefined;
+    }
+    try {
+      const answer = await this.summarize(opts.summarizer, streamingPrompt(words, text), signal);
+      const marked = splitSummary(answer).summary;
+      const spoken = speakable((marked ?? answer).trim());
+      if (!spoken) return undefined;
+      return opts.truncate ? truncateToSeconds(spoken, opts.truncate).text : spoken;
+    } catch (err) {
+      if (!signal?.aborted) {
+        this.notify(`Streaming: the summary by ${opts.summarizer} failed: ${errorMessage(err)}`, "error");
+      }
+      return undefined;
+    }
+  }
+
+  /** Streaming: speak one summary, crossfading over what plays when `fade`. */
+  private async narrate(text: string, fade: boolean, signal?: AbortSignal): Promise<void> {
+    try {
+      const r = await this.speech.say(text, { signal, ...(fade ? { fadeMs: FADE_MS } : {}) });
+      if (!r.stopped && !r.player && r.notPlayed !== REPLACED) {
+        this.notify(`Streaming could not play: ${r.notPlayed ?? "unknown reason"}`, "error");
+      }
+    } catch (err) {
+      if (signal?.aborted) return;
+      if (err instanceof ReadingFailed)
+        this.notify(readingFailedMessage("Streaming", "reasoning", err.reason), "error");
+      else this.notify(`Streaming failed: ${errorMessage(err)}`, "error");
     }
   }
 
