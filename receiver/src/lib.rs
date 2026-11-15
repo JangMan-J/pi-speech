@@ -5,6 +5,7 @@ pub mod audio;
 pub mod engines;
 pub mod front;
 pub mod http;
+pub mod lease;
 pub mod models;
 pub mod pair;
 mod private;

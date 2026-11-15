@@ -632,24 +632,45 @@ pub fn download(ctx: &Ctx, conn: &mut Conn, req: &Request) -> Response {
         let _ = child.wait();
         return Response::sent();
     }
-    let mut finished = false;
+    // The lines come on a thread of their own, so a client that goes away while none comes (a long
+    // unpacking prints nothing) is seen too: then the download stops.
+    let (tx, rx) = mpsc::channel::<String>();
     if let Some(out) = child.stdout.take() {
-        for line in BufReader::new(out).lines() {
-            let Ok(line) = line else { break };
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
+        thread::spawn(move || {
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    return;
+                }
             }
-            let ended = serde_json::from_str::<Value>(line)
-                .is_ok_and(|v| matches!(v["event"].as_str(), Some("done" | "stopped" | "error")));
-            if ctx.down.load(Ordering::SeqCst)
-                || conn.write_chunk(format!("{line}\n").as_bytes()).is_err()
-            {
-                // The client went away (or the receiver shuts down): stop the download.
-                drop(stdin.take());
-                break;
+        });
+    }
+    let mut finished = false;
+    loop {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(line) => {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let ended = serde_json::from_str::<Value>(line).is_ok_and(|v| {
+                    matches!(v["event"].as_str(), Some("done" | "stopped" | "error"))
+                });
+                if ctx.down.load(Ordering::SeqCst)
+                    || conn.write_chunk(format!("{line}\n").as_bytes()).is_err()
+                {
+                    // The client went away (or the receiver shuts down): stop the download.
+                    drop(stdin.take());
+                    break;
+                }
+                finished |= ended;
             }
-            finished |= ended;
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if ctx.down.load(Ordering::SeqCst) || conn.peer_gone() {
+                    drop(stdin.take());
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
     drop(stdin.take());

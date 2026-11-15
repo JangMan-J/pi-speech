@@ -1,6 +1,6 @@
 use pi_speech_receiver::audio::{play, record};
 use pi_speech_receiver::server::{self, Config, Server, DEFAULT_PORT};
-use pi_speech_receiver::{models, shared, signals, speak, ssh, token, transcribe};
+use pi_speech_receiver::{lease, models, shared, signals, speak, ssh, token, transcribe};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -12,9 +12,10 @@ const NETWORK_NOTE: &str = "--network allows a --listen address that is not loop
 
 fn usage() -> String {
     format!(
-        "usage: {SERVE_USAGE}\n       {}\n       {}\n       {}\n       {}\n       {}\n       {}\n       {}\n\n{NETWORK_NOTE}\n\n{}\n\n{}",
+        "usage: {SERVE_USAGE}\n       {}\n       {}\n       {}\n       {}\n       {}\n       {}\n       {}\n       {}\n\n{NETWORK_NOTE}\n\n{}\n\n{}",
         ssh::USAGE,
         ssh::PAIR_USAGE,
+        lease::USAGE,
         play::USAGE,
         record::USAGE,
         transcribe::USAGE,
@@ -113,6 +114,7 @@ fn main() -> ExitCode {
         Some("ssh") => return ssh::ssh_main(&args[1..]),
         Some("pair") => return ssh::pair_main(&args[1..]),
         Some("shared") => return shared::shared_main(&args[1..]),
+        Some("lease") => return lease::lease_main(&args[1..]),
         Some("serve") => &args[1..],
         _ => &args[..],
     };

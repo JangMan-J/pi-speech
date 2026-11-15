@@ -733,6 +733,60 @@ fn a_faded_cancel_fades_the_built_in_player_out_and_ends_it_as_cancelled() {
     std::fs::remove_dir_all(dir).ok();
 }
 
+/// `lease`: joins the shared receiver (starting it), says its port and token, and holds it
+/// until its input ends; the receiver stops once no lease holds it.
+#[cfg(unix)]
+#[test]
+fn a_lease_holds_the_shared_receiver_until_its_input_ends() {
+    use std::io::{BufRead, Write};
+    let dir = scratch("cli-lease");
+    let mut c = command(&dir, &["lease"]);
+    c.stdin(Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    let mut out = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    out.read_line(&mut line).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(v["event"], "ready", "{line}");
+    let port = v["port"].as_u64().unwrap() as u16;
+    let token = v["token"].as_str().unwrap().to_string();
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let health = request(addr, "GET", "/v1/health", Some(&token), &[], b"", None);
+    assert_eq!(health.status, 200, "{}", health.text());
+
+    // A second lease (another Pi) shares it.
+    let mut c2 = command(&dir, &["lease"]);
+    c2.stdin(Stdio::piped());
+    let mut second = c2.spawn().unwrap();
+    let mut line2 = String::new();
+    BufReader::new(second.stdout.take().unwrap())
+        .read_line(&mut line2)
+        .unwrap();
+    let v2: serde_json::Value = serde_json::from_str(&line2).unwrap();
+    assert_eq!(v2["port"].as_u64(), Some(port as u64));
+
+    // The first goes: the receiver stays for the second; the second goes: it stops.
+    let _ = child.stdin.take().unwrap().write_all(b"");
+    assert_eq!(exit_code_within(&mut child, 5), Some(0));
+    assert_eq!(
+        request(addr, "GET", "/v1/health", Some(&token), &[], b"", None).status,
+        200
+    );
+    drop(second.stdin.take());
+    assert_eq!(exit_code_within(&mut second, 5), Some(0));
+    assert!(wait_until(Duration::from_secs(5), || {
+        std::net::TcpStream::connect(addr).is_err()
+    }));
+    assert_eq!(
+        command(&dir, &["lease", "--probe"])
+            .status()
+            .unwrap()
+            .code(),
+        Some(2)
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
+
 #[test]
 fn levels_endpoint_reports_active_recording_and_playback_bands() {
     let dir = scratch("cli-levels");
