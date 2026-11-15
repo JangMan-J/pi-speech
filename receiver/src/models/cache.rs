@@ -12,10 +12,10 @@
 //! so that two downloads of the same model (say from two Pi sessions sharing one receiver) never
 //! write the same part or unpack at once: the second waits, then finds the model in place or
 //! resumes the part.
-//! A shared lexicon (a Piper voice's) is the file `<name>` in the cache root, and `<name>.part`
-//! while it is being downloaded. `<name>.lock` is the same kind of lock for a download of the
-//! lexicon, so that two downloads of voices that share it never write the same `<name>.part` at
-//! once.
+//! A shared lexicon (a Piper or Kitten voice's) is the file `<name>` in the cache root, and
+//! `<name>.part` while it is being downloaded. `<name>.lock` is the same kind of lock for a
+//! download of the lexicon, so that two downloads of voices that share it never write the same
+//! `<name>.part` at once.
 //!
 //! A download removes its lock file as it ends, while it still holds it, so a lock file is in
 //! the cache only while a download runs (or after a hard kill, until the next download of the
