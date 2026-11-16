@@ -5,8 +5,8 @@
 //! `~/Library/Caches/pi-speech/models` on macOS, `%LOCALAPPDATA%\pi-speech\models` on Windows.
 //!
 //! Inside it, a model is the directory `<dir>` (complete: it is renamed into place only once
-//! unpacked); `<dir>.part` is a download in progress or interrupted; `.unpack-<dir>-<12 hex>` is
-//! a directory being unpacked (left behind only by a hard kill, and removed by the next download
+//! unpacked); `<dir>.part` is a download in progress or interrupted;
+//! `.unpack-<dir>-<lowercase hex>` is a directory being unpacked (left behind only by a hard kill, and removed by the next download
 //! of the same model, which holds `<dir>.lock`; another model's is never taken for it).
 //! Nothing locks the cache as a whole: downloads of different models run at once.
 //! `<dir>.lock` is an empty file that a download of the model holds locked (the system's file
@@ -103,13 +103,14 @@ pub fn unpack_prefix(entry: &Entry) -> String {
 /// The random bytes in an unpacking directory's name: `.unpack-<dir>-<hex of these>`.
 pub const UNPACK_RANDOM_BYTES: usize = 6;
 
-/// Whether `name` is an unpacking directory of `entry`: its prefix, then exactly the random
-/// hex. The prefix alone would also match another model's (`.unpack-voice-` is the start of
-/// `.unpack-voice-hi-<hex>`), and that one may be unpacking right now in another download.
+/// Whether `name` is an unpacking directory of `entry`: its prefix, then a non-empty suffix of
+/// lowercase hex of any length. The prefix alone would also match another model's
+/// (`.unpack-voice-` is the start of `.unpack-voice-hi-<hex>`), but the `-` left in that model's
+/// suffix is not hex, so one that may be unpacking in another download is never matched.
 pub fn is_unpack_of(name: &str, entry: &Entry) -> bool {
     name.strip_prefix(&unpack_prefix(entry))
         .is_some_and(|rest| {
-            rest.len() == 2 * UNPACK_RANDOM_BYTES
+            !rest.is_empty()
                 && rest
                     .bytes()
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
