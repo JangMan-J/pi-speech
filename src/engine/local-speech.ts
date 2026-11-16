@@ -11,6 +11,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import type { BridgeModels } from "../bridge/index";
 import { ChunkBuffer, clipOf } from "./audio-stream";
+import { type LocalModel, listModels } from "./local-models";
 import type { AudioStream, SpeechProvider, SynthesisRequest, SynthesizedAudio } from "./provider";
 
 export class LocalSpeechError extends Error {
@@ -468,6 +469,8 @@ export class LocalSpeechProvider implements SpeechProvider {
   private readonly worker: SpeechWorker;
   /** What the worker runs with for the chosen device (the GPU runtime's), as it was started. */
   private deviceEnv: NodeJS.ProcessEnv = {};
+  /** The catalogue's language lists, fetched once rather than for every utterance. */
+  private catalogue?: Promise<LocalModel[]>;
 
   constructor(
     /** The binary's path; throws why there is none. */
@@ -515,12 +518,23 @@ export class LocalSpeechProvider implements SpeechProvider {
     return listVoices(this.binary(), id, { signal, env: this.env() });
   }
 
+  private languages(): Promise<LocalModel[]> {
+    // Speaking still works with a receiver whose catalogue cannot be read; without its languages, send none.
+    this.catalogue ??= listModels(this.binary(), this.env()).catch(() => []);
+    return this.catalogue;
+  }
+
   async synthesizeStream(req: SynthesisRequest): Promise<AudioStream> {
     const remote = this.remote();
     if (remote) return remote.speak(req.model, req.text, { voice: req.voice, signal: req.signal });
     this.binary();
     await this.applyDevice();
-    const lang = req.language && req.language !== "auto" ? req.language : undefined;
+    const requested = req.language && req.language !== "auto" ? req.language : undefined;
+    const lang =
+      requested &&
+      (await this.languages()).some((model) => model.id === req.model && model.languages.includes(requested))
+        ? requested
+        : undefined;
     return this.worker.speak(req.model, req.text, { voice: req.voice, signal: req.signal, lang });
   }
 

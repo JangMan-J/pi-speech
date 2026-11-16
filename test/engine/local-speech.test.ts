@@ -25,6 +25,7 @@ afterEach(() => rmSync(dir, { recursive: true, force: true }));
 function fakeSpeak(): string {
   const p = join(dir, "fake-speak");
   const log = join(dir, "log.json");
+  const modelsLog = join(dir, "models.log");
   const pid = join(dir, "pid");
   writeFileSync(
     p,
@@ -33,6 +34,15 @@ const fs = require("node:fs");
 const [, , cmd, id, ...rest] = process.argv;
 fs.writeFileSync(${JSON.stringify(pid)}, String(process.pid));
 const ev = (v) => process.stderr.write(JSON.stringify(v) + "\\n");
+if (cmd === "models" && id === "list") {
+  fs.appendFileSync(${JSON.stringify(modelsLog)}, "list\\n");
+  for (const m of [
+    { id: "ok", kind: "speech", languages: ["en", "de"] },
+    { id: "kokoro-multi-lang-v1.1", kind: "speech", languages: [] },
+    { id: "piper", kind: "speech", languages: ["en"] },
+  ]) process.stdout.write(JSON.stringify(m) + "\\n");
+  process.exit(0);
+}
 if (cmd !== "speak") process.exit(2);
 if (id === "--serve") {
   // The running worker: framed answers (kind byte, length, body); model "ok" speaks [1,2,3,4] then [5,6].
@@ -198,6 +208,18 @@ describe.skipIf(!STAND_IN_BINARY)("LocalSpeechProvider", () => {
     await expect(provider.synthesize({ text: "Hi.", model: "missing", voice: "", language: "auto" })).rejects.toThrow(
       /not downloaded/,
     );
+    provider.close();
+  });
+
+  it("omits a language the model's catalogue does not list, and caches the catalogue", async () => {
+    const bin = fakeSpeak();
+    const provider = new LocalSpeechProvider(() => bin);
+    const request = () => JSON.parse(readFileSync(join(dir, "log.json"), "utf8")).request;
+    await provider.synthesize({ text: "Hi.", model: "kokoro-multi-lang-v1.1", voice: "", language: "en" });
+    expect(request().lang).toBeUndefined();
+    await provider.synthesize({ text: "Hi.", model: "piper", voice: "", language: "en" });
+    expect(request().lang).toBe("en");
+    expect(readFileSync(join(dir, "models.log"), "utf8").trim().split("\n")).toHaveLength(1);
     provider.close();
   });
 
