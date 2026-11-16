@@ -108,8 +108,10 @@ export interface Settings {
   languages: LanguageOverrides;
   /** The language spoken into dictation and transcribed files, such as "ja"; undefined leaves it to the model. */
   dictationLanguage?: string;
-  /** A command the dictation transcript is handed to (%s is the text); undefined pastes into the editor. */
+  /** A command the dictation transcript is handed to (%s is the text); kept while the mode is Pi. */
   dictationOutput?: string;
+  /** Where dictation goes: Pi's input box (the default, also when absent), or the command in `dictationOutput`. */
+  dictationOutputMode?: DictationOutputMode;
   modelSort: ModelSort;
   /** User-defined OpenAI-compatible speech endpoints, by name (src/engine/endpoints.ts). */
   endpoints: Record<string, EndpointConfig>;
@@ -147,6 +149,9 @@ export interface Settings {
 
 /** Where on-device models run: the CPU, or an NVIDIA GPU. */
 export type Device = "cpu" | "gpu";
+
+/** Dictation output: Pi's input box, or a user-defined command. Absent in the file means Pi. */
+export type DictationOutputMode = "pi" | "command";
 
 export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
   speechModel: "google/gemini-3.8-flash-tts",
@@ -296,6 +301,8 @@ export class SettingsFile {
       if (spoken) s.dictationLanguage = spoken;
       const output = str(raw.dictationOutput);
       if (output) s.dictationOutput = output;
+      // A stored command on its own (a config from before the mode) is not a choice: Pi until picked.
+      if (raw.dictationOutputMode === "command") s.dictationOutputMode = "command";
       if (isSort(raw.modelSort)) s.modelSort = raw.modelSort;
       s.endpoints = endpointsFrom(raw.endpoints);
       s.hotkeys = hotkeysFrom(raw.hotkeys);
@@ -358,6 +365,7 @@ export class SettingsFile {
       languages: s.languages,
       ...(s.dictationLanguage ? { dictationLanguage: s.dictationLanguage } : {}),
       ...(s.dictationOutput ? { dictationOutput: s.dictationOutput } : {}),
+      ...(s.dictationOutputMode === "command" ? { dictationOutputMode: "command" } : {}),
       ...(s.modelSort !== DEFAULT_SETTINGS.modelSort ? { modelSort: s.modelSort } : {}),
       ...(Object.keys(s.endpoints).length ? { endpoints: s.endpoints } : {}),
       ...(s.hotkeys.speak !== DEFAULT_HOTKEYS.speak || s.hotkeys.dictate !== DEFAULT_HOTKEYS.dictate || s.hotkeys.ptt

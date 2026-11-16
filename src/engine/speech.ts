@@ -606,8 +606,13 @@ export class Speech {
       }
       case "dictation-output": {
         const cmd = value.trim();
-        if (cmd) s.dictationOutput = cmd;
-        else delete s.dictationOutput;
+        if (cmd) {
+          s.dictationOutput = cmd;
+          s.dictationOutputMode = "command";
+        } else {
+          delete s.dictationOutput;
+          s.dictationOutputMode = "pi";
+        }
         this.save();
         return `Dictation output: ${cmd ? "your command" : "Pi"}`;
       }

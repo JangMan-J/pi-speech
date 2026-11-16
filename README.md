@@ -34,8 +34,8 @@ engine; `PI_SPEECH_BINARY` names another). Without the binary it uses one of `pa
 the frame shared with pi-picks and pi-hashline. It is always 19 lines: a title line, with what speech is doing
 on its right (`▶ speaking`, `● REC 0:03`, `… transcribing`); a tab line; the text field; a column header; 10
 rows; one status line; and the key bar, with rules around them. The tabs are **Main**, **Read aloud**,
-**Speech model**, **Voice**, **Transcription model**, **Dictation output**, **Hotkeys** and **Bridge**, in
-that order. Tab and Shift+Tab switch tabs. Esc on a tab returns to Main; Esc on Main closes the panel.
+**Speech model**, **Voice**, **Transcription model**, **Hotkeys** and **Bridge**, in that
+order. Tab and Shift+Tab switch tabs. Esc on a tab returns to Main; Esc on Main closes the panel.
 
 Main's text field is the **Speak** line: typing anywhere on Main types the message, and Enter in it speaks the
 message. Its
@@ -47,7 +47,7 @@ tab).
 
 ```
 ─ Speech ───────────────────────────────────────────────────────────────────────────────────────
-   Main │ Read aloud │ Speech model │ Voice │ Transcription model │ Dictation output  >>
+   Main │ Read aloud │ Speech model │ Voice │ Transcription model │ Hotkeys  >>
 ────────────────────────────────────────────────────────────────────────────────────────────────
   Speak: >   type a message · Enter speaks · [tags] direct this model
   Setting               Value
@@ -58,7 +58,7 @@ tab).
   Transcription source  Provider
   Transcription model   openai/whisper-large-v3-turbo ›
   Dictation language    auto
-  Dictation output      Pi ›
+  Dictation output      Pi
   Bridge connection     not connected ›
   Spectrum OSD          Braille
   (0/10)
@@ -77,7 +77,7 @@ lists the models of the bundled `pi-speech-receiver` with their size and whether
 
 ```
 ─ Speech ───────────────────────────────────────────────────────────────────────────────────────
-   Main │ Read aloud │ Speech model │ Voice │ Transcription model │ Dictation output  >>
+   Main │ Read aloud │ Speech model │ Voice │ Transcription model │ Hotkeys  >>
 ────────────────────────────────────────────────────────────────────────────────────────────────
   Search: >
   Model                                    Size           State  Languages
@@ -99,7 +99,9 @@ lists the models of the bundled `pi-speech-receiver` with their size and whether
 
 Enter picks a downloaded model. On one that is not downloaded, Enter says its size and Enter again downloads it,
 with its progress on the status line, and then picks it. Ctrl+O downloads the highlighted model, Ctrl+T twice
-deletes it. Letters type into the filter. A stopped download goes on from where it stopped the next time.
+deletes it. Letters type into the filter. Several models can download at once, each row showing its own
+progress; a model turns downloaded in the open list and can be picked at once. A stopped download goes on
+from where it stopped the next time.
 Models are kept in the per-user model cache (`~/.cache/pi-speech/models` on Linux, or `PI_SPEECH_MODELS_DIR`).
 
 Local transcription (dictation, Transcribe file…, `--transcribe`, `speech_transcribe`) runs
@@ -201,7 +203,7 @@ under the rows says what the highlighted one does:
 
 ```
 ─ Speech ───────────────────────────────────────────────────────────────────────────────────────
-   Main │ Read aloud │ Speech model │ Voice │ Transcription model │ Dictation output  >>
+   Main │ Read aloud │ Speech model │ Voice │ Transcription model │ Hotkeys  >>
 ────────────────────────────────────────────────────────────────────────────────────────────────
 
   Setting            Value
@@ -246,7 +248,7 @@ Enter runs the highlighted one:
 
 ```
 ─ Speech ───────────────────────────────────────────────────────────────────────────────────────
-  <<  Read aloud │ Speech model │ Voice │ Transcription model │ Dictation output │ Hotkeys  >>
+  <<  Read aloud │ Speech model │ Voice │ Transcription model │ Hotkeys │ Bridge  >>
 ────────────────────────────────────────────────────────────────────────────────────────────────
 
   Setting            Value
@@ -352,8 +354,10 @@ its file, without a new request, and the list stays open. Transcribe asks for an
 goes into the editor and the panel closes. The agent tools (`speech_synthesize`, `speech_transcribe`) are turned
 on and off with `/speech --set tools on|off`.
 **Dictation language** is the language you speak (`ja`, `pt-BR`, or `auto`): it goes with every dictation and
-transcribed file until you change it. **Dictation output** chooses where a finished transcript lands: _Pi_
-(the default) inserts it into Pi's input box, or _User-defined_ hands it to a command you supply — `%s` stands
+transcribed file until you change it. **Dictation output** is a Main row choosing where a finished transcript
+lands: _Pi_ (the default) inserts it into Pi's input box, or _User-defined_ hands it to a command you supply.
+←→ cycles it; becoming _User-defined_ (or Enter on it) edits the command in place on Main, and cycling back
+to _Pi_ keeps the saved command. `%s` stands
 for the text (also on the command's stdin and in `$DICTATION_TEXT`), e.g. `zellij action write-chars %s` or
 `wl-copy`. The command runs in `sh`, or in PowerShell on Windows (`Set-Clipboard %s`; PowerShell 7 when
 installed, since Windows PowerShell 5.1 can split text with quotes into several arguments). If the command fails, the
@@ -365,7 +369,7 @@ Enter on Speech model or Transcription model opens the model browser on its tab:
 
 ```
 ─ Speech ───────────────────────────────────────────────────────────────────────────────────────
-   Main │ Read aloud │ Speech model │ Voice │ Transcription model │ Dictation output  >>
+   Main │ Read aloud │ Speech model │ Voice │ Transcription model │ Hotkeys  >>
 ────────────────────────────────────────────────────────────────────────────────────────────────
   Search: >
   Model                          Provider                                      Price ▲    Voices

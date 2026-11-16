@@ -72,14 +72,14 @@ try {
   ctx.or.setTranscript('words from a file'); await t.key('ctrl+t'); check(/Audio file/.test(shot()),'Ctrl+T asks for audio path');
   t.type(path.join(ROOT,'e2e/fixtures/quick-brown-fox.wav')); await t.key('Enter'); await t.until(s=>/words from a file/.test(s));
   capture(t); check(t.lines().some(l=>/words from a file/.test(l)) && !t.find('─ Speech'),'transcription closes panel and enters editor'); t.close();
-  t = await openPanelPi(ctx,{cols:100,rows:40,env}); await t.open(); await t.key('Tab',6);
+  t = await openPanelPi(ctx,{cols:100,rows:40,env}); await t.open(); await t.key('Tab',5);
   check(/Speak….*Alt\+S/.test(shot()) && /Push-to-talk/.test(shot()),'Hotkeys has three actions');
   t.type('k'); await t.key('alt+d'); check(/Alt\+D/.test(shot()) && saved().hotkeys?.speak === 'alt+d','custom Speak key saves');
   await t.key('Escape'); await sleep(3000); await t.key('alt+d');
   check(/Speak: >/.test(shot()),'Alt+D opens panel immediately');
   await selectRow(t,'Spectrum OSD'); await t.key('Left');
   check(/Spectrum OSD\s+Off/.test(shot()) && saved().osdStyle === 'off', 'OSD cycles off and saves');
-  await t.key('Tab',6); await t.key('Down'); await t.key('Enter'); await sleep(500);
+  await t.key('Tab',5); await t.key('Down'); await t.key('Enter'); await sleep(500);
   capture(t); check(!t.find('─ Speech') && /REC|record|Dictation/i.test(t.screen()), 'Hotkeys Dictate starts recording and closes panel');
   await t.key('alt+d');
   // The Pi adapter suppresses the title badge whenever the footer owns the live state

@@ -190,6 +190,29 @@ describe("the settings file", () => {
     expect(f.load()).toEqual({ ...DEFAULT_SETTINGS, languages: {} });
   });
 
+  it("dictation output: a stored command alone is Pi; the mode is saved only as User-defined", () => {
+    mkdirSync(dir, { recursive: true });
+    // An existing config holding only a command (from before the mode existed).
+    writeFileSync(join(dir, "settings.json"), JSON.stringify({ version: 1, dictationOutput: "wl-copy %s" }));
+    const f = new SettingsFile(dir);
+    expect(f.load()).toMatchObject({ dictationOutput: "wl-copy %s" });
+    expect(f.load().dictationOutputMode).toBeUndefined();
+    expect(new SettingsFile(join(dir, "fresh")).load().dictationOutputMode).toBeUndefined();
+    f.save({ ...f.load(), dictationOutputMode: "command" });
+    expect(JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"))).toMatchObject({
+      dictationOutput: "wl-copy %s",
+      dictationOutputMode: "command",
+    });
+    expect(f.load().dictationOutputMode).toBe("command");
+    // Back to Pi: the command stays in the file, the mode does not.
+    f.save({ ...f.load(), dictationOutputMode: "pi" });
+    const raw = JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"));
+    expect(raw.dictationOutput).toBe("wl-copy %s");
+    expect(raw).not.toHaveProperty("dictationOutputMode");
+    writeFileSync(join(dir, "settings.json"), JSON.stringify({ version: 1, dictationOutputMode: "bogus" }));
+    expect(f.load().dictationOutputMode).toBeUndefined();
+  });
+
   it("writes nothing when there is nothing to migrate", () => {
     const f = new SettingsFile(dir);
     f.load();

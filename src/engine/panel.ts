@@ -4,7 +4,7 @@
  * same engine operations as the `/speech --` actions. The Pi adapter draws the view model and feeds the keys;
  * nothing here knows about terminals.
  *
- * Eight tabs organize Main, Read aloud, models, Voice, Dictation output, Hotkeys and Bridge; a model or a voice shows only its name there (prices, features and languages are in the pickers).
+ * Seven tabs organize Main, Read aloud, models, Voice, Hotkeys and Bridge; a model or a voice shows only its name there (prices, features and languages are in the pickers). Dictation output is a Main row: Pi or a user-defined command, edited in place.
  * Values cycle in place; rows that list things open a picker; Hotkeys and Bridge connection are submenus.
  * Hotkeys holds every action, runnable, and changes the keys of Speak and Dictate.
  */
@@ -12,6 +12,7 @@
 import { basename } from "node:path";
 import { type BridgeHealth, type BridgeProbe, bridgeTarget, displayUrl, PairingError } from "../bridge/index";
 import type { VoiceLanguage } from "../voice-language/index";
+import type { DownloadChange } from "./downloads";
 import type { Engine } from "./engine";
 import { errorMessage } from "./env";
 import { featureLine, type ModelKind, modelColumns, vendorOf } from "./features";
@@ -90,14 +91,13 @@ export type RowId =
 export type MenuId = "main" | "hotkeys" | "bridge" | "readAloud";
 
 /** The panel's tabs, in order; Tab and Shift+Tab step through them. */
-export type TabId = "main" | "readAloud" | "speechModel" | "voice" | "transcription" | "output" | "hotkeys" | "bridge";
+export type TabId = "main" | "readAloud" | "speechModel" | "voice" | "transcription" | "hotkeys" | "bridge";
 export const TABS: ReadonlyArray<{ id: TabId; label: string }> = [
   { id: "main", label: "Main" },
   { id: "readAloud", label: "Read aloud" },
   { id: "speechModel", label: "Speech model" },
   { id: "voice", label: "Voice" },
   { id: "transcription", label: "Transcription model" },
-  { id: "output", label: "Dictation output" },
   { id: "hotkeys", label: "Hotkeys" },
   { id: "bridge", label: "Bridge" },
 ];
@@ -446,7 +446,7 @@ const MAIN: RowBase[] = [
   { id: "transcriptionSource", label: "Transcription source" },
   { id: "transcription", label: "Transcription model", opens: true },
   { id: "language", label: "Dictation language" },
-  { id: "output", label: "Dictation output", opens: true },
+  { id: "output", label: "Dictation output" },
   { id: "bridge", label: "Bridge connection", opens: true },
   { id: "osdStyle", label: "Spectrum OSD" },
 ];
@@ -525,6 +525,7 @@ const CYCLES: ReadonlySet<RowId> = new Set<RowId>([
   "osdStyle",
   "speechSource",
   "transcriptionSource",
+  "output",
   "bridgeMode",
   "playOn",
   "recordOn",
@@ -703,15 +704,17 @@ export class Panel {
   /** The on-device models, of both kinds, with their state. */
   private localModels?: LocalModel[];
   private localLoad?: Promise<LocalModel[]>;
+  /** The listing last applied; an older listing resolving later must not overwrite a fresher one. */
+  private localSeq = 0;
+  private localApplied = 0;
   private localError?: string;
   /** A model not downloaded that the user chose: the next Enter downloads it. */
   private offer?: string;
   /** A downloaded model that the next x deletes. */
   private deleting?: string;
-  /** The download running, and how far it is. */
-  /** The engine's download in progress (it outlives this panel), as the lists and status line follow it. */
-  private get downloading() {
-    return this.engine.downloads.current;
+  /** The engine's download of `id` in progress (downloads outlive this panel), as the lists follow it. */
+  private downloadOf(id: string) {
+    return this.engine.downloads.get(id);
   }
   private unlistenDownloads?: () => void;
   /** The Speak line's text, kept while the cursor is on the rows. */
@@ -743,9 +746,9 @@ export class Panel {
     if (s.speechSource === "local" || s.transcriptionSource === "local") this.track(this.loadLocal());
     this.probe();
     this.engine.onRemoteChange = this.remoteChanged;
-    // A download goes on when this panel closes; any panel open follows it, and refreshes the lists at its end.
-    this.unlistenDownloads = this.engine.downloads.listen(() => this.downloadChanged());
-    const d = this.downloading;
+    // Downloads go on when this panel closes; any panel open follows them, and refreshes the lists at each end.
+    this.unlistenDownloads = this.engine.downloads.listen((c) => this.downloadChanged(c));
+    const d = this.engine.downloads.active.values().next().value;
     if (d) this.setStatus("busy", d.progress ? downloadLine(d.id, d.progress) : `… downloading ${d.id}`);
   }
 
@@ -755,25 +758,28 @@ export class Panel {
     this.changed();
   };
 
-  /** The engine's download moved on or ended: say so on the status line, and refresh the lists at its end. */
-  private downloadChanged(): void {
-    const d = this.downloading;
-    if (d) {
-      if (d.progress) this.setStatus("busy", downloadLine(d.id, d.progress));
+  /** An engine download moved on or ended: say so on the status line, and refresh the lists at its end. */
+  private downloadChanged(change: DownloadChange): void {
+    const end = change.end;
+    if (!end) {
+      const d = this.downloadOf(change.id);
+      if (d?.progress) this.setStatus("busy", downloadLine(d.id, d.progress));
       this.changed();
       return;
     }
-    const end = this.engine.downloads.last;
-    if (!end) return;
     if (end.status === "stopped") {
       this.setStatus("info", `Download of ${end.id} stopped; the next download goes on from there`);
     } else if (end.status === "failed") {
       this.setStatus("error", `✗ Download of ${end.id} failed: ${end.error}`);
     } else {
       this.setStatus("success", end.summary ? `✓ ${end.id} downloaded · ${end.summary}` : `✓ ${end.id} downloaded`);
+      // Selectable at once in an open picker; the fresh listing below confirms it.
+      const m = this.localModels?.find((x) => x.id === end.id);
+      if (m) m.downloaded = true;
       if (end.direction === "speech") this.track(this.loadVoices());
     }
     this.track(this.loadLocal(true));
+    this.changed();
   }
 
   dispose(): void {
@@ -924,10 +930,6 @@ export class Panel {
         action: "details",
         optional: true,
       });
-    if (view.tab === "output") {
-      view.rows = [];
-      view.selected = -1;
-    }
     return view;
   }
 
@@ -940,7 +942,6 @@ export class Panel {
           ? "readAloud"
           : (mode.picker.row as TabId);
     if (mode.kind === "input") {
-      if (mode.purpose === "output") return "output";
       if (["connect", "pairAddress", "pairCode", "secret", "confirm"].includes(mode.purpose))
         return this.tab(mode.back);
     }
@@ -956,8 +957,7 @@ export class Panel {
     if (row >= 0) this.selected = row;
     this.mode = { kind: "list" };
     if (tab === "main") return;
-    if (tab === "output") this.askOutput();
-    else if (tab === "speechModel" || tab === "voice" || tab === "transcription") this.openPicker(tab);
+    if (tab === "speechModel" || tab === "voice" || tab === "transcription") this.openPicker(tab);
     else this.activate(tab);
   }
 
@@ -1006,7 +1006,7 @@ export class Panel {
       case "language":
         return { ...base, value: value(s.dictationLanguage ?? "auto") };
       case "output":
-        return { ...base, value: s.dictationOutput ? "User-defined" : "Pi" };
+        return { ...base, value: s.dictationOutputMode === "command" ? "User-defined" : "Pi" };
       case "osdStyle":
         return { ...base, value: value(OSD_WORDS[s.osdStyle]) };
       case "speak":
@@ -1153,7 +1153,7 @@ export class Panel {
       const current = p.row === "speechModel" ? s.localSpeechModel : s.localTranscriptionModel;
       const models = (p.ids ?? []).flatMap((id) => this.localModels?.find((m) => m.id === id) ?? []);
       const items = models.map((m): PickerItem => {
-        const d = this.downloading;
+        const d = this.downloadOf(m.id);
         const state =
           d?.id === m.id
             ? d.progress?.phase === "progress" && d.progress.total
@@ -1365,8 +1365,9 @@ export class Panel {
       case "transcription":
         return [{ key: "Enter", action: "browse, sort and filter" }, close];
       case "language":
-      case "output":
         return [{ key: "Enter", action: "set" }, close];
+      case "output":
+        return [{ key: "←→", action: "Pi · User-defined" }, close];
       case "osdStyle":
         return [{ key: "←→", action: OSD_STYLES.map((s) => OSD_WORDS[s]).join(" · ") }, close];
       case "hotkeys":
@@ -1489,7 +1490,8 @@ export class Panel {
     const m = this.mode;
     if (key === "tab" || key === "backtab") {
       if (m.kind === "input" && (m.purpose === "secret" || m.purpose === "confirm")) return;
-      this.arrive(TABS[(TABS.findIndex((t) => t.id === this.tab()) + (key === "tab" ? 1 : 7)) % 8].id);
+      const at = TABS.findIndex((t) => t.id === this.tab());
+      this.arrive(TABS[(at + (key === "tab" ? 1 : -1) + TABS.length) % TABS.length].id);
       return;
     }
     if (m.kind === "input" && m.purpose === "speak") {
@@ -1571,8 +1573,7 @@ export class Panel {
         this.step(id, key === "left" ? -1 : 1);
         return;
       case "enter":
-        if (["readAloud", "speechModel", "voice", "transcription", "output", "bridge"].includes(id))
-          this.arrive(id as TabId);
+        if (["readAloud", "speechModel", "voice", "transcription", "bridge"].includes(id)) this.arrive(id as TabId);
         else this.activate(id);
         return;
       case "language":
@@ -1719,6 +1720,7 @@ export class Panel {
         this.ask("dictation");
         return;
       case "output":
+        // Enter edits in place: to User-defined from Pi, or the saved command while User-defined.
         this.askOutput();
         return;
       case "history":
@@ -1775,6 +1777,17 @@ export class Panel {
       this.speech.settings.osdStyle = next;
       this.speech.save();
       this.setStatus("success", `✓ Spectrum OSD: ${OSD_WORDS[next]}`);
+    } else if (id === "output") {
+      const s = this.speech.settings;
+      const next = cycle(["pi", "command"] as const, s.dictationOutputMode === "command" ? "command" : "pi", dir);
+      if (next === "command") {
+        // Becoming User-defined edits the command in place; nothing is saved until Enter there.
+        this.askOutput();
+      } else {
+        s.dictationOutputMode = "pi";
+        this.speech.save();
+        this.setStatus("success", "✓ Dictation output: Pi");
+      }
     } else if (id === "speechSource" || id === "transcriptionSource") {
       const direction = directionOf(id);
       const s = this.speech.settings;
@@ -1942,7 +1955,7 @@ export class Panel {
     const model = this.localModels?.find((x) => x.id === id);
     if (!model) return;
     this.deleting = undefined;
-    if (this.downloading?.id === id) {
+    if (this.downloadOf(id)) {
       this.setStatus("info", `${id} is still downloading; it can be chosen once it is done`);
       return;
     }
@@ -1982,7 +1995,7 @@ export class Panel {
       this.setStatus("info", `${id} is not downloaded`);
       return;
     }
-    if (this.downloading?.id === id) {
+    if (this.downloadOf(id)) {
       this.setStatus("info", `${id} is downloading`);
       return;
     }
@@ -2585,11 +2598,21 @@ export class Panel {
   /** The on-device models and their state; `fresh` lists them again (after a download or a delete). */
   private loadLocal(fresh = false): Promise<LocalModel[]> {
     if (fresh) this.localLoad = undefined;
-    this.localLoad ??= this.speech.local.list().then(
+    if (this.localLoad) return this.localLoad;
+    const seq = ++this.localSeq;
+    this.localLoad = this.speech.local.list().then(
       (all) => {
-        this.localModels = all;
-        this.localError = undefined;
-        return all;
+        if (seq >= this.localApplied) {
+          this.localApplied = seq;
+          this.localModels = all;
+          this.localError = undefined;
+          // An open local picker follows the fresh list (a download ended): its ids and each model's state.
+          if (this.mode.kind === "picker" && this.mode.picker.local && isModelRow(this.mode.picker.row)) {
+            const kind = directionOf(this.mode.picker.row);
+            this.mode.picker.ids = all.filter((m) => m.kind === kind).map((m) => m.id);
+          }
+        }
+        return this.localModels ?? all;
       },
       (err) => {
         this.localLoad = undefined;

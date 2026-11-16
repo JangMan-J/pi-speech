@@ -500,7 +500,7 @@ export class LocalModels {
     return kind ? all.filter((m) => m.kind === kind) : all;
   }
 
-  /** Download a model: into this machine's cache, or the Remote machine's while its models are the ones used. */
+  /** Download a model: into this machine's cache, or the Remote machine's while its models are the ones used. Each call runs independently (its own process), so downloads of different models proceed at once. */
   download(id: string, options: Omit<DownloadOptions, "env"> = {}): Download {
     const remote = this.remote();
     if (remote) {

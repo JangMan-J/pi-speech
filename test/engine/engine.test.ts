@@ -124,6 +124,38 @@ describe("the engine", () => {
     expect(existsSync(join(work, "history"))).toBe(false);
   });
 
+  it("Pi dictation output does not run a stored command; User-defined does", async () => {
+    fakeOpenRouter("dictated words");
+    const wav = Buffer.concat([Buffer.from("RIFF"), Buffer.alloc(4), Buffer.from("WAVE")]);
+    const { engine, work } = makeEngine(
+      {},
+      {
+        name: "local",
+        start: async () => ({ stop: async () => ({ audio: wav, format: "wav" as const }), cancel: async () => {} }),
+      },
+    );
+    const out = join(work, "out.txt");
+    const cmd = process.platform === "win32" ? `$env:DICTATION_TEXT | Set-Content -NoNewline '${out}'` : `cat > ${out}`;
+    // A legacy config: a command stored, no mode picked — Pi mode, so it pastes and never runs it.
+    engine.speech.settings.dictationOutput = cmd;
+    const { ui, pasted } = scriptedUi();
+    await engine.dictation.toggle(ui);
+    await engine.dictation.toggle(ui);
+    expect(pasted).toEqual(["dictated words"]);
+    expect(existsSync(out)).toBe(false);
+    // Choosing it (as --dictation-output does) runs it instead of pasting.
+    await engine.speech.set("dictation-output", cmd);
+    expect(engine.speech.settings.dictationOutputMode).toBe("command");
+    await engine.dictation.toggle(ui);
+    await engine.dictation.toggle(ui);
+    expect(existsSync(out)).toBe(true);
+    expect(readFileSync(out, "utf8")).toContain("dictated");
+    expect(pasted).toEqual(["dictated words"]);
+    // An empty --dictation-output returns to Pi.
+    await engine.speech.set("dictation-output", "");
+    expect(engine.speech.settings.dictationOutputMode).toBe("pi");
+  });
+
   it("the saved dictation language goes with every dictation; a toggle may name another, or auto", async () => {
     const requests = fakeOpenRouter("dictated words");
     const wav = Buffer.concat([Buffer.from("RIFF"), Buffer.alloc(4), Buffer.from("WAVE")]);

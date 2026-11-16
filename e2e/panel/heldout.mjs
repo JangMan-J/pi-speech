@@ -10,7 +10,7 @@ async function scenario(options, run, terminal = {}) {
 const screen = t => capture(t).join('\n');
 await scenario({},async t=>{
   check(!/idle/i.test(screen(t).split('\n')[0]),'idle title has no badge');
-  await t.key('Tab',7); check(/Remote machine/.test(screen(t)),'Shift/Tab navigation reaches Bridge');
+  await t.key('Tab',6); check(/Remote machine/.test(screen(t)),'Shift/Tab navigation reaches Bridge');
   await t.key('Tab'); check(/Speak: >/.test(screen(t)),'Tab wraps to Main');
   await t.key('shift+tab'); check(/Remote machine/.test(screen(t)),'Shift+Tab wraps to Bridge');
   await t.key('Escape'); check(/Speak: >/.test(screen(t)),'Esc on tab returns to Main');
@@ -19,7 +19,7 @@ await scenario({},async t=>{
 const bad = { PI_SPEECH_BRIDGE_URL:'http://127.0.0.1:9', PI_SPEECH_BRIDGE_TOKEN:'x'.repeat(40), SSH_TTY:'/dev/pts/3' };
 await scenario({env:bad},async t=>{
   check(/Speak: >/.test(screen(t)),'unreachable receiver does not prevent opening');
-  await t.key('Tab',7); await sleep(1500);
+  await t.key('Tab',6); await sleep(1500);
   check(/✗.*unreachable|unreachable.*✗/.test(screen(t)),'Bridge reports receiver unreachable');
 },{env:bad,unset:['SSH_CONNECTION','PI_SPEECH_LOCAL_MIC']});
 await scenario({},async t=>{
@@ -41,7 +41,7 @@ const rcv = await startReceiver();
 try {
   const env={PI_SPEECH_BRIDGE_URL:rcv.url,PI_SPEECH_BRIDGE_TOKEN:rcv.token,SSH_TTY:'/dev/pts/3'};
   await scenario({env},async (t,ctx)=>{
-    await t.key('Tab',7); await sleep(1000);
+    await t.key('Tab',6); await sleep(1000);
     check(/Bridge\s+auto/.test(screen(t)),'Bridge starts auto');
     check(/Pairing\s+✓ Connected to 127\.0\.0\.1:\d+.*ms/.test(screen(t)),'Pairing shows reachable receiver');
     for (const mode of ['on','off','auto']) {
@@ -53,7 +53,7 @@ try {
   },{env,unset:['SSH_CONNECTION','PI_SPEECH_LOCAL_MIC']});
 } finally { await rcv.stop(); rcv.cleanup(); }
 await scenario({},async (t,ctx)=>{
-  await t.key('Tab',6); await t.key('Down'); t.type('k'); t.type('x'); await sleep(300);
+  await t.key('Tab',5); await t.key('Down'); t.type('k'); t.type('x'); await sleep(300);
   check(/cannot be a hotkey/.test(screen(t)),'bare hotkey refused');
   t.type('k'); await t.key('alt+s'); check(/already the key of Speak/.test(screen(t)),'duplicate hotkey refused');
   t.type('k'); await t.key('Escape'); screen(t);
@@ -67,7 +67,7 @@ await scenario({},async (t,ctx)=>{
   try {
     await restarted.open();
     check(/Alt\+X dictate/.test(screen(restarted)), 'custom Dictate key survives Pi restart');
-    await restarted.key('Tab',6);
+    await restarted.key('Tab',5);
     check(/Dictate\s+Alt\+X/.test(screen(restarted)), 'Hotkeys shows saved binding after restart');
   } finally { restarted.close(); }
 });

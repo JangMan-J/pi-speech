@@ -31,7 +31,7 @@ const MAIN_ROWS: PanelRow[] = [
   { id: "transcriptionSource", label: "Transcription source", value: "Provider" },
   { id: "transcription", label: "Transcription model", value: "openai/whisper-large-v3-turbo", opens: true },
   { id: "language", label: "Dictation language", value: "auto" },
-  { id: "output", label: "Dictation output", value: "Pi", opens: true },
+  { id: "output", label: "Dictation output", value: "Pi" },
   { id: "osdStyle", label: "Spectrum OSD", value: "Braille" },
 ];
 
@@ -235,18 +235,17 @@ describe("renderPanel in the shared 19-line frame", () => {
     expect(renderPanel(fixture({ hints }), 60)[17]).toBe("  Enter pick · Ctrl+P sample · type to filter · Esc back");
     expect(renderPanel(fixture({ hints }), 45)[17]).toBe("  Enter pick · type to filter · Esc back");
 
-    // An input-only tab (Dictation output) with no rows draws neither a Setting/Value header nor (0/0).
-    const outputTab = renderPanel(
+    // Dictation output edits in place on Main: the rows stay and the field sits under its row.
+    const outputInput = renderPanel(
       fixture({
-        tab: "output",
-        rows: [],
-        selected: -1,
-        input: { label: "Dictation output", value: "", cursor: 0, placeholder: "a command" },
+        tab: "main",
+        selected: MAIN_ROWS.findIndex((r) => r.id === "output"),
+        input: { label: "Dictation output", value: "", cursor: 0, placeholder: "a command", under: "output" },
       }),
       100,
     );
-    expect(outputTab[4]).toBe("");
-    expect(outputTab[15]).toBe("");
+    expect(outputInput.join("\n")).toContain("a command");
+    expect(outputInput.join("\n")).toContain("Dictation output");
   });
 
   it("returns one narrow-terminal line below MIN_WIDTH and never exceeds termWidth", () => {

@@ -94,7 +94,7 @@ function open(
     if (panel.view().menu !== menu && panel.view().menu !== "main") await press("escape");
     if (menu !== "main" && panel.view().menu === "main") {
       if (menu === "hotkeys") {
-        for (let i = 0; i < 6; i++) await press("tab");
+        while (panel.view().tab !== "hotkeys") await press("tab");
       } else {
         await goTo("Bridge connection");
         await press("enter");
@@ -172,14 +172,7 @@ describe("the panel view model: the main view", () => {
       .view()
       .rows.filter((r) => r.opens)
       .map((r) => r.label);
-    expect(opens).toEqual([
-      "Read aloud options",
-      "Speech model",
-      "Voice",
-      "Transcription model",
-      "Dictation output",
-      "Bridge connection",
-    ]);
+    expect(opens).toEqual(["Read aloud options", "Speech model", "Voice", "Transcription model", "Bridge connection"]);
   });
 
   it("shows only the name of a model or a voice: no price, features, provider or language", async () => {
@@ -516,7 +509,7 @@ describe("the panel view model: keys in the main view", () => {
       "Transcription source": `←→ Provider · Local · ${LETTER_HINTS} · Esc close`,
       "Transcription model": `Enter browse, sort and filter · ${LETTER_HINTS} · Esc close`,
       "Dictation language": `Enter set · ${LETTER_HINTS} · Esc close`,
-      "Dictation output": `Enter set · ${LETTER_HINTS} · Esc close`,
+      "Dictation output": `←→ Pi · User-defined · ${LETTER_HINTS} · Esc close`,
       "Bridge connection": `Enter the Remote machine, and what runs there · ${LETTER_HINTS} · Esc close`,
       "Spectrum OSD": `←→ Braille · Bars · Mirrored · 1-line · Off · ${LETTER_HINTS} · Esc close`,
     };
@@ -1560,16 +1553,55 @@ describe("the panel view model: history, files, and the dictation language", () 
     expect(settingsOf(p.work).dictationLanguage).toBeUndefined();
   });
 
-  it("Dictation output is Pi, or User-defined with a command, set under its row", async () => {
+  it("Dictation output is Pi by default and with only a legacy command stored", async () => {
+    const fresh = open();
+    expect(fresh.row("Dictation output")?.value).toBe("Pi");
+    const legacy = open(
+      {},
+      {
+        before: (e) => {
+          e.speech.settings.dictationOutput = "wl-copy %s";
+        },
+      },
+    );
+    expect(legacy.row("Dictation output")?.value).toBe("Pi");
+  });
+
+  it("Dictation output cycles in place: User-defined edits the command on Main, Pi keeps it", async () => {
     const p = open();
     await p.goTo("Dictation output");
-    await p.press("enter");
-    expect(p.panel.view().input).toMatchObject({ label: "Dictation output", under: "output" });
+    // Cycling to User-defined opens the in-place field on Main (no tab switch); Esc cancels to Pi.
+    await p.press("right");
+    expect(p.panel.view().tab).toBe("main");
+    expect(p.panel.view().input).toMatchObject({ label: "Dictation output", under: "output", value: "" });
+    await p.press("escape");
+    expect(p.panel.view().input).toBeUndefined();
+    expect(p.row("Dictation output")?.value).toBe("Pi");
+    // Again, typing a command and Enter saves it as User-defined.
+    await p.press("right");
     await p.type("wl-copy %s");
     await p.press("enter");
+    expect(p.panel.view().tab).toBe("main");
     expect(p.row("Dictation output")?.value).toBe("User-defined");
     expect(p.row("Dictation output")?.note).toBeUndefined();
+    expect(settingsOf(p.work)).toMatchObject({ dictationOutput: "wl-copy %s", dictationOutputMode: "command" });
+    // Enter while User-defined re-opens the field, prefilled; Esc keeps User-defined.
+    await p.press("enter");
+    expect(p.panel.view().input).toMatchObject({ label: "Dictation output", value: "wl-copy %s" });
+    await p.press("escape");
+    expect(p.row("Dictation output")?.value).toBe("User-defined");
+    // Cycling back to Pi keeps the saved command.
+    await p.press("right");
+    expect(p.row("Dictation output")?.value).toBe("Pi");
     expect(settingsOf(p.work).dictationOutput).toBe("wl-copy %s");
+    expect(settingsOf(p.work).dictationOutputMode).toBeUndefined();
+    // Emptying the field returns to Pi.
+    await p.press("right", "enter");
+    expect(p.row("Dictation output")?.value).toBe("User-defined");
+    await p.press("enter");
+    for (let i = 0; i < 12; i++) await p.press("backspace");
+    await p.press("enter");
+    expect(p.row("Dictation output")?.value).toBe("Pi");
   });
 });
 
@@ -1645,7 +1677,7 @@ describe.skipIf(!STAND_IN_BINARY)("the panel view model: Local sources", () => {
     p.panel.handle({ key: "down" });
     p.panel.handle({ key: "enter" });
     p.panel.handle({ key: "enter" });
-    await vi.waitFor(() => expect(p.engine.downloads.current?.progress?.phase).toBe("unpacking"));
+    await vi.waitFor(() => expect(p.engine.downloads.get("whisper-small")?.progress?.phase).toBe("unpacking"));
     p.panel.dispose(); // closed while it unpacks
 
     const changed = vi.fn();
@@ -1668,6 +1700,34 @@ describe.skipIf(!STAND_IN_BINARY)("the panel view model: Local sources", () => {
     expect(again.view().status?.text).toBe("✓ whisper-small downloaded · Transcription model: whisper-small (local)");
     expect(settingsOf(p.work).localTranscriptionModel).toBe("whisper-small");
     expect(changed).toHaveBeenCalled();
+  });
+
+  it("in an open picker a model goes not downloaded → unpacking → downloaded and Enter selects it there", async () => {
+    const p = local();
+    const gate = join(dirname(p.bin.path), "unpack.gate");
+    writeFileSync(gate, "");
+    p.engine.speech.setSource("transcription", "local");
+    await p.goTo("Transcription model");
+    await p.press("enter");
+    const item = () => p.panel.view().picker?.items.find((i) => i.id === "whisper-small");
+    expect(item()?.cols?.[0]).toBe("not downloaded");
+    p.panel.handle({ key: "down" });
+    p.panel.handle({ combo: "ctrl+o" });
+    await vi.waitFor(() => expect(item()?.cols?.[0]).toBe("unpacking"));
+    expect(p.panel.view().picker).toBeDefined();
+    // A second model's download starts and reaches unpacking while the first is still there.
+    const other = p.engine.downloads.start({ id: "kokoro", size: 100 });
+    await vi.waitFor(() => expect(p.engine.downloads.get("kokoro")?.progress?.phase).toBe("unpacking"));
+    expect(p.engine.downloads.active.size).toBe(2);
+    rmSync(gate);
+    await vi.waitFor(() => expect(item()?.cols?.[0]).toBe("downloaded"));
+    await expect(other).resolves.toMatchObject({ status: "done", id: "kokoro" });
+    // Still in the same picker: Enter selects the now-downloaded model.
+    expect(p.panel.view().picker).toBeDefined();
+    await p.press("enter");
+    expect(p.panel.view().picker).toBeUndefined();
+    expect(p.row("Transcription model")?.value).toBe("whisper-small");
+    expect(settingsOf(p.work).localTranscriptionModel).toBe("whisper-small");
   });
 
   it("in the list Ctrl+O downloads and Ctrl+T (twice) deletes the highlighted model", async () => {
@@ -1743,18 +1803,23 @@ describe.skipIf(!STAND_IN_BINARY)("the panel view model: Local sources", () => {
 });
 
 describe("tab navigation", () => {
-  it("visits eight tabs in both directions, wraps, and Esc returns home then closes", async () => {
+  it("visits seven tabs in both directions, wraps, and Esc returns home then closes", async () => {
     const p = open();
-    const tabs = ["main", "readAloud", "speechModel", "voice", "transcription", "output", "hotkeys", "bridge"];
+    const tabs = ["main", "readAloud", "speechModel", "voice", "transcription", "hotkeys", "bridge"];
+    expect(p.panel.view().tabs.map((t) => t.label)).toEqual([
+      "Main",
+      "Read aloud",
+      "Speech model",
+      "Voice",
+      "Transcription model",
+      "Hotkeys",
+      "Bridge",
+    ]);
     expect(p.panel.view().rows).toHaveLength(10);
     expect(p.panel.view().rows.some((r) => r.id === "hotkeys")).toBe(false);
     for (const tab of [...tabs.slice(1), "main"]) {
       await p.press("tab");
       expect(p.panel.view().tab).toBe(tab);
-      if (tab === "output") {
-        expect(p.panel.view().rows).toEqual([]);
-        expect(p.panel.view().selected).toBe(-1);
-      }
     }
     for (const tab of [...tabs.slice(1).reverse(), "main"]) {
       await p.press("backtab");
