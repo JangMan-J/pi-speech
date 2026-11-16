@@ -128,7 +128,8 @@ pub fn download(
         });
         return Ok(target);
     }
-    // No other download is unpacking: these are a hard kill's.
+    // With the model's lock held no other download of this model is unpacking, so these are a
+    // hard kill's; another model's unpacking directories never match (`cache::is_unpack_of`).
     for leftover in cache::unpack_leftovers(root, entry) {
         let _ = cache::remove(&leftover);
     }
@@ -624,7 +625,7 @@ fn fetch(
 
 /// Unpack the checked archive at `part` and rename the model into place.
 fn unpack(entry: &Entry, root: &Path, part: &Path, stop: &AtomicBool) -> Result<PathBuf, Failure> {
-    let suffix = crate::token::random_hex(6)
+    let suffix = crate::token::random_hex(cache::UNPACK_RANDOM_BYTES)
         .map_err(|e| format!("cannot name a temporary directory: {e}"))?;
     let tmp = root.join(format!("{}{suffix}", cache::unpack_prefix(entry)));
     let result = unpack_into(entry, part, &tmp, stop).and_then(|()| {
@@ -1000,6 +1001,90 @@ mod tests {
         assert!(!part.exists());
         assert!(cache::unpack_leftovers(&root, &entry).is_empty());
         assert!(!cache::model_lock_path(&root, &entry).exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn noise(n: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn downloads_of_different_models_run_at_once_and_never_touch_each_others_unpacking() {
+        // `voice`'s unpacking prefix `.unpack-voice-` is the start of `voice-hi`'s.
+        let named = |dir: &str, data: &[u8], pause: u64| {
+            let body = archive(dir, data);
+            let size = body.len() as u64;
+            let sha = hex(&Sha256::digest(&body));
+            let mut e = model(
+                serve_slowly(body, &[Duration::from_millis(pause)]),
+                size,
+                sha,
+            );
+            e.id = dir.into();
+            e.dir = dir.into();
+            e
+        };
+        let (a_data, b_data) = (noise(200 * 1024, 7), noise(120 * 1024, 11));
+        let a = named("voice", &a_data, 5);
+        let b = named("voice-hi", &b_data, 15);
+
+        // 1. Both download and unpack at once, in parallel, and each gets its whole model.
+        let root = scratch("two-models");
+        let run = |entry: &Entry| {
+            let (entry, root) = (entry.clone(), root.clone());
+            std::thread::spawn(move || {
+                let stop = AtomicBool::new(false);
+                let mut events = Vec::new();
+                let r = super::download(&entry, &root, true, &stop, &mut |e| events.push(e));
+                (r, events)
+            })
+        };
+        let (ra, rb) = (run(&a), run(&b));
+        for (r, entry, data) in [(ra, &a, &a_data), (rb, &b, &b_data)] {
+            let (r, events) = r.join().unwrap();
+            let target = root.join(&entry.dir);
+            assert_eq!(r, Ok(target.clone()), "{events:?}");
+            assert!(events.contains(&Event::Unpacking));
+            assert_eq!(&fs::read(target.join("data.bin")).unwrap(), data);
+            assert!(cache::unpack_leftovers(&root, entry).is_empty());
+            assert!(!cache::model_lock_path(&root, entry).exists());
+        }
+        fs::remove_dir_all(&root).unwrap();
+
+        // 2. While `voice-hi` is unpacking (its lock held, its unpacking directory there),
+        //    `voice` downloads and unpacks without waiting, and leaves the other's directory.
+        let root = scratch("two-models-unpacking");
+        fs::create_dir_all(&root).unwrap();
+        let held = File::create(cache::model_lock_path(&root, &b)).unwrap();
+        held.lock().unwrap();
+        let unpacking = root.join(format!("{}0123456789ab", cache::unpack_prefix(&b)));
+        fs::create_dir_all(unpacking.join("voice-hi")).unwrap();
+        fs::write(unpacking.join("voice-hi/data.bin"), b"half").unwrap();
+        let a = named("voice", &a_data, 0);
+        // And a hard kill's leftover of `voice` itself, which it does remove.
+        let stale = root.join(format!("{}fedcba987654", cache::unpack_prefix(&a)));
+        fs::create_dir_all(&stale).unwrap();
+        let stop = AtomicBool::new(false);
+        let r = super::download(&a, &root, true, &stop, &mut |_| {});
+        assert_eq!(r, Ok(root.join("voice")));
+        assert!(!stale.exists());
+        assert_eq!(
+            fs::read(unpacking.join("voice-hi/data.bin")).unwrap(),
+            b"half"
+        );
+        assert_eq!(cache::unpack_leftovers(&root, &b), vec![unpacking.clone()]);
+        // Deleting `voice` leaves it too.
+        cache::delete(&root, &a).unwrap();
+        assert!(unpacking.is_dir());
+        drop(held);
         fs::remove_dir_all(&root).unwrap();
     }
 

@@ -5,8 +5,10 @@
 //! `~/Library/Caches/pi-speech/models` on macOS, `%LOCALAPPDATA%\pi-speech\models` on Windows.
 //!
 //! Inside it, a model is the directory `<dir>` (complete: it is renamed into place only once
-//! unpacked); `<dir>.part` is a download in progress or interrupted; `.unpack-<dir>-*` is a
-//! directory being unpacked (left behind only by a hard kill, and removed by the next download).
+//! unpacked); `<dir>.part` is a download in progress or interrupted; `.unpack-<dir>-<12 hex>` is
+//! a directory being unpacked (left behind only by a hard kill, and removed by the next download
+//! of the same model, which holds `<dir>.lock`; another model's is never taken for it).
+//! Nothing locks the cache as a whole: downloads of different models run at once.
 //! `<dir>.lock` is an empty file that a download of the model holds locked (the system's file
 //! lock) from before it fetches `<dir>.part` until the model is in place or the download ends,
 //! so that two downloads of the same model (say from two Pi sessions sharing one receiver) never
@@ -98,6 +100,22 @@ pub fn unpack_prefix(entry: &Entry) -> String {
     format!(".unpack-{}-", entry.dir)
 }
 
+/// The random bytes in an unpacking directory's name: `.unpack-<dir>-<hex of these>`.
+pub const UNPACK_RANDOM_BYTES: usize = 6;
+
+/// Whether `name` is an unpacking directory of `entry`: its prefix, then exactly the random
+/// hex. The prefix alone would also match another model's (`.unpack-voice-` is the start of
+/// `.unpack-voice-hi-<hex>`), and that one may be unpacking right now in another download.
+pub fn is_unpack_of(name: &str, entry: &Entry) -> bool {
+    name.strip_prefix(&unpack_prefix(entry))
+        .is_some_and(|rest| {
+            rest.len() == 2 * UNPACK_RANDOM_BYTES
+                && rest
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+}
+
 /// Whether `entry` is downloaded: its directory is there (it appears only complete).
 pub fn is_downloaded(root: &Path, entry: &Entry) -> bool {
     model_path(root, entry).is_dir()
@@ -133,9 +151,8 @@ pub fn partial_bytes(root: &Path, entry: &Entry) -> u64 {
     }
 }
 
-/// Leftover unpacking directories of `entry`.
+/// Leftover unpacking directories of `entry` (never another model's, see [`is_unpack_of`]).
 pub fn unpack_leftovers(root: &Path, entry: &Entry) -> Vec<PathBuf> {
-    let prefix = unpack_prefix(entry);
     let Ok(read) = fs::read_dir(root) else {
         return Vec::new();
     };
@@ -143,7 +160,7 @@ pub fn unpack_leftovers(root: &Path, entry: &Entry) -> Vec<PathBuf> {
         .filter(|e| {
             e.file_name()
                 .to_str()
-                .is_some_and(|n| n.starts_with(&prefix))
+                .is_some_and(|n| is_unpack_of(n, entry))
         })
         .map(|e| e.path())
         .collect()
