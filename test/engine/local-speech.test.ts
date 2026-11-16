@@ -37,9 +37,9 @@ const ev = (v) => process.stderr.write(JSON.stringify(v) + "\\n");
 if (cmd === "models" && id === "list") {
   fs.appendFileSync(${JSON.stringify(modelsLog)}, "list\\n");
   for (const m of [
-    { id: "ok", kind: "speech", languages: ["en", "de"] },
-    { id: "kokoro-multi-lang-v1.1", kind: "speech", languages: [] },
-    { id: "piper", kind: "speech", languages: ["en"] },
+    { id: "supertonic-3-int8", kind: "speech", languages: ["en", "de", "fr"] },
+    { id: "kokoro-multi-lang-v1.1", kind: "speech", languages: ["en", "zh"] },
+    { id: "piper-en_US-lessac-medium", kind: "speech", languages: ["en"] },
   ]) process.stdout.write(JSON.stringify(m) + "\\n");
   process.exit(0);
 }
@@ -199,8 +199,8 @@ describe.skipIf(!STAND_IN_BINARY)("LocalSpeechProvider", () => {
     const bin = fakeSpeak();
     const provider = new LocalSpeechProvider(() => bin);
     const request = () => JSON.parse(readFileSync(join(dir, "log.json"), "utf8")).request;
-    await provider.synthesize({ text: "Hallo.", model: "ok", voice: "M2", language: "de" });
-    expect(request()).toMatchObject({ model: "ok", text: "Hallo.", voice: "M2", lang: "de" });
+    await provider.synthesize({ text: "Hallo.", model: "supertonic-3-int8", voice: "M2", language: "de" });
+    expect(request()).toMatchObject({ model: "supertonic-3-int8", text: "Hallo.", voice: "M2", lang: "de" });
     const pid = readFileSync(join(dir, "pid"), "utf8");
     await provider.synthesize({ text: "Hi.", model: "ok", voice: "", language: "auto" });
     expect(request().lang).toBeUndefined();
@@ -211,14 +211,16 @@ describe.skipIf(!STAND_IN_BINARY)("LocalSpeechProvider", () => {
     provider.close();
   });
 
-  it("omits a language the model's catalogue does not list, and caches the catalogue", async () => {
+  it("omits languages for voice-language families and unsupported Supertonic languages, and caches the catalogue", async () => {
     const bin = fakeSpeak();
     const provider = new LocalSpeechProvider(() => bin);
     const request = () => JSON.parse(readFileSync(join(dir, "log.json"), "utf8")).request;
     await provider.synthesize({ text: "Hi.", model: "kokoro-multi-lang-v1.1", voice: "", language: "en" });
     expect(request().lang).toBeUndefined();
-    await provider.synthesize({ text: "Hi.", model: "piper", voice: "", language: "en" });
-    expect(request().lang).toBe("en");
+    await provider.synthesize({ text: "Hi.", model: "piper-en_US-lessac-medium", voice: "", language: "en" });
+    expect(request().lang).toBeUndefined();
+    await provider.synthesize({ text: "Hi.", model: "supertonic-3-int8", voice: "", language: "zh" });
+    expect(request().lang).toBeUndefined();
     expect(readFileSync(join(dir, "models.log"), "utf8").trim().split("\n")).toHaveLength(1);
     provider.close();
   });

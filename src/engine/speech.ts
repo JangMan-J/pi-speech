@@ -15,8 +15,8 @@ import { buildEndpoints, type Endpoint, endpointNameProblem, PRESETS } from "./e
 import { childEnv, type Env, errorMessage } from "./env";
 import { featureLine } from "./features";
 import { History, type HistoryMessage, historyDir, type SavedMessage } from "./history";
-import { LocalModels } from "./local-models";
-import { LocalSpeechProvider } from "./local-speech";
+import { type LocalModel, LocalModels } from "./local-models";
+import { LocalSpeechProvider, localSpeechLanguage } from "./local-speech";
 import {
   DEFAULT_VOICE,
   fetchSpeechCatalog,
@@ -934,12 +934,13 @@ export class Speech {
   /** A sample of a local voice, in the model's language when it has one, else in English. */
   private async localSample(target: { model: string; voice: string }, opts: CallOptions): Promise<SampleResult> {
     const { model, voice } = target;
-    let languages: string[] = [];
+    let entry: LocalModel | undefined;
     try {
-      languages = (await this.local.list("speech")).find((m) => m.id === model)?.languages ?? [];
+      entry = (await this.local.list("speech")).find((m) => m.id === model);
     } catch {
       /* the sample is then in English; speaking says what is wrong */
     }
+    const languages = entry?.languages ?? [];
     const vl =
       languages.length === 1
         ? voiceLanguage({ model, voice, override: languages[0] })
@@ -951,7 +952,7 @@ export class Speech {
       text: s.text,
       model,
       voice,
-      language: s.language,
+      language: localSpeechLanguage(entry, s.language) ?? "auto",
       signal: opts.signal,
     });
     return {

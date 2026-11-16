@@ -14,6 +14,16 @@ import { ChunkBuffer, clipOf } from "./audio-stream";
 import { type LocalModel, listModels } from "./local-models";
 import type { AudioStream, SpeechProvider, SynthesisRequest, SynthesizedAudio } from "./provider";
 
+/** Catalogue languages describe the voice; only Supertonic is told a language. */
+export function localSpeechLanguage(
+  model: Pick<LocalModel, "id" | "languages"> | undefined,
+  requested: string | undefined,
+): string | undefined {
+  return model?.id.startsWith("supertonic") && requested && requested !== "auto" && model.languages.includes(requested)
+    ? requested
+    : undefined;
+}
+
 export class LocalSpeechError extends Error {
   override name = "LocalSpeechError";
 }
@@ -529,12 +539,10 @@ export class LocalSpeechProvider implements SpeechProvider {
     if (remote) return remote.speak(req.model, req.text, { voice: req.voice, signal: req.signal });
     this.binary();
     await this.applyDevice();
-    const requested = req.language && req.language !== "auto" ? req.language : undefined;
-    const lang =
-      requested &&
-      (await this.languages()).some((model) => model.id === req.model && model.languages.includes(requested))
-        ? requested
-        : undefined;
+    const lang = localSpeechLanguage(
+      (await this.languages()).find((model) => model.id === req.model),
+      req.language,
+    );
     return this.worker.speak(req.model, req.text, { voice: req.voice, signal: req.signal, lang });
   }
 

@@ -2,11 +2,15 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { LocalSpeechProvider } from "../../src/engine/local-speech";
 import { READING_MIN_CHARS } from "../../src/engine/pieces";
 import { LOCAL_SPEECH_UNAVAILABLE } from "../../src/engine/speech";
 import { fakeOpenRouter, fakeReceiver, makeEngine, STAND_IN_BINARY, until } from "./fixtures";
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
 const tick = async (n = 10) => {
   for (let i = 0; i < n; i++) await new Promise((r) => setTimeout(r, 0));
 };
@@ -92,7 +96,9 @@ describe.skipIf(!STAND_IN_BINARY)("Speech source Local", () => {
   it("a sample plays through the binary and is not saved", async () => {
     const requests = fakeOpenRouter();
     const { engine, local, work, texts } = await localEngine();
+    const synthesis = vi.spyOn(LocalSpeechProvider.prototype, "synthesizeStream");
     const r = await engine.speech.sample();
+    expect(synthesis).toHaveBeenCalledWith(expect.objectContaining({ model: "kokoro", language: "auto" }));
     expect(r).toMatchObject({ model: "kokoro", voice: "default", player: "local", language: "en" });
     expect(texts()).toHaveLength(1);
     expect(local.plays).toHaveLength(1);
