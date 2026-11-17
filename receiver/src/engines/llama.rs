@@ -362,6 +362,7 @@ impl LlamaServer {
         if let Some(mm) = mmproj {
             cmd.args(["--mmproj", &mm.to_string_lossy()]);
         }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(dir) = bin.parent() {
             #[cfg(target_os = "linux")]
             {

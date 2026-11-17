@@ -1,7 +1,7 @@
 /** The process environment pi-speech reads, and helpers over it. */
 
 import { accessSync, constants, existsSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 
 export type Env = Record<string, string | undefined>;
 
@@ -38,7 +38,7 @@ export function findExecutable(
   platform: NodeJS.Platform = process.platform,
 ): string | undefined {
   if (platform !== "win32") {
-    if (name.includes("/")) return isExecutable(name) ? name : undefined;
+    if (name.includes("/") || isAbsolute(name)) return isExecutable(name) ? name : undefined;
     for (const dir of (env.PATH ?? "").split(":")) {
       if (!dir) continue;
       const p = join(dir, name);

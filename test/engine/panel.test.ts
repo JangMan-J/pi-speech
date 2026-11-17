@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { packageVersion } from "../../src/engine/binary";
 import type { Engine } from "../../src/engine/engine";
 import { matchItems, Panel, type PanelKey, type PanelView } from "../../src/engine/panel";
 import type { Hotkeys } from "../../src/engine/settings";
@@ -915,7 +916,7 @@ describe("the panel view model: Device and Receiver, on this machine", () => {
       bin,
       `#!${process.execPath}
 const cmd = process.argv[2];
-if (cmd === "--version") { console.log("pi-speech-receiver 0.2.5"); process.exit(0); }
+if (cmd === "--version") { console.log("pi-speech-receiver ${packageVersion()}"); process.exit(0); }
 if (cmd === "gpu") { console.log(JSON.stringify({ driver: false, cuda: null, cudnn: false, hardware: false, edition: "cpu", target: null, usable: false, why: "no NVIDIA driver (libcuda.so.1 does not load)" })); process.exit(0); }
 `,
       { mode: 0o755 },
@@ -924,7 +925,7 @@ if (cmd === "gpu") { console.log(JSON.stringify({ driver: false, cuda: null, cud
     await p.goTo("Receivers");
     await p.press("enter");
     await p.press("down"); // Receiver
-    expect(p.row("Receiver")).toMatchObject({ value: "CPU v0.2.5", note: "env" });
+    expect(p.row("Receiver")).toMatchObject({ value: `CPU v${packageVersion()}`, note: "env" });
     await p.press("right");
     expect(p.panel.view().status?.text).toMatch(/GPU unavailable: no NVIDIA driver/);
     expect(p.engine.speech.settings.localDevice).toBe("cpu");
