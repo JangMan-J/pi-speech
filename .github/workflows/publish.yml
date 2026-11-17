@@ -4,9 +4,10 @@ name: Publish
 # npm authenticates this workflow by OIDC (trusted publishing): no npm token is stored,
 # and every published version carries a provenance attestation automatically.
 #
-# A release is one npm package carrying every system's receiver binary under bin/<os>-<cpu>/,
-# bundled by npm/platforms.mjs from the native builds below. src/engine/binary.ts picks this
-# machine's binary at runtime. One package, one trusted publisher (already linked): no bootstrap.
+# A release publishes the small JS/TS extension + `receivers.json` to npm, and uploads each
+# platform's receiver archive (`pi-speech-receiver-<os>-<cpu>.tar.gz`) to the GitHub Release.
+# The extension fetches the user's (or Remote machine's) binary on demand into its cache,
+# checked against `receivers.json`'s SHA-256.
 on:
   push:
     tags: ["v*"]
@@ -18,40 +19,38 @@ concurrency:
   group: publish
   cancel-in-progress: false
 
-# sherpa-onnx's CUDA 13 bundle, whose shared libraries the Linux x64 receiver links (and carries);
-# it must be the version the receiver's sherpa-onnx crate is (Cargo.lock), and the bundle the GPU
-# runtime entry of receiver/src/models/catalog.rs names.
+# sherpa-onnx's CUDA bundles, whose shared libraries the optional GPU receivers link (and carry);
+# they must match the sherpa-onnx crate version in Cargo.lock.
 env:
-  GPU_BUNDLE: sherpa-onnx-v2.0.1-cuda-13.x-cudnn-9.x-onnxruntime1.28.2-linux-x64-gpu
-  GPU_BUNDLE_SHA256: 40ca5c7730a349258f23e9a7bf5c3cbf69f13c498cc50387e8f9f06924a554f8
+  GPU_BUNDLE_13: sherpa-onnx-v2.0.1-cuda-13.x-cudnn-9.x-onnxruntime1.28.2-linux-x64-gpu
+  GPU_BUNDLE_13_SHA256: 40ca5c7730a349258f23e9a7bf5c3cbf69f13c498cc50387e8f9f06924a554f8
+  GPU_BUNDLE_12: sherpa-onnx-v2.0.1-cuda-12.x-cudnn-9.x-onnxruntime1.28.2-linux-x64-gpu
+  GPU_BUNDLE_12_SHA256: 2aa541a65c1e7d921a053283419b70b30c1f6ae0a0f52f64b947ebe88c5f2a77
 
 jobs:
   check:
     uses: ./.github/workflows/ci.yml
 
-  # The receiver for each target, built on a native runner of that system and processor. No
-  # caches: a release build starts from the lock file alone. sherpa-onnx-sys's build script
-  # downloads sherpa-onnx's static libraries (on Windows the static-MT archive, matching
-  # receiver/.cargo/config.toml's +crt-static). Linux x64 links the shared libraries of sherpa-onnx's
-  # CUDA 13 bundle instead (the `shared` feature), and carries its three core libraries beside the
-  # binary: it runs on the CPU as the others do, and on an NVIDIA GPU once the user downloads that
-  # bundle (with ONNX Runtime's CUDA provider) as the GPU runtime.
+  # The receiver for each CPU and GPU target, built on a native runner of that system and processor.
+  # No caches: a release build starts from the lock file alone. All 5 CPU targets are statically
+  # linked single binaries; the optional Linux x64 GPU editions link sherpa-onnx's CUDA 12/13
+  # shared libraries and carry them beside the binary (found via $ORIGIN rpath).
   build:
     name: Receiver for ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: true
       matrix:
-        # Must match TARGETS in npm/platforms.mjs; the publish job fails on a missing one.
-        # Linux builds on Ubuntu 22.04 (glibc 2.35), not ubuntu-latest (24.04, glibc 2.39): a binary
-        # runs only on a glibc at least as new as the one it was built against, so the older runner
-        # reaches more systems. ci.yml's receiver job only tests, so it stays on ubuntu-latest.
+        # Must match TARGETS + GPU_TARGETS in npm/platforms.mjs.
+        # Linux builds on Ubuntu 22.04 (glibc 2.35), not ubuntu-latest (24.04, glibc 2.39).
         include:
-          - { target: linux-x64, runner: ubuntu-22.04, arch: X64, shared: true }
+          - { target: linux-x64, runner: ubuntu-22.04, arch: X64 }
           - { target: linux-arm64, runner: ubuntu-22.04-arm, arch: ARM64 }
           - { target: darwin-arm64, runner: macos-latest, arch: ARM64 }
           - { target: darwin-x64, runner: macos-15-intel, arch: X64 }
           - { target: win32-x64, runner: windows-latest, arch: X64 }
+          - { target: linux-x64-cuda13, runner: ubuntu-22.04, arch: X64, cuda: "13" }
+          - { target: linux-x64-cuda12, runner: ubuntu-22.04, arch: X64, cuda: "12" }
     env:
       PI_SPEECH_AUDIO_NULL: "1"
     defaults:
@@ -69,21 +68,26 @@ jobs:
       - name: Install the ALSA development library (the audio engine links it)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - name: Fetch sherpa-onnx's CUDA bundle (its shared libraries)
-        if: matrix.shared
+      - name: Fetch sherpa-onnx's CUDA bundle (for GPU editions)
+        if: matrix.cuda != ''
         run: |
-          curl -fsSL --retry 3 "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/$GPU_BUNDLE.tar.bz2" -o gpu.tar.bz2
-          echo "$GPU_BUNDLE_SHA256  gpu.tar.bz2" | sha256sum -c -
+          if [ "${{ matrix.cuda }}" = "13" ]; then
+            bundle="$GPU_BUNDLE_13"
+            sha="$GPU_BUNDLE_13_SHA256"
+          else
+            bundle="$GPU_BUNDLE_12"
+            sha="$GPU_BUNDLE_12_SHA256"
+          fi
+          curl -fsSL --retry 3 "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/$bundle.tar.bz2" -o gpu.tar.bz2
+          echo "$sha  gpu.tar.bz2" | sha256sum -c -
           tar -xjf gpu.tar.bz2
-          echo "SHERPA_ONNX_LIB_DIR=$PWD/$GPU_BUNDLE/lib" >> "$GITHUB_ENV"
+          echo "SHERPA_ONNX_LIB_DIR=$PWD/$bundle/lib" >> "$GITHUB_ENV"
       - name: Build the release binary
-        run: cargo build --release --locked ${{ matrix.shared && '--no-default-features --features shared' || '' }}
-      - name: Put the shared libraries beside the binary
-        if: matrix.shared
+        run: cargo build --release --locked ${{ matrix.cuda != '' && '--no-default-features --features shared' || '' }}
+      - name: Put the shared libraries beside the GPU binary
+        if: matrix.cuda != ''
         run: |
-          for lib in libsherpa-onnx-c-api.so libonnxruntime.so libonnxruntime_providers_shared.so; do
-            cp "$SHERPA_ONNX_LIB_DIR/$lib" target/release/
-          done
+          cp -P "$SHERPA_ONNX_LIB_DIR/"*.so* target/release/
           readelf -d target/release/pi-speech-receiver | grep -q 'RUNPATH.*\$ORIGIN'
       - name: Smoke-test the release binary (models list prints JSON lines)
         run: |
@@ -120,7 +124,7 @@ jobs:
           path: |
             receiver/target/release/pi-speech-receiver
             receiver/target/release/pi-speech-receiver.exe
-            receiver/target/release/*.so
+            receiver/target/release/*.so*
           if-no-files-found: error
           retention-days: 7
 
@@ -129,7 +133,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: npm
     permissions:
-      contents: write # create the GitHub release
+      contents: write # create the GitHub release and upload receiver archives
       id-token: write # npm trusted publishing (OIDC)
     steps:
       - uses: actions/checkout@v7
@@ -151,7 +155,8 @@ jobs:
             exit 1
           fi
       - run: npm ci
-      - run: npm run check
+      - run: npm run typecheck
+      - run: npm run lint
       - uses: actions/download-artifact@v4
         with:
           pattern: receiver-*
@@ -159,22 +164,32 @@ jobs:
       - name: Collect the built binaries
         run: |
           mkdir -p bundle
-          for target in $(node npm/platforms.mjs targets); do
-            exe=pi-speech-receiver
-            [ "${target%%-*}" = win32 ] && exe=pi-speech-receiver.exe
+          for d in artifacts/receiver-*; do
+            target="${d#artifacts/receiver-}"
             mkdir -p "bundle/$target"
-            cp "artifacts/receiver-$target/"* "bundle/$target/"
+            cp -P "$d/"* "bundle/$target/"
           done
-      - name: Bundle every platform's binary into the package
-        run: node npm/platforms.mjs bundle --binaries-dir bundle
-      - name: Check the package carries all five binaries
+      - name: Pack release archives and write receivers.json
         run: |
-          for target in $(node npm/platforms.mjs targets); do
-            exe=pi-speech-receiver
-            [ "${target%%-*}" = win32 ] && exe=pi-speech-receiver.exe
-            test -x "bin/$target/$exe" || { echo "::error::missing bin/$target/$exe"; exit 1; }
-          done
+          version="$(node -p 'require("./package.json").version')"
+          node npm/platforms.mjs release \
+            --binaries-dir bundle \
+            --assets-dir release-assets \
+            --manifest receivers.json \
+            --version "$version" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --tag "${GITHUB_REF_NAME}"
+          cat receivers.json
           npm pack --dry-run
+      - name: Create the GitHub release and upload receiver archives (before npm publish)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" release-assets/*.tar.gz --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" release-assets/*.tar.gz --verify-tag --generate-notes --title "${GITHUB_REF_NAME}"
+          fi
       - name: Is this version already on npm?
         id: registry
         run: |
@@ -191,12 +206,3 @@ jobs:
         run: npm publish
         env:
           NPM_CONFIG_LOGLEVEL: verbose
-      - name: Create the GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            echo "::notice::Release ${GITHUB_REF_NAME} already exists"
-          else
-            gh release create "${GITHUB_REF_NAME}" --verify-tag --generate-notes --title "${GITHUB_REF_NAME}"
-          fi

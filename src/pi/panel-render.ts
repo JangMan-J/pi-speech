@@ -7,7 +7,16 @@
 
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { Hint, PanelView, PickerItem, PickerView, StatusTone } from "../engine/panel";
-import { contentWidth, FRAME_ROWS, type FrameStyle, frameLines, type Measure, spread } from "./frame";
+import {
+  contentWidth,
+  FRAME_ROWS,
+  type FrameSort,
+  type FrameStyle,
+  frameLines,
+  type Measure,
+  sortArrow,
+  spread,
+} from "./frame";
 
 export interface PanelStyle {
   accent(text: string): string;
@@ -38,8 +47,8 @@ export const PLAIN: PanelStyle = {
 
 /** Below this only a one-line message is drawn. */
 export const MIN_WIDTH = 40;
-/** A model list's Price and Voices columns, about; one figure so the text is equally wide on every tab. */
-export const RIGHT_COLS_W = 24;
+/** Keep the right edge of the table centered (`termWidth / 2`) on fullscreen terminals. */
+export const RIGHT_COLS_W = 0;
 
 const CURSOR = "▶ ";
 const NO_MARKER = "  ";
@@ -307,7 +316,7 @@ function renderForm(view: PanelView, w: number, s: PanelStyle): { header: string
   const maxLabel = Math.max(...view.rows.map((r) => width(r.label) + 2));
   const labelW = Math.min(Math.max(8, w - 10), Math.max(MIN_LABEL, maxLabel));
   const room = Math.max(0, w - CURSOR.length - labelW);
-  const header = `  ${s.accent(pad("Setting", labelW))}${s.accent("Value")}`;
+  const header = `  ${s.accent("Setting")}`;
   const start = windowStart(view.selected, view.rows.length);
   const rows = view.rows.slice(start, start + FRAME_ROWS).map((r, i) => {
     const on = start + i === view.selected;
@@ -317,11 +326,12 @@ function renderForm(view: PanelView, w: number, s: PanelStyle): { header: string
       return mark + (on ? s.accent(s.bold(trimmed)) : trimmed) + (r.opens ? s.dim(OPENS) : "");
     }
     const label = pad(cutText(r.label, labelW - 1), labelW);
+    const valueStyle = r.disabled ? s.dim : r.muted ? (on ? same : s.dim) : on ? s.bold : same;
     const entry = drawEntry(
       { value: r.value, note: r.note, short: r.short, alert: r.alert, opens: r.opens },
       room,
       s,
-      on ? s.bold : same,
+      valueStyle,
     );
     return mark + (on ? s.accent(s.bold(label)) : s.dim(label)) + entry;
   });
@@ -332,42 +342,24 @@ function renderPicker(p: PickerView, w: number, s: PanelStyle): { header: string
   if (p.loading) return { header: "", rows: [NO_MARKER + s.dim("loading…")] };
   if (!p.items.length) return { header: "", rows: [NO_MARKER + s.dim(cutText(p.empty, Math.max(0, w - 2)))] };
 
-  const catalog = p.noun === "models" && !p.keepColumns;
-  const provider = (it: PickerItem) => (catalog && it.cols?.[0] ? `[${it.cols[0]}]` : "");
-  const rightOf = (it: PickerItem): string[] => {
-    const extra = catalog
-      ? it.cols
-        ? it.cols.slice(1)
-        : it.note
-          ? [it.note]
-          : []
-      : (it.cols ?? (it.note ? [it.note] : []));
-    return [it.price ?? "", ...extra];
-  };
-  const names = catalog
-    ? ["Price", "Voices"]
-    : p.keepColumns
-      ? ["Size", "State", "Languages"]
-      : p.noun === "voices"
-        ? ["", "Language"]
-        : ["Price", "Notes"];
+  const columns = p.columns ?? [];
+  const provider = (it: PickerItem) => (it.provider ? `[${it.provider}]` : "");
+  const rightOf = (it: PickerItem): string[] => [it.price ?? "", ...(it.cols ?? (it.note ? [it.note] : []))];
 
-  const nRight = Math.max(1, ...p.items.map((it) => rightOf(it).length));
+  const nRight = Math.max(columns.length, ...p.items.map((it) => rightOf(it).length));
   const rightW = Array.from({ length: nRight }, (_, c) => {
+    const col = columns[c];
     const first = rightOf(p.items[0])[c] ?? "";
     const uniform =
-      c > 0 &&
-      !catalog &&
-      !p.keepColumns &&
-      p.items.length > 1 &&
-      p.items.every((it) => (rightOf(it)[c] ?? "") === first);
+      Boolean(col?.hideIfUniform) && p.items.length > 1 && p.items.every((it) => (rightOf(it)[c] ?? "") === first);
     const dataMax = uniform ? 0 : Math.min(COL_CAP, Math.max(0, ...p.items.map((it) => width(rightOf(it)[c] ?? ""))));
-    const headName = names[c] ?? "";
+    const headName = col?.header ?? "";
     return dataMax > 0 ? Math.max(dataMax, headName ? width(headName) + 2 : 0) : 0;
   });
 
+  const provHeader = p.providerHeader ?? "Provider";
   const rawProvW = Math.max(0, ...p.items.map((it) => width(provider(it))));
-  let provW = rawProvW > 0 ? Math.max(rawProvW, width("Provider ▲")) : 0;
+  let provW = rawProvW > 0 ? Math.max(rawProvW, width(`${provHeader} ▲`)) : 0;
 
   const calcRightBlock = () => rightW.reduce((sum, cw) => sum + (cw ? GAP + cw : 0), 0);
   const minName = 12;
@@ -386,7 +378,8 @@ function renderPicker(p: PickerView, w: number, s: PanelStyle): { header: string
   const provBlock = provW ? GAP + provW : 0;
   const rightBlock = calcRightBlock();
   const noun =
-    p.noun === "models" ? "Model" : p.noun === "voices" ? "Voice" : p.noun === "messages" ? "Message" : "Name";
+    p.nounHeader ??
+    (p.noun === "models" ? "Model" : p.noun === "voices" ? "Voice" : p.noun === "messages" ? "Message" : "Name");
   const nameFloor = Math.max(width(noun) + 2, 8);
   const nameFull = Math.max(nameFloor, ...p.items.map((it) => width(it.label) + 2));
   const maxNameAvail = Math.max(4, w - CURSOR.length - provBlock - rightBlock);
@@ -394,39 +387,32 @@ function renderPicker(p: PickerView, w: number, s: PanelStyle): { header: string
   const leftW = CURSOR.length + nameW + provBlock;
   const fill = Math.max(0, w - leftW - rightBlock);
 
-  const sortCol =
-    p.sort === "name"
-      ? "name"
-      : p.sort === "provider" && provW > 0
-        ? "Provider"
-        : p.sort === "price" && rightW[0] > 0 && names[0] === "Price"
-          ? "Price"
-          : "";
-  const sortRightPlain = p.sort && !sortCol ? `Sort: ${p.sort}` : "";
-  const sortRightStyled = p.sort && !sortCol ? `${s.dim("Sort:")} ${s.bold(s.accent(p.sort))}` : "";
+  const desc = p.sort?.endsWith("-desc") ?? false;
+  const sortKey = p.sort ? (desc ? p.sort.slice(0, -5) : p.sort) : "";
+  const arrow = sortArrow(desc ? "desc" : "asc");
+  const sortRightIdx = columns.findIndex((col, c) => col.sortKey === sortKey && rightW[c] > 0);
+  const sortName = sortKey === "name";
+  const sortProv = sortKey === "provider" && provW > 0;
 
   const head = (text: string, on: boolean) =>
-    on ? s.bold(s.accent(text)) + s.bold(s.warning(" ▲")) : text ? s.accent(text) : "";
+    on ? s.bold(s.accent(text)) + s.bold(s.warning(` ${arrow}`)) : text ? s.accent(text) : "";
   const headW = (text: string, on: boolean) => width(text) + (on ? 2 : 0);
 
-  const nameHeadW = headW(noun, sortCol === "name");
-  const provHeadW = headW("Provider", sortCol === "Provider");
-  const midFill =
-    sortRightPlain && fill >= width(sortRightPlain) + GAP
-      ? spaces(fill - width(sortRightPlain)) + sortRightStyled
-      : spaces(fill);
+  const nameHeadW = headW(noun, sortName);
+  const provHeadW = headW(provHeader, sortProv);
+  const midFill = spaces(fill);
 
   const header =
     NO_MARKER +
-    head(noun, sortCol === "name") +
+    head(noun, sortName) +
     spaces(Math.max(0, nameW - nameHeadW)) +
-    (provW ? spaces(GAP) + head("Provider", sortCol === "Provider") + spaces(Math.max(0, provW - provHeadW)) : "") +
+    (provW ? spaces(GAP) + head(provHeader, sortProv) + spaces(Math.max(0, provW - provHeadW)) : "") +
     midFill +
     rightW
       .map((cw, c) => {
         if (!cw) return "";
-        const label = cutText(names[c] ?? "", Math.max(0, cw - (sortCol === names[c] ? 2 : 0)));
-        const on = !!label && sortCol === names[c];
+        const on = c === sortRightIdx;
+        const label = cutText(columns[c]?.header ?? "", Math.max(0, cw - (on ? 2 : 0)));
         return spaces(Math.max(GAP, GAP + cw - headW(label, on))) + head(label, on);
       })
       .join("");
@@ -503,6 +489,24 @@ function renderKeys(view: PanelView, w: number, s: PanelStyle): string {
   return `  ${hintLine(view.hints, Math.max(0, w - 2), s)}`;
 }
 
+const SORT_LABELS: Record<string, string> = {
+  price: "Price",
+  provider: "Provider",
+  newest: "Newest",
+  name: "Alphabetical",
+  recommended: "Recommended",
+  size: "Size",
+  state: "Downloaded",
+};
+const MAX_SORT_LABEL_W = Math.max(...Object.values(SORT_LABELS).map((v) => v.length));
+
+function frameSort(sort: string | undefined): FrameSort | undefined {
+  if (!sort) return undefined;
+  const key = sort.endsWith("-desc") ? sort.slice(0, -5) : sort;
+  const label = SORT_LABELS[key] ?? key;
+  return { label, maxLabelWidth: MAX_SORT_LABEL_W };
+}
+
 /**
  * The panel as 19 framed lines of at most `termWidth` columns, or one line when the terminal is narrower
  * than MIN_WIDTH.
@@ -519,6 +523,7 @@ export function renderPanel(view: PanelView, termWidth: number, s: PanelStyle = 
       title: view.title,
       badge: view.state ? stateStyle(view.state, s)(view.state) : undefined,
       tabs: renderTabs(view, w, s),
+      sort: frameSort(view.picker?.sort),
       input: renderInput(view, w, s),
       header: body.header,
       rows: body.rows,

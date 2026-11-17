@@ -158,10 +158,12 @@ describe("read-aloud summaries", () => {
   it("another Pi model: one request with the reply (without the reasoning); its answer is read", async () => {
     const h = harness(undefined, { summarizer: "anthropic/claude-haiku", length: "minimum" });
     const asked: Array<[string, string]> = [];
-    h.r.summarize = async (model, prompt) => {
-      asked.push([model, prompt]);
-      return "Two things changed.";
-    };
+    h.r.attachHost({
+      summarize: async (model, prompt) => {
+        asked.push([model, prompt]);
+        return "Two things changed.";
+      },
+    });
     h.r.mode = "summary";
     const run = [
       {
@@ -184,9 +186,11 @@ describe("read-aloud summaries", () => {
 
   it("another Pi model that fails is reported, and nothing is read", async () => {
     const h = harness(undefined, { summarizer: "anthropic/claude-haiku" });
-    h.r.summarize = async () => {
-      throw new Error("rate limited");
-    };
+    h.r.attachHost({
+      summarize: async () => {
+        throw new Error("rate limited");
+      },
+    });
     h.r.mode = "summary";
     await h.r.onRunEnd(reply("Answer."));
     expect(h.spoken).toEqual([]);
@@ -208,10 +212,12 @@ describe("streaming", () => {
   it("summarizes the reasoning with the summarizer, its length shown as a placeholder, and speaks it", async () => {
     const h = streaming({ length: "abridged" });
     const asked: Array<[string, string]> = [];
-    h.r.summarize = async (model, prompt) => {
-      asked.push([model, prompt]);
-      return "Reading the logs.";
-    };
+    h.r.attachHost({
+      summarize: async (model, prompt) => {
+        asked.push([model, prompt]);
+        return "Reading the logs.";
+      },
+    });
     h.r.mode = "streaming";
     h.r.onThinkingBlock(LONG);
     await flush();
@@ -241,7 +247,7 @@ describe("streaming", () => {
 
   it("does nothing outside streaming mode; at run end it says what is held, never the reply", async () => {
     const h = streaming();
-    h.r.summarize = async () => "summary";
+    h.r.attachHost({ summarize: async () => "summary" });
     h.r.mode = "summary";
     h.r.onThinkingBlock(LONG);
     await flush();
@@ -259,7 +265,7 @@ describe("streaming", () => {
   it("truncates each spoken summary to the Truncate at limit", async () => {
     const long = "A sentence with some words. ".repeat(20);
     const h = streaming({ truncate: 15 });
-    h.r.summarize = async () => long;
+    h.r.attachHost({ summarize: async () => long });
     h.r.mode = "streaming";
     h.r.onThinkingBlock(LONG);
     await flush();

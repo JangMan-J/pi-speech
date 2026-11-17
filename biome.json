@@ -12,7 +12,6 @@
       "!scripts/init-package.mjs",
       "!scripts/smoke-pack.mjs",
       "!GLOSSARY.md",
-      "!VECTORS",
       "!src/pi/frame.ts"
     ]
   },

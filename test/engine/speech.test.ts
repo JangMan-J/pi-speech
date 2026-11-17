@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { LocalSpeechProvider } from "../../src/engine/local-speech";
-import { READING_MIN_CHARS } from "../../src/engine/pieces";
+import { READING_MIN_CHARS } from "../../src/engine/reading";
 import { LOCAL_SPEECH_UNAVAILABLE } from "../../src/engine/speech";
 import { fakeOpenRouter, fakeReceiver, makeEngine, STAND_IN_BINARY, until } from "./fixtures";
 

@@ -4,54 +4,28 @@
  */
 
 import { clipOf, collect, streamFromBody } from "./audio-stream";
-import { chatSynthesize, chatSynthesizeStream, chatTranscribe } from "./chat-audio";
+import { dispatchSynthesize, dispatchSynthesizeStream, dispatchTranscribe } from "./chat-audio";
 import { type KeyRegistry, resolveApiKey } from "./credentials";
 import { type Env, errorMessage } from "./env";
 import { FEATURES, type ModelKind, modelFeatures, vendorOf } from "./features";
+import { bearer, errorText } from "./http";
 import { chatPriceTag, type OpenRouterPricing, priceTag } from "./pricing";
-import type {
-  AudioStream,
-  SpeechProvider,
-  SynthesisRequest,
-  SynthesizedAudio,
-  TranscriptionRequest,
-  Via,
+import {
+  type AudioStream,
+  CHAT_NOTE,
+  DEFAULT_VOICE,
+  type ModelOption,
+  type SpeechCatalog,
+  type SpeechProvider,
+  type SynthesisRequest,
+  type SynthesizedAudio,
+  type TranscriptionRequest,
 } from "./provider";
 
-export type { SynthesizedAudio } from "./provider";
+export { CHAT_NOTE, DEFAULT_VOICE, type ModelOption, type SpeechCatalog, type SynthesizedAudio } from "./provider";
 export { wrapPcmAsWav } from "./wav";
 
 export const OPENROUTER_API = "https://openrouter.ai/api/v1";
-
-/** Voice value for models that list no voices: the request then carries no `voice` at all. */
-export const DEFAULT_VOICE = "default";
-
-export interface ModelOption {
-  id: string;
-  /** Human-readable name from the catalog, or the id. */
-  label: string;
-  /** Voices the model accepts (speech models only), from the catalog's `supported_voices`. */
-  voices?: string[];
-  /** Price tag in dollars per minute of audio, e.g. "$0.006/min" or "~$0.064/min". */
-  price?: string;
-  /** Who makes the model, e.g. "ElevenLabs". */
-  vendor?: string;
-  /** What the catalog says the model offers (src/engine/features.ts); empty when it states nothing. */
-  features?: string[];
-  /** The languages as the catalog states them: "90+ langs", "English". */
-  languages?: string;
-  /** The catalog's (short) description. */
-  description?: string;
-  /** When the model was added to the catalog, in seconds since the epoch. */
-  created?: number;
-  /** The endpoint type the model is reached through; undefined is the audio endpoint. */
-  via?: Via;
-}
-
-export interface SpeechCatalog {
-  tts: ModelOption[];
-  stt: ModelOption[];
-}
 
 interface CatalogModel {
   id: string;
@@ -78,11 +52,14 @@ const CHAT_VOICES: Array<[RegExp, string[]]> = [
     ["alloy", "ash", "ballad", "cedar", "coral", "echo", "fable", "marin", "nova", "onyx", "sage", "shimmer", "verse"],
   ],
 ];
-/** What the panel says of a chat model, before the catalog's own description. */
-export const CHAT_NOTE: Record<ModelKind, string> = {
-  tts: "A chat model asked to read; a reading that strays from the text is not played.",
-  stt: "A chat model asked to transcribe; a few obey a spoken order instead.",
-};
+
+function openRouterError(status: number, body: string, apiKey: string): Error {
+  const text = errorText(body, apiKey);
+  if (status === 401 || status === 403) {
+    return new Error(`OpenRouter rejected the API key (HTTP ${status})${text ? `: ${text}` : ""}`);
+  }
+  return new Error(`HTTP ${status}${text ? `: ${text}` : ""}`);
+}
 
 /**
  * The models that speak and the models that transcribe, by the endpoint type each is served on:
@@ -160,7 +137,7 @@ export async function synthesizeStream(
   const request = (format: string) =>
     fetch(`${OPENROUTER_API}/audio/speech`, {
       method: "POST",
-      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      headers: { ...bearer(apiKey), "Content-Type": "application/json" },
       body: JSON.stringify({
         model,
         input: text,
@@ -172,10 +149,10 @@ export async function synthesizeStream(
 
   let res = await request("pcm");
   if (!res.ok) {
-    const errText = await res.text();
-    if (res.status !== 400 || !/response_format/.test(errText)) throw new Error(`HTTP ${res.status}: ${errText}`);
+    const errBody = await res.text().catch(() => "");
+    if (res.status !== 400 || !/response_format/.test(errBody)) throw openRouterError(res.status, errBody, apiKey);
     res = await request("mp3");
-    if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+    if (!res.ok) throw openRouterError(res.status, await res.text().catch(() => ""), apiKey);
   }
   return streamFromBody(res.body, res.headers.get("content-type") || "audio/mpeg", "OpenRouter");
 }
@@ -203,7 +180,7 @@ export async function transcribe(
 ): Promise<string> {
   const res = await fetch(`${OPENROUTER_API}/audio/transcriptions`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    headers: { ...bearer(apiKey), "Content-Type": "application/json" },
     body: JSON.stringify({
       model,
       input_audio: { data: Buffer.from(audio).toString("base64"), format },
@@ -211,7 +188,7 @@ export async function transcribe(
     }),
     signal,
   });
-  if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+  if (!res.ok) throw openRouterError(res.status, await res.text().catch(() => ""), apiKey);
   const data = (await res.json()) as { text?: unknown };
   return typeof data.text === "string" ? data.text : "";
 }
@@ -222,6 +199,7 @@ export const OPENROUTER_NO_KEY =
 /** OpenRouter as a speech provider: every model of its catalog. The voice language is not sent. */
 export class OpenRouterProvider implements SpeechProvider {
   readonly name = "OpenRouter";
+  readonly defaultVoice = DEFAULT_VOICE;
 
   constructor(
     private readonly registry: () => KeyRegistry | undefined,
@@ -244,20 +222,16 @@ export class OpenRouterProvider implements SpeechProvider {
   }
 
   async synthesize(req: SynthesisRequest): Promise<SynthesizedAudio> {
-    if (req.via === "chat") {
-      const voice = req.voice && req.voice !== DEFAULT_VOICE ? req.voice : undefined;
-      return chatSynthesize(this.target(await this.key()), { text: req.text, model: req.model, voice }, req.signal);
-    }
-    const stream = await this.synthesizeStream(req);
-    return clipOf(stream.format, await collect(stream.chunks), this.name);
+    const key = await this.key();
+    return dispatchSynthesize(this.target(key), req, req.model, () => this.audioStream(key, req));
   }
 
   async synthesizeStream(req: SynthesisRequest): Promise<AudioStream> {
     const key = await this.key();
-    if (req.via === "chat") {
-      const voice = req.voice && req.voice !== DEFAULT_VOICE ? req.voice : undefined;
-      return chatSynthesizeStream(this.target(key), { text: req.text, model: req.model, voice }, req.signal);
-    }
+    return dispatchSynthesizeStream(this.target(key), req, req.model, () => this.audioStream(key, req));
+  }
+
+  private async audioStream(key: string, req: SynthesisRequest): Promise<AudioStream> {
     try {
       return await synthesizeStream(key, req.text, req.model, req.voice, req.signal);
     } catch (err) {
@@ -270,7 +244,9 @@ export class OpenRouterProvider implements SpeechProvider {
   }
 
   async transcribe(req: TranscriptionRequest): Promise<string> {
-    if (req.via === "chat") return chatTranscribe(this.target(await this.key()), req, req.signal);
-    return transcribe(await this.key(), req.audio, req.format, req.model, req.language, req.signal);
+    const key = await this.key();
+    return dispatchTranscribe(this.target(key), req, req.model, () =>
+      transcribe(key, req.audio, req.format, req.model, req.language, req.signal),
+    );
   }
 }

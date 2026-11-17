@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SpeechCatalog } from "../../src/engine/openrouter";
 import { Panel } from "../../src/engine/panel";
-import { READING_MIN_CHARS } from "../../src/engine/pieces";
+import { READING_MIN_CHARS } from "../../src/engine/reading";
 import { Surface } from "../../src/engine/surface";
 import { CATALOG, makeEngine as makeFixtureEngine, scriptedUi } from "./fixtures";
 
@@ -133,10 +133,8 @@ describe("a chat model as the transcription model", () => {
     panel.handle({ key: "enter" });
     await panel.idle();
     const row = () => panel.view().picker?.items.find((i) => i.id === "google/gemini-3.8-flash");
-    expect(row()).toMatchObject({ price: "~$0.0023/min", cols: ["OpenRouter"] });
+    expect(row()).toMatchObject({ price: "~$0.0023/min", provider: "OpenRouter" });
     expect(panel.view().picker?.items).toHaveLength(3);
-    panel.handle({ key: "down" });
-    await panel.idle();
     expect(panel.view().picker?.detail).toMatch(/^A chat model asked to transcribe/);
   });
 });
@@ -217,5 +215,15 @@ describe("a chat model as the speech model", () => {
     const { engine } = makeEngine();
     await engine.speech.speak("Hello.", { play: false });
     expect(paths(requests)).toEqual(["/audio/speech"]);
+  });
+
+  it("reconcile preserves a custom voice on a chat model that lists no voices", async () => {
+    fakeOpenRouter();
+    const { engine } = makeEngine();
+    await engine.speech.set("tts-model", "acme/talker");
+    await engine.speech.set("voice", "nova");
+    engine.speech.start();
+    await engine.speech.ready();
+    expect(engine.speech.settings.voice).toBe("nova");
   });
 });

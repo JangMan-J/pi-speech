@@ -58,12 +58,21 @@ describe("model features from the catalog", () => {
     expect(featureLine({})).toBe("");
   });
 
-  it("the columns after the price: the provider, then for a speech model its number of voices", () => {
-    expect(modelColumns("tts", { voices: Array(30).fill("v") }, "OpenRouter")).toEqual(["OpenRouter", "30 voices"]);
+  it("the columns after the price: provider, number of voices, and inline tag syntax when known", () => {
+    expect(modelColumns("tts", { id: "elevenlabs/eleven-v4", voices: Array(30).fill("v") }, "OpenRouter")).toEqual([
+      "OpenRouter",
+      "30 voices",
+      "[tags]",
+    ]);
+    expect(modelColumns("tts", { id: "canopylabs/orpheus", voices: ["tara"] }, "OpenRouter")).toEqual([
+      "OpenRouter",
+      "1 voice",
+      "<tags>",
+    ]);
     // a single voice reads in the singular; an unknown count is one voice, not a blank
-    expect(modelColumns("tts", { voices: ["only"] }, "OpenAI")).toEqual(["OpenAI", "1 voice"]);
-    expect(modelColumns("tts", {}, "OpenRouter")).toEqual(["OpenRouter", "1 voice"]);
-    expect(modelColumns("tts", { voices: [] }, "OpenRouter")).toEqual(["OpenRouter", "1 voice"]);
+    expect(modelColumns("tts", { voices: ["only"] }, "OpenAI")).toEqual(["OpenAI", "1 voice", ""]);
+    expect(modelColumns("tts", {}, "OpenRouter")).toEqual(["OpenRouter", "1 voice", ""]);
+    expect(modelColumns("tts", { voices: [] }, "OpenRouter")).toEqual(["OpenRouter", "1 voice", ""]);
     // a transcription model: the provider alone
     expect(modelColumns("stt", {}, "Groq")).toEqual(["Groq"]);
   });

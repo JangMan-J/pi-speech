@@ -29,7 +29,7 @@
   "files": [
     "index.ts",
     "src",
-    "bin",
+    "receivers.json",
     "receiver/src",
     "receiver/Cargo.toml",
     "receiver/Cargo.lock",

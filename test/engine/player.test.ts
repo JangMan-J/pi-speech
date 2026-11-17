@@ -231,4 +231,15 @@ describe("replay: a saved message played as a Stream", () => {
     expect(r).toMatchObject({ ok: false, reason: expect.stringMatching(/cannot read .*gone\.wav: ENOENT/) });
     expect(f.log).toEqual([]);
   });
+
+  it("tracks replacement fade per ticket without racing across back-to-back claims", () => {
+    const f = fakeOutput();
+    const p = new Player(() => f.output);
+    const t1 = p.claim();
+    const t2 = p.claim(450);
+    const t3 = p.claim();
+    expect(p.replaceFadeFor(t1)).toBe(450);
+    expect(p.replaceFadeFor(t2)).toBeUndefined();
+    expect(p.replaceFadeFor(t3)).toBeUndefined();
+  });
 });

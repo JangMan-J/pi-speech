@@ -34,14 +34,34 @@ export const MACHINES: Machine[] = ["this", "remote"];
 export type Source = "provider" | "local";
 export const SOURCES: Source[] = ["provider", "local"];
 
-/** How the model lists of the panel are ordered. */
-export type ModelSort = "price" | "provider" | "newest" | "name";
+/** How the model lists of the panel are ordered (`Ctrl+S`). */
+export type ModelSort = "price" | "price-desc" | "provider" | "provider-desc" | "newest" | "name" | "name-desc";
 /** A saved order no longer offered (features) falls back to price. */
-export const MODEL_SORTS: ModelSort[] = ["price", "provider", "newest", "name"];
+export const MODEL_SORTS: ModelSort[] = [
+  "name",
+  "name-desc",
+  "price",
+  "price-desc",
+  "provider",
+  "provider-desc",
+  "newest",
+];
+
+/** How local model lists of the panel are ordered (`Ctrl+S`). */
+export type LocalModelSort = "recommended" | "size" | "size-desc" | "state" | "state-desc" | "name" | "name-desc";
+export const LOCAL_MODEL_SORTS: LocalModelSort[] = [
+  "name",
+  "name-desc",
+  "recommended",
+  "size",
+  "size-desc",
+  "state",
+  "state-desc",
+];
 
 /** How the live audio spectrum OSD above the editor is drawn (`off` hides it). */
-export type OsdStyle = "braille" | "bars" | "mirror" | "line" | "off";
-export const OSD_STYLES: OsdStyle[] = ["braille", "bars", "mirror", "line", "off"];
+export type OsdStyle = "line" | "helix" | "braille" | "prism" | "orb" | "wave" | "off";
+export const OSD_STYLES: OsdStyle[] = ["line", "helix", "braille", "prism", "orb", "wave", "off"];
 
 /** The keys of the Pi shortcuts, as Pi names them (`alt+s`). Pi binds speak/dictate when loading. */
 export interface Hotkeys {
@@ -108,11 +128,16 @@ export interface Settings {
   languages: LanguageOverrides;
   /** The language spoken into dictation and transcribed files, such as "ja"; undefined leaves it to the model. */
   dictationLanguage?: string;
-  /** A command the dictation transcript is handed to (%s is the text); kept while the mode is Pi. */
-  dictationOutput?: string;
-  /** Where dictation goes: Pi's input box (the default, also when absent), or the command in `dictationOutput`. */
-  dictationOutputMode?: DictationOutputMode;
+  /** Whether dictation types live into Pi's editor while recording (for live-capable local STT models). */
+  dictationLive?: boolean;
+  /** Trailing word or phrase that, when spoken at the end of dictation, submits the message in Pi. */
+  dictationSubmitWord?: string;
+  /** Domain vocabulary lines (terms or `wrong -> right`) for biasing STT and fixing spelling. */
+  dictationVocabulary?: string[];
+  /** Voice slash commands (`/cmd` or `phrase -> /cmd`) invoked when spoken alone. */
+  dictationCommands?: string[];
   modelSort: ModelSort;
+  localModelSort: LocalModelSort;
   /** User-defined OpenAI-compatible speech endpoints, by name (src/engine/endpoints.ts). */
   endpoints: Record<string, EndpointConfig>;
   /** The keys of Speak and Dictate; a change applies when Pi next loads the extension. */
@@ -143,15 +168,14 @@ export interface Settings {
   remoteHost?: string;
   /** macOS: the notice that Option+letter reached Pi as a character has been shown (once per install). */
   optionKeyHintShown?: boolean;
+  /** Whether provider models with no known price are shown in model pickers (toggled with Ctrl+U). */
+  showUnpricedModels?: boolean;
   /** Live audio spectrum OSD style above the editor. */
   osdStyle: OsdStyle;
 }
 
 /** Where on-device models run: the CPU, or an NVIDIA GPU. */
 export type Device = "cpu" | "gpu";
-
-/** Dictation output: Pi's input box, or a user-defined command. Absent in the file means Pi. */
-export type DictationOutputMode = "pi" | "command";
 
 export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
   speechModel: "google/gemini-3.8-flash-tts",
@@ -160,7 +184,8 @@ export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
   tools: true,
   bridge: "auto",
   languages: {},
-  modelSort: "price",
+  modelSort: "name",
+  localModelSort: "name",
   endpoints: {},
   hotkeys: DEFAULT_HOTKEYS,
   readAloud: DEFAULT_READ_ALOUD,
@@ -170,7 +195,7 @@ export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
   playOn: "remote",
   recordOn: "remote",
   modelsOn: "remote",
-  osdStyle: "braille",
+  osdStyle: "line",
 });
 
 /** The saved directions, in the order the panel shows them. */
@@ -193,6 +218,7 @@ function readJson(file: string): Json | undefined {
 const str = (v: unknown): string | undefined => (typeof v === "string" && v ? v : undefined);
 const isMode = (v: unknown): v is BridgeMode => v === "auto" || v === "on" || v === "off";
 const isSort = (v: unknown): v is ModelSort => MODEL_SORTS.includes(v as ModelSort);
+const isLocalSort = (v: unknown): v is LocalModelSort => LOCAL_MODEL_SORTS.includes(v as LocalModelSort);
 const isSource = (v: unknown): v is Source => SOURCES.includes(v as Source);
 const isMachine = (v: unknown): v is Machine => MACHINES.includes(v as Machine);
 const isOsdStyle = (v: unknown): v is OsdStyle => OSD_STYLES.includes(v as OsdStyle);
@@ -299,11 +325,15 @@ export class SettingsFile {
       s.languages = languagesFrom(raw.languages);
       const spoken = str(raw.dictationLanguage);
       if (spoken) s.dictationLanguage = spoken;
-      const output = str(raw.dictationOutput);
-      if (output) s.dictationOutput = output;
-      // A stored command on its own (a config from before the mode) is not a choice: Pi until picked.
-      if (raw.dictationOutputMode === "command") s.dictationOutputMode = "command";
+      if (raw.dictationLive === true) s.dictationLive = true;
+      const submitWord = str(raw.dictationSubmitWord);
+      if (submitWord) s.dictationSubmitWord = submitWord;
+      const vocab = strings(raw.dictationVocabulary);
+      if (vocab?.length) s.dictationVocabulary = vocab;
+      const cmds = strings(raw.dictationCommands);
+      if (cmds?.length) s.dictationCommands = cmds;
       if (isSort(raw.modelSort)) s.modelSort = raw.modelSort;
+      if (isLocalSort(raw.localModelSort)) s.localModelSort = raw.localModelSort;
       s.endpoints = endpointsFrom(raw.endpoints);
       s.hotkeys = hotkeysFrom(raw.hotkeys);
       s.readAloud = readAloudFrom(raw.readAloud);
@@ -317,7 +347,11 @@ export class SettingsFile {
       const localTranscription = str(raw.localTranscriptionModel);
       if (localTranscription) s.localTranscriptionModel = localTranscription;
       if (raw.optionKeyHintShown === true) s.optionKeyHintShown = true;
+      if (raw.showUnpricedModels === true) s.showUnpricedModels = true;
       if (isOsdStyle(raw.osdStyle)) s.osdStyle = raw.osdStyle;
+      else if (raw.osdStyle === "bars" || raw.osdStyle === "peaks") s.osdStyle = "line";
+      else if (raw.osdStyle === "mirror") s.osdStyle = "wave";
+      else if (raw.osdStyle === "wave") s.osdStyle = "wave";
       const address = str(raw.bridgeAddress);
       if (address) s.bridgeAddress = address;
       const remoteHost = str(raw.remoteHost);
@@ -364,9 +398,12 @@ export class SettingsFile {
       bridge: s.bridge,
       languages: s.languages,
       ...(s.dictationLanguage ? { dictationLanguage: s.dictationLanguage } : {}),
-      ...(s.dictationOutput ? { dictationOutput: s.dictationOutput } : {}),
-      ...(s.dictationOutputMode === "command" ? { dictationOutputMode: "command" } : {}),
+      ...(s.dictationLive ? { dictationLive: true } : {}),
+      ...(s.dictationSubmitWord ? { dictationSubmitWord: s.dictationSubmitWord } : {}),
+      ...(s.dictationVocabulary?.length ? { dictationVocabulary: s.dictationVocabulary } : {}),
+      ...(s.dictationCommands?.length ? { dictationCommands: s.dictationCommands } : {}),
       ...(s.modelSort !== DEFAULT_SETTINGS.modelSort ? { modelSort: s.modelSort } : {}),
+      ...(s.localModelSort !== DEFAULT_SETTINGS.localModelSort ? { localModelSort: s.localModelSort } : {}),
       ...(Object.keys(s.endpoints).length ? { endpoints: s.endpoints } : {}),
       ...(s.hotkeys.speak !== DEFAULT_HOTKEYS.speak || s.hotkeys.dictate !== DEFAULT_HOTKEYS.dictate || s.hotkeys.ptt
         ? {
@@ -386,6 +423,7 @@ export class SettingsFile {
       ...(s.localTranscriptionModel ? { localTranscriptionModel: s.localTranscriptionModel } : {}),
       ...(s.localDevice !== "cpu" ? { localDevice: s.localDevice } : {}),
       ...(s.optionKeyHintShown ? { optionKeyHintShown: true } : {}),
+      ...(s.showUnpricedModels ? { showUnpricedModels: true } : {}),
       ...(s.bridgeAddress ? { bridgeAddress: s.bridgeAddress } : {}),
       ...(s.remoteHost ? { remoteHost: s.remoteHost } : {}),
       ...Object.fromEntries(DIRECTIONS.filter((d) => s[d] !== DEFAULT_SETTINGS[d]).map((d) => [d, s[d]])),

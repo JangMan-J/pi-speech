@@ -165,6 +165,11 @@ impl Writer {
         Ok(())
     }
 
+    /// Flush buffered PCM samples to the file so live readers can inspect in-progress audio.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.out.flush()
+    }
+
     /// Set the sizes in the header and flush the file to disk; returns the frames written.
     pub fn finish(mut self) -> io::Result<u64> {
         let (riff, data) = header_sizes(self.data_bytes);

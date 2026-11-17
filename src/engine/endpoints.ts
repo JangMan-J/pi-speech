@@ -14,13 +14,23 @@
  */
 
 import { clipOf, collect, streamFromBody } from "./audio-stream";
-import { chatSynthesize, chatSynthesizeStream, chatTranscribe } from "./chat-audio";
+import { dispatchSynthesize, dispatchSynthesizeStream, dispatchTranscribe } from "./chat-audio";
 import type { KeyRegistry } from "./credentials";
 import type { Env } from "./env";
 import { FEATURES, type ModelKind, modelFeatures } from "./features";
 import { bearer as auth, failure } from "./http";
-import { CHAT_NOTE, DEFAULT_VOICE, type ModelOption, type SpeechCatalog } from "./openrouter";
-import type { AudioStream, SpeechProvider, SynthesisRequest, SynthesizedAudio, TranscriptionRequest } from "./provider";
+import { lookupOpenAiPrice, type OpenAiPriceTable, OpenAiPricingCache } from "./openai-pricing";
+import {
+  type AudioStream,
+  CHAT_NOTE,
+  DEFAULT_VOICE,
+  type ModelOption,
+  type SpeechCatalog,
+  type SpeechProvider,
+  type SynthesisRequest,
+  type SynthesizedAudio,
+  type TranscriptionRequest,
+} from "./provider";
 
 /** A user-defined endpoint, as saved in the settings. */
 export interface EndpointConfig {
@@ -254,9 +264,11 @@ export class Endpoint implements SpeechProvider {
   /** For messages: "Groq", or the name of a user-defined endpoint. */
   readonly name: string;
   readonly baseUrl: string;
+  readonly defaultVoice = DEFAULT_VOICE;
   /** Whether it is one of PRESETS (and so needs a key to be offered). */
   readonly builtIn: boolean;
   private readonly preset?: Preset;
+  private readonly pricingCache: OpenAiPricingCache;
 
   constructor(
     /** The prefix of its model ids. */
@@ -264,11 +276,17 @@ export class Endpoint implements SpeechProvider {
     private readonly config: EndpointConfig | undefined,
     private readonly registry: () => KeyRegistry | undefined,
     private readonly env: Env,
+    pricingCache?: OpenAiPricingCache,
   ) {
     this.preset = config ? undefined : PRESETS[id];
     this.builtIn = this.preset !== undefined;
     this.name = this.preset?.title ?? id;
     this.baseUrl = (config?.baseUrl ?? this.preset?.baseUrl ?? "").replace(/\/+$/, "");
+    this.pricingCache = pricingCache ?? new OpenAiPricingCache();
+  }
+
+  ownsModel(model: string): boolean {
+    return model.startsWith(`${this.id}:`);
   }
 
   /** The key now: the configured one, an environment variable, or what Pi holds for this name. */
@@ -330,11 +348,16 @@ export class Endpoint implements SpeechProvider {
         .catch(() => undefined);
     }
     const host = this.baseUrl.replace(/^[a-z]+:\/\//, "");
-    const price = isLoopback(this.baseUrl) ? "$0" : undefined;
-    const served = price
-      ? `Served by ${this.name} (${host}), on this machine.`
-      : `Served by ${this.name} (${host}) with your key; its model list states no price.`;
+    const isOpenAi = this.baseUrl === "https://api.openai.com/v1";
+    const openAiPrices: OpenAiPriceTable | undefined = isOpenAi ? await this.pricingCache.fetch() : undefined;
+    const loopbackPrice = isLoopback(this.baseUrl) ? "$0" : undefined;
     const option = (kind: ModelKind, model: string, chat = false): ModelOption => {
+      const price = loopbackPrice ?? lookupOpenAiPrice(openAiPrices, kind, model);
+      const served = loopbackPrice
+        ? `Served by ${this.name} (${host}), on this machine.`
+        : price
+          ? `Served by ${this.name} (${host}) with your key.`
+          : `Served by ${this.name} (${host}) with your key; its model list states no price.`;
       const found = modelFeatures(kind, { id: model, price }).features;
       const many = chat || (kind === "stt" && STT_MULTILINGUAL.test(model));
       return {
@@ -361,30 +384,28 @@ export class Endpoint implements SpeechProvider {
   }
 
   async synthesize(req: SynthesisRequest): Promise<SynthesizedAudio> {
-    if (req.via === "chat") {
-      await this.ensureCredential();
-      const voice = req.voice && req.voice !== DEFAULT_VOICE ? req.voice : undefined;
-      return chatSynthesize(await this.target(), { text: req.text, model: this.bare(req.model), voice }, req.signal);
-    }
-    const stream = await this.synthesizeStream(req);
-    return clipOf(stream.format, await collect(stream.chunks), this.name);
+    await this.ensureCredential();
+    const target = await this.target();
+    const model = this.bare(req.model);
+    return dispatchSynthesize(target, req, model, () =>
+      endpointSynthesizeStream(target, { ...req, model }, req.signal),
+    );
   }
 
   async synthesizeStream(req: SynthesisRequest): Promise<AudioStream> {
     await this.ensureCredential();
     const target = await this.target();
-    if (req.via === "chat") {
-      const voice = req.voice && req.voice !== DEFAULT_VOICE ? req.voice : undefined;
-      return chatSynthesizeStream(target, { text: req.text, model: this.bare(req.model), voice }, req.signal);
-    }
-    return endpointSynthesizeStream(target, { ...req, model: this.bare(req.model) }, req.signal);
+    const model = this.bare(req.model);
+    return dispatchSynthesizeStream(target, req, model, () =>
+      endpointSynthesizeStream(target, { ...req, model }, req.signal),
+    );
   }
 
   async transcribe(req: TranscriptionRequest): Promise<string> {
     await this.ensureCredential();
     const target = await this.target();
-    if (req.via === "chat") return chatTranscribe(target, { ...req, model: this.bare(req.model) }, req.signal);
-    return endpointTranscribe(target, { ...req, model: this.bare(req.model) }, req.signal);
+    const model = this.bare(req.model);
+    return dispatchTranscribe(target, req, model, () => endpointTranscribe(target, { ...req, model }, req.signal));
   }
 }
 
@@ -393,7 +414,8 @@ export function buildEndpoints(
   configured: Record<string, EndpointConfig>,
   registry: () => KeyRegistry | undefined,
   env: Env,
+  pricingCache?: OpenAiPricingCache,
 ): Endpoint[] {
   const names = [...new Set([...Object.keys(PRESETS), ...Object.keys(configured)])];
-  return names.map((name) => new Endpoint(name, configured[name], registry, env));
+  return names.map((name) => new Endpoint(name, configured[name], registry, env, pricingCache));
 }

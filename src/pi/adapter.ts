@@ -5,24 +5,36 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
+  colorToRgb,
+  Editor,
   isKeyRelease,
   isKeyRepeat,
   isKittyProtocolActive,
   type KeyId,
   matchesKey,
   parseKey,
+  truncateToWidth,
 } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { splitEditorPrefill } from "../engine/dictation-rules";
 import type { Engine } from "../engine/engine";
 import { errorMessage } from "../engine/env";
 import { STATUS_KEY, statusLine } from "../engine/indicator";
-import { centre, OSD_COLUMNS, renderOsd } from "../engine/osd";
+import {
+  ansiRgbTint,
+  centre,
+  holdingPresence,
+  OSD_COLUMNS,
+  type OsdThemeColors,
+  previewBands,
+  type Rgb,
+  renderOsd,
+  vividRgb,
+} from "../engine/osd";
 import type { Panel } from "../engine/panel";
 import { type Hotkeys, keyLabel } from "../engine/settings";
 import type { SpeechResult } from "../engine/speech";
-import { parse, Surface, type SurfaceUi } from "../engine/surface";
-import { openPanel } from "./panel";
-import { pick } from "./picker";
+import { ACTION_NAMES, ACTION_VALUES, parse, Surface, type SurfaceUi } from "../engine/surface";
 
 export const SYNTHESIZE_TOOL = "speech_synthesize";
 /**
@@ -32,33 +44,10 @@ export const SYNTHESIZE_TOOL = "speech_synthesize";
 export const RELOAD_ARG = "--reload-hotkeys";
 export const TRANSCRIBE_TOOL = "speech_transcribe";
 const OSD_KEY = "pi-speech-osd";
-const OSD_POLL_MS = 65;
+const OSD_POLL_MS = 48;
+/** Ticks of overall level kept for the Orb's rings: as long as a ring takes to leave the graph. */
+const OSD_TRAIL = 40;
 const TOOLS = [SYNTHESIZE_TOOL, TRANSCRIBE_TOOL];
-
-const ACTIONS = [
-  "stop",
-  "replay",
-  "dictate",
-  "type",
-  "transcribe",
-  "sample",
-  "status",
-  "models",
-  "voices",
-  "languages",
-  "read-aloud",
-  "bridge",
-  "language",
-  "set",
-  "endpoints",
-  "endpoint",
-  "help",
-];
-const ACTION_VALUES: Record<string, string[]> = {
-  "read-aloud": ["on", "off", "summary", "streaming"],
-  bridge: ["auto", "on", "off", "status"],
-  set: ["tts-model", "voice", "stt-model", "stt-language", "tools", "dictation-output", "tts-source", "stt-source"],
-};
 
 const KITTY_FN_CODES: Record<string, string> = {
   "11": "f1",
@@ -107,16 +96,99 @@ function errorResult(err: unknown) {
   return { content: [{ type: "text" as const, text }], details: { error: text }, isError: true };
 }
 
+/** Multi-line editor overlay where Enter inserts a newline and Shift+Enter saves & closes. */
+function multiLineEditor(ctx: ExtensionContext, title: string, prefill?: string): Promise<string | undefined> {
+  if (!hasTerminal(ctx) || typeof ctx.ui.custom !== "function") {
+    return ctx.ui.editor(title, prefill);
+  }
+  return ctx.ui.custom<string | undefined>((tui, theme, _kb, done) => {
+    const editorTheme = {
+      borderColor: (s: string) => theme.fg("border", s),
+      selectList: {
+        selectedPrefix: (s: string) => theme.fg("accent", s),
+        selectedText: (s: string) => theme.fg("accent", theme.bold(s)),
+        description: (s: string) => theme.fg("dim", s),
+        scrollInfo: (s: string) => theme.fg("dim", s),
+        noMatch: (s: string) => theme.fg("dim", s),
+      },
+    };
+    const { guide, body } = splitEditorPrefill(prefill);
+    const ed = new Editor(tui, editorTheme, { paddingX: 1 });
+    ed.disableSubmit = true;
+    if (body) ed.setText(body);
+    let focused = true;
+    ed.focused = true;
+    const hint = `${theme.fg("dim", "Enter")} ${theme.fg("muted", "newline")}  ${theme.fg("dim", "Shift+Enter")} ${theme.fg("muted", "save")}  ${theme.fg("dim", "Esc")} ${theme.fg("muted", "cancel")}`;
+    return {
+      get focused() {
+        return focused;
+      },
+      set focused(v: boolean) {
+        focused = v;
+        ed.focused = v;
+      },
+      invalidate() {
+        ed.invalidate();
+      },
+      render(width: number): string[] {
+        const w = Math.max(1, width);
+        const rule = theme.fg("accent", "─".repeat(w));
+        const header = truncateToWidth(` ${theme.fg("accent", theme.bold(title))}`, w, "…");
+        const guideLines = guide.map((line, i) =>
+          truncateToWidth(` ${theme.fg(i === 0 ? "muted" : "dim", line)}`, w, "…"),
+        );
+        return [
+          rule,
+          header,
+          ...(guideLines.length ? [...guideLines, ""] : [""]),
+          ...ed.render(w),
+          truncateToWidth(` ${hint}`, w, "…"),
+          rule,
+        ];
+      },
+      handleInput(data: string): void {
+        if (isKeyRelease(data)) return;
+        if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
+          done(undefined);
+          return;
+        }
+        if (matchesKey(data, "shift+enter")) {
+          done(ed.getText());
+          return;
+        }
+        if (matchesKey(data, "enter")) {
+          ed.insertTextAtCursor("\n");
+          tui.requestRender();
+          return;
+        }
+        ed.handleInput(data);
+        tui.requestRender();
+      },
+    };
+  });
+}
+
 /** The engine's view of one Pi context's UI. */
-function surfaceUi(ctx: ExtensionContext): SurfaceUi {
+function surfaceUi(
+  ctx: ExtensionContext,
+  sendMessage?: (text: string, opts?: { expandPromptTemplates?: boolean }) => void,
+): SurfaceUi {
   return {
     cwd: ctx.cwd,
     notify: (message, level) => ctx.ui.notify(message, level),
     paste: (text) => ctx.ui.pasteToEditor(text),
+    setEditor: (text) => ctx.ui.setEditorText(text),
+    getEditor: () => ctx.ui.getEditorText(),
+    editor: (title, prefill) => multiLineEditor(ctx, title, prefill),
+    ...(sendMessage
+      ? {
+          submit: (text: string) => sendMessage(text),
+          runCommand: (cmd: string) => sendMessage(cmd, { expandPromptTemplates: true }),
+        }
+      : {}),
     select: (title, options) => ctx.ui.select(title, options),
     input: (title, placeholder) => ctx.ui.input(title, placeholder),
-    pick: (title, options, current) =>
-      hasTerminal(ctx) ? pick(ctx, title, options, current) : ctx.ui.select(title, options),
+    pick: (title, options) => ctx.ui.select(title, options),
   };
 }
 
@@ -227,6 +299,16 @@ export function registerPi(
   let osdTui: { requestRender(): void } | undefined;
   let osdUp = false;
   let lastBands: number[] = [];
+  let osdTick = 0;
+  let silenceTicks = 0;
+  /** The overall level (`0..1`) of the latest ticks, the newest first: the Orb draws its rings from it. */
+  let levelTrail: number[] = [];
+  const trailLevel = () => {
+    const level = lastBands.length ? lastBands.reduce((a, b) => a + b, 0) / lastBands.length / 100 : 0;
+    levelTrail = [level, ...levelTrail.slice(0, OSD_TRAIL - 1)];
+  };
+  let previewUntil = 0;
+  let seenOsdStyle = engine.speech.settings.osdStyle;
   let levelsTimer: ReturnType<typeof setInterval> | undefined;
   let levelsInflight = false;
   let pttActive = false;
@@ -247,35 +329,104 @@ export function registerPi(
   const hideOsd = () => {
     stopLevels();
     lastBands = [];
+    levelTrail = [];
+    osdTick = 0;
+    silenceTicks = 0;
     if (osdUp) ui?.setWidget?.(OSD_KEY, undefined);
     osdUp = false;
     osdTui = undefined;
   };
 
-  /** The OSD's lines now, centred in `width`: red while recording, the accent while playing. */
+  const supportsTruecolor = () => {
+    const ct = (env.COLORTERM ?? "").toLowerCase();
+    if (ct === "truecolor" || ct === "24bit") return true;
+    return Boolean(
+      env.KITTY_WINDOW_ID ||
+        env.GHOSTTY_RESOURCES_DIR ||
+        env.WEZTERM_PANE ||
+        env.ALACRITTY_WINDOW_ID ||
+        env.KONSOLE_VERSION ||
+        env.WT_SESSION,
+    );
+  };
+
+  /** Extract high-contrast semantic RGB stops from Pi's active theme (including terminal-derived `system` theme). */
+  const osdPaletteFromTheme = (theme: ExtensionContext["ui"]["theme"] | undefined): OsdThemeColors | undefined => {
+    if (!theme?.colors) return undefined;
+    const acc = theme.colors.accent;
+    // When `system` theme has no OSC terminal palette response yet, its tokens are uncalibrated 0..15 ANSI indices.
+    if (!acc || (acc.kind === "indexed" && acc.index < 16)) return undefined;
+    const appearance = theme.appearance === "light" ? "light" : "dark";
+    const pickRgb = (token: keyof typeof theme.colors, fallback: Rgb, boost = 1.24): Rgb => {
+      const c = theme.colors[token];
+      if (!c) return fallback;
+      const rgb = colorToRgb(c);
+      return vividRgb([rgb.r, rgb.g, rgb.b], boost);
+    };
+    const panelBg = theme.colors.toolPendingBg ? colorToRgb(theme.colors.toolPendingBg) : undefined;
+    const bg: Rgb = panelBg
+      ? appearance === "light"
+        ? [Math.round((panelBg.r + 255) / 2), Math.round((panelBg.g + 255) / 2), Math.round((panelBg.b + 255) / 2)]
+        : [Math.round(panelBg.r * 0.45), Math.round(panelBg.g * 0.45), Math.round(panelBg.b * 0.45)]
+      : appearance === "light"
+        ? [245, 247, 250]
+        : [14, 16, 24];
+    const inkRaw = theme.colors.text ? colorToRgb(theme.colors.text) : undefined;
+    const ink: Rgb = inkRaw ? [inkRaw.r, inkRaw.g, inkRaw.b] : appearance === "light" ? [38, 42, 48] : [238, 245, 250];
+    return {
+      appearance,
+      bg,
+      ink,
+      accent: pickRgb("accent", [180, 105, 255]),
+      error: pickRgb("error", [255, 52, 88]),
+      warning: pickRgb("warning", [255, 208, 62]),
+      success: pickRgb("success", [62, 238, 152]),
+      keyword: pickRgb("syntaxKeyword", [58, 122, 255]),
+      variable: pickRgb("syntaxVariable", [0, 222, 245]),
+      string: pickRgb("syntaxString", [255, 142, 38]),
+      magenta: pickRgb("thinkingXhigh", [255, 86, 205], 1.18),
+    };
+  };
+
+  /** The OSD's lines now, centred in `width` with theme-derived truecolor / 256-colour shading (or plain under NO_COLOR). */
   const osdLines = (width: number): string[] => {
     const style = engine.speech.settings.osdStyle;
     if (style === "off") return [];
     const d = engine.dictation.state;
     const mode = d === "starting" || d === "recording" ? "recording" : "playing";
-    const tinted = latest ? hasTerminal(latest) && !env.NO_COLOR : false;
+    const tinted = latest ? hasTerminal(latest) && !env.NO_COLOR && env.TERM !== "dumb" : false;
     const theme = ui?.theme;
-    const tint =
-      tinted && theme
-        ? { dot: (t: string) => theme.fg("error", t), accent: (t: string) => theme.fg("accent", t) }
-        : undefined;
-    return centre(renderOsd({ style, mode, bands: lastBands, tint }), OSD_COLUMNS[style], width);
+    const colorMode = typeof theme?.getColorMode === "function" ? theme.getColorMode() : undefined;
+    const truecolor = colorMode === "truecolor" || (colorMode === undefined && supportsTruecolor());
+    const tint = tinted
+      ? {
+          ...(theme ? { dot: (t: string) => theme.fg("error", t), accent: (t: string) => theme.fg("accent", t) } : {}),
+          rgb: ansiRgbTint(truecolor),
+        }
+      : undefined;
+    const palette = tinted ? osdPaletteFromTheme(theme) : undefined;
+    const cols = OSD_COLUMNS[style];
+    const presence = holdingPresence(silenceTicks);
+    const lines = centre(
+      renderOsd({ style, mode, bands: lastBands, tick: osdTick, presence, trail: levelTrail, palette, tint }),
+      cols,
+      width,
+    );
+    return width < cols ? lines.map((l) => truncateToWidth(l, Math.max(1, width), "")) : lines;
   };
 
-  /** Show the OSD while recording or playing (when it is on and this UI can draw widgets), else remove it. */
+  /** Show the OSD while recording, playing, or previewing a newly selected style, else remove it. */
   const updateOsd = () => {
     if (!ui || typeof ui.setWidget !== "function") return;
     const d = engine.dictation.state;
-    const live = d === "starting" || d === "recording" || engine.player.playing;
-    if (engine.speech.settings.osdStyle === "off" || !live) {
+    const activeAudio = d === "starting" || d === "recording" || engine.player.playing;
+    const previewing = !activeAudio && Date.now() < previewUntil;
+    if (engine.speech.settings.osdStyle === "off" || (!activeAudio && !previewing)) {
+      previewUntil = 0;
       hideOsd();
       return;
     }
+    if (previewing && lastBands.length === 0) lastBands = previewBands(osdTick);
     if (!osdUp) {
       osdUp = true;
       ui.setWidget(
@@ -291,12 +442,30 @@ export function registerPi(
       levelsTimer = setInterval(() => {
         if (levelsInflight) return;
         levelsInflight = true;
+        osdTick++;
+        const nowActive =
+          engine.dictation.state === "starting" || engine.dictation.state === "recording" || engine.player.playing;
+        if (!nowActive) {
+          if (Date.now() >= previewUntil) {
+            levelsInflight = false;
+            updateOsd();
+            return;
+          }
+          lastBands = previewBands(osdTick);
+          trailLevel();
+          levelsInflight = false;
+          updateOsd();
+          return;
+        }
         void engine.routes
           .levels()
           .then((r) => {
             const next =
               engine.dictation.state === "recording" ? r?.recording : engine.player.playing ? r?.playing : undefined;
-            lastBands = next ?? lastBands.map((v) => v * 0.65);
+            lastBands = next ?? lastBands.map((v) => (v * 0.5 < 0.5 ? 0 : v * 0.5));
+            if (lastBands.some((v) => v >= 1)) silenceTicks = 0;
+            else silenceTicks++;
+            trailLevel();
             updateOsd();
           })
           .finally(() => {
@@ -324,7 +493,7 @@ export function registerPi(
     const current = ctx.ui;
     const tinted = hasTerminal(ctx) && !env.NO_COLOR;
     // Always there, in its own colours: footer extensions place it by its key (zentui: colorModes "original").
-    engine.indicator.attach(() => current.setStatus(STATUS_KEY, statusLine(engine.indicator.state(), tinted)));
+    engine.indicator.attach((state) => current.setStatus(STATUS_KEY, statusLine(state, tinted)));
     updateOsd();
   };
   engine.notify = (message, level) => {
@@ -344,6 +513,13 @@ export function registerPi(
   };
   engine.onToolsChanged = applyTools;
 
+  let panelModule: Promise<typeof import("./panel")> | undefined;
+  let warmPanelTimer: ReturnType<typeof setTimeout> | undefined;
+  const loadPanel = () => {
+    panelModule ??= import("./panel");
+    return panelModule;
+  };
+
   pi.on("session_start", async (_event, ctx) => {
     attach(ctx);
     engine.start();
@@ -353,9 +529,20 @@ export function registerPi(
     void engine.announce().then((n) => {
       if (n) engine.notify(n.message, n.level);
     });
+    if (!panelModule && !warmPanelTimer && hasTerminal(ctx)) {
+      warmPanelTimer = setTimeout(() => {
+        warmPanelTimer = undefined;
+        void loadPanel().catch(() => {});
+      }, 250);
+      warmPanelTimer.unref();
+    }
   });
 
   pi.on("session_shutdown", async () => {
+    if (warmPanelTimer) {
+      clearTimeout(warmPanelTimer);
+      warmPanelTimer = undefined;
+    }
     stopPtt?.();
     stopPtt = undefined;
     hideOsd();
@@ -363,12 +550,14 @@ export function registerPi(
   });
 
   // Read-aloud: the user's Pi models summarize when chosen (one extra request per reply).
-  engine.readAloud.models = () => (latest ? piModels(latest) : []);
-  engine.readAloud.currentModel = () => (latest?.model ? `${latest.model.provider}/${latest.model.id}` : undefined);
-  engine.readAloud.summarize = (ref, prompt, signal) => {
-    if (!latest) return Promise.reject(new Error("Pi's models are not available yet"));
-    return summarizeWith(latest, ref, prompt, signal);
-  };
+  engine.readAloud.attachHost({
+    models: () => (latest ? piModels(latest) : []),
+    currentModel: () => (latest?.model ? `${latest.model.provider}/${latest.model.id}` : undefined),
+    summarize: (ref, prompt, signal) => {
+      if (!latest) return Promise.reject(new Error("Pi's models are not available yet"));
+      return summarizeWith(latest, ref, prompt, signal);
+    },
+  });
 
   // Summarized with the same model: a guideline asks for a marked summary at the end of each reply.
   pi.on("before_agent_start", async (event, ctx) => {
@@ -407,23 +596,40 @@ export function registerPi(
   // Pi binds an extension's shortcuts when it loads the extension: leaving Hotkeys with a changed key closes
   // the panel and reloads Pi, which loads the extension again with the new keys.
   const hotkeys = { ...engine.speech.settings.hotkeys };
-  const open = (ctx: ExtensionContext, speak: boolean) =>
-    openPanel(
+  const sendUser = (text: string, opts?: { expandPromptTemplates?: boolean }) => pi.sendUserMessage(text, opts);
+  const open = async (ctx: ExtensionContext) => {
+    const { openPanel } = await loadPanel();
+    seenOsdStyle = engine.speech.settings.osdStyle;
+    return openPanel(
       ctx,
       engine,
       surface,
-      surfaceUi(ctx),
+      surfaceUi(ctx, sendUser),
       env,
       (p) => {
         panel = p;
-        if (!p && latest) watchPtt(latest);
+        if (!p) {
+          previewUntil = 0;
+          if (latest) watchPtt(latest);
+        }
         // Who shows the live state depends on whether the panel is open, and on the OSD it may have changed.
         engine.indicator.refresh();
         updateOsd();
       },
-      speak,
       hotkeys,
+      () => {
+        const nextStyle = engine.speech.settings.osdStyle;
+        if (nextStyle !== seenOsdStyle) {
+          seenOsdStyle = nextStyle;
+          lastBands = [];
+          levelTrail = [];
+          silenceTicks = 0;
+          previewUntil = nextStyle === "off" ? 0 : Date.now() + 1800;
+          updateOsd();
+        }
+      },
     );
+  };
 
   /**
    * macOS: a terminal that does not send Option as Alt types Ω for Option+Z, so the hotkey never reaches Pi.
@@ -510,7 +716,9 @@ export function registerPi(
             } else {
               pttTarget = "editor";
               panel?.close();
-              void engine.dictation.toggle(surfaceUi(ctx)).catch((err) => engine.notify(errorMessage(err), "error"));
+              void engine.dictation
+                .toggle(surfaceUi(ctx, sendUser))
+                .catch((err) => engine.notify(errorMessage(err), "error"));
             }
           }
           return { consume: true };
@@ -521,7 +729,10 @@ export function registerPi(
           pttTarget = undefined;
           if (engine.dictation.state === "starting" || engine.dictation.state === "recording") {
             if (target === "composer" && panel?.inSpeakComposer()) panel.dictateNow();
-            else void engine.dictation.toggle(surfaceUi(ctx)).catch((err) => engine.notify(errorMessage(err), "error"));
+            else
+              void engine.dictation
+                .toggle(surfaceUi(ctx, sendUser))
+                .catch((err) => engine.notify(errorMessage(err), "error"));
           }
           return { consume: true };
         }
@@ -533,10 +744,10 @@ export function registerPi(
   };
 
   pi.registerShortcut(hotkeys.dictate as KeyId, {
-    description: "Dictate: record, then press again to insert the transcript at the cursor (never sends)",
+    description: "Dictate: record, then press again to insert the transcript at the cursor",
     handler: async (ctx) => {
       attach(ctx);
-      await engine.dictation.toggle(surfaceUi(ctx));
+      await engine.dictation.toggle(surfaceUi(ctx, sendUser));
     },
   });
 
@@ -544,7 +755,7 @@ export function registerPi(
     description: "Open /speech with the cursor on its Speak line: type a message, Enter speaks it",
     handler: async (ctx) => {
       attach(ctx);
-      await open(ctx, true);
+      await open(ctx);
     },
   });
 
@@ -554,7 +765,7 @@ export function registerPi(
     getArgumentCompletions(prefix) {
       const words = prefix.split(/\s+/);
       if (words.length === 1 && words[0].startsWith("-")) {
-        return ACTIONS.map((a) => `--${a}`)
+        return ACTION_NAMES.map((a) => `--${a}`)
           .filter((a) => a.startsWith(words[0]))
           .map((a) => ({ value: a, label: a }));
       }
@@ -573,7 +784,7 @@ export function registerPi(
         }
         // With a terminal UI, /speech alone opens the settings panel; elsewhere (RPC) the menu of dialogs.
         if (parse(args).kind === "menu" && hasTerminal(ctx)) {
-          const rebind = await open(ctx, false);
+          const rebind = await open(ctx);
           // A changed hotkey: reload Pi silently so it is bound at once (later, if the agent is running).
           if (rebind) {
             if (!ctx.isIdle()) {
@@ -585,7 +796,7 @@ export function registerPi(
           }
           return;
         }
-        await surface.run(args, surfaceUi(ctx));
+        await surface.run(args, surfaceUi(ctx, sendUser));
       } catch (err) {
         ctx.ui.notify(errorMessage(err), "error");
       }

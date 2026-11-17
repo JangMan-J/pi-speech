@@ -23,9 +23,6 @@ pub enum Kind {
     Transcription,
     /// Text to speech.
     Speech,
-    /// Libraries the models run with: a GPU runtime (sherpa-onnx's CUDA bundle, with ONNX
-    /// Runtime's CUDA provider), listed only by a build that can use it ([`GPU_RUNTIMES`]).
-    Runtime,
 }
 
 impl Kind {
@@ -33,7 +30,6 @@ impl Kind {
         match self {
             Kind::Transcription => "transcription",
             Kind::Speech => "speech",
-            Kind::Runtime => "runtime",
         }
     }
 
@@ -41,10 +37,76 @@ impl Kind {
         match s {
             "transcription" => Some(Kind::Transcription),
             "speech" => Some(Kind::Speech),
-            "runtime" => Some(Kind::Runtime),
             _ => None,
         }
     }
+}
+
+/// Whether a local transcription model is fast enough for live typing into Pi's editor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiveCapable {
+    Always,
+    Gpu,
+    Never,
+}
+
+impl LiveCapable {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LiveCapable::Always => "always",
+            LiveCapable::Gpu => "gpu",
+            LiveCapable::Never => "never",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "always" => Some(LiveCapable::Always),
+            "gpu" => Some(LiveCapable::Gpu),
+            "never" => Some(LiveCapable::Never),
+            _ => None,
+        }
+    }
+}
+
+/// How a local model handles the spoken-language setting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LanguageMode {
+    Selectable,
+    Auto,
+    Fixed,
+}
+
+impl LanguageMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LanguageMode::Selectable => "selectable",
+            LanguageMode::Auto => "auto",
+            LanguageMode::Fixed => "fixed",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "selectable" => Some(LanguageMode::Selectable),
+            "auto" => Some(LanguageMode::Auto),
+            "fixed" => Some(LanguageMode::Fixed),
+            _ => None,
+        }
+    }
+}
+
+/// Declarative capability, grouping, and ranking metadata emitted by `models list`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EntryMeta {
+    pub runtime: Option<String>,
+    pub group: Option<String>,
+    pub speakers: Option<u32>,
+    pub live_capable: Option<LiveCapable>,
+    pub language_mode: Option<LanguageMode>,
+    pub tags: Option<String>,
+    pub cpu_rank: Option<u16>,
+    pub gpu_rank: Option<u16>,
 }
 
 /// One downloadable model.
@@ -66,6 +128,10 @@ pub struct Entry {
     /// each is fetched and checked on its own into the model's directory, and `url`, `sha256`
     /// say nothing (`size` is their sum). Empty for an archive.
     pub files: Vec<ModelFile>,
+    /// Shared files (`lexicon`, `vocoder`) fetched into the cache root alongside this model.
+    pub shared: Vec<Lexicon>,
+    /// Capability, grouping, and ranking metadata for clients.
+    pub meta: EntryMeta,
 }
 
 /// One file of a model published as separate files.
@@ -130,17 +196,18 @@ impl Catalog {
     }
 
     pub fn builtin() -> Catalog {
+        let entries: Vec<Entry> = BUILTIN
+            .iter()
+            .map(Builtin::entry)
+            .chain(BUILTIN_FILES.iter().map(BuiltinFiles::entry))
+            .collect();
+        let lexicons: Lexicons = entries
+            .iter()
+            .flat_map(|e| e.shared.iter().map(|l| (e.id.clone(), l.clone())))
+            .collect();
         Catalog {
-            entries: BUILTIN
-                .iter()
-                .chain(GPU_RUNTIMES.iter())
-                .map(Builtin::entry)
-                .chain(BUILTIN_FILES.iter().map(BuiltinFiles::entry))
-                .collect(),
-            lexicons: BUILTIN
-                .iter()
-                .filter_map(|b| Some((b.id.to_string(), b.lexicon?.lexicon())))
-                .collect(),
+            entries,
+            lexicons,
             allow_http: false,
         }
     }
@@ -149,12 +216,16 @@ impl Catalog {
         self.entries.iter().find(|e| e.id == id)
     }
 
-    /// The lexicon `entry` needs, if any.
-    pub fn lexicon(&self, entry: &Entry) -> Option<&Lexicon> {
+    /// All shared files (`lexicon`, `vocoder`) `entry` needs in the cache root.
+    pub fn shared<'a>(&'a self, entry: &'a Entry) -> Vec<&'a Lexicon> {
+        if !entry.shared.is_empty() {
+            return entry.shared.iter().collect();
+        }
         self.lexicons
             .iter()
-            .find(|(id, _)| *id == entry.id)
+            .filter(|(id, _)| *id == entry.id)
             .map(|(_, l)| l)
+            .collect()
     }
 }
 
@@ -173,10 +244,11 @@ pub fn parse_with_lexicons(text: &str) -> Result<(Vec<Entry>, Lexicons), String>
     let mut entries = Vec::new();
     let mut lexicons = Vec::new();
     for (i, v) in items.iter().enumerate() {
-        let e = entry(v).map_err(|e| format!("entry {i}: {e}"))?;
+        let mut e = entry(v).map_err(|e| format!("entry {i}: {e}"))?;
         if let Some(l) = v.get("lexicon") {
             let l = lexicon(l).map_err(|e| format!("entry {i}: lexicon: {e}"))?;
-            lexicons.push((e.id.clone(), l));
+            lexicons.push((e.id.clone(), l.clone()));
+            e.shared.push(l);
         }
         entries.push(e);
     }
@@ -240,6 +312,31 @@ fn entry(v: &Value) -> Result<Entry, String> {
             .map(model_file)
             .collect::<Result<Vec<_>, _>>()?,
     };
+    let opt_str = |k: &str| v.get(k).and_then(Value::as_str).map(String::from);
+    let opt_u16 = |k: &str| {
+        v.get(k)
+            .and_then(Value::as_u64)
+            .and_then(|n| u16::try_from(n).ok())
+    };
+    let opt_u32 = |k: &str| {
+        v.get(k)
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+    };
+    let meta = EntryMeta {
+        runtime: opt_str("runtime"),
+        group: opt_str("group"),
+        speakers: opt_u32("speakers"),
+        live_capable: opt_str("live_capable")
+            .as_deref()
+            .and_then(LiveCapable::parse),
+        language_mode: opt_str("language_mode")
+            .as_deref()
+            .and_then(LanguageMode::parse),
+        tags: opt_str("tags"),
+        cpu_rank: opt_u16("cpu_rank"),
+        gpu_rank: opt_u16("gpu_rank"),
+    };
     Ok(Entry {
         id: s("id")?,
         kind: Kind::parse(&kind).ok_or_else(|| format!("unknown kind {kind:?}"))?,
@@ -257,6 +354,8 @@ fn entry(v: &Value) -> Result<Entry, String> {
         },
         dir,
         files,
+        shared: Vec::new(),
+        meta,
     })
 }
 
@@ -325,32 +424,280 @@ impl BuiltinLexicon {
     }
 }
 
-/// sherpa-onnx's English lexicon, the one its English Piper voices and Kitten speak through.
+/// sherpa-onnx's English lexicon, the one its English Piper, Kitten, Matcha and ZipVoice voices speak through.
 const LEXICON_EN_US: BuiltinLexicon = BuiltinLexicon {
     path: "tts-models/lexicon-en-us.txt",
     size: 6_305_773,
     sha256: "8b67ae549a465eee78f92ecb74644ad90c3c58ce65f19c68baf85878a10ef73a",
 };
 
+/// Shared 22 kHz Vocos vocoder for Matcha-TTS models.
+const VOCOS_22KHZ: BuiltinLexicon = BuiltinLexicon {
+    path: "vocoder-models/vocos-22khz-univ.onnx",
+    size: 53_884_024,
+    sha256: "0574a135aa1db2de6e181050db2ec528496cacd4a4701fc5d7faf9f9804c0081",
+};
+
+/// Shared 24 kHz Vocos vocoder for ZipVoice models.
+const VOCOS_24KHZ: BuiltinLexicon = BuiltinLexicon {
+    path: "vocoder-models/vocos_24khz.onnx",
+    size: 54_157_409,
+    sha256: "bcb3b970e384161c4d634f0bb9e999ff1c471b34c9bc0b1049a5014065ed3cc0",
+};
+
 const RELEASES: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/";
+
+const SPEECH_CPU_ORDER: &[&str] = &[
+    "phonon-31m-en",
+    "kokoro-multi-lang-v1.1",
+    "kokoro-multi-lang-v1.0",
+    "kokoro-en-v0.19",
+    "pocket-tts",
+    "pocket-tts-int8",
+    "piper-en",
+    "matcha-icefall-en_US-ljspeech",
+    "matcha-icefall-zh-en",
+    "supertonic-3-int8",
+    "kitten-mini-en-v0.8",
+    "kitten-micro-en-v0.8",
+    "kitten-nano-en-v0.8-fp32",
+    "kitten-nano-en-v0.8-int8",
+    "zipvoice-distill-int8",
+    "zipvoice-distill-fp32",
+    "kokoro-multi-lang-v1.1-int8",
+    "kokoro-multi-lang-v1.0-int8",
+    "kokoro-en-v0.19-int8",
+    "zonos3-mini-q8",
+    "orpheus-3b-q4",
+    "orpheus-3b-q8",
+    "qwen3-tts-1.7b-q4",
+    "qwen3-tts-1.7b-q8",
+];
+
+const SPEECH_GPU_ORDER: &[&str] = &[
+    "orpheus-3b-q4",
+    "orpheus-3b-q8",
+    "zonos3-mini-q8",
+    "qwen3-tts-1.7b-q8",
+    "qwen3-tts-1.7b-q4",
+    "phonon-31m-en",
+    "kokoro-multi-lang-v1.1",
+    "kokoro-multi-lang-v1.0",
+    "kokoro-en-v0.19",
+    "zipvoice-distill-fp32",
+    "pocket-tts",
+    "matcha-icefall-en_US-ljspeech",
+    "matcha-icefall-zh-en",
+    "piper-en",
+    "supertonic-3-int8",
+    "kitten-mini-en-v0.8",
+    "kitten-micro-en-v0.8",
+    "kitten-nano-en-v0.8-fp32",
+    "kitten-nano-en-v0.8-int8",
+    "pocket-tts-int8",
+    "zipvoice-distill-int8",
+    "kokoro-multi-lang-v1.1-int8",
+    "kokoro-multi-lang-v1.0-int8",
+    "kokoro-en-v0.19-int8",
+];
+
+const STT_CPU_ORDER: &[&str] = &[
+    "parakeet-tdt-0.6b-v3-int8",
+    "parakeet-tdt-0.6b-ultra-int8",
+    "sense-voice-int8",
+    "whisper-turbo",
+    "whisper-large-v3-int8",
+    "parakeet-tdt-0.6b-redux-int8",
+    "parakeet-tdt-0.6b-v2-int8",
+    "whisper-medium-int8",
+    "whisper-medium.en-int8",
+    "whisper-small",
+    "moonshine-tiny-en-v2",
+    "moonshine-base-en-v2",
+    "cohere-transcribe-int8",
+    "qwen3-asr-0.6b-int8",
+    "canary-180m-flash-int8",
+    "omnilingual-1b-v2-int8",
+    "omnilingual-300m-v2-int8",
+    "parakeet-tdt-110m-en-int8",
+    "dolphin-base-int8",
+    "nemotron-3.5-asr-0.6b-int8",
+    "whisper-distil-large-v3.5",
+    "whisper-tiny.en",
+    "whisper-base.en",
+    "moonshine-base-es-v2",
+    "moonshine-base-zh-v2",
+    "moonshine-base-ja-v2",
+    "moonshine-tiny-ko-v2",
+    "moonshine-base-ar-v2",
+    "moonshine-base-uk-v2",
+    "moonshine-base-vi-v2",
+    "parakeet-tdt-0.6b-v3-fp32",
+    "nemotron-3.5-asr-0.6b-fp32",
+    "canary-1b-v2",
+    "parakeet-tdt-0.6b-v2-fp16",
+    "canary-180m-flash-fp32",
+    "whisper-turbo-fp32",
+    "whisper-medium-fp32",
+    "whisper-large-v3-fp32",
+];
+
+const STT_GPU_ORDER: &[&str] = &[
+    "parakeet-tdt-0.6b-v3-fp32",
+    "whisper-large-v3-fp32",
+    "whisper-turbo-fp32",
+    "nemotron-3.5-asr-0.6b-fp32",
+    "canary-1b-v2",
+    "parakeet-tdt-0.6b-v2-fp16",
+    "whisper-medium-fp32",
+    "canary-180m-flash-fp32",
+    "parakeet-tdt-0.6b-ultra-int8",
+    "parakeet-tdt-0.6b-v3-int8",
+    "whisper-large-v3-int8",
+    "whisper-turbo",
+    "cohere-transcribe-int8",
+    "qwen3-asr-0.6b-int8",
+    "omnilingual-1b-v2-int8",
+    "sense-voice-int8",
+    "parakeet-tdt-0.6b-redux-int8",
+    "parakeet-tdt-0.6b-v2-int8",
+    "whisper-medium-int8",
+    "whisper-medium.en-int8",
+    "whisper-small",
+    "moonshine-tiny-en-v2",
+    "moonshine-base-en-v2",
+    "omnilingual-300m-v2-int8",
+    "canary-180m-flash-int8",
+    "nemotron-3.5-asr-0.6b-int8",
+    "parakeet-tdt-110m-en-int8",
+    "dolphin-base-int8",
+    "whisper-distil-large-v3.5",
+    "whisper-tiny.en",
+    "whisper-base.en",
+    "moonshine-base-es-v2",
+    "moonshine-base-zh-v2",
+    "moonshine-base-ja-v2",
+    "moonshine-tiny-ko-v2",
+    "moonshine-base-ar-v2",
+    "moonshine-base-uk-v2",
+    "moonshine-base-vi-v2",
+];
+
+fn rank_in(order: &[&str], id: &str) -> u16 {
+    order.iter().position(|&x| x == id).unwrap_or(order.len()) as u16
+}
+
+fn builtin_shared(id: &str, lexicon: Option<&'static BuiltinLexicon>) -> Vec<Lexicon> {
+    let mut out: Vec<Lexicon> = lexicon.into_iter().map(BuiltinLexicon::lexicon).collect();
+    if id.starts_with("matcha-") {
+        out.push(VOCOS_22KHZ.lexicon());
+    } else if id.starts_with("zipvoice-") {
+        out.push(VOCOS_24KHZ.lexicon());
+    }
+    out
+}
+
+fn builtin_meta(id: &str, kind: Kind, languages: &[String]) -> EntryMeta {
+    match kind {
+        Kind::Speech => {
+            let group = id.starts_with("piper-").then(|| "piper-en".to_string());
+            let rank_id = if group.is_some() { "piper-en" } else { id };
+            let speakers = match id {
+                "piper-en_US-libritts-high" => Some(904),
+                "piper-en_GB-vctk-medium" => Some(109),
+                "piper-en_GB-aru-medium" => Some(12),
+                "piper-en_GB-semaine-medium" => Some(4),
+                _ => None,
+            };
+            let runtime = (id.starts_with("zonos3-")
+                || id.starts_with("qwen3-tts-")
+                || id.starts_with("orpheus-"))
+            .then(|| "llama".to_string());
+            let language_mode = id
+                .starts_with("supertonic")
+                .then_some(LanguageMode::Selectable);
+            let tags = id.starts_with("orpheus-3b-").then(|| "<tags>".to_string());
+            EntryMeta {
+                runtime,
+                group,
+                speakers,
+                live_capable: None,
+                language_mode,
+                tags,
+                cpu_rank: Some(rank_in(SPEECH_CPU_ORDER, rank_id)),
+                gpu_rank: Some(rank_in(SPEECH_GPU_ORDER, rank_id)),
+            }
+        }
+        Kind::Transcription => {
+            let live_capable = if id.starts_with("nemotron-3.5-asr-")
+                || id.starts_with("parakeet-")
+                || id.starts_with("sense-voice-")
+                || id.starts_with("moonshine-")
+                || id.starts_with("canary-180m-")
+                || id.starts_with("dolphin-")
+                || id.starts_with("whisper-tiny")
+                || id.starts_with("whisper-base")
+                || id.starts_with("whisper-small")
+                || id.starts_with("whisper-distil-")
+            {
+                LiveCapable::Always
+            } else if id.starts_with("whisper-turbo") {
+                LiveCapable::Gpu
+            } else {
+                LiveCapable::Never
+            };
+            let language_mode = if id.starts_with("canary-")
+                || id.starts_with("cohere-")
+                || id.starts_with("nemotron-")
+            {
+                LanguageMode::Selectable
+            } else if id.starts_with("moonshine-")
+                || id.ends_with(".en")
+                || id.contains(".en-")
+                || id.contains("-en-")
+                || id.starts_with("parakeet-tdt-0.6b-v2")
+                || id == "whisper-distil-large-v3.5"
+                || (languages.len() == 1 && languages[0] != "mul" && !id.starts_with("whisper-"))
+            {
+                LanguageMode::Fixed
+            } else {
+                LanguageMode::Auto
+            };
+            EntryMeta {
+                runtime: None,
+                group: None,
+                speakers: None,
+                live_capable: Some(live_capable),
+                language_mode: Some(language_mode),
+                tags: None,
+                cpu_rank: Some(rank_in(STT_CPU_ORDER, id)),
+                gpu_rank: Some(rank_in(STT_GPU_ORDER, id)),
+            }
+        }
+    }
+}
 
 impl Builtin {
     fn entry(&self) -> Entry {
         let archive = self.path.rsplit('/').next().unwrap_or(self.path);
+        let languages: Vec<String> = self
+            .languages
+            .split_whitespace()
+            .map(String::from)
+            .collect();
+        let meta = builtin_meta(self.id, self.kind, &languages);
         Entry {
             id: self.id.into(),
             kind: self.kind,
             name: self.name.into(),
-            languages: self
-                .languages
-                .split_whitespace()
-                .map(String::from)
-                .collect(),
+            languages,
             size: self.size,
             url: format!("{RELEASES}{}", self.path),
             sha256: self.sha256.into(),
             dir: archive.trim_end_matches(".tar.bz2").into(),
             files: Vec::new(),
+            shared: builtin_shared(self.id, self.lexicon),
+            meta,
         }
     }
 }
@@ -392,6 +739,9 @@ struct BuiltinFiles {
     dir: &'static str,
     /// Each file: its name in the repository (and the directory), size, SHA-256.
     files: &'static [(&'static str, u64, &'static str)],
+    /// Additional files from another Hugging Face repository (at a fixed commit):
+    /// `(local_name, full_url, size, sha256)`.
+    extra_files: &'static [(&'static str, &'static str, u64, &'static str)],
 }
 
 impl BuiltinFiles {
@@ -400,32 +750,45 @@ impl BuiltinFiles {
             "https://huggingface.co/{}/resolve/{}",
             self.repo, self.revision
         );
+        let mut files: Vec<ModelFile> = self
+            .files
+            .iter()
+            .map(|&(name, size, sha256)| ModelFile {
+                name: name.into(),
+                url: format!("{base}/{name}"),
+                size,
+                sha256: sha256.into(),
+            })
+            .collect();
+        for &(name, url, size, sha256) in self.extra_files {
+            files.push(ModelFile {
+                name: name.into(),
+                url: url.into(),
+                size,
+                sha256: sha256.into(),
+            });
+        }
+        let languages: Vec<String> = self
+            .languages
+            .split_whitespace()
+            .map(String::from)
+            .collect();
+        let meta = builtin_meta(self.id, self.kind, &languages);
         Entry {
             id: self.id.into(),
             kind: self.kind,
             name: self.name.into(),
-            languages: self
-                .languages
-                .split_whitespace()
-                .map(String::from)
-                .collect(),
-            size: self.files.iter().map(|f| f.1).sum(),
+            languages,
+            size: files.iter().map(|f| f.size).sum(),
             url: format!(
                 "https://huggingface.co/{}/tree/{}",
                 self.repo, self.revision
             ),
             sha256: String::new(),
             dir: self.dir.into(),
-            files: self
-                .files
-                .iter()
-                .map(|&(name, size, sha256)| ModelFile {
-                    name: name.into(),
-                    url: format!("{base}/{name}"),
-                    size,
-                    sha256: sha256.into(),
-                })
-                .collect(),
+            files,
+            shared: Vec::new(),
+            meta,
         }
     }
 }
@@ -474,6 +837,7 @@ const BUILTIN_FILES: &[BuiltinFiles] = &[
                 "d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d",
             ),
         ],
+        extra_files: &[],
     },
     BuiltinFiles {
         id: "nemotron-3.5-asr-0.6b-fp32",
@@ -515,6 +879,7 @@ const BUILTIN_FILES: &[BuiltinFiles] = &[
                 "729cc103155bafa785f9cd45746cd41cabe97eab7182fc04d594129587958f8a",
             ),
         ],
+        extra_files: &[],
     },
     BuiltinFiles {
         id: "canary-1b-v2",
@@ -556,41 +921,437 @@ const BUILTIN_FILES: &[BuiltinFiles] = &[
                 "399db68418b655f50275779cfe425c55a5ef6dda12cf38375d709566927ef513",
             ),
         ],
+        extra_files: &[],
+    },
+    BuiltinFiles {
+        id: "phonon-31m-en",
+        kind: Kind::Speech,
+        name: "Phonon 31M (English, 13 voices, fast CPU streaming)",
+        languages: "en",
+        repo: "gradium/phonon-31m-en",
+        revision: "92741c5b07d085ff840e26fea8ce43110b87852f",
+        dir: "hf-phonon-31m-en",
+        files: &[
+            (
+                "config.json",
+                4634,
+                "b5d0f88353638370d94035b7d73d7d6577c0554d78f8d7ecfd40490aae39ae85",
+            ),
+            (
+                "tokenizer.json",
+                277_967,
+                "691a00068fa7b989f2f3e5ae5daa2d1a5bb319f2d5360deafcfb19a8bb6e7936",
+            ),
+            (
+                "model.q8.gguf",
+                64_512_352,
+                "a7d9aad2cd6dc66473f24a08bc6d2939030ef4d751ef82349361fbef3272dbae",
+            ),
+            (
+                "default-voice.safetensors",
+                256_136,
+                "dc537478eaadc1a5257fcda2e3501ab81e14c111a5d95a5838f350db2afd0f1a",
+            ),
+        ],
+        extra_files: &[
+            (
+                "voices/Zoey.safetensors",
+                "https://huggingface.co/gradium/phonon-voices/resolve/0ee17205f254b5abc43b266c8a0f215565c352f7/voices/NbpkqMVS3CJeq2j8.safetensors",
+                256_136,
+                "97c7f8c253413574406ab80dd23f49c3ebb2517163b00a9bf86b9c4cf43e7e23",
+            ),
+            (
+                "voices/Juniper.safetensors",
+                "https://huggingface.co/gradium/phonon-voices/resolve/0ee17205f254b5abc43b266c8a0f215565c352f7/voices/NIWIOv5vTi5eRMj8.safetensors",
+                256_136,
+                "444378eb06b7c492b86e8fc7d13e4db1a3c0cf3e68891a960bf6f0a41a13ef35",
+            ),
+            (
+                "voices/Everly.safetensors",
+                "https://huggingface.co/gradium/phonon-voices/resolve/0ee17205f254b5abc43b266c8a0f215565c352f7/voices/vjFyp2BcCyTlUmYb.safetensors",
+                256_136,
+                "958ea94da14f46dd48c7f64adac11ed2ad2aa45f7ccd165dfebab5272664402e",
+            ),
+            (
+                "voices/Harper.safetensors",
+                "https://huggingface.co/gradium/phonon-voices/resolve/0ee17205f254b5abc43b266c8a0f215565c352f7/voices/4SZHfMpw-p46Ywgs.safetensors",
+                256_136,
+                "6b3da6e2d796a20c51af892c482bd6509fb88267a221aff83c870843dee2a123",
+            ),
+            (
+                "voices/Easton.safetensors",
+                "https://huggingface.co/gradium/phonon-voices/resolve/0ee17205f254b5abc43b266c8a0f215565c352f7/voices/LMDIYE0Oa377Qh6Z.safetensors",
+                256_136,
+                "45c582673cb20edb04ddcca2b5a8865ddfb0a82599efadb269021e87d20fbdd4",
+            ),
+            (
+                "voices/Micah.safetensors",
+                "https://huggingface.co/gradium/phonon-voices/resolve/0ee17205f254b5abc43b266c8a0f215565c352f7/voices/40QrMVgAxFiUnP9f.safetensors",
+                256_136,
+                "0de1098d1051686a138d068e83ff09deb5053328bc74ec9541a1fdb90bfc24da",
+            ),
+            (
+                "voices/Miles.safetensors",
+                "https://huggingface.co/gradium/phonon-voices/resolve/0ee17205f254b5abc43b266c8a0f215565c352f7/voices/d9XCyhjo4JhkHF1d.safetensors",
+                256_136,
+                "eab20e4f159b48cfbc01b1885804e24f681f80e7a64f909182763a4e3361bee8",
+            ),
+            (
+                "voices/Maeve.safetensors",
+                "https://huggingface.co/gradium/phonon-voices/resolve/0ee17205f254b5abc43b266c8a0f215565c352f7/voices/6PWnV0Nq4wu7RVBT.safetensors",
+                256_136,
+                "56494ee67d533ad227ff0dfd0b1c13ff5aa91f1ad6e596e66c2986ba3005e844",
+            ),
+            (
+                "voices/Freya.safetensors",
+                "https://huggingface.co/gradium/phonon-voices/resolve/0ee17205f254b5abc43b266c8a0f215565c352f7/voices/GgfEkEJtxZR7gnpy.safetensors",
+                256_136,
+                "eb3cd47418349e618408c16bea7153988b3ad04b41a6033039dd474a9a4dcd23",
+            ),
+            (
+                "voices/Pippa.safetensors",
+                "https://huggingface.co/gradium/phonon-voices/resolve/0ee17205f254b5abc43b266c8a0f215565c352f7/voices/uem82D50GRv2Dwma.safetensors",
+                256_136,
+                "d41a8f01d6e33450f1ce062d332914da10beee99e585dab531750706f187c48a",
+            ),
+            (
+                "voices/Alfie.safetensors",
+                "https://huggingface.co/gradium/phonon-voices/resolve/0ee17205f254b5abc43b266c8a0f215565c352f7/voices/X6NceqF285Gr04gb.safetensors",
+                256_136,
+                "4de75497fff3030168e8aa6dca23ffeb332b1bc8c25d0bf3507ceadac953ae9c",
+            ),
+            (
+                "voices/Hugh.safetensors",
+                "https://huggingface.co/gradium/phonon-voices/resolve/0ee17205f254b5abc43b266c8a0f215565c352f7/voices/YyKcxPG7iIgS3jsK.safetensors",
+                256_136,
+                "3169d74b47a54d1eb15e4c243f56393abe9fe90c7e1c308ecf96ee67618b152a",
+            ),
+        ],
+    },
+    BuiltinFiles {
+        id: "zonos3-mini-q8",
+        kind: Kind::Speech,
+        name: "ZONOS3 Mini (Q8, GPU, 44.1 kHz, 8 langs)",
+        languages: "en fr de es it pt ja zh",
+        repo: "ggml-org/ZONOS3-Mini-GGUF",
+        revision: "2e7bc4126a2343787298e1a297a3d1c4a13165aa",
+        dir: "hf-zonos3-mini-q8",
+        files: &[
+            (
+                "ZONOS3-Mini-Q8_0.gguf",
+                854_726_208,
+                "60568efc88e2f9231f4f5c061e246421f575986642d72ab9ae68f77d6cf76be4",
+            ),
+            (
+                "mmproj-ZONOS3-Mini-F32.gguf",
+                1_142_502_880,
+                "aeeb92325b4b6927bef656390b78e1246148065f947d8b59c2663557a809414d",
+            ),
+        ],
+        extra_files: &[],
+    },
+    BuiltinFiles {
+        id: "qwen3-tts-1.7b-q8",
+        kind: Kind::Speech,
+        name: "Qwen3-TTS 1.7B (Q8, GPU, 10 langs)",
+        languages: "zh en de it pt es ja ko fr ru",
+        repo: "ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF",
+        revision: "ca27d74bc954b73dadab5b71ca265d87fc861a7c",
+        dir: "hf-qwen3-tts-1.7b-q8",
+        files: &[
+            (
+                "Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf",
+                1_847_874_400,
+                "ac7931aeb2e7aad1a6ed6602d353a5679c9d096b18ce8204ac730a8408d572e1",
+            ),
+            (
+                "mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf",
+                446_422_912,
+                "6fd65188839bcd6ecc91b277ad471e22a0edfada4699a0fe82f1165c18cfcce2",
+            ),
+        ],
+        extra_files: &[],
+    },
+    BuiltinFiles {
+        id: "qwen3-tts-1.7b-q4",
+        kind: Kind::Speech,
+        name: "Qwen3-TTS 1.7B (Q4_K_M, GPU, 10 langs)",
+        languages: "zh en de it pt es ja ko fr ru",
+        repo: "ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF",
+        revision: "ca27d74bc954b73dadab5b71ca265d87fc861a7c",
+        dir: "hf-qwen3-tts-1.7b-q4",
+        files: &[
+            (
+                "Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf",
+                1_035_965_280,
+                "8d18c94acb2addd042f97da63c98be144eafa76d0d9495177eab65130cf85129",
+            ),
+            (
+                "mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf",
+                446_422_912,
+                "6fd65188839bcd6ecc91b277ad471e22a0edfada4699a0fe82f1165c18cfcce2",
+            ),
+        ],
+        extra_files: &[],
+    },
+    BuiltinFiles {
+        id: "orpheus-3b-q4",
+        kind: Kind::Speech,
+        name: "Orpheus 3B (Q4_K_M, GPU, 8 expressive voices)",
+        languages: "en",
+        repo: "unsloth/orpheus-3b-0.1-ft-GGUF",
+        revision: "e2b00302c46af8205f521f60016600aa25a068e6",
+        dir: "hf-orpheus-3b-q4",
+        files: &[
+            (
+                "orpheus-3b-0.1-ft-Q4_K_M.gguf",
+                2_092_569_120,
+                "4e94a925593c8fc1c20ee50e5b0e4bf915ea106a0bda3b917ff69b02559f7ab9",
+            ),
+        ],
+        extra_files: &[
+            (
+                "snac_24khz.onnx",
+                "https://huggingface.co/onnx-community/snac_24khz-ONNX/resolve/f317cdff7efb7b2a63148c9e68bbb0320fe629a1/onnx/decoder_model.onnx",
+                52_600_822,
+                "9e2991fce96c3b49c508304e656052f4f6b860fe8432164fcd976eee195fd4f0",
+            ),
+        ],
+    },
+    BuiltinFiles {
+        id: "orpheus-3b-q8",
+        kind: Kind::Speech,
+        name: "Orpheus 3B (Q8_0, GPU, 8 expressive voices)",
+        languages: "en",
+        repo: "unsloth/orpheus-3b-0.1-ft-GGUF",
+        revision: "e2b00302c46af8205f521f60016600aa25a068e6",
+        dir: "hf-orpheus-3b-q8",
+        files: &[
+            (
+                "orpheus-3b-0.1-ft-Q8_0.gguf",
+                3_516_431_616,
+                "9a01ea76b66dd66d08a0952ed72932f0ecce59db3d5c9b1a33621ff7200ba531",
+            ),
+        ],
+        extra_files: &[
+            (
+                "snac_24khz.onnx",
+                "https://huggingface.co/onnx-community/snac_24khz-ONNX/resolve/f317cdff7efb7b2a63148c9e68bbb0320fe629a1/onnx/decoder_model.onnx",
+                52_600_822,
+                "9e2991fce96c3b49c508304e656052f4f6b860fe8432164fcd976eee195fd4f0",
+            ),
+        ],
+    },
+    BuiltinFiles {
+        id: "whisper-large-v3-int8",
+        kind: Kind::Transcription,
+        name: "Whisper large-v3 (int8, 99 langs)",
+        languages: WHISPER_LANGUAGES,
+        repo: "csukuangfj/sherpa-onnx-whisper-large-v3",
+        revision: "2a6507094dd6020d939d78e3f1834a1d06267fca",
+        dir: "hf-whisper-large-v3-int8",
+        files: &[
+            (
+                "large-v3-encoder.int8.onnx",
+                766_671_985,
+                "d531cf17248acc43e8c09b472a0877055e770877857a5332fc1304b36534ec85",
+            ),
+            (
+                "large-v3-decoder.int8.onnx",
+                1_008_265_203,
+                "ebc6bfd88e162a46cb3edee8a7e727e1dcbc65cabecb19e2573695e4d495e1af",
+            ),
+            (
+                "large-v3-tokens.txt",
+                816_730,
+                "b34b360dbb493e781e479794586d661700670d65564001f23024971d1f2fa126",
+            ),
+        ],
+        extra_files: &[],
+    },
+    BuiltinFiles {
+        id: "whisper-large-v3-fp32",
+        kind: Kind::Transcription,
+        name: "Whisper large-v3 (fp32, for GPU, 99 langs)",
+        languages: WHISPER_LANGUAGES,
+        repo: "csukuangfj/sherpa-onnx-whisper-large-v3",
+        revision: "2a6507094dd6020d939d78e3f1834a1d06267fca",
+        dir: "hf-whisper-large-v3-fp32",
+        files: &[
+            (
+                "large-v3-encoder.onnx",
+                762_135,
+                "a55051fb0570a1a1c1d05b57988b949bf029fee2bd218245250720353076b756",
+            ),
+            (
+                "large-v3-encoder.weights",
+                2_967_470_080,
+                "23ed0376b33fd0e2b9de5043ca2830ce5cdb0219ef18f79ced25987fe38e1cb4",
+            ),
+            (
+                "large-v3-decoder.onnx",
+                2_835_288,
+                "fc6e718cd7863e5d7330fb581347cb397dee756a0ed2063990f37ca20a4ad666",
+            ),
+            (
+                "large-v3-decoder.weights",
+                3_206_492_160,
+                "b66bdf300b57c68ef7b31b2e4038fcd1377a105928af1ef621afd4dce7aa6b49",
+            ),
+            (
+                "large-v3-tokens.txt",
+                816_730,
+                "b34b360dbb493e781e479794586d661700670d65564001f23024971d1f2fa126",
+            ),
+        ],
+        extra_files: &[],
+    },
+    BuiltinFiles {
+        id: "whisper-turbo-fp32",
+        kind: Kind::Transcription,
+        name: "Whisper large-v3 turbo (fp32, for GPU, 99 langs)",
+        languages: WHISPER_LANGUAGES,
+        repo: "csukuangfj/sherpa-onnx-whisper-turbo",
+        revision: "2ca6ff69fc878651b770880507669577ac41c2ff",
+        dir: "hf-whisper-turbo-fp32",
+        files: &[
+            (
+                "turbo-encoder.onnx",
+                735_920,
+                "1b960f278564fb8bbacd544d4f85f4dd6d8a64d3aa89543d8f2c4021c926f976",
+            ),
+            (
+                "turbo-encoder.weights",
+                2_600_325_120,
+                "746f879ecf066450ab0cdecc05383380b85157270ff6c0a9fb7cfdd917036e12",
+            ),
+            (
+                "turbo-decoder.onnx",
+                636_209_532,
+                "b24db5d90fa230c5eaa6b823d74862ced9e0d1dc3e01ec46601968e8db0e09ec",
+            ),
+            (
+                "turbo-tokens.txt",
+                816_730,
+                "b34b360dbb493e781e479794586d661700670d65564001f23024971d1f2fa126",
+            ),
+        ],
+        extra_files: &[],
+    },
+    BuiltinFiles {
+        id: "whisper-medium-int8",
+        kind: Kind::Transcription,
+        name: "Whisper medium (int8, 99 langs)",
+        languages: WHISPER_LANGUAGES,
+        repo: "csukuangfj/sherpa-onnx-whisper-medium",
+        revision: "8c31d28503847560985df21f90e14f0c736e075e",
+        dir: "hf-whisper-medium-int8",
+        files: &[
+            (
+                "medium-encoder.int8.onnx",
+                374_196_283,
+                "1c54582b4d829de0089f6cb63bbbdb3bf7555398bacaf855fbecf1a84dfd193e",
+            ),
+            (
+                "medium-decoder.int8.onnx",
+                571_059_257,
+                "595d00a338a365a7bfa0ca7f296cabc639583bef770ab6130df90f49a6412747",
+            ),
+            (
+                "medium-tokens.txt",
+                816_730,
+                "b34b360dbb493e781e479794586d661700670d65564001f23024971d1f2fa126",
+            ),
+        ],
+        extra_files: &[],
+    },
+    BuiltinFiles {
+        id: "whisper-medium-fp32",
+        kind: Kind::Transcription,
+        name: "Whisper medium (fp32, for GPU, 99 langs)",
+        languages: WHISPER_LANGUAGES,
+        repo: "csukuangfj/sherpa-onnx-whisper-medium",
+        revision: "8c31d28503847560985df21f90e14f0c736e075e",
+        dir: "hf-whisper-medium-fp32",
+        files: &[
+            (
+                "medium-encoder.onnx",
+                1_430_791_931,
+                "352c45af645ce03ef83dbb68f63e5cea13baa5537e5feb13bc88a5976df6a4fd",
+            ),
+            (
+                "medium-decoder.onnx",
+                1_627_278_264,
+                "c3c7b60335a3564f265162846d2a815b3f020674daeab66107b58618077dd547",
+            ),
+            (
+                "medium-tokens.txt",
+                816_730,
+                "b34b360dbb493e781e479794586d661700670d65564001f23024971d1f2fa126",
+            ),
+        ],
+        extra_files: &[],
+    },
+    BuiltinFiles {
+        id: "whisper-medium.en-int8",
+        kind: Kind::Transcription,
+        name: "Whisper medium (int8, English)",
+        languages: "en",
+        repo: "csukuangfj/sherpa-onnx-whisper-medium.en",
+        revision: "251ab4521f354490e8f2c206fbd0b7f3f6b0a7ec",
+        dir: "hf-whisper-medium-en-int8",
+        files: &[
+            (
+                "medium.en-encoder.int8.onnx",
+                374_196_283,
+                "5a8e3a36619e0b67db9320eef3152db59d4b440f5ce0212d2c162a61b750bf80",
+            ),
+            (
+                "medium.en-decoder.int8.onnx",
+                571_055_161,
+                "7303be339ed4e51f4ffb7ae84f3803b10cf8e67e1dcf8a98cb4d843f0dea0141",
+            ),
+            (
+                "medium.en-tokens.txt",
+                835_554,
+                "306cd27f03c1a714eca7108e03d66b7dc042abe8c258b44c199a7ed9838dd930",
+            ),
+        ],
+        extra_files: &[],
+    },
+    BuiltinFiles {
+        id: "parakeet-tdt-0.6b-ultra-int8",
+        kind: Kind::Transcription,
+        name: "Parakeet TDT 0.6b Ultra (int8, English)",
+        languages: "en",
+        repo: "csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-ultra-int8",
+        revision: "402e1190ce85b9793118ee223db21fb0d12f52db",
+        dir: "hf-parakeet-tdt-0.6b-ultra-int8",
+        files: &[
+            (
+                "encoder.int8.onnx",
+                652_282_345,
+                "b43072e1b721f18a3df03fcfeb763ff7c4debdf29843598a3aba2f703e2780a3",
+            ),
+            (
+                "decoder.int8.onnx",
+                11_845_274,
+                "1fab98fe6c12aded87d2da66272cc9e148d0a0044ce3850a12fe56302ec4a922",
+            ),
+            (
+                "joiner.int8.onnx",
+                6_355_277,
+                "8a71aaccfdba3d451775507a889afd2257d2e754463fd81095a8c8f290f924c2",
+            ),
+            (
+                "tokens.txt",
+                93_939,
+                "d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d",
+            ),
+        ],
+        extra_files: &[],
     },
 ];
-
-/// sherpa-onnx's CUDA bundles, of the sherpa-onnx version this binary links: their `lib/` holds
-/// ONNX Runtime with its CUDA provider. A GPU run puts that directory first on the library path
-/// (the provider loads only from beside ONNX Runtime). Only a Linux x64 build linked against
-/// the shared libraries can use them; others list none. Which one fits is the CUDA the system
-/// has (`pi-speech-receiver gpu`).
-#[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "shared"))]
-const GPU_RUNTIMES: &[Builtin] = &[
-    Builtin {
-        id: "gpu-runtime-cuda13",
-        kind: Kind::Runtime,
-        name: "GPU runtime (NVIDIA CUDA 13, cuDNN 9)",
-        languages: "",
-        size: 254_696_132,
-        path:
-            "v2.0.1/sherpa-onnx-v2.0.1-cuda-13.x-cudnn-9.x-onnxruntime1.28.2-linux-x64-gpu.tar.bz2",
-        sha256: "40ca5c7730a349258f23e9a7bf5c3cbf69f13c498cc50387e8f9f06924a554f8",
-        lexicon: None,
-    },
-    Builtin {
-        id: "gpu-runtime-cuda12",
-        kind: Kind::Runtime,
-        name: "GPU runtime (NVIDIA CUDA 12, cuDNN 9)",
-        languages: "",
-        size: 393_636_488,
-        path:
-            "v2.0.1/sherpa-onnx-v2.0.1-cuda-12.x-cudnn-9.x-onnxruntime1.28.2-linux-x64-gpu.tar.bz2",
-        sha256: "2aa541a65c1e7d921a053283419b70b30c1f6ae0a0f52f64b947ebe88c5f2a77",
-        lexicon: None,
-    },
-];
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64", feature = "shared")))]
-const GPU_RUNTIMES: &[Builtin] = &[];
 
 const BUILTIN: &[Builtin] = &[
     Builtin {
@@ -844,6 +1605,16 @@ const BUILTIN: &[Builtin] = &[
         lexicon: None,
     },
     Builtin {
+        id: "omnilingual-1b-v2-int8",
+        kind: Kind::Transcription,
+        name: "Omnilingual ASR 1B v2 (int8, 1600 langs)",
+        languages: "mul",
+        size: 787_296_506,
+        path: "asr-models/sherpa-onnx-omnilingual-asr-1600-languages-1B-ctc-v2-int8-2026-02-05.tar.bz2",
+        sha256: "f4deae6e6cbf4ca785b89eaa3836156581208bf977ea2e6d7ae84d7efcfc3a40",
+        lexicon: None,
+    },
+    Builtin {
         id: "parakeet-tdt-0.6b-v2-fp16",
         kind: Kind::Transcription,
         name: "Parakeet TDT 0.6b v2, English (fp16, for GPU)",
@@ -886,6 +1657,136 @@ const BUILTIN: &[Builtin] = &[
         lexicon: None,
     },
     Builtin {
+        id: "kokoro-multi-lang-v1.0",
+        kind: Kind::Speech,
+        name: "Kokoro multi-lang v1.0 (53 voices, 8 langs)",
+        languages: "en es fr hi it ja pt zh",
+        size: 349_886_476,
+        path: "tts-models/kokoro-multi-lang-v1_0.tar.bz2",
+        sha256: "60703707bc05ccd48d60e1eb723f38b07d6e474795a0b6a588d7220400e0f7a4",
+        lexicon: None,
+    },
+    Builtin {
+        id: "kokoro-multi-lang-v1.0-int8",
+        kind: Kind::Speech,
+        name: "Kokoro multi-lang v1.0 (int8: 53 voices, 8 langs)",
+        languages: "en es fr hi it ja pt zh",
+        size: 132_353_410,
+        path: "tts-models/kokoro-int8-multi-lang-v1_0.tar.bz2",
+        sha256: "72c347230107ef8a31098ec4d468a605244beef5f1ed00db97efa13518800653",
+        lexicon: None,
+    },
+    Builtin {
+        id: "kokoro-en-v0.19",
+        kind: Kind::Speech,
+        name: "Kokoro English v0.19 (11 voices)",
+        languages: "en",
+        size: 319_625_534,
+        path: "tts-models/kokoro-en-v0_19.tar.bz2",
+        sha256: "912804855a04745fa77a30be545b3f9a5d15c4d66db00b88cbcd4921df605ac7",
+        lexicon: None,
+    },
+    Builtin {
+        id: "kokoro-en-v0.19-int8",
+        kind: Kind::Speech,
+        name: "Kokoro English v0.19 (int8: 11 voices)",
+        languages: "en",
+        size: 103_248_205,
+        path: "tts-models/kokoro-int8-en-v0_19.tar.bz2",
+        sha256: "c9f0dd393615805b0bab050c340834d5e684e732aec91c0e860cd30e982c08bd",
+        lexicon: None,
+    },
+    Builtin {
+        id: "matcha-icefall-en_US-ljspeech",
+        kind: Kind::Speech,
+        name: "Matcha-TTS LJSpeech (US English)",
+        languages: "en",
+        size: 76_764_067,
+        path: "tts-models/matcha-icefall-en_US-ljspeech.tar.bz2",
+        sha256: "cff849fee69d7d3b22e0b0267aa6b863e32d05039a1eca963765a314a73450c0",
+        lexicon: Some(&LEXICON_EN_US),
+    },
+    Builtin {
+        id: "matcha-icefall-zh-en",
+        kind: Kind::Speech,
+        name: "Matcha-TTS Chinese+English",
+        languages: "zh en",
+        size: 79_033_838,
+        path: "tts-models/matcha-icefall-zh-en.tar.bz2",
+        sha256: "271b804af570400d3bcdcb53bf6e53cc9f75180ee763b9f13eb5eaf2b0d086ef",
+        lexicon: None,
+    },
+    Builtin {
+        id: "zipvoice-distill-int8",
+        kind: Kind::Speech,
+        name: "ZipVoice distill (int8, flow-matching)",
+        languages: "zh en",
+        size: 109_162_785,
+        path: "tts-models/sherpa-onnx-zipvoice-distill-int8-zh-en-emilia.tar.bz2",
+        sha256: "77219c8b40f4ee8d73a7f902305ff6c1128ef9b54461c41b4ca6ed890b6c2803",
+        lexicon: Some(&LEXICON_EN_US),
+    },
+    Builtin {
+        id: "zipvoice-distill-fp32",
+        kind: Kind::Speech,
+        name: "ZipVoice distill (fp32, flow-matching)",
+        languages: "zh en",
+        size: 477_800_463,
+        path: "tts-models/sherpa-onnx-zipvoice-distill-fp32-zh-en-emilia.tar.bz2",
+        sha256: "3b6729d03bf4ba64deeec113048bdbbe55dbc30580b609be76342e0099fd23a8",
+        lexicon: Some(&LEXICON_EN_US),
+    },
+    Builtin {
+        id: "piper-en_US-lessac-high",
+        kind: Kind::Speech,
+        name: "Piper lessac high (US English)",
+        languages: "en",
+        size: 115_545_841,
+        path: "tts-models/vits-piper-en_US-lessac-high.tar.bz2",
+        sha256: "8619d204c7005866fe4f420181dfa79622af6a6222389f0b0818d2af31e0db0e",
+        lexicon: Some(&LEXICON_EN_US),
+    },
+    Builtin {
+        id: "piper-en_US-ryan-high",
+        kind: Kind::Speech,
+        name: "Piper ryan high (US English male)",
+        languages: "en",
+        size: 115_630_708,
+        path: "tts-models/vits-piper-en_US-ryan-high.tar.bz2",
+        sha256: "6a71edf4d308b9cb2eaeadc8d1f3c6bf96120ecb7fe52c29a2b6e139c59760ed",
+        lexicon: Some(&LEXICON_EN_US),
+    },
+    Builtin {
+        id: "piper-en_GB-cori-high",
+        kind: Kind::Speech,
+        name: "Piper cori high (British English)",
+        languages: "en",
+        size: 115_574_061,
+        path: "tts-models/vits-piper-en_GB-cori-high.tar.bz2",
+        sha256: "42922f07738fcde2e49eed4e959635692f73b933de35a6b7c1010162ff566292",
+        lexicon: Some(&LEXICON_EN_US),
+    },
+    Builtin {
+        id: "piper-en_US-libritts-high",
+        kind: Kind::Speech,
+        name: "Piper LibriTTS high (904 US speakers)",
+        languages: "en",
+        size: 131_033_598,
+        path: "tts-models/vits-piper-en_US-libritts-high.tar.bz2",
+        sha256: "d9d35056703fd38ed38e95c202a50f603fefdc8a92a7b6332c4f1a41616eac72",
+        lexicon: Some(&LEXICON_EN_US),
+    },
+    Builtin {
+        id: "piper-en_GB-vctk-medium",
+        kind: Kind::Speech,
+        name: "Piper VCTK (109 British speakers)",
+        languages: "en",
+        size: 80_488_085,
+        path: "tts-models/vits-piper-en_GB-vctk-medium.tar.bz2",
+        sha256: "abafd35bdab0a72a3c6b947228ae3cccdf3624db83313c77d1abb5cbc75e1f64",
+        lexicon: Some(&LEXICON_EN_US),
+    },
+    Builtin {
         id: "piper-en_US-lessac-medium",
         kind: Kind::Speech,
         name: "Piper lessac (US English)",
@@ -905,6 +1806,106 @@ const BUILTIN: &[Builtin] = &[
         sha256: "fcd45962906933eec4431d3688f7d74aaac8713c87c6717f91fd3b23463aa1a1",
         lexicon: Some(&LEXICON_EN_US),
     },
+    Builtin {
+        id: "piper-en_US-kristin-medium",
+        kind: Kind::Speech,
+        name: "Piper kristin (US English)",
+        languages: "en",
+        size: 67_259_230,
+        path: "tts-models/vits-piper-en_US-kristin-medium.tar.bz2",
+        sha256: "c2206f572df2956c50b1ae3367eebce3853c663e890cba8048cd62b1e4dbe6c7",
+        lexicon: Some(&LEXICON_EN_US),
+    },
+    Builtin {
+        id: "piper-en_US-amy-medium",
+        kind: Kind::Speech,
+        name: "Piper amy (US English)",
+        languages: "en",
+        size: 67_223_746,
+        path: "tts-models/vits-piper-en_US-amy-medium.tar.bz2",
+        sha256: "9a5d1fc497f85e8022b785bff5f8105203b1e33099ee6265203efc70b0cb0264",
+        lexicon: Some(&LEXICON_EN_US),
+    },
+    Builtin {
+        id: "piper-en_US-john-medium",
+        kind: Kind::Speech,
+        name: "Piper john (US English male)",
+        languages: "en",
+        size: 67_249_181,
+        path: "tts-models/vits-piper-en_US-john-medium.tar.bz2",
+        sha256: "d90362cfa48e429d3096f644785184446145b6e38216f2eaf4c0601b8aad5a36",
+        lexicon: Some(&LEXICON_EN_US),
+    },
+    Builtin {
+        id: "piper-en_US-bryce-medium",
+        kind: Kind::Speech,
+        name: "Piper bryce (US English male)",
+        languages: "en",
+        size: 67_278_133,
+        path: "tts-models/vits-piper-en_US-bryce-medium.tar.bz2",
+        sha256: "f35bb77ddecdf229798e850d1c77ded839d4179879be8b90da5f82e7beb538f2",
+        lexicon: Some(&LEXICON_EN_US),
+    },
+    Builtin {
+        id: "piper-en_US-norman-medium",
+        kind: Kind::Speech,
+        name: "Piper norman (US English male)",
+        languages: "en",
+        size: 67_203_672,
+        path: "tts-models/vits-piper-en_US-norman-medium.tar.bz2",
+        sha256: "1f32065d480abe9abc7c7f91442125d0b34c1cc065d1e600466cac408eabf3b8",
+        lexicon: Some(&LEXICON_EN_US),
+    },
+    Builtin {
+        id: "piper-en_GB-alan-medium",
+        kind: Kind::Speech,
+        name: "Piper alan (British English male)",
+        languages: "en",
+        size: 67_220_121,
+        path: "tts-models/vits-piper-en_GB-alan-medium.tar.bz2",
+        sha256: "a48d4017da0f77668b27bed63fe6e04dd64c6397e1fadad4f460efb0ef7c9012",
+        lexicon: Some(&LEXICON_EN_US),
+    },
+    Builtin {
+        id: "piper-en_GB-jenny_dioco-medium",
+        kind: Kind::Speech,
+        name: "Piper jenny (British English)",
+        languages: "en",
+        size: 67_225_842,
+        path: "tts-models/vits-piper-en_GB-jenny_dioco-medium.tar.bz2",
+        sha256: "a0888024569bafbefc05a4b48ddf8419d8dbbf3205f4af37cf7c6f1a87cc20c5",
+        lexicon: Some(&LEXICON_EN_US),
+    },
+    Builtin {
+        id: "piper-en_GB-northern_english_male-medium",
+        kind: Kind::Speech,
+        name: "Piper northern male (British English)",
+        languages: "en",
+        size: 67_210_490,
+        path: "tts-models/vits-piper-en_GB-northern_english_male-medium.tar.bz2",
+        sha256: "2bb2c1e709f58c11f17c693b3b38f500e110e7f54f2651774ec48b8d41f12c55",
+        lexicon: Some(&LEXICON_EN_US),
+    },
+    Builtin {
+        id: "piper-en_GB-semaine-medium",
+        kind: Kind::Speech,
+        name: "Piper semaine (4 expressive British voices)",
+        languages: "en",
+        size: 80_241_918,
+        path: "tts-models/vits-piper-en_GB-semaine-medium.tar.bz2",
+        sha256: "b2a1e39062fce8f7fb14b7fa5fb93d89c58e3af2245270387f408099f5a2da9f",
+        lexicon: Some(&LEXICON_EN_US),
+    },
+    Builtin {
+        id: "piper-en_GB-aru-medium",
+        kind: Kind::Speech,
+        name: "Piper aru (12 British speakers)",
+        languages: "en",
+        size: 80_309_222,
+        path: "tts-models/vits-piper-en_GB-aru-medium.tar.bz2",
+        sha256: "15b6e7a545d899167a688a054b95730ec8cdfd35d27d00bab1dc5234c4a451a0",
+        lexicon: Some(&LEXICON_EN_US),
+    },
     // German, French and Spanish Piper voices (thorsten, siwis, davefx) are left out for now:
     // sherpa-onnx 2.0 has no espeak-ng, so a Piper voice speaks only through a lexicon, and
     // sherpa-onnx publishes an English one only. A lexicon for their language (`lexicon-de-de.txt`
@@ -912,6 +1913,16 @@ const BUILTIN: &[Builtin] = &[
     // bring them back: e.g. `tts-models/vits-piper-de_DE-thorsten-medium.tar.bz2`, 67_214_254
     // bytes, SHA-256 50487d9c95fdf2191f31d2588569381063ba1591dcd4c7d4bdd30f12b2191714.
     // Kitten speaks through the same English lexicon as Piper (its archives carry none).
+    Builtin {
+        id: "kitten-nano-en-v0.8-fp32",
+        kind: Kind::Speech,
+        name: "Kitten nano v0.8 (fp32)",
+        languages: "en",
+        size: 63_815_222,
+        path: "tts-models/kitten-nano-en-v0_8-fp32.tar.bz2",
+        sha256: "16092117bfe591ddcd58d078e1454603b8e1caea46f85653b2c2efae76bd883e",
+        lexicon: Some(&LEXICON_EN_US),
+    },
     Builtin {
         id: "kitten-nano-en-v0.8-int8",
         kind: Kind::Speech,
@@ -953,6 +1964,16 @@ const BUILTIN: &[Builtin] = &[
         lexicon: None,
     },
     Builtin {
+        id: "pocket-tts",
+        kind: Kind::Speech,
+        name: "Pocket TTS (fp32)",
+        languages: "en",
+        size: 168_148_625,
+        path: "tts-models/sherpa-onnx-pocket-tts-2026-01-26.tar.bz2",
+        sha256: "61422a478ef09d9b2c067261fb822e11786e0c86842c76d8633b7069968be7b5",
+        lexicon: None,
+    },
+    Builtin {
         id: "pocket-tts-int8",
         kind: Kind::Speech,
         name: "Pocket TTS (int8)",
@@ -983,7 +2004,7 @@ mod tests {
         };
         for e in &c.entries {
             assert!(e.size > 1_000_000);
-            assert_eq!(e.languages.is_empty(), e.kind == Kind::Runtime, "{}", e.id);
+            assert!(!e.languages.is_empty(), "{}", e.id);
             if e.files.is_empty() {
                 // An archive of sherpa-onnx's releases.
                 let releases = "https://github.com/k2-fsa/sherpa-onnx/releases/download/";
@@ -992,9 +2013,7 @@ mod tests {
                     .strip_prefix(releases)
                     .unwrap_or_else(|| panic!("{}", e.url));
                 assert!(
-                    tag.starts_with("asr-models/")
-                        || tag.starts_with("tts-models/")
-                        || (e.kind == Kind::Runtime && tag.starts_with("v2.0.1/")),
+                    tag.starts_with("asr-models/") || tag.starts_with("tts-models/"),
                     "{}",
                     e.url
                 );
@@ -1011,7 +2030,12 @@ mod tests {
                 for f in &e.files {
                     assert!(plain_relative(&f.name), "{}", f.name);
                     assert!(f.url.starts_with("https://huggingface.co/"), "{}", f.url);
-                    assert!(f.url.contains("/resolve/") && f.url.ends_with(&f.name));
+                    assert!(
+                        f.url.contains("/resolve/")
+                            && (f.url.ends_with(&f.name)
+                                || f.url.ends_with(".safetensors")
+                                || f.url.ends_with(".onnx"))
+                    );
                     let rev = f
                         .url
                         .split("/resolve/")
@@ -1026,29 +2050,42 @@ mod tests {
             }
         }
         let kinds = |k| c.entries.iter().filter(|e| e.kind == k).count();
-        assert_eq!(kinds(Kind::Transcription), 30);
-        assert_eq!(kinds(Kind::Speech), 9);
-        // Every Piper and Kitten voice names the English lexicon; Kokoro carries its own, and
-        // Supertonic and Pocket TTS need none.
+        assert_eq!(kinds(Kind::Transcription), 38);
+        assert_eq!(kinds(Kind::Speech), 40);
+        // Every English Piper, Kitten, Matcha-en and ZipVoice voice names the English lexicon;
+        // Matcha and ZipVoice also name their shared vocoder.
         for e in c.entries.iter().filter(|e| e.kind == Kind::Speech) {
-            let lexicon = c.lexicon(e);
-            if e.id.starts_with("piper-") || e.id.starts_with("kitten-") {
+            let shared = c.shared(e);
+            if e.id.starts_with("piper-")
+                || e.id.starts_with("kitten-")
+                || e.id == "matcha-icefall-en_US-ljspeech"
+            {
                 assert!(
-                    e.id.starts_with("piper-en_") || e.id.starts_with("kitten-"),
+                    e.id.starts_with("piper-en_")
+                        || e.id.starts_with("kitten-")
+                        || e.id == "matcha-icefall-en_US-ljspeech",
                     "{}",
                     e.id
                 );
                 assert_eq!(e.languages, ["en"], "{}", e.id);
-                let l = lexicon.unwrap();
-                assert_eq!(l.name, "lexicon-en-us.txt");
+                let l = shared
+                    .iter()
+                    .find(|s| s.name == "lexicon-en-us.txt")
+                    .unwrap();
                 assert_eq!(
                     l.url,
                     "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/lexicon-en-us.txt"
                 );
                 assert_eq!(l.size, 6_305_773);
                 assert_eq!(l.sha256.len(), 64);
-            } else {
-                assert!(lexicon.is_none(), "{}", e.id);
+            }
+            if e.id.starts_with("matcha-") {
+                assert!(shared.iter().any(|s| s.name == "vocos-22khz-univ.onnx"));
+            } else if e.id.starts_with("zipvoice-") {
+                assert!(shared.iter().any(|s| s.name == "vocos_24khz.onnx"));
+                assert!(shared.iter().any(|s| s.name == "lexicon-en-us.txt"));
+            } else if !(e.id.starts_with("piper-") || e.id.starts_with("kitten-")) {
+                assert!(shared.is_empty(), "{}", e.id);
             }
         }
         // The directories earlier versions unpacked by hand are found as downloaded.
@@ -1074,6 +2111,46 @@ mod tests {
             assert_eq!(c.get(id).unwrap().dir, dir);
         }
         assert_eq!(c.get("supertonic-3-int8").unwrap().languages.len(), 31);
+        for e in &c.entries {
+            assert!(e.meta.cpu_rank.is_some(), "missing cpu_rank on {}", e.id);
+            assert!(e.meta.gpu_rank.is_some(), "missing gpu_rank on {}", e.id);
+            if e.kind == Kind::Transcription {
+                assert!(
+                    e.meta.live_capable.is_some(),
+                    "missing live_capable on {}",
+                    e.id
+                );
+                assert!(
+                    e.meta.language_mode.is_some(),
+                    "missing language_mode on {}",
+                    e.id
+                );
+            }
+        }
+        assert_eq!(
+            c.get("orpheus-3b-q4").unwrap().meta.tags.as_deref(),
+            Some("<tags>")
+        );
+        assert_eq!(
+            c.get("orpheus-3b-q4").unwrap().meta.runtime.as_deref(),
+            Some("llama")
+        );
+        assert_eq!(
+            c.get("supertonic-3-int8").unwrap().meta.language_mode,
+            Some(LanguageMode::Selectable)
+        );
+        assert_eq!(
+            c.get("piper-en_US-libritts-high")
+                .unwrap()
+                .meta
+                .group
+                .as_deref(),
+            Some("piper-en")
+        );
+        assert_eq!(
+            c.get("piper-en_US-libritts-high").unwrap().meta.speakers,
+            Some(904)
+        );
     }
 
     #[test]

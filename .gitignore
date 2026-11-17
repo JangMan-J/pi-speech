@@ -2,8 +2,10 @@ node_modules/
 *.log
 .proto/
 receiver/target/
+receiver/target-gpu/
 *.tgz
 .env
 .env.*
 .pad/
 .probe/
+receivers.json

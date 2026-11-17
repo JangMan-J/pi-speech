@@ -7,11 +7,12 @@
  *   off   local
  */
 
-import { type BridgeAudio, bridgeConfig, bridgeTarget, createBridgeAudioFrom, displayUrl } from "../bridge/index";
+import { type BridgeAudio, bridgeConfig, bridgeTarget, createBridgeAudioFrom, displayUrl } from "../bridge/client";
 import type { AudioInput, AudioOutput } from "./audio";
 import { type Env, overSsh } from "./env";
 import { LocalInput } from "./local-input";
 import { LocalOutput } from "./local-output";
+import type { ModelBackend } from "./model-backend";
 import { type BridgeMode, DEFAULT_SETTINGS, type DirectionSetting, type Machine } from "./settings";
 
 export type RouteName = "local" | "bridge";
@@ -91,6 +92,14 @@ export class Routes {
     return this.on("modelsOn");
   }
 
+  /** The Remote machine's model backend when `modelsRoute === "bridge"`, else undefined (use local receiver). */
+  remoteModels(): ModelBackend | undefined {
+    if (this.modelsRoute !== "bridge") return undefined;
+    if (this.bridge.models) return this.bridge.models;
+    const no = () => Promise.reject(new Error("this bridge cannot run models on the Remote machine"));
+    return { list: no, voices: no, transcribe: no, speak: no };
+  }
+
   output(): AudioOutput {
     if (this.outputRoute === "bridge") return this.bridge.output;
     return this.route === "bridge" ? this.plainOutput() : this.localOutput;
@@ -138,8 +147,8 @@ export class Routes {
     return {
       name: local.name,
       stop: (kind) => local.stop(kind),
-      async playStream(stream, kind) {
-        const started = await local.playStream(stream, kind);
+      async playStream(stream, kind, opts) {
+        const started = await local.playStream(stream, kind, opts);
         if (!started.ok) return { ok: false, reason: say(started.reason) };
         const done = started.done.then((o) =>
           o.state === "failed" ? { state: "failed" as const, error: say(o.error) } : o,

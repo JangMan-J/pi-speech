@@ -1,6 +1,15 @@
 //! pi-speech-receiver: the playback-machine side of the playback bridge.
 //! The wire contract is `protocol/bridge.md`.
 
+/// The receiver version (`package.json` when built in the repository, else Cargo's).
+pub const VERSION: &str = env!("PI_SPEECH_VERSION");
+/// Whether this build is the GPU (`shared`) or CPU (`static`) edition.
+pub const EDITION: &str = if cfg!(feature = "shared") {
+    "gpu"
+} else {
+    "cpu"
+};
+
 pub mod audio;
 pub mod engines;
 pub mod front;

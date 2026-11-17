@@ -6,7 +6,7 @@ import type { Engine } from "../../src/engine/engine";
 import { matchItems, Panel, type PanelKey, type PanelView } from "../../src/engine/panel";
 import type { Hotkeys } from "../../src/engine/settings";
 import { Surface } from "../../src/engine/surface";
-import { fakeOpenRouter, fakeReceiver, makeEngine, STAND_IN_BINARY, scriptedUi } from "./fixtures";
+import { fakeOpenRouter, fakeReceiver, makeEngine, STAND_IN_BINARY, scriptedUi, trackTemp } from "./fixtures";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -18,9 +18,9 @@ const ROWS = [
   "Voice",
   "Transcription source",
   "Transcription model",
-  "Dictation language",
-  "Dictation output",
-  "Bridge connection",
+  "Dictation options",
+  "Hotkeys",
+  "Receivers",
   "Spectrum OSD",
 ];
 
@@ -30,8 +30,8 @@ const ACTIONS = ["Speak…", "Dictate", "Push-to-talk"];
 /** The main view's own keys, on its hint line. */
 const LETTER_HINTS = "Ctrl+O replay · Ctrl+L history · Ctrl+N stop · Ctrl+T transcribe";
 
-/** The rows of Bridge connection. */
-const BRIDGE_ROWS = ["Bridge", "Remote machine", "Pairing", "Play audio on", "Record audio on", "Run models on"];
+/** The rows of Receivers over SSH. */
+const BRIDGE_ROWS = ["Bridge", "Device", "Pairing", "Receiver", "Play audio on", "Record audio on", "Run models on"];
 
 const XAI_TOKEN = "xai-login-token-abcdef";
 
@@ -86,19 +86,11 @@ function open(
    * or in Bridge connection for Bridge.
    */
   const goTo = async (label: string) => {
-    if (label === "Hotkeys") {
-      while (panel.view().tab !== "hotkeys") await press("tab");
-      return;
-    }
     const menu = ACTIONS.includes(label) ? "hotkeys" : BRIDGE_ROWS.includes(label) ? "bridge" : "main";
     if (panel.view().menu !== menu && panel.view().menu !== "main") await press("escape");
     if (menu !== "main" && panel.view().menu === "main") {
-      if (menu === "hotkeys") {
-        while (panel.view().tab !== "hotkeys") await press("tab");
-      } else {
-        await goTo("Bridge connection");
-        await press("enter");
-      }
+      await goTo(menu === "hotkeys" ? "Hotkeys" : "Receivers");
+      await press("enter");
     }
     // Down through the rows, and past the last one through the Speak line on to the first.
     for (let i = 0; i <= panel.view().rows.length + 1 && selectedLabel() !== label; i++) await press("down");
@@ -154,11 +146,12 @@ describe("the panel view model: the main view", () => {
       Voice: "Kore",
       "Transcription source": "Provider",
       "Transcription model": "openai/whisper-large-v3-turbo",
-      "Dictation language": "auto",
-      "Dictation output": "Pi",
-      "Bridge connection": "not connected",
-      "Spectrum OSD": "Braille",
+      "Dictation options": "Filled",
+      Hotkeys: "Alt+S · Alt+Z",
+      Receivers: expect.stringMatching(/^Local/),
+      "Spectrum OSD": "Lines",
     });
+    expect(p.row("Dictation options")).toMatchObject({ value: "Filled", note: "auto", opens: true });
   });
 
   it("the key bar carries the keys Pi has bound", async () => {
@@ -172,7 +165,15 @@ describe("the panel view model: the main view", () => {
       .view()
       .rows.filter((r) => r.opens)
       .map((r) => r.label);
-    expect(opens).toEqual(["Read aloud options", "Speech model", "Voice", "Transcription model", "Bridge connection"]);
+    expect(opens).toEqual([
+      "Read aloud options",
+      "Speech model",
+      "Voice",
+      "Transcription model",
+      "Dictation options",
+      "Hotkeys",
+      "Receivers",
+    ]);
   });
 
   it("shows only the name of a model or a voice: no price, features, provider or language", async () => {
@@ -268,8 +269,8 @@ describe("the panel view model: keys in the main view", () => {
       ["Length", "Minimum ~15 s", false],
       ["Truncate at", "Off", false],
     ]);
-    expect(v.status).toEqual({ tone: "info", text: "Off: nothing is read aloud." });
-    expect(p.hint()).toBe("←→ Off · Summarized · Streaming · Esc Main");
+    expect(v.status).toEqual({ tone: "info", text: "Off." });
+    expect(p.hint()).toBe("← → Selects · Esc Main");
     await p.press("escape");
     expect(p.panel.view().menu).toBe("main");
     expect(p.selectedLabel()).toBe("Read aloud options");
@@ -284,9 +285,9 @@ describe("the panel view model: keys in the main view", () => {
       lines.push([p.row("Read")?.value, p.panel.view().status?.text]);
     }
     expect(lines).toEqual([
-      ["Summarized", "Reads a spoken summary of the reply when the run ends."],
-      ["Streaming", "Narrates a spoken summary of each reasoning step as it is produced."],
-      ["Off", "Off: nothing is read aloud."],
+      ["Summarized", "Speaks a summary when the reply ends."],
+      ["Streaming", "Speaks summaries of reasoning steps mid-run."],
+      ["Off", "Off."],
     ]);
     await p.press("left");
     expect(p.engine.readAloud.mode).toBe("streaming");
@@ -300,8 +301,10 @@ describe("the panel view model: keys in the main view", () => {
       {},
       {
         before: (e) => {
-          e.readAloud.models = () => ["anthropic/claude-haiku", "openai/gpt-mini"];
-          e.readAloud.currentModel = () => "openai/gpt-mini";
+          e.readAloud.attachHost({
+            models: () => ["anthropic/claude-haiku", "openai/gpt-mini"],
+            currentModel: () => "openai/gpt-mini",
+          });
         },
       },
     );
@@ -316,30 +319,29 @@ describe("the panel view model: keys in the main view", () => {
 
     // Not the session's model when it is not one of the user's: the first of theirs.
     p.engine.setReadAloudOptions({ summarizer: undefined });
-    p.engine.readAloud.currentModel = () => "local/unlisted";
+    p.engine.readAloud.attachHost({ currentModel: () => "local/unlisted" });
     p.engine.setReadMode("streaming");
     expect(p.engine.speech.settings.readAloud.summarizer).toBe("anthropic/claude-haiku");
   });
 
-  it("Space steps a value that changes in place, as Enter does, and nothing else", async () => {
+  it("Space steps a value that changes in place and opens submenus/pickers like Enter", async () => {
     const p = open();
-    await p.press("enter"); // Read aloud options
+    await p.type(" "); // Main: Read aloud options opens submenu
+    expect(p.panel.view().crumb).toBe("Read aloud options");
     await p.type(" ");
     expect(p.engine.readAloud.mode).toBe("summary");
     await p.type(" ");
     expect(p.engine.readAloud.mode).toBe("streaming");
-    await p.press("down"); // Summarized by opens a list: Space does not change it
-    const before = p.engine.speech.settings.readAloud.summarizer;
+    await p.press("down"); // Summarized by: Space opens its picker
     await p.type(" ");
-    expect(p.panel.view().picker).toBeUndefined();
-    expect(p.engine.speech.settings.readAloud.summarizer).toBe(before);
-    await p.press("down"); // Length
+    expect(p.panel.view().picker?.title).toBe("Summarized by");
+    await p.press("escape", "down"); // Length
     await p.type(" ");
     expect(p.engine.speech.settings.readAloud.length).toBe("abridged");
   });
 
   it("Streaming with no Pi model to take shows none, as a problem, never Same model", async () => {
-    const p = open({}, { before: (e) => (e.readAloud.models = () => []) });
+    const p = open({}, { before: (e) => e.readAloud.attachHost({ models: () => [] }) });
     p.engine.setReadMode("streaming");
     await p.press("enter");
     expect(p.row("Summarized by")).toMatchObject({ value: "none", note: "✗ choose a model", alert: true });
@@ -348,19 +350,19 @@ describe("the panel view model: keys in the main view", () => {
   it("Length and Truncate at cycle in place, are saved, and their lines say what they promise", async () => {
     const p = open();
     await p.press("enter", "down", "down");
-    expect(p.panel.view().status?.text).toBe("Best effort: about 15 s.");
-    expect(p.hint()).toBe("←→ Minimum · Abridged · Full · Esc Main");
+    expect(p.panel.view().status?.text).toBe("~15 s target.");
+    expect(p.hint()).toBe("← → Selects · Esc Main");
     await p.press("right");
     expect(p.row("Length")?.value).toBe("Abridged ~30 s");
-    expect(p.panel.view().status?.text).toBe("Best effort: about 30 s.");
+    expect(p.panel.view().status?.text).toBe("~30 s target.");
     await p.press("enter");
     expect(p.row("Length")?.value).toBe("Full ~60 s");
     await p.press("down");
-    expect(p.panel.view().status?.text).toBe("Off: length not guaranteed.");
-    expect(p.hint()).toBe("←→ Off · 15 s · 30 s · 60 s · 120 s · Esc Main");
+    expect(p.panel.view().status?.text).toBe("Off.");
+    expect(p.hint()).toBe("← → Selects · Esc Main");
     await p.press("right", "right");
     expect(p.row("Truncate at")?.value).toBe("30 s");
-    expect(p.panel.view().status?.text).toBe("Stops at 30 s, at a sentence end.");
+    expect(p.panel.view().status?.text).toBe("Stops at 30 s.");
     await p.press("left", "left", "left");
     expect(p.row("Truncate at")?.value).toBe("120 s");
     const saved = JSON.parse(readFileSync(join(p.work, "agent", "pi-speech", "settings.json"), "utf8"));
@@ -369,14 +371,15 @@ describe("the panel view model: keys in the main view", () => {
 
   it("Summarized by opens a picker of Same model and the user's Pi models", async () => {
     const p = open();
-    p.engine.readAloud.models = () => ["anthropic/claude-haiku", "openai/gpt-mini"];
+    p.engine.readAloud.attachHost({ models: () => ["anthropic/claude-haiku", "openai/gpt-mini"] });
     await p.press("enter", "down");
-    expect(p.panel.view().status?.text).toBe("Same model, same reply. No extra request.");
-    expect(p.hint()).toBe("Enter choose a model · Esc Main");
+    expect(p.panel.view().status?.text).toBe("Summarization only: same model, same reply. No additional request.");
+    expect(p.hint()).toBe("Enter choose summarization model · Esc Main");
     await p.press("right");
     expect(p.panel.view().picker).toBeUndefined();
     await p.press("enter");
     expect(p.hint()).toBe("Enter pick · type to filter · Esc back");
+    expect(p.panel.view().status?.text).toBe("Summarization only: same model, same reply (no additional request).");
     const picker = p.panel.view().picker;
     expect(picker?.title).toBe("Summarized by");
     expect(picker?.items.map((i) => [i.label, i.current])).toEqual([
@@ -384,12 +387,30 @@ describe("the panel view model: keys in the main view", () => {
       ["anthropic/claude-haiku", false],
       ["openai/gpt-mini", false],
     ]);
+    await p.press("down");
+    expect(p.panel.view().status?.text).toBe(
+      "Summarization only: one additional request to anthropic/claude-haiku per reply (your speech model speaks it).",
+    );
     await p.type("haiku");
     await p.press("enter");
     expect(p.panel.view().picker).toBeUndefined();
     expect(p.row("Summarized by")?.value).toBe("anthropic/claude-haiku");
-    expect(p.panel.view().status?.text).toBe("Extra request to anthropic/claude-haiku per reply.");
+    expect(p.panel.view().status?.text).toBe(
+      "Summarization only: one additional request to anthropic/claude-haiku per reply.",
+    );
     expect(p.engine.speech.settings.readAloud.summarizer).toBe("anthropic/claude-haiku");
+    await p.press("up", "left"); // Streaming
+    await p.press("down");
+    expect(p.panel.view().status?.text).toBe(
+      "Summarization only: additional requests to anthropic/claude-haiku made per step batch.",
+    );
+    await p.press("enter");
+    expect(p.panel.view().status?.text).toBe(
+      "Summarization only: additional requests to anthropic/claude-haiku made per step batch (your speech model speaks it).",
+    );
+    await p.press("escape");
+    await p.press("up", "left"); // Summarized
+    await p.press("down");
     await p.press("enter", "enter");
     expect(p.row("Summarized by")?.value).toBe("Same model");
     expect(p.engine.speech.settings.readAloud.summarizer).toBeUndefined();
@@ -502,16 +523,16 @@ describe("the panel view model: keys in the main view", () => {
   it("the hints follow the row; Esc is last", async () => {
     const p = open();
     const hints: Record<string, string> = {
-      "Read aloud options": `Enter what is read and how · ${LETTER_HINTS} · Esc close`,
-      "Speech source": `←→ Provider · Local · ${LETTER_HINTS} · Esc close`,
-      "Speech model": `Enter browse, sort and filter · ${LETTER_HINTS} · Esc close`,
+      "Read aloud options": `Enter options · ${LETTER_HINTS} · Esc close`,
+      "Speech source": `← → Selects · ${LETTER_HINTS} · Esc close`,
+      "Speech model": `Enter browse · ${LETTER_HINTS} · Esc close`,
       Voice: `Enter choose · Ctrl+P sample · F2 language · ${LETTER_HINTS} · Esc close`,
-      "Transcription source": `←→ Provider · Local · ${LETTER_HINTS} · Esc close`,
-      "Transcription model": `Enter browse, sort and filter · ${LETTER_HINTS} · Esc close`,
-      "Dictation language": `Enter set · ${LETTER_HINTS} · Esc close`,
-      "Dictation output": `←→ Pi · User-defined · ${LETTER_HINTS} · Esc close`,
-      "Bridge connection": `Enter the Remote machine, and what runs there · ${LETTER_HINTS} · Esc close`,
-      "Spectrum OSD": `←→ Braille · Bars · Mirrored · 1-line · Off · ${LETTER_HINTS} · Esc close`,
+      "Transcription source": `← → Selects · ${LETTER_HINTS} · Esc close`,
+      "Transcription model": `Enter browse · ${LETTER_HINTS} · Esc close`,
+      "Dictation options": `Enter options · ${LETTER_HINTS} · Esc close`,
+      Hotkeys: `Enter keys · ${LETTER_HINTS} · Esc close`,
+      Receivers: `Enter receivers · ${LETTER_HINTS} · Esc close`,
+      "Spectrum OSD": `← → Selects · ${LETTER_HINTS} · Esc close`,
     };
     for (const label of ROWS) {
       await p.goTo(label);
@@ -529,12 +550,12 @@ describe("the panel view model: keys in the main view", () => {
         .view()
         .hints.filter((h) => h.optional)
         .map((h) => h.key),
-    ).toEqual(["Ctrl+P", "F2", "Tab"]);
+    ).toEqual(["Ctrl+P", "F2"]);
     await p.type("zz");
     expect(p.hint()).toBe("Backspace · Esc back");
     await p.press("escape", "up");
     await p.press("enter");
-    expect(p.hint()).toBe("Enter pick · Ctrl+S sort · type to filter · Esc back");
+    expect(p.hint()).toBe("Enter pick · Ctrl+S sort · Ctrl+T local · type to filter · Esc back");
     await p.engine.speech.set("tts-model", "hexgrad/kokoro-82m");
     let release!: () => void;
     p.engine.speech.voicesFor = () =>
@@ -576,30 +597,30 @@ describe("the panel view model: keys in the main view", () => {
   });
 });
 
-describe("the panel view model: Bridge connection", () => {
-  it("on this machine it is Remote machine (Connect) and DIRECTION: no bridge mode or Pairing rows", async () => {
+describe("the panel view model: Receivers", () => {
+  it("on this machine with Device Local it shows only Device and Receiver (hiding Bridge, Pairing, and DIRECTION)", async () => {
     const p = open();
     await p.panel.idle();
-    await p.goTo("Bridge connection");
+    await p.goTo("Receivers");
     await p.press("enter");
     const v = p.panel.view();
-    expect(v).toMatchObject({ menu: "bridge", crumb: "Bridge connection", selected: 0 });
-    expect(v.rows.map((r) => r.label)).toEqual(["Remote machine", "Play audio on", "Record audio on", "Run models on"]);
-    expect(p.row("Remote machine")).toMatchObject({ value: "not connected", note: "Enter connects", opens: true });
-    expect(p.hint()).toBe("Enter connect · Esc Main");
+    expect(v).toMatchObject({ menu: "bridge", crumb: "Receivers", selected: 0 });
+    expect(v.rows.map((r) => r.label)).toEqual(["Device", "Receiver"]);
+    expect(p.row("Device")).toMatchObject({ value: "Local", note: "Enter connects to Remote", opens: true });
+    expect(p.hint()).toBe("← → Selects · Enter connect · Esc Main");
     await p.press("escape");
     expect(p.panel.view().menu).toBe("main");
-    expect(p.selectedLabel()).toBe("Bridge connection");
+    expect(p.selectedLabel()).toBe("Receivers");
   });
 
   it("over SSH it holds the bridge mode, which cycles auto, on, off in place and is saved", async () => {
     const p = open({ SSH_CONNECTION: "1 2 3 4" });
     await p.panel.idle();
-    await p.goTo("Bridge connection");
+    await p.goTo("Receivers");
     await p.press("enter");
     expect(p.panel.view().rows.map((r) => r.label)).toEqual(BRIDGE_ROWS);
     expect(p.row("Bridge")?.value).toBe("auto");
-    expect(p.hint()).toBe("←→ auto · on · off · Esc Main");
+    expect(p.hint()).toBe("← → Selects · Esc Main");
     await p.press("right");
     expect(p.row("Bridge")?.value).toBe("on");
     await p.press("enter");
@@ -629,38 +650,38 @@ describe("the panel view model: Bridge connection", () => {
   });
 });
 
-describe("the panel view model: Remote machine's Connect, on this machine", () => {
-  it("the main view's Bridge connection row says what the bridge is connected to", async () => {
+describe("the panel view model: Device and Receiver, on this machine", () => {
+  it("the main view's Receivers row summarizes Local or Remote connection state", async () => {
     const p = open();
     await p.panel.idle();
-    expect(p.row("Bridge connection")).toMatchObject({ value: "not connected", opens: true });
+    expect(p.row("Receivers")).toMatchObject({ value: expect.stringMatching(/^Local/), opens: true });
     p.engine.speech.settings.remoteHost = "spider";
     p.engine.remoteState = "connecting";
-    expect(p.row("Bridge connection")).toMatchObject({ value: "spider", note: "… connecting" });
+    expect(p.row("Receivers")).toMatchObject({ value: "spider", note: "… connecting" });
     p.engine.remoteState = "connected";
-    expect(p.row("Bridge connection")).toMatchObject({ value: "spider", note: expect.stringMatching(/^✓ over SSH/) });
+    expect(p.row("Receivers")).toMatchObject({ value: "spider", note: expect.stringMatching(/^✓ CPU/) });
     p.engine.remoteState = "lost";
     p.engine.remoteError = "the connection to spider ended";
-    expect(p.row("Bridge connection")).toMatchObject({
+    expect(p.row("Receivers")).toMatchObject({
       value: "spider",
       note: "✗ the connection to spider ended",
       alert: true,
     });
     const ssh = open({ SSH_CONNECTION: "1 2 3 4" });
     await ssh.panel.idle();
-    expect(ssh.row("Bridge connection")).toMatchObject({ value: "ssh forward", note: "✓" });
+    expect(ssh.row("Receivers")).toMatchObject({ value: "ssh forward", note: "✓" });
   });
 
-  it("Enter opens Connect; arrows step through the Hosts of ~/.ssh/config", async () => {
-    const home = mkdtempSync(join(tmpdir(), "pi-speech-home-"));
+  it("Enter on Device opens Connect; arrows step through the Hosts of ~/.ssh/config", async () => {
+    const home = trackTemp(mkdtempSync(join(tmpdir(), "pi-speech-home-")));
     mkdirSync(join(home, ".ssh"));
     writeFileSync(join(home, ".ssh", "config"), "Host spider\n  HostName 100.64.0.9\nHost *.lan\nHost build lab\n");
     const p = open({ HOME: home });
-    await p.goTo("Bridge connection");
+    await p.goTo("Receivers");
     await p.press("enter");
-    await p.goTo("Remote machine");
+    await p.goTo("Device");
     await p.press("enter");
-    expect(p.panel.view().input).toMatchObject({ label: "Connect to", value: "", under: "remoteMachine" });
+    expect(p.panel.view().input).toMatchObject({ label: "Connect to", value: "", under: "device" });
     expect(p.panel.view().status?.text).toBe("Your ssh Hosts: spider, build, lab");
     expect(p.hint()).toBe("Enter connect · ↑↓ your ssh Hosts · Esc back");
     await p.press("down");
@@ -694,9 +715,9 @@ describe("the panel view model: Remote machine's Connect, on this machine", () =
         },
       },
     );
-    await p.goTo("Bridge connection");
+    await p.goTo("Receivers");
     await p.press("enter");
-    await p.press("enter"); // Remote machine: Connect
+    await p.press("enter"); // Device: Connect
     await p.type("spider");
     p.panel.handle({ key: "enter" });
     await vi.waitFor(() => expect(p.panel.view().login?.prompt).toBe("spider has no pi-speech-receiver. Install it?"));
@@ -712,7 +733,202 @@ describe("the panel view model: Remote machine's Connect, on this machine", () =
     expect(p.panel.view().login?.value).toBe("hunter2"); // the renderer draws it as dots
     await p.press("enter");
     expect(p.panel.view().status?.text).toMatch(/^✓ Connected to spider over SSH, receiver 0.3.0/);
-    expect(p.row("Remote machine")).toMatchObject({ value: "spider", note: expect.stringMatching(/^✓ over SSH/) });
+    expect(p.row("Device")).toMatchObject({ value: "Remote · spider", note: expect.stringMatching(/^✓ over SSH/) });
+  });
+
+  it("Receiver shows edition/version on connection, offers u only when outdated, and Device ←→ toggles Local ↔ Remote", async () => {
+    const expected = "0.2.5";
+    let installedVersion = "0.3.0";
+    let updatedCalls = 0;
+    const p = open(
+      {},
+      {
+        before: (e) => {
+          (e as unknown as { receiverVersion: string }).receiverVersion = expected;
+          e.probeBridge = async () => ({
+            ok: true,
+            address: "127.0.0.1",
+            port: 40000,
+            ms: 12,
+            version: installedVersion,
+          });
+          e.connectRemote = async (dest, _prompts, opts) => {
+            if (opts?.update === "force") {
+              updatedCalls++;
+              installedVersion = expected;
+            }
+            e.speech.settings.remoteHost = dest;
+            await e.setBridge("on");
+            e.remoteState = "connected";
+            e.onRemoteChange();
+            return {
+              dest,
+              address: "127.0.0.1:40000",
+              token: "t",
+              version: installedVersion,
+              edition: "cpu",
+              outdated: installedVersion !== expected,
+              alive: () => true,
+              close: async () => {},
+            };
+          };
+        },
+      },
+    );
+    await p.goTo("Receivers");
+    await p.press("enter");
+    await p.press("enter");
+    await p.type("spider");
+    await p.press("enter");
+    expect(p.panel.view().status?.text).toMatch(/receiver 0\.3\.0.*expected 0\.2\.5/);
+    expect(p.row("Device")).toMatchObject({ value: "Remote · spider", note: expect.stringMatching(/^✓ over SSH/) });
+    expect(p.row("Receiver")).toMatchObject({
+      value: "CPU v0.3.0",
+      note: "! u updates to v0.2.5",
+      alert: true,
+    });
+    expect(p.hint()).toContain("u update to v0.2.5");
+    await p.press("down"); // Receiver
+    expect(p.hint()).toContain("u update to v0.2.5");
+    await p.type("u");
+    expect(updatedCalls).toBe(1);
+    expect(p.panel.view().status?.text).toBe("✓ Updated pi-speech-receiver on spider to 0.2.5");
+    expect(p.row("Receiver")).toMatchObject({ value: "CPU v0.2.5" });
+    expect(p.row("Receiver")?.alert).toBeFalsy();
+    expect(p.hint()).not.toContain("update to");
+    await p.type("u");
+    expect(updatedCalls).toBe(1);
+    expect(p.panel.view().status?.text).toBe("pi-speech-receiver on spider is already current (0.2.5)");
+    // Device ←→ toggles back to Local (turning off the bridge while remembering spider) and back to Remote
+    await p.press("up"); // Device
+    expect(p.engine.routes.route).toBe("bridge");
+    await p.press("left");
+    expect(p.engine.routes.route).toBe("local");
+    expect(settingsOf(p.work).bridge).toBe("auto");
+    expect(settingsOf(p.work).remoteHost).toBe("spider");
+    expect(p.row("Device")).toMatchObject({ value: "Local", note: expect.stringContaining("spider") });
+    await p.press("escape");
+    expect(p.row("Receivers")).toMatchObject({ value: expect.stringMatching(/^Local/) });
+    expect(p.row("Receivers")?.alert).toBeFalsy();
+    await p.goTo("Receivers");
+    await p.press("enter", "right");
+    expect(p.engine.routes.route).toBe("bridge");
+    expect(p.row("Device")).toMatchObject({ value: "Remote · spider" });
+  });
+
+  it.skipIf(!STAND_IN_BINARY)(
+    "toggling Device from Remote to Local reloads local models/voices on this machine instead of failing on a closed bridge",
+    async () => {
+      const bin = fakeReceiver(mkdtempSync(join(tmpdir(), "pi-speech-toggle-dev-")));
+      let linkOpen = false;
+      const p = open(
+        { PI_SPEECH_BINARY: bin.path },
+        {
+          before: (e) => {
+            // Simulate a bridge whose models endpoint requires the live SSH link token (throws once link closes).
+            (e.routes.bridge as { models?: unknown }).models = {
+              list: async () => {
+                if (!linkOpen) throw new Error("no bridge token");
+                return [
+                  {
+                    id: "kokoro",
+                    kind: "speech",
+                    name: "Kokoro",
+                    languages: ["en"],
+                    size: 100000000,
+                    downloaded: true,
+                    partial: 0,
+                    path: "/remote/kokoro",
+                  },
+                ];
+              },
+              voices: async () => {
+                if (!linkOpen) throw new Error("no bridge token");
+                return [{ name: "af_alloy", number: 0 }];
+              },
+              transcribe: async () => "ok",
+              speak: async () => {
+                throw new Error("unused");
+              },
+            };
+            e.connectRemote = async (dest) => {
+              linkOpen = true;
+              e.speech.settings.remoteHost = dest;
+              await e.setBridge("on");
+              e.setDirection("modelsOn", "remote");
+              e.remoteState = "connected";
+              e.onRemoteChange();
+              return {
+                dest,
+                address: "127.0.0.1:38275",
+                token: "ephemeral",
+                version: "0.2.5",
+                edition: "gpu",
+                alive: () => linkOpen,
+                close: async () => {
+                  linkOpen = false;
+                },
+              };
+            };
+          },
+        },
+      );
+      p.engine.speech.setSource("speech", "local");
+      p.engine.speech.settings.localSpeechModel = "kokoro";
+      p.engine.speech.setSource("transcription", "local");
+      p.engine.speech.settings.localTranscriptionModel = "parakeet-v3";
+
+      await p.goTo("Receivers");
+      await p.press("enter", "enter");
+      await p.type("decent-spider");
+      await p.press("enter");
+      expect(p.engine.routes.route).toBe("bridge");
+
+      // Toggle Device back to Local via left arrow: link closes, bridge switches off, local models reload cleanly.
+      const origDisconnect = p.engine.disconnectRemote.bind(p.engine);
+      p.engine.disconnectRemote = async (forget, opts) => {
+        linkOpen = false;
+        return origDisconnect(forget, opts);
+      };
+      await p.press("left");
+      expect(p.engine.routes.route).toBe("local");
+      await p.press("escape");
+      expect(p.panel.view().status?.tone).not.toBe("error");
+      // On this machine: parakeet-v3 is downloaded, kokoro is not downloaded (so Speech model says not downloaded, Voice says download model first — never local models/voices unavailable).
+      expect(p.row("Transcription model")).toMatchObject({ value: "parakeet-v3" });
+      expect(p.row("Transcription model")?.alert).toBeFalsy();
+      expect(p.row("Speech model")).toMatchObject({ value: "kokoro", note: "✗ not downloaded", alert: true });
+      expect(p.row("Voice")).toEqual({
+        id: "voice",
+        label: "Voice",
+        value: "default",
+        note: "download model first",
+        disabled: true,
+      });
+    },
+  );
+
+  it("Local Receiver reports unavailable GPU hardware cleanly when switching CPU → GPU", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-speech-nogpu-"));
+    const bin = join(dir, "fake-receiver");
+    writeFileSync(
+      bin,
+      `#!${process.execPath}
+const cmd = process.argv[2];
+if (cmd === "--version") { console.log("pi-speech-receiver 0.2.5"); process.exit(0); }
+if (cmd === "gpu") { console.log(JSON.stringify({ driver: false, cuda: null, cudnn: false, hardware: false, edition: "cpu", target: null, usable: false, why: "no NVIDIA driver (libcuda.so.1 does not load)" })); process.exit(0); }
+`,
+      { mode: 0o755 },
+    );
+    const p = open({ PI_SPEECH_BINARY: bin });
+    await p.goTo("Receivers");
+    await p.press("enter");
+    await p.press("down"); // Receiver
+    expect(p.row("Receiver")).toMatchObject({ value: "CPU v0.2.5", note: "env" });
+    await p.press("right");
+    expect(p.panel.view().status?.text).toMatch(/GPU unavailable: no NVIDIA driver/);
+    expect(p.engine.speech.settings.localDevice).toBe("cpu");
+    rmSync(dir, { recursive: true, force: true });
   });
 
   it("Esc on a question or the password declines it, and the connection says why", async () => {
@@ -728,7 +944,7 @@ describe("the panel view model: Remote machine's Connect, on this machine", () =
         },
       },
     );
-    await p.goTo("Bridge connection");
+    await p.goTo("Receivers");
     await p.press("enter");
     await p.press("enter");
     await p.type("spider");
@@ -739,7 +955,7 @@ describe("the panel view model: Remote machine's Connect, on this machine", () =
   });
 
   it("address:port pairs with a receiver there without SSH; paired, the bridge goes on with the audio here", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "pi-speech-pair-"));
+    const dir = trackTemp(mkdtempSync(join(tmpdir(), "pi-speech-pair-")));
     const tokenFile = join(dir, "bridge.token");
     const token = "r".repeat(64);
     const p = open({ PI_SPEECH_BRIDGE_TOKEN_FILE: tokenFile });
@@ -762,7 +978,7 @@ describe("the panel view model: Remote machine's Connect, on this machine", () =
           : Response.json({ error: "wrong pairing code", attempts_left: 4 }, { status: 403 });
       }),
     );
-    await p.goTo("Bridge connection");
+    await p.goTo("Receivers");
     await p.press("enter");
     await p.press("enter");
     await p.type("100.64.0.2:47613");
@@ -776,25 +992,30 @@ describe("the panel view model: Remote machine's Connect, on this machine", () =
   });
 });
 
-describe("the panel view model: Bridge connection's DIRECTION", () => {
-  it("without the bridge in use, each row is This machine and does not change; the status line says why", async () => {
-    const p = open();
-    await p.goTo("Record audio on");
-    expect(p.row("Record audio on")).toMatchObject({ value: "This machine", note: "no bridge in use" });
-    await p.press("enter");
-    expect(p.panel.view().status?.text).toMatch(/Without the bridge in use .*This machine/);
-    expect(p.engine.speech.settings.recordOn).toBe("remote");
+describe("the panel view model: Receivers' DIRECTION", () => {
+  it("reveals DIRECTION rows only while a bridge is active, and clamps selection cleanly when the bridge turns off", async () => {
+    const p = open({ SSH_CONNECTION: "1 2 3 4" });
+    await p.goTo("Run models on");
+    expect(p.panel.view().rows.map((r) => r.label)).toEqual(BRIDGE_ROWS);
+    expect(p.selectedLabel()).toBe("Run models on");
+    // Turn Bridge off: the three routing rows disappear and selection clamps when Bridge is turned off from row 0 or via engine.
+    await p.engine.setBridge("off");
+    expect(p.panel.view().rows.map((r) => r.label)).toEqual(["Bridge", "Device", "Pairing", "Receiver"]);
+    expect(p.selectedLabel()).toBe("Receiver");
+    expect(p.hint()).toMatch(/Esc Main$/);
+    await p.engine.setBridge("auto");
+    expect(p.panel.view().rows.map((r) => r.label)).toEqual(BRIDGE_ROWS);
   });
 
   it("over SSH each row cycles This machine | Remote machine and is saved; a choice that needs this host's microphone warns", async () => {
     const p = open({ SSH_CONNECTION: "1 2 3 4" });
     await p.goTo("Record audio on");
-    expect(BRIDGE_ROWS.slice(3).map((l) => p.row(l)?.value)).toEqual([
+    expect(BRIDGE_ROWS.slice(4).map((l) => p.row(l)?.value)).toEqual([
       "Remote machine",
       "Remote machine",
       "Remote machine",
     ]);
-    expect(p.hint()).toBe("←→ This machine · Remote machine · Esc Main");
+    expect(p.hint()).toBe("← → Selects · Esc Main");
     await p.press("right");
     expect(p.row("Record audio on")?.value).toBe("This machine");
     expect(p.panel.view().status).toMatchObject({ tone: "warning", text: expect.stringMatching(/needs a microphone/) });
@@ -809,7 +1030,7 @@ describe("the panel view model: Bridge connection's DIRECTION", () => {
   });
 });
 
-describe("the panel view model: Bridge connection's Remote machine and Pairing (Pi over SSH)", () => {
+describe("the panel view model: Receivers' Device and Pairing (Pi over SSH)", () => {
   // Over SSH the receiver is the user's own machine: the bridge mode and Pairing rows are there.
   const SSH = { SSH_CONNECTION: "1 2 3 4" };
   const connected = async () => ({ ok: true, address: "127.0.0.1", port: 47613, ms: 52, version: "0.3.0" }) as const;
@@ -821,16 +1042,15 @@ describe("the panel view model: Bridge connection's Remote machine and Pairing (
       reason: "the playback receiver is not reachable at http://127.0.0.1:47613: fetch failed",
     }) as const;
 
-  it("shows the bridge, the Remote machine's address (the ssh forward by default), and a connected receiver", async () => {
+  it("shows the bridge, the Device's address (the ssh forward by default), and a connected receiver", async () => {
     const p = open(SSH, { before: (e) => (e.probeBridge = connected) });
-    await p.goTo("Bridge connection");
+    await p.goTo("Receivers");
     await p.press("enter");
     expect(p.panel.view().rows.map((r) => r.label)).toEqual(BRIDGE_ROWS);
-    expect(p.row("Remote machine")).toMatchObject({ value: "127.0.0.1:47613", note: "ssh forward" });
-    expect(p.row("Remote machine")?.opens).toBeFalsy();
+    expect(p.row("Device")).toMatchObject({ value: "Remote · 127.0.0.1:47613", note: "ssh forward" });
     expect(p.row("Pairing")).toMatchObject({ value: "✓ Connected to 127.0.0.1:47613 · 52 ms", opens: true });
-    await p.goTo("Remote machine");
-    expect(p.hint()).toBe("Enter where it comes from · Esc Main");
+    await p.goTo("Device");
+    expect(p.hint()).toBe("← → Selects · Enter where it comes from · Esc Main");
     await p.press("enter");
     expect(p.panel.view().status).toMatchObject({ tone: "info", text: expect.stringMatching(/PI_SPEECH_BRIDGE_URL/) });
     await p.goTo("Pairing");
@@ -842,8 +1062,8 @@ describe("the panel view model: Bridge connection's Remote machine and Pairing (
       { ...SSH, PI_SPEECH_BRIDGE_URL: "http://localhost:5000" },
       { before: (e) => (e.probeBridge = connected) },
     );
-    await p.goTo("Remote machine");
-    expect(p.row("Remote machine")).toMatchObject({ value: "localhost:5000", note: "from PI_SPEECH_BRIDGE_URL" });
+    await p.goTo("Device");
+    expect(p.row("Device")).toMatchObject({ value: "Remote · localhost:5000", note: "from PI_SPEECH_BRIDGE_URL" });
   });
 
   it("an unreachable receiver is ✗ Re-pair, whose Enter opens the address field", async () => {
@@ -852,11 +1072,11 @@ describe("the panel view model: Bridge connection's Remote machine and Pairing (
     expect(p.row("Pairing")).toMatchObject({ value: "✗ Re-pair", note: "receiver unreachable", opens: true });
     await p.press("enter");
     expect(p.panel.view().input).toMatchObject({ label: "Address", value: "", under: "pairing" });
-    expect(p.panel.view().status?.text).toMatch(/pi-speech-receiver ssh <pi-host>.*--network/);
+    expect(p.panel.view().status?.text).toMatch(/--network/);
   });
 
   it("an address whose receiver refuses this machine's token pairs with the code its terminal shows", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "pi-speech-pair-"));
+    const dir = trackTemp(mkdtempSync(join(tmpdir(), "pi-speech-pair-")));
     const tokenFile = join(dir, "bridge.token");
     const token = "r".repeat(64);
     const p = open({ ...SSH, PI_SPEECH_BRIDGE_TOKEN_FILE: tokenFile }, { before: (e) => (e.probeBridge = refused) });
@@ -908,7 +1128,7 @@ describe("the panel view model: Bridge connection's Remote machine and Pairing (
     expect(p.panel.view().status).toMatchObject({ tone: "success", text: expect.stringContaining(tokenFile) });
     expect(readFileSync(tokenFile, "utf8").trim()).toBe(token);
     expect(settingsOf(p.work).bridgeAddress).toBe("100.64.0.2:47613");
-    expect(p.row("Remote machine")).toMatchObject({ value: "100.64.0.2:47613", note: "set in Pairing" });
+    expect(p.row("Device")).toMatchObject({ value: "Remote · 100.64.0.2:47613", note: "set in Pairing" });
     // Over SSH pairing leaves the bridge mode and the directions as they are.
     expect(settingsOf(p.work).bridge ?? "auto").toBe("auto");
   });
@@ -945,7 +1165,7 @@ describe("the panel view model: Bridge connection's Remote machine and Pairing (
           return ok ? connected() : refused();
         }),
     });
-    await p.goTo("Bridge connection");
+    await p.goTo("Receivers");
     await p.press("enter");
     expect(n).toBe(1);
     expect(p.row("Pairing")?.value).toBe("✗ Re-pair");
@@ -964,6 +1184,7 @@ describe("the panel view model: Hotkeys", () => {
   it("holds the actions with keys of their own; the submenu has its own title and hints", async () => {
     const p = open();
     await p.goTo("Hotkeys");
+    await p.press("enter");
     const v = p.panel.view();
     expect(v).toMatchObject({ menu: "hotkeys", crumb: "Hotkeys", selected: 0 });
     expect(v.rows.map((r) => [r.label, r.value])).toEqual([
@@ -1043,7 +1264,7 @@ describe("the panel view model: Hotkeys", () => {
     expect(p.panel.view().picker).toBeUndefined();
     expect(p.panel.view()).toMatchObject({ menu: "main", speak: { focused: true } });
     await p.press("down");
-    await p.goTo("Bridge connection");
+    await p.goTo("Receivers");
     await p.press("enter", "speak");
     expect(p.panel.view()).toMatchObject({ menu: "main", speak: { focused: true } });
   });
@@ -1057,7 +1278,7 @@ describe("the panel view model: Hotkeys", () => {
     expect(p.panel.view().status?.text).toBe("♪ speaking…");
     p.local.end(1, { state: "completed" });
     await vi.waitFor(() => expect(p.panel.view().status?.text).toBe("✓ Spoken"));
-    await p.goTo("Bridge connection");
+    await p.goTo("Receivers");
     await p.press({ combo: "ctrl+o" });
     expect(p.local.plays).toHaveLength(3);
     expect(p.close).not.toHaveBeenCalled();
@@ -1067,6 +1288,7 @@ describe("the panel view model: Hotkeys", () => {
     const p = open();
     await p.engine.speech.speak("still speaking");
     await p.goTo("Hotkeys");
+    await p.press("enter");
     const stop = vi.spyOn(p.engine.player, "stop");
     await p.type("s");
     expect(stop).not.toHaveBeenCalled();
@@ -1246,21 +1468,24 @@ describe("the panel view model: Hotkeys", () => {
     expect(p.engine.speech.settings.hotkeys.ptt).toBeUndefined();
   });
 
-  it("Spectrum OSD cycles through braille, bars, mirror, line, and off", async () => {
+  it("Spectrum OSD defaults to Lines and cycles through Helix, Braille, Prism, Orb, Waves, and Off", async () => {
     const p = open();
     await p.goTo("Spectrum OSD");
-    expect(p.row("Spectrum OSD")?.value).toBe("Braille");
-    await p.press("right");
-    expect(p.row("Spectrum OSD")?.value).toBe("Bars");
-    expect(p.engine.speech.settings.osdStyle).toBe("bars");
-    await p.press("right");
-    expect(p.row("Spectrum OSD")?.value).toBe("Mirrored");
-    await p.press("right");
-    expect(p.row("Spectrum OSD")?.value).toBe("1-line");
-    await p.press("right");
-    expect(p.row("Spectrum OSD")?.value).toBe("Off");
-    await p.press("right");
-    expect(p.row("Spectrum OSD")?.value).toBe("Braille");
+    expect(p.row("Spectrum OSD")?.value).toBe("Lines");
+    const expected: Array<[string, string]> = [
+      ["Helix", "helix"],
+      ["Braille", "braille"],
+      ["Prism", "prism"],
+      ["Orb", "orb"],
+      ["Waves", "wave"],
+      ["Off", "off"],
+      ["Lines", "line"],
+    ];
+    for (const [label, id] of expected) {
+      await p.press("right");
+      expect(p.row("Spectrum OSD")?.value).toBe(label);
+      expect(p.engine.speech.settings.osdStyle).toBe(id);
+    }
   });
 });
 
@@ -1324,21 +1549,30 @@ describe("the panel view model: pickers", () => {
     expect(p.engine.speech.settings.voice).toBe("Kore");
   });
 
-  it("the model pickers list the models by price, cheapest first, the subscription model last, and say so", async () => {
+  it("the model pickers list the models alphabetically by default, and Ctrl+S price puts cheapest first, subscription last", async () => {
     const p = open({}, { xai: true });
     await p.goTo("Speech model");
     await p.press("enter");
     const picker = p.panel.view().picker;
-    expect(picker).toMatchObject({ title: "Speech model", sort: "price", noun: "models", total: 4 });
+    expect(picker).toMatchObject({ title: "Speech model", sort: "name", noun: "models", total: 4 });
     expect(picker?.items.map((i) => i.id)).toEqual([
+      "google/gemini-3.8-flash-tts",
+      "hexgrad/kokoro-82m",
+      "x-ai/grok-voice-tts-1.0",
+      "xai",
+    ]);
+    await p.press({ combo: "ctrl+s" }, { combo: "ctrl+s" }); // name -> name-desc -> price
+    const byPrice = p.panel.view().picker;
+    expect(byPrice?.sort).toBe("price");
+    expect(byPrice?.items.map((i) => i.id)).toEqual([
       "hexgrad/kokoro-82m",
       "x-ai/grok-voice-tts-1.0",
       "google/gemini-3.8-flash-tts",
       "xai",
     ]);
-    expect(picker?.items[2]).toMatchObject({ price: "~$0.03/min", note: "tags · fast · 2 voices", current: true });
-    expect(picker?.items[3]).toMatchObject({ label: "xAI Grok", price: "subscription", note: "xAI login" });
-    expect(picker?.selected).toBe(0);
+    expect(byPrice?.items[2]).toMatchObject({ price: "~$0.03/min", note: "tags · fast · 2 voices", current: true });
+    expect(byPrice?.items[3]).toMatchObject({ label: "xAI Grok", price: "subscription", note: "xAI login" });
+    expect(byPrice?.selected).toBe(0);
     await p.press("up");
     expect(p.picked()?.id).toBe("xai");
     await p.press("escape");
@@ -1370,8 +1604,45 @@ describe("the panel view model: pickers", () => {
     );
     await p.goTo("Speech model");
     await p.press("enter");
+    await p.press({ combo: "ctrl+s" }, { combo: "ctrl+s" }); // name -> name-desc -> price
+    // Unpriced models (d/none) are hidden by default while free (c/free) and priced models stay visible.
+    expect(p.panel.view().picker?.items.map((i) => i.id)).toEqual(["c/free", "a/one", "b/two"]);
+    expect(p.panel.view().picker?.detail).toContain("1 model without price hidden · F4 shows them");
+    expect(p.hint()).toContain("F4 show 1 unpriced");
+    // F4 reveals unpriced models with price "unknown" and persists showUnpricedModels.
+    await p.press({ combo: "f4" });
     expect(p.panel.view().picker?.items.map((i) => i.id)).toEqual(["c/free", "a/one", "b/two", "d/none"]);
-    expect(p.panel.view().picker?.items[3].price).toBe("price unknown");
+    expect(p.panel.view().picker?.items[3].price).toBe("unknown");
+    expect(settingsOf(p.work).showUnpricedModels).toBe(true);
+    await p.press({ combo: "f4" });
+    expect(p.panel.view().picker?.items.map((i) => i.id)).toEqual(["c/free", "a/one", "b/two"]);
+    expect(settingsOf(p.work).showUnpricedModels).toBeUndefined();
+  });
+
+  it("never filters out xAI subscription or free models when hiding unpriced models", async () => {
+    const p = open(
+      {},
+      {
+        xai: true,
+        before: (e) => {
+          e.speech.models = async () => ({
+            tts: [
+              { id: "xai", label: "xAI Grok", voices: ["ara"] },
+              { id: "local/free", label: "free", price: "$0" },
+              { id: "ep:unpriced", label: "unpriced" },
+            ],
+            stt: [],
+          });
+        },
+      },
+    );
+    await p.goTo("Speech model");
+    await p.press("enter");
+    expect(p.panel.view().picker?.items.map((i) => [i.id, i.price])).toEqual([
+      ["local/free", "free"],
+      ["xai", "subscription"],
+    ]);
+    expect(p.panel.view().picker?.detail).toContain("1 model without price hidden");
   });
 
   it("typing xai finds xAI Grok first; the count follows the filter", async () => {
@@ -1424,27 +1695,64 @@ describe("matching in the pickers", () => {
 describe("the panel view model: browsing models", () => {
   const ids = (p: ReturnType<typeof open>) => p.panel.view().picker?.items.map((i) => i.id);
 
-  it("Ctrl+S changes the order: price, provider, newest, name; the choice is saved", async () => {
+  it("Ctrl+S changes the order: name/desc, price/desc, provider/desc, newest; the choice is saved", async () => {
     const p = open();
     await p.goTo("Speech model");
     await p.press("enter");
+    expect(ids(p)).toEqual(["google/gemini-3.8-flash-tts", "hexgrad/kokoro-82m", "x-ai/grok-voice-tts-1.0"]);
+    await p.press({ combo: "ctrl+s" });
+    expect(p.panel.view().picker?.sort).toBe("name-desc");
+    await p.press({ combo: "ctrl+s" });
+    expect(p.panel.view().picker?.sort).toBe("price");
     expect(ids(p)).toEqual(["hexgrad/kokoro-82m", "x-ai/grok-voice-tts-1.0", "google/gemini-3.8-flash-tts"]);
+    await p.press({ combo: "ctrl+s" });
+    expect(p.panel.view().picker?.sort).toBe("price-desc");
+    expect(ids(p)).toEqual(["google/gemini-3.8-flash-tts", "x-ai/grok-voice-tts-1.0", "hexgrad/kokoro-82m"]);
     await p.press({ combo: "ctrl+s" });
     expect(p.panel.view().picker?.sort).toBe("provider");
     expect(ids(p)).toEqual(["google/gemini-3.8-flash-tts", "hexgrad/kokoro-82m", "x-ai/grok-voice-tts-1.0"]);
+    await p.press({ combo: "ctrl+s" });
+    expect(p.panel.view().picker?.sort).toBe("provider-desc");
+    expect(ids(p)).toEqual(["x-ai/grok-voice-tts-1.0", "hexgrad/kokoro-82m", "google/gemini-3.8-flash-tts"]);
     await p.press({ combo: "ctrl+s" });
     expect(p.panel.view().picker?.sort).toBe("newest");
     expect(ids(p)).toEqual(["google/gemini-3.8-flash-tts", "x-ai/grok-voice-tts-1.0", "hexgrad/kokoro-82m"]);
     expect(settingsOf(p.work).modelSort).toBe("newest");
     await p.press({ combo: "ctrl+s" });
     expect(p.panel.view().picker?.sort).toBe("name");
-    await p.press({ combo: "ctrl+s" });
-    expect(p.panel.view().picker?.sort).toBe("price");
     // the other model list follows the same order
     await p.press({ combo: "ctrl+s" }, "escape");
     await p.goTo("Transcription model");
     await p.press("enter");
-    expect(p.panel.view().picker?.sort).toBe("provider");
+    expect(p.panel.view().picker?.sort).toBe("name-desc");
+  });
+
+  it("refreshes provider models asynchronously whenever /speech opens", async () => {
+    let calls = 0;
+    const p = open(
+      {},
+      {
+        before: (e) => {
+          e.speech.models = async (opts) => {
+            calls++;
+            return {
+              tts: opts?.refresh
+                ? [
+                    { id: "google/gemini-3.8-flash-tts", label: "Gemini", price: "~$0.03/min" },
+                    { id: "openai:tts-1", label: "tts-1", price: "~$0.012/min" },
+                  ]
+                : [{ id: "google/gemini-3.8-flash-tts", label: "Gemini", price: "~$0.03/min" }],
+              stt: [],
+            };
+          };
+        },
+      },
+    );
+    await p.panel.idle();
+    expect(calls).toBeGreaterThanOrEqual(2);
+    await p.goTo("Speech model");
+    await p.press("enter");
+    expect(ids(p)).toContain("openai:tts-1");
   });
 
   it("each model shows its features, and typing finds a model by one", async () => {
@@ -1452,7 +1760,7 @@ describe("the panel view model: browsing models", () => {
     await p.goTo("Speech model");
     await p.press("enter");
     const items = p.panel.view().picker?.items ?? [];
-    expect(items.map((i) => i.note)).toEqual(["8 langs · 2 voices", "20+ langs · 2 voices", "tags · fast · 2 voices"]);
+    expect(items.map((i) => i.note)).toEqual(["tags · fast · 2 voices", "8 langs · 2 voices", "20+ langs · 2 voices"]);
     await p.type("tags");
     expect(ids(p)).toEqual(["google/gemini-3.8-flash-tts"]);
   });
@@ -1461,11 +1769,11 @@ describe("the panel view model: browsing models", () => {
     const p = open();
     await p.goTo("Speech model");
     await p.press("enter");
+    expect(p.panel.view().picker?.detail).toMatch(/^Gemini 3.8 Flash TTS/);
+    await p.press("down");
     expect(p.panel.view().picker?.detail).toMatch(/^Kokoro 82M is a lightweight/);
     await p.press("down");
     expect(p.panel.view().picker?.detail).toBe("");
-    await p.press("down");
-    expect(p.panel.view().picker?.detail).toMatch(/^Gemini 3.8 Flash TTS/);
   });
 });
 
@@ -1525,9 +1833,12 @@ describe("the panel view model: history, files, and the dictation language", () 
     expect(p.close).not.toHaveBeenCalled();
   });
 
-  it("Dictation language is saved, shown, sent with a transcribed file, and removed with auto", async () => {
+  it("Dictation language inside Dictation options is saved, shown on Main, sent with a transcribed file, and removed with auto", async () => {
     const p = open();
-    await p.goTo("Dictation language");
+    await p.goTo("Dictation options");
+    await p.press("enter", "down");
+    expect(p.selectedLabel()).toBe("Language");
+    expect(p.hint()).toBe("Enter set · Esc Main");
     await p.press("enter");
     expect(p.panel.view().input).toMatchObject({ label: "Spoken language", under: "language" });
     await p.type("not a tag!");
@@ -1540,8 +1851,10 @@ describe("the panel view model: history, files, and the dictation language", () 
     await p.type("ja");
     await p.press("enter");
     expect(p.panel.view().input).toBeUndefined();
-    expect(p.row("Dictation language")?.value).toBe("ja");
+    expect(p.row("Language")?.value).toBe("ja");
     expect(settingsOf(p.work).dictationLanguage).toBe("ja");
+    await p.press("escape");
+    expect(p.row("Dictation options")).toMatchObject({ value: "Filled", note: "ja" });
     const audio = join(p.work, "note.wav");
     writeFileSync(audio, "RIFFfake");
     await p.press({ combo: "ctrl+t" });
@@ -1549,59 +1862,232 @@ describe("the panel view model: history, files, and the dictation language", () 
     await p.press("enter");
     expect(p.requests.at(-1)?.body).toMatchObject({ language: "ja" });
     await p.engine.speech.set("stt-language", "auto");
-    expect(p.row("Dictation language")?.value).toBe("auto");
+    expect(p.row("Dictation options")).toMatchObject({ value: "Filled", note: "auto" });
     expect(settingsOf(p.work).dictationLanguage).toBeUndefined();
   });
 
-  it("Dictation output is Pi by default and with only a legacy command stored", async () => {
-    const fresh = open();
-    expect(fresh.row("Dictation output")?.value).toBe("Pi");
-    const legacy = open(
-      {},
-      {
-        before: (e) => {
-          e.speech.settings.dictationOutput = "wl-copy %s";
-        },
+  it("Dictation options configures Typed/Filled output, Language, Submit word presets/User-defined, Vocabulary, and Voice commands via Pi editor", async () => {
+    let lastEditor: { title: string; prefill?: string } | undefined;
+    const editorReply = { value: undefined as string | undefined };
+    const p = open();
+    const ui = {
+      ...p.ui,
+      editor: async (title: string, prefill?: string) => {
+        lastEditor = { title, prefill };
+        return editorReply.value;
       },
-    );
-    expect(legacy.row("Dictation output")?.value).toBe("Pi");
+    };
+    const panel2 = new Panel(p.engine, new Surface(p.engine), { ui, close: p.close, changed: p.changed });
+    panel2.open();
+    const press2 = async (k: Parameters<Panel["handle"]>[0]) => {
+      panel2.handle(k);
+      await panel2.idle();
+    };
+    while (panel2.view().rows[panel2.view().selected]?.label !== "Dictation options") {
+      await press2({ key: "down" });
+    }
+    await press2({ key: "enter" });
+    expect(panel2.view().crumb).toBe("Dictation options");
+    // While Transcription source is Provider, Output is locked on Filled with explanatory note.
+    expect(panel2.view().rows[0]).toMatchObject({
+      label: "Output",
+      value: "Filled",
+      note: "Typed requires Local transcription",
+      disabled: true,
+    });
+    await press2({ key: "right" });
+    expect(panel2.view().rows[0].value).toBe("Filled");
+    expect(panel2.view().status?.text).toBe("Typed output requires Transcription source: Local");
+
+    // Switch Transcription source to Local so Output unlocks and cycles Filled <-> Typed.
+    p.engine.speech.setSource("transcription", "local");
+    expect(panel2.view().rows.map((r) => [r.label, r.value])).toEqual([
+      ["Output", "Filled"],
+      ["Language", "auto"],
+      ["Submit word", "Off"],
+      ["Vocabulary", "Off"],
+      ["Commands", "Off"],
+    ]);
+    await press2({ key: "right" });
+    expect(panel2.view().rows[0]).toMatchObject({ label: "Output", value: "Typed" });
+    expect(settingsOf(p.work).dictationLive).toBe(true);
+    // Down past Language to Submit word: cycles Off -> Send it -> Submit -> User-defined -> Off.
+    await press2({ key: "down" });
+    expect(panel2.view().rows[panel2.view().selected]?.label).toBe("Language");
+    await press2({ key: "down" });
+    await press2({ text: " " });
+    expect(panel2.view().rows[2]).toMatchObject({ label: "Submit word", value: "Send it" });
+    expect(panel2.view().input).toBeUndefined();
+    await press2({ text: " " });
+    expect(panel2.view().rows[2]).toMatchObject({ label: "Submit word", value: "Submit" });
+    expect(panel2.view().input).toBeUndefined();
+    await press2({ text: " " });
+    expect(panel2.view().rows[2]).toMatchObject({ label: "Submit word", value: "User-defined" });
+    expect(panel2.view().input).toBeUndefined();
+    await press2({ text: " " });
+    expect(panel2.view().rows[2]).toMatchObject({ label: "Submit word", value: "Off" });
+    await press2({ key: "left" });
+    expect(panel2.view().rows[2]).toMatchObject({ label: "Submit word", value: "User-defined" });
+    await press2({ key: "enter" });
+    expect(panel2.view().input).toMatchObject({ label: "Submit word", value: "" });
+    for (const c of "over") await press2({ text: c });
+    await press2({ key: "enter" });
+    expect(panel2.view().rows[2]).toMatchObject({ label: "Submit word", value: "User-defined", note: "over" });
+    expect(settingsOf(p.work).dictationSubmitWord).toBe("over");
+    editorReply.value = "# comment\nPi\nzelij, Zellij\n";
+    await press2({ key: "down" });
+    await press2({ key: "enter" });
+    expect(lastEditor?.title).toBe("Dictation vocabulary");
+    expect(lastEditor?.prefill).toContain("# Fix spelling and capitalization");
+    expect(panel2.view().rows[3]).toMatchObject({ label: "Vocabulary", value: "2 terms" });
+    expect(settingsOf(p.work).dictationVocabulary).toEqual(["Pi", "zelij, Zellij"]);
+    editorReply.value = "# comment\n/compact\n";
+    await press2({ key: "down" });
+    await press2({ key: "enter" });
+    expect(lastEditor?.title).toBe("Voice slash commands");
+    expect(panel2.view().rows[4]).toMatchObject({ label: "Commands", value: "1 command" });
+    expect(settingsOf(p.work).dictationCommands).toEqual(["/compact"]);
+    await press2({ key: "escape" });
+    expect(panel2.view().rows.find((r) => r.label === "Dictation options")).toMatchObject({
+      value: "Typed",
+      note: "auto",
+    });
+    // Switching back to Provider shows Filled on Main without erasing saved dictationLive.
+    p.engine.speech.setSource("transcription", "provider");
+    expect(panel2.view().rows.find((r) => r.label === "Dictation options")).toMatchObject({
+      value: "Filled",
+      note: "auto",
+    });
+    expect(settingsOf(p.work).dictationLive).toBe(true);
   });
 
-  it("Dictation output cycles in place: User-defined edits the command on Main, Pi keeps it", async () => {
+  it("Space cycles every non-submenu setting across Main, Read aloud, Dictation, and Receivers", async () => {
     const p = open();
-    await p.goTo("Dictation output");
-    // Cycling to User-defined opens the in-place field on Main (no tab switch); Esc cancels to Pi.
-    await p.press("right");
-    expect(p.panel.view().tab).toBe("main");
-    expect(p.panel.view().input).toMatchObject({ label: "Dictation output", under: "output", value: "" });
+    // Main: Speech source, Transcription source, Spectrum OSD
+    await p.goTo("Speech source");
+    await p.press({ text: " " });
+    expect(p.row("Speech source")?.value).toBe("Local");
+    await p.press({ text: " " });
+    expect(p.row("Speech source")?.value).toBe("Provider");
+
+    await p.goTo("Transcription source");
+    await p.press({ text: " " });
+    expect(p.row("Transcription source")?.value).toBe("Local");
+
+    await p.goTo("Spectrum OSD");
+    await p.press({ text: " " });
+    expect(p.row("Spectrum OSD")?.value).toBe("Helix");
+
+    // Read aloud: rows 1..3 start muted while Read is Off, remain editable, and unmute once Read is Summarized
+    await p.goTo("Read aloud options");
+    await p.press({ text: " " });
+    expect(p.panel.view().crumb).toBe("Read aloud options");
+    expect(p.panel.view().rows.map((r) => Boolean(r.muted))).toEqual([false, true, true, true]);
+    await p.press({ text: " " });
+    expect(p.panel.view().rows[0].value).toBe("Summarized");
+    expect(p.panel.view().rows.map((r) => Boolean(r.muted))).toEqual([false, false, false, false]);
+    await p.press("down"); // Summarized by: Space opens picker
+    await p.press({ text: " " });
+    expect(p.panel.view().picker?.title).toBe("Summarized by");
+    await p.press("escape", "down"); // Length
+    await p.press({ text: " " });
+    expect(p.panel.view().rows[2].value).toBe("Abridged ~30 s");
+    await p.press("down"); // Truncate at
+    await p.press({ text: " " });
+    expect(p.panel.view().rows[3].value).toBe("15 s");
     await p.press("escape");
+
+    // Dictation options (Transcription source is Local from above): Space enters submenu, cycles Output and Submit word
+    await p.goTo("Dictation options");
+    await p.press({ text: " " });
+    expect(p.panel.view().crumb).toBe("Dictation options");
+    await p.press({ text: " " });
+    expect(p.panel.view().rows[0].value).toBe("Typed");
+    await p.press("down", "down"); // past Language to Submit word
+    await p.press({ text: " " });
+    expect(p.panel.view().rows[2].value).toBe("Send it");
+    await p.press({ text: " " });
+    expect(p.panel.view().rows[2].value).toBe("Submit");
+    await p.press("escape");
+
+    // Receivers: Space enters submenu, Device (Local -> Connect)
+    await p.goTo("Receivers");
+    await p.press({ text: " " });
+    expect(p.panel.view().crumb).toBe("Receivers");
+    await p.press({ text: " " });
+    expect(p.panel.view().input?.label).toBe("Connect to");
+  });
+
+  it("locks Voice on single-voice or unchosen-local models and locks Dictation language when local STT fixes or auto-detects it", async () => {
+    const p = open();
+    await p.panel.idle();
+    // Local speech with no model chosen yet: Voice is locked without chevron or Enter choose hint.
+    p.engine.speech.setSource("speech", "local");
+    await p.goTo("Voice");
+    expect(p.row("Voice")).toEqual({
+      id: "voice",
+      label: "Voice",
+      value: "none",
+      note: "choose a speech model",
+      disabled: true,
+    });
+    expect(p.hint()).toBe(`${LETTER_HINTS} · Esc close`);
+    await p.press("enter");
+    expect(p.panel.view().picker).toBeUndefined();
+    expect(p.panel.view().status?.text).toBe("Choose a local speech model first: Speech model");
+
+    // Provider model whose only voice is "default": Voice is locked as single voice, keeping Ctrl+P sample.
+    p.engine.speech.setSource("speech", "provider");
+    p.engine.speech.voicesFor = async () => ["default"];
+    await p.engine.speech.set("tts-model", "hexgrad/kokoro-82m");
+    p.panel.open();
+    await p.panel.idle();
+    await p.goTo("Voice");
+    expect(p.row("Voice")).toEqual({
+      id: "voice",
+      label: "Voice",
+      value: "default",
+      note: "single voice",
+      disabled: true,
+    });
+    expect(p.hint()).toBe(`Ctrl+P sample · F2 language · ${LETTER_HINTS} · Esc close`);
+    await p.press("enter");
+    expect(p.panel.view().picker).toBeUndefined();
+    expect(p.panel.view().status?.text).toBe("hexgrad/kokoro-82m has a single voice (Ctrl+P samples it)");
+
+    // Local STT language modes: auto-detected (whisper-small), fixed (moonshine-base-ja-v2), selectable (canary-1b-v2).
+    p.engine.speech.setSource("transcription", "local");
+    p.engine.speech.settings.localTranscriptionModel = "whisper-small";
+    await p.goTo("Dictation options");
+    await p.press("enter", "down");
+    expect(p.row("Language")).toEqual({
+      id: "language",
+      label: "Language",
+      value: "auto",
+      note: "detected by model",
+      disabled: true,
+    });
+    expect(p.hint()).toBe("Esc Main");
+    await p.press("enter");
     expect(p.panel.view().input).toBeUndefined();
-    expect(p.row("Dictation output")?.value).toBe("Pi");
-    // Again, typing a command and Enter saves it as User-defined.
-    await p.press("right");
-    await p.type("wl-copy %s");
-    await p.press("enter");
-    expect(p.panel.view().tab).toBe("main");
-    expect(p.row("Dictation output")?.value).toBe("User-defined");
-    expect(p.row("Dictation output")?.note).toBeUndefined();
-    expect(settingsOf(p.work)).toMatchObject({ dictationOutput: "wl-copy %s", dictationOutputMode: "command" });
-    // Enter while User-defined re-opens the field, prefilled; Esc keeps User-defined.
-    await p.press("enter");
-    expect(p.panel.view().input).toMatchObject({ label: "Dictation output", value: "wl-copy %s" });
-    await p.press("escape");
-    expect(p.row("Dictation output")?.value).toBe("User-defined");
-    // Cycling back to Pi keeps the saved command.
-    await p.press("right");
-    expect(p.row("Dictation output")?.value).toBe("Pi");
-    expect(settingsOf(p.work).dictationOutput).toBe("wl-copy %s");
-    expect(settingsOf(p.work).dictationOutputMode).toBeUndefined();
-    // Emptying the field returns to Pi.
-    await p.press("right", "enter");
-    expect(p.row("Dictation output")?.value).toBe("User-defined");
-    await p.press("enter");
-    for (let i = 0; i < 12; i++) await p.press("backspace");
-    await p.press("enter");
-    expect(p.row("Dictation output")?.value).toBe("Pi");
+    expect(p.panel.view().status?.text).toBe("whisper-small detects the spoken language automatically");
+
+    p.engine.speech.settings.localTranscriptionModel = "moonshine-base-ja-v2";
+    expect(p.row("Language")).toEqual({
+      id: "language",
+      label: "Language",
+      value: "ja",
+      note: "fixed by model",
+      disabled: true,
+    });
+
+    p.engine.speech.settings.localTranscriptionModel = "canary-1b-v2";
+    expect(p.row("Language")).toEqual({
+      id: "language",
+      label: "Language",
+      value: "auto",
+    });
+    expect(p.hint()).toBe("Enter set · Esc Main");
   });
 });
 
@@ -1621,12 +2107,12 @@ describe.skipIf(!STAND_IN_BINARY)("the panel view model: Local sources", () => {
     await p.press("enter");
     const picker = p.panel.view().picker;
     expect(picker).toMatchObject({ title: "Transcription model", noun: "models", total: 2, loading: false });
-    expect(picker?.sort).toBeUndefined();
+    expect(picker?.sort).toBe("name");
     expect(picker?.items.map((i) => [i.label, i.price, i.cols?.[0]])).toEqual([
       ["parakeet-v3", "640 MB", "downloaded"],
       ["whisper-small", "639 MB", "not downloaded"],
     ]);
-    expect(p.hint()).toBe("Enter pick · Ctrl+O download · Ctrl+T delete · Esc back");
+    expect(p.hint()).toBe("Enter pick · Ctrl+O download · Alt+O uninstall · Ctrl+S sort · Ctrl+T provider · Esc back");
     await p.press("enter");
     expect(p.panel.view().picker).toBeUndefined();
     expect(p.row("Transcription model")).toEqual(expect.objectContaining({ value: "parakeet-v3" }));
@@ -1730,7 +2216,7 @@ describe.skipIf(!STAND_IN_BINARY)("the panel view model: Local sources", () => {
     expect(settingsOf(p.work).localTranscriptionModel).toBe("whisper-small");
   });
 
-  it("in the list Ctrl+O downloads and Ctrl+T (twice) deletes the highlighted model", async () => {
+  it("in the list Ctrl+O downloads and Alt+O (twice) uninstalls the highlighted model; Ctrl+T toggles local and provider lists", async () => {
     const p = local();
     p.engine.speech.setSource("transcription", "local");
     await p.goTo("Transcription model");
@@ -1738,15 +2224,37 @@ describe.skipIf(!STAND_IN_BINARY)("the panel view model: Local sources", () => {
     await p.press("down");
     await p.press({ combo: "ctrl+o" });
     expect(p.panel.view().status?.text).toBe("✓ whisper-small downloaded");
-    expect(p.panel.view().picker?.items[1].cols?.[0]).toBe("downloaded");
-    await p.press({ combo: "ctrl+t" });
-    expect(p.panel.view().status?.text).toBe("! Ctrl+T again deletes whisper-small (639 MB)");
+    expect(p.panel.view().picker?.items.find((i) => i.id === "whisper-small")?.cols?.[0]).toBe("downloaded");
+    await p.press({ combo: "alt+o" });
+    expect(p.panel.view().status?.text).toBe("! Alt+O again uninstalls whisper-small (639 MB)");
     expect(p.calls()).not.toContain("models delete whisper-small");
-    await p.press({ combo: "ctrl+t" });
+    await p.press({ combo: "alt+o" });
     expect(p.panel.view().status?.text).toBe("✓ whisper-small deleted · 1.2 KB freed");
-    expect(p.panel.view().picker?.items[1].cols?.[0]).toBe("not downloaded");
-    await p.press({ combo: "ctrl+t" });
+    expect(p.panel.view().picker?.items.find((i) => i.id === "whisper-small")?.cols?.[0]).toBe("not downloaded");
+    await p.press({ combo: "alt+o" });
     expect(p.panel.view().status?.text).toBe("whisper-small is not downloaded");
+    // Ctrl+T toggles between local and provider lists in place.
+    await p.press({ combo: "ctrl+t" });
+    expect(p.panel.view().status?.text).toBe("✓ Transcription source: Provider");
+    expect(p.hint()).toBe("Enter pick · Ctrl+S sort · Ctrl+T local · type to filter · Esc back");
+    expect(p.panel.view().picker?.items.some((i) => i.id === "openai/whisper-large-v3-turbo")).toBe(true);
+    await p.press({ combo: "ctrl+t" });
+    expect(p.panel.view().status?.text).toBe("✓ Transcription source: Local");
+    expect(p.hint()).toBe("Enter pick · Ctrl+O download · Alt+O uninstall · Ctrl+S sort · Ctrl+T provider · Esc back");
+    // Also works in the Speech model tab.
+    await p.press("escape");
+    await p.press("tab", "tab");
+    expect(p.panel.view().tab).toBe("speechModel");
+    expect(p.hint()).toBe("Enter pick · Ctrl+S sort · Ctrl+T local · type to filter · Esc back");
+    await p.press({ combo: "ctrl+t" });
+    expect(p.panel.view().status?.text).toBe("✓ Speech source: Local");
+    expect(p.hint()).toBe("Enter pick · Ctrl+O download · Alt+O uninstall · Ctrl+S sort · Ctrl+T provider · Esc back");
+    expect(p.panel.view().picker?.items.map((i) => i.id)).toEqual(["kokoro"]);
+    await p.press({ combo: "ctrl+t" });
+    expect(p.panel.view().status?.text).toBe("✓ Speech source: Provider");
+    // Return to local transcription for the filter check below.
+    await p.press("tab", "tab");
+    expect(p.panel.view().tab).toBe("transcription");
     // Other letters still filter.
     await p.type("par");
     expect(p.panel.view().picker?.items.map((i) => i.id)).toEqual(["parakeet-v3"]);
@@ -1800,6 +2308,118 @@ describe.skipIf(!STAND_IN_BINARY)("the panel view model: Local sources", () => {
     // The provider voice is kept for Provider.
     expect(settingsOf(p.work).voice).toBe("Kore");
   });
+
+  it("groups single-voice Piper English models under piper-en and picks/downloads voices in Voice", async () => {
+    const p = local();
+    // Stand-in binary with two single-voice Piper entries + one multi-speaker Piper entry.
+    const binPath = p.bin.path;
+    writeFileSync(
+      binPath,
+      readFileSync(binPath, "utf8").replace(
+        '{ id: "kokoro", kind: "speech", name: "Kokoro", languages: ["en"], size: 100000000 }',
+        `{ id: "kokoro", kind: "speech", name: "Kokoro", languages: ["en"], size: 100000000 },
+  { id: "piper-en_US-lessac-high", kind: "speech", name: "Piper lessac high", languages: ["en"], size: 115000000 },
+  { id: "piper-en_GB-alba-medium", kind: "speech", name: "Piper alba", languages: ["en"], size: 67000000 },
+  { id: "piper-en_GB-vctk-medium", kind: "speech", name: "Piper VCTK (109 British)", languages: ["en"], size: 80000000 }`,
+      ),
+    );
+    p.engine.speech.setSource("speech", "local");
+    await p.goTo("Speech model");
+    await p.press("enter");
+    const modelIds = p.panel.view().picker?.items.map((i) => i.id);
+    expect(modelIds).toContain("piper-en");
+    expect(modelIds).not.toContain("piper-en_GB-vctk-medium");
+    expect(modelIds).not.toContain("piper-en_US-lessac-high");
+    expect(modelIds).not.toContain("piper-en_GB-alba-medium");
+
+    // Alphabetically: kokoro -> piper-en; moving down onto piper-en opens the Voice picker for piper-en without persisting synthetic "piper-en".
+    await p.press("down", "enter");
+    expect(p.panel.view().tab).toBe("voice");
+    expect(settingsOf(p.work).localSpeechModel).toBeUndefined();
+    expect(p.panel.view().picker?.items.map((i) => [i.id, i.label, i.cols?.[0]])).toEqual([
+      ["piper-en_GB-alba-medium", "alba-medium (UK)", "not downloaded"],
+      ["piper-en_US-lessac-high", "lessac-high (US)", "not downloaded"],
+      ["piper-en_GB-vctk-medium", "vctk-medium (UK, 109 voices)", "not downloaded"],
+    ]);
+    // Enter twice downloads and selects alba-medium (UK) (now first alphabetically).
+    await p.press("enter");
+    expect(p.panel.view().status?.text).toMatch(/alba-medium \(UK\) is not downloaded.*Enter downloads it/);
+    await p.press("enter");
+    expect(p.row("Speech model")?.value).toBe("piper-en");
+    expect(p.row("Voice")?.value).toBe("alba-medium (UK)");
+    expect(settingsOf(p.work).localSpeechModel).toBe("piper-en_GB-alba-medium");
+  });
+
+  it("sorts local speech models alphabetically by default and cycles name/desc, recommended, size/desc, state/desc via Ctrl+S", async () => {
+    const p = local();
+    const binPath = p.bin.path;
+    writeFileSync(
+      binPath,
+      readFileSync(binPath, "utf8").replace(
+        '{ id: "kokoro", kind: "speech", name: "Kokoro", languages: ["en"], size: 100000000 }',
+        `{ id: "orpheus-3b-q4", kind: "speech", name: "Orpheus 3B", languages: ["en"], size: 2140000000 },
+  { id: "kokoro-multi-lang-v1.1", kind: "speech", name: "Kokoro 1.1", languages: ["en"], size: 365000000 },
+  { id: "phonon-31m-en", kind: "speech", name: "Phonon 31M", languages: ["en"], size: 68000000 }`,
+      ),
+    );
+    p.engine.speech.setSource("speech", "local");
+    await p.goTo("Speech model");
+    await p.press("enter");
+    // Default is alphabetical (name).
+    expect(p.panel.view().picker?.sort).toBe("name");
+    expect(p.panel.view().picker?.items.map((i) => i.id)).toEqual([
+      "kokoro-multi-lang-v1.1",
+      "orpheus-3b-q4",
+      "phonon-31m-en",
+    ]);
+    await p.press({ combo: "ctrl+s" });
+    expect(p.panel.view().picker?.sort).toBe("name-desc");
+    expect(p.panel.view().picker?.items.map((i) => i.id)).toEqual([
+      "phonon-31m-en",
+      "orpheus-3b-q4",
+      "kokoro-multi-lang-v1.1",
+    ]);
+    // Download phonon-31m-en (highlighted at index 0) so it stays pinned at top in recommended even on GPU.
+    await p.press({ combo: "ctrl+o" });
+    expect(p.panel.view().picker?.items[0].cols?.[0]).toBe("downloaded");
+    await p.press({ combo: "ctrl+s" });
+    expect(p.panel.view().picker?.sort).toBe("recommended");
+    expect(p.panel.view().picker?.items.map((i) => i.id)).toEqual([
+      "phonon-31m-en",
+      "kokoro-multi-lang-v1.1",
+      "orpheus-3b-q4",
+    ]);
+    await p.press({ combo: "ctrl+s" });
+    expect(p.panel.view().picker?.sort).toBe("size");
+    expect(p.panel.view().picker?.items.map((i) => i.id)).toEqual([
+      "phonon-31m-en",
+      "kokoro-multi-lang-v1.1",
+      "orpheus-3b-q4",
+    ]);
+    await p.press({ combo: "ctrl+s" });
+    expect(p.panel.view().picker?.sort).toBe("size-desc");
+    expect(p.panel.view().picker?.items.map((i) => i.id)).toEqual([
+      "orpheus-3b-q4",
+      "kokoro-multi-lang-v1.1",
+      "phonon-31m-en",
+    ]);
+    await p.press({ combo: "ctrl+s" });
+    expect(p.panel.view().picker?.sort).toBe("state");
+    await p.press({ combo: "ctrl+s" });
+    expect(p.panel.view().picker?.sort).toBe("state-desc");
+    expect(settingsOf(p.work).localModelSort).toBe("state-desc");
+    await p.press({ combo: "ctrl+s" });
+    expect(p.panel.view().picker?.sort).toBe("name");
+
+    // On GPU device, recommended promotes orpheus-3b-q4 above kokoro (behind downloaded phonon-31m-en).
+    await p.press({ combo: "ctrl+s" }, { combo: "ctrl+s" }); // recommended
+    p.engine.speech.settings.localDevice = "gpu";
+    expect(p.panel.view().picker?.items.map((i) => i.id)).toEqual([
+      "phonon-31m-en",
+      "orpheus-3b-q4",
+      "kokoro-multi-lang-v1.1",
+    ]);
+  });
 });
 
 describe("tab navigation", () => {
@@ -1813,10 +2433,10 @@ describe("tab navigation", () => {
       "Voice",
       "Transcription model",
       "Hotkeys",
-      "Bridge",
+      "Receivers",
     ]);
     expect(p.panel.view().rows).toHaveLength(10);
-    expect(p.panel.view().rows.some((r) => r.id === "hotkeys")).toBe(false);
+    expect(p.panel.view().rows.some((r) => r.id === "hotkeys")).toBe(true);
     for (const tab of [...tabs.slice(1), "main"]) {
       await p.press("tab");
       expect(p.panel.view().tab).toBe(tab);

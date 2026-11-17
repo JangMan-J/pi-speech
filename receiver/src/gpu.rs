@@ -1,20 +1,18 @@
 //! `gpu`: what this machine has for running models on an NVIDIA GPU, as one JSON line:
 //!
-//! `{"driver":true,"cuda":13,"cudnn":true,"runtime":"gpu-runtime-cuda13","downloaded":true,
-//!   "lib":"/…/lib","usable":true,"why":null}`
+//! `{"driver":true,"cuda":13,"cudnn":true,"hardware":true,"edition":"cpu",
+//!   "target":"linux-x64-cuda13","usable":false,"why":"this receiver is the CPU edition"}`
 //!
 //! - `driver`: the NVIDIA driver library (`libcuda.so.1`) loads.
 //! - `cuda`: the newest CUDA runtime (`libcudart.so.13`, `.12`) that loads, or null.
 //! - `cudnn`: cuDNN 9 (`libcudnn.so.9`) loads.
-//! - `runtime`: the catalogue's GPU runtime for that CUDA (null when there is none, or this build
-//!   cannot use one); `downloaded` whether it is in the model cache, and `lib` its library
-//!   directory, which a GPU run puts first on the library path.
-//! - `usable`: all of it is there; else `why` says what is missing.
+//! - `hardware`: driver, CUDA 12/13 and cuDNN 9 are all present.
+//! - `edition`: `"gpu"` (linked with CUDA ONNX Runtime) or `"cpu"`.
+//! - `target`: the GPU receiver target that fits this machine (`linux-x64-cuda13` / `-cuda12`), or null.
+//! - `usable`: hardware is present and this binary is the GPU edition; else `why` says what is missing.
 //!
 //! Nothing is installed or changed; the libraries are only opened and closed again.
 
-use crate::models::cache;
-use crate::models::catalog::{Catalog, Kind};
 use serde_json::json;
 use std::process::ExitCode;
 
@@ -40,6 +38,15 @@ fn loads(_name: &str) -> bool {
     false
 }
 
+fn gpu_target(cuda: Option<u32>) -> Option<String> {
+    let v = cuda?;
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        Some(format!("linux-x64-cuda{v}"))
+    } else {
+        None
+    }
+}
+
 /// The probe, as `gpu` prints it.
 pub fn probe() -> serde_json::Value {
     let driver = loads("libcuda.so.1");
@@ -47,42 +54,19 @@ pub fn probe() -> serde_json::Value {
         .into_iter()
         .find(|v| loads(&format!("libcudart.so.{v}")));
     let cudnn = loads("libcudnn.so.9");
-    let catalog = Catalog::load().ok();
-    let runtime = cuda.and_then(|v| {
-        catalog.as_ref().and_then(|c| {
-            c.entries
-                .iter()
-                .find(|e| e.kind == Kind::Runtime && e.id == format!("gpu-runtime-cuda{v}"))
-                .cloned()
-        })
-    });
-    let root = cache::models_dir().ok();
-    let downloaded = match (&runtime, &root) {
-        (Some(e), Some(r)) => cache::is_downloaded(r, e),
-        _ => false,
-    };
-    let lib = match (&runtime, &root) {
-        (Some(e), Some(r)) => Some(cache::model_path(r, e).join("lib")),
-        _ => None,
-    };
-    let has_runtimes = catalog
-        .as_ref()
-        .is_some_and(|c| c.entries.iter().any(|e| e.kind == Kind::Runtime));
-    let why = if !has_runtimes {
-        Some("this build of pi-speech-receiver runs models on the CPU only".to_string())
-    } else if !driver {
-        Some("no NVIDIA driver (libcuda.so.1 does not load)".into())
+    let hardware = driver && cuda.is_some() && cudnn;
+    let target = if hardware { gpu_target(cuda) } else { None };
+    let gpu_build = cfg!(feature = "shared");
+    let why: Option<&'static str> = if !driver {
+        Some("no NVIDIA driver (libcuda.so.1 does not load)")
     } else if cuda.is_none() {
-        Some("no CUDA 12 or 13 runtime (libcudart.so.12 or .13 does not load)".into())
+        Some("no CUDA 12 or 13 runtime (libcudart.so.12 or .13 does not load)")
     } else if !cudnn {
-        Some("no cuDNN 9 (libcudnn.so.9 does not load)".into())
-    } else if !downloaded {
-        runtime.as_ref().map(|e| {
-            format!(
-                "the GPU runtime is not downloaded: pi-speech-receiver models download {}",
-                e.id
-            )
-        })
+        Some("no cuDNN 9 (libcudnn.so.9 does not load)")
+    } else if target.is_none() {
+        Some("no GPU receiver build is available for this platform")
+    } else if !gpu_build {
+        Some("this receiver is the CPU edition")
     } else {
         None
     };
@@ -90,10 +74,10 @@ pub fn probe() -> serde_json::Value {
         "driver": driver,
         "cuda": cuda,
         "cudnn": cudnn,
-        "runtime": runtime.as_ref().map(|e| e.id.clone()),
-        "downloaded": downloaded,
-        "lib": lib.map(|p| p.to_string_lossy().into_owned()),
-        "usable": why.is_none(),
+        "hardware": hardware,
+        "edition": crate::EDITION,
+        "target": target,
+        "usable": hardware && gpu_build,
         "why": why,
     })
 }

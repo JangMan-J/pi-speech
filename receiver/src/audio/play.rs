@@ -175,7 +175,7 @@ impl Shared {
         let mut since = Instant::now();
         let mut meter = Meter::new(rate);
         let mut seq = 0u64;
-        let mut window = [0.0f32; 256];
+        let mut window = [0.0f32; super::spectrum::WINDOW];
         while end.is_none() && !self.drained.load(Ordering::Acquire) {
             end = self
                 .done

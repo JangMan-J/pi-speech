@@ -25,6 +25,8 @@ export interface SurfaceUi extends DictationUi {
   /** A searchable picker for long lists; `current` is preselected when the UI can. */
   pick(title: string, options: string[], current?: string): Promise<string | undefined>;
   input(title: string, placeholder?: string): Promise<string | undefined>;
+  /** Pi's native multi-line editor dialog, when available. */
+  editor?(title: string, prefill?: string): Promise<string | undefined>;
 }
 
 interface ActionSpec {
@@ -145,6 +147,13 @@ export function describeSample(r: SampleResult): { message: string; level: "info
 
 const BRIDGE_ARGS = ["auto", "on", "off", "status"];
 
+export const ACTION_NAMES: readonly string[] = Object.keys(ACTIONS);
+export const ACTION_VALUES: Readonly<Record<string, readonly string[]>> = {
+  "read-aloud": ["on", "off", "summary", "streaming"],
+  bridge: BRIDGE_ARGS,
+  set: SETTING_NAMES,
+};
+
 /** Runs /speech for one UI. Errors are thrown as readable Errors for the caller to show. */
 export class Surface {
   constructor(private readonly engine: Engine) {}
@@ -190,10 +199,7 @@ export class Surface {
   }
 
   async replay(ui: SurfaceUi): Promise<void> {
-    const file = this.speech.lastMessage();
-    if (!file) throw new Error("Nothing to replay: no spoken message in the history yet");
-    const started = await this.engine.player.play(file, "message");
-    if (!started.ok) throw new Error(`Replay did not start: ${started.reason}`);
+    const file = await this.engine.replay();
     ui.notify(`Replaying ${basename(file)}`, "info");
   }
 

@@ -5,6 +5,17 @@
  * its own credential and sends it only to its own service.
  */
 
+import type { ModelKind } from "./features";
+
+/** Voice value for models that list no voices: the request then carries no `voice` at all. */
+export const DEFAULT_VOICE = "default";
+
+/** What the panel says of a chat model, before the catalog's own description. */
+export const CHAT_NOTE: Record<ModelKind, string> = {
+  tts: "A chat model asked to read; a reading that strays from the text is not played.",
+  stt: "A chat model asked to transcribe; a few obey a spoken order instead.",
+};
+
 /** Synthesized audio in a file format the history keeps. */
 export interface SynthesizedAudio {
   audio: Uint8Array;
@@ -42,6 +53,39 @@ export interface AudioStream {
  */
 export type Via = "chat";
 
+export interface ModelOption {
+  id: string;
+  /** Human-readable name from the catalog, or the id. */
+  label: string;
+  /** Voices the model accepts (speech models only), from the catalog's `supported_voices`. */
+  voices?: string[];
+  /** Price tag in dollars per minute of audio, e.g. "$0.006/min" or "~$0.064/min". */
+  price?: string;
+  /** Who makes the model, e.g. "ElevenLabs". */
+  vendor?: string;
+  /** What the catalog says the model offers (src/engine/features.ts); empty when it states nothing. */
+  features?: string[];
+  /** The languages as the catalog states them: "90+ langs", "English". */
+  languages?: string;
+  /** The catalog's (short) description. */
+  description?: string;
+  /** When the model was added to the catalog, in seconds since the epoch. */
+  created?: number;
+  /** The endpoint type the model is reached through; undefined is the audio endpoint. */
+  via?: Via;
+  /** Optional display overrides supplied by the owning provider adapter. */
+  shortLabel?: string;
+  priceLabel?: string;
+  pickerNote?: string;
+  unpricedExempt?: boolean;
+  voicesUnknown?: boolean;
+}
+
+export interface SpeechCatalog {
+  tts: ModelOption[];
+  stt: ModelOption[];
+}
+
 export interface SynthesisRequest {
   text: string;
   model: string;
@@ -68,6 +112,22 @@ export interface TranscriptionRequest {
 export interface SpeechProvider {
   /** For messages, e.g. "OpenRouter". */
   readonly name: string;
+  /** Default voice when switching to a model owned by this provider. */
+  readonly defaultVoice?: string;
+  /** Reason shown when a model owned by this provider returns an empty voice list. */
+  readonly emptyVoicesReason?: string;
+  /** Whether this provider owns `model` (outside the shared OpenRouter catalog). */
+  ownsModel?(model: string): boolean;
+  /** Display label for `model` when shown in a row or picker. */
+  modelLabel?(model: string): string;
+  /** Alert note when `model` is missing from the active catalog. */
+  missingModelNote?(model: string): string;
+  /** Dynamic voice list for `model`, when the provider fetches voices outside the static catalog. */
+  voicesFor?(model: string): Promise<string[]>;
+  /** Provider-supplied metadata for voice-language inference (e.g. xAI voice language). */
+  voiceLanguageMetadata?(model: string, voice: string): { language?: string } | undefined;
+  /** Fill in provider-owned display defaults for a catalog option (e.g. subscription pricing). */
+  enrichOption?(option: ModelOption): ModelOption;
   /** Throws a readable error, sending nothing, when this provider's credential is missing. */
   ensureCredential(): Promise<void>;
   /** Throws a readable error on failure. */

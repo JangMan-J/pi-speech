@@ -200,8 +200,8 @@ export function openPanel(
   ui: SurfaceUi,
   env: Env,
   track: (panel: Panel | undefined) => void,
-  speak = false,
   hotkeys: Hotkeys = DEFAULT_HOTKEYS,
+  onChanged?: () => void,
 ): Promise<boolean> {
   return ctx.ui.custom<boolean>((tui, theme, _keybindings, done) => {
     let closed = false;
@@ -332,6 +332,7 @@ export function openPanel(
       close,
       changed: () => {
         syncLogin();
+        onChanged?.();
         if (!closed) tui.requestRender();
       },
       hotkeys,
@@ -340,7 +341,6 @@ export function openPanel(
     const keys = new KeyDecoder(hotkeys);
     track(panel);
     panel.open();
-    void speak;
     panel.openSpeaker();
     syncLogin();
     return {

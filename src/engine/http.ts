@@ -14,7 +14,7 @@ function relayed(raw: unknown): string | undefined {
 }
 
 /** The message of an error reply in the shapes these services use, else its text; never the key. */
-export function errorText(body: string, key?: string): string {
+export function errorText(body: string, key?: string, maxLen = 400): string {
   let text = body;
   try {
     const j = JSON.parse(body) as { error?: unknown; detail?: unknown; message?: unknown };
@@ -30,7 +30,7 @@ export function errorText(body: string, key?: string): string {
     /* not JSON: the text as is */
   }
   if (key) text = text.split(key).join("[key]");
-  return text.replace(/\s+/g, " ").trim().slice(0, 400);
+  return text.replace(/\s+/g, " ").trim().slice(0, maxLen);
 }
 
 export function failure(title: string, status: number, body: string, key?: string): Error {

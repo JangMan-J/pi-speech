@@ -57,6 +57,10 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             }
             "--token-file" => token_file = Some(PathBuf::from(value("--token-file")?)),
             "--network" if inline.is_none() => network = true,
+            "-V" | "--version" if inline.is_none() => {
+                println!("pi-speech-receiver {}", pi_speech_receiver::VERSION);
+                std::process::exit(0);
+            }
             "-h" | "--help" => {
                 println!("{}", usage());
                 std::process::exit(0);

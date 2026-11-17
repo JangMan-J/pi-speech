@@ -1,15 +1,27 @@
 /** Test fixtures: an engine with a fixed catalog, a recording fake output, and a fake OpenRouter fetch. */
 
-import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { vi } from "vitest";
-import type { BridgeAudio } from "../../src/bridge/index";
+import { afterEach, vi } from "vitest";
+import type { BridgeAudio } from "../../src/bridge/client";
 import type { AudioInput, AudioOutput, PlayKind, PlayOutcome, PlayStart } from "../../src/engine/audio";
+import { packageVersion } from "../../src/engine/binary";
 import { Engine } from "../../src/engine/engine";
 import type { SpeechCatalog } from "../../src/engine/openrouter";
 import type { AudioStream, StreamFormat } from "../../src/engine/provider";
 import type { SurfaceUi } from "../../src/engine/surface";
+
+const TEMP_DIRS = new Set<string>();
+afterEach(() => {
+  for (const dir of TEMP_DIRS) rmSync(dir, { recursive: true, force: true });
+  TEMP_DIRS.clear();
+});
+
+export function trackTemp(dir: string): string {
+  TEMP_DIRS.add(dir);
+  return dir;
+}
 
 export const CATALOG: SpeechCatalog = {
   tts: [
@@ -153,7 +165,7 @@ export function makeEngine(
   localInput?: AudioInput,
   catalog: SpeechCatalog = CATALOG,
 ) {
-  const work = mkdtempSync(join(tmpdir(), "pi-speech-engine-"));
+  const work = trackTemp(mkdtempSync(join(tmpdir(), "pi-speech-engine-")));
   const local = fakeOutput("local");
   const bridgeOut = fakeOutput("bridge");
   const noInput: AudioInput = {
@@ -165,7 +177,7 @@ export function makeEngine(
   const bridge: BridgeAudio = {
     output: bridgeOut,
     input: { ...noInput, name: "bridge" },
-    health: async () => ({ ok: true, version: "0.1.0" }),
+    health: async () => ({ ok: true, version: packageVersion() ?? "0.2.5" }),
   };
   const engine = new Engine({
     agentDir: join(work, "agent"),
@@ -215,6 +227,7 @@ export const STAND_IN_BINARY = process.platform !== "win32";
  * and its process id to `speak.pid`.
  */
 export function fakeReceiver(dir: string): { path: string; log: string } {
+  trackTemp(dir);
   const path = join(dir, "fake-receiver");
   const log = join(dir, "calls.log");
   const state = join(dir, "downloaded.json");
@@ -241,7 +254,7 @@ if (cmd === "transcribe" && sub === "--serve") {
     const now = JSON.parse(fs.readFileSync(state, "utf8"));
     if (!now.includes(r.model)) return out({ error: r.model + " is not downloaded" });
     if (r.load) return out({ loaded: true });
-    fs.appendFileSync(${JSON.stringify(log)}, "transcribe " + r.model + " " + r.audio + "\\n");
+    fs.appendFileSync(${JSON.stringify(log)}, "transcribe " + r.model + " " + r.audio + (r.language ? " --language " + r.language : "") + "\\n");
     fs.readFileSync(r.audio);
     out({ text: "local words from " + r.model });
   });

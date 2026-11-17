@@ -9,9 +9,13 @@
 
 export const STATUS_KEY = "pi-speech";
 
+export type DictationPhase = "starting" | "recording" | "transcribing";
+
 export interface IndicatorState {
   /** The dictation indicator, when dictation is not idle. */
   dictation?: string;
+  /** Structured dictation phase so renderers never inspect glyph prefixes. */
+  dictationPhase?: DictationPhase;
   playing: boolean;
   route: "local" | "bridge";
 }
@@ -34,7 +38,10 @@ const ansi = (code: number, text: string) => `\x1b[38;5;${code}m${text}\x1b[0m`;
  */
 export function statusLine(s: IndicatorState, color: boolean): string {
   const paint = (code: number, text: string) => (color ? ansi(code, text) : text);
-  if (s.dictation) return paint(s.dictation.startsWith("●") ? ANSI.recording : ANSI.transcribing, s.dictation);
+  if (s.dictation) {
+    const transcribing = s.dictationPhase ? s.dictationPhase === "transcribing" : !s.dictation.startsWith("●");
+    return paint(transcribing ? ANSI.transcribing : ANSI.recording, s.dictation);
+  }
   if (s.playing) return paint(ANSI.speaking, "▶ speaking");
   return paint(ANSI.idle, s.route === "bridge" ? `${MIC} bridge` : MIC);
 }
@@ -44,14 +51,20 @@ export function liveState(s: IndicatorState): string {
   return s.dictation ?? (s.playing ? "▶ speaking" : "");
 }
 
-/** Pushes the status text to a sink, only when it changes. */
+export type IndicatorSink = (state: IndicatorState, text: string | undefined) => void;
+
+function stateKey(s: IndicatorState): string {
+  return `${s.dictationPhase ?? ""}|${s.dictation ?? ""}|${s.playing ? 1 : 0}|${s.route}`;
+}
+
+/** Pushes structured IndicatorState (and plain text) to a sink, only when it changes. */
 export class Indicator {
   /** The state now. */
   state(): IndicatorState {
     return this.read();
   }
 
-  private last: string | undefined | null = null;
+  private lastKey: string | null = null;
   private readonly listeners = new Set<() => void>();
   /**
    * Whether something else shows the live state now (the spectrum OSD): the panel's header then says nothing
@@ -61,19 +74,19 @@ export class Indicator {
 
   constructor(
     private readonly read: () => IndicatorState,
-    private sink: (text: string | undefined) => void = () => {},
+    private sink: IndicatorSink = () => {},
   ) {}
 
-  /** Send to a new sink (a new session's UI); the current text is sent at once. */
-  attach(sink: (text: string | undefined) => void): void {
+  /** Send to a new sink (a new session's UI); the current state is sent at once. */
+  attach(sink: IndicatorSink): void {
     this.sink = sink;
-    this.last = null;
+    this.lastKey = null;
     this.update();
   }
 
-  /** Send the text again, whether or not it changed: what the sink shows may depend on more than the state. */
+  /** Send the state again, whether or not it changed: what the sink shows may depend on more than the state. */
   refresh(): void {
-    this.last = null;
+    this.lastKey = null;
     this.update();
   }
 
@@ -82,18 +95,20 @@ export class Indicator {
     return this.shownElsewhere() ? "" : liveState(this.read());
   }
 
-  /** Hear every change of the text; returns the function that stops listening. */
+  /** Hear every change of the state; returns the function that stops listening. */
   listen(listener: () => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }
 
   update(): void {
-    const text = indicatorText(this.read());
-    if (text === this.last) return;
-    this.last = text;
+    const state = this.read();
+    const key = stateKey(state);
+    if (key === this.lastKey) return;
+    this.lastKey = key;
+    const text = indicatorText(state);
     try {
-      this.sink(text);
+      this.sink(state, text);
     } catch {
       /* the UI is gone */
     }

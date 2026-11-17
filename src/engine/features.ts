@@ -44,7 +44,23 @@ export interface ModelFeatures {
 const TAGS =
   /audio tags|emotion and pace tags|\btags\b|square brackets|parenthetical controls|natural-language (?:controls|text prompt)|style (?:prompts?|instructions?|controls?)|directed voice/i;
 /** Models whose documentation (not the cut catalog text) describes inline style direction. */
-const TAGS_DOCUMENTED = /^(?:google\/gemini-[\w.-]*tts|canopylabs\/orpheus)/;
+const TAGS_DOCUMENTED =
+  /^(?:google\/gemini-[\w.-]*tts|canopylabs\/orpheus|elevenlabs\/.*(?:v3|v4)|inworld\/|resemble-ai\/chatterbox|orpheus-3b-|xai$)/i;
+const ANGLE_TAGS = /^(?:canopylabs\/orpheus|resemble-ai\/chatterbox|orpheus-3b-)/i;
+const PAREN_TAGS = /^(?:fishaudio\/|minimax\/)/i;
+const BRACKET_TAGS = /^(?:elevenlabs\/.*(?:v3|v4)|google\/gemini-[\w.-]*tts|inworld\/|xai$)/i;
+
+export type TagSyntax = "[tags]" | "<tags>" | "(tags)";
+
+/** The inline delivery tag syntax a speech model supports, or undefined when none is known. */
+export function inlineTags(m: FeatureSource & { features?: string[]; tags?: string }): TagSyntax | undefined {
+  if (m.tags === "[tags]" || m.tags === "<tags>" || m.tags === "(tags)") return m.tags;
+  if (ANGLE_TAGS.test(m.id)) return "<tags>";
+  if (BRACKET_TAGS.test(m.id)) return "[tags]";
+  if (PAREN_TAGS.test(m.id) && (TAGS.test(m.description ?? "") || m.features?.includes("tags"))) return "(tags)";
+  if (m.features?.includes("tags") || TAGS.test(m.description ?? "")) return "[tags]";
+  return undefined;
+}
 const FAST = /low-latency|lower-latency|real-time|\bfast\b|\bspeed\b|(?<!non-)streaming/i;
 /** Flash and Turbo are the vendors' names for their fast tier. */
 const FAST_ID = /(?:^|[-/])(?:flash|turbo)(?:$|[-:.])/;
@@ -93,11 +109,15 @@ export function featureLine(m: { features?: string[]; languages?: string; voices
  * yours), then for a speech model how many voices it has. What else a model offers is in its description, under
  * the list, and typing finds it (tags, fast, ...).
  */
-export function modelColumns(kind: ModelKind, m: { voices?: string[] }, provider: string): string[] {
+export function modelColumns(
+  kind: ModelKind,
+  m: Partial<FeatureSource> & { features?: string[]; voices?: string[] },
+  provider: string,
+): string[] {
   if (kind === "stt") return [provider];
   // Every model in the list can speak, so it has at least one voice; an unknown count reads "1 voice".
   const n = m.voices?.length || 1;
-  return [provider, `${n} voice${n === 1 ? "" : "s"}`];
+  return [provider, `${n} voice${n === 1 ? "" : "s"}`, inlineTags({ ...m, id: m.id ?? "" }) ?? ""];
 }
 
 /** The vendor of a model: the part of its catalog name before the colon, else the first part of its id. */

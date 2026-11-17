@@ -11,7 +11,7 @@
 
 import { type ChildProcess, spawn } from "node:child_process";
 import type { AudioOutput, PlayKind, PlayOutcome, PlayStart, StreamOptions } from "./audio";
-import { type BinaryChoice, findBinary } from "./binary";
+import { type BinaryChoice, ensureBinary, findBinary } from "./binary";
 import { childEnv, type Env, errorMessage, findExecutable } from "./env";
 import { FADE_IN_ENV, FADE_OUT_ENV, LEVELS_ENV, levelsFile, readLevels, removeLevels } from "./levels";
 import type { AudioStream, PcmFormat, StreamFormat } from "./provider";
@@ -139,6 +139,10 @@ export class LocalOutput implements AudioOutput {
   }
 
   async playStream(stream: AudioStream, kind: PlayKind, opts: StreamOptions = {}): Promise<PlayStart> {
+    if (!this.opts.binary && !this.env.PI_SPEECH_STREAM_PLAYER) {
+      const current = findBinary(this.env);
+      if (!current.ok && !current.chosen) await ensureBinary(this.env);
+    }
     const choice = chooseStreamPlayer(this.env, stream.format, this.opts.binary);
     if (!choice.ok) return choice;
     return this.launch(choice.name, choice.bin, choice.args, kind, stream.chunks, opts.fadeMs);

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { wrapPcmAsWav } from "../../src/engine/openrouter";
-import { joinWav } from "../../src/engine/wav";
+import { joinWav, quietSplitByte, sliceWav, wavPcmInfo } from "../../src/engine/wav";
 
 const pcm = (n: number, fill: number) => new Uint8Array(n).fill(fill);
 
@@ -46,5 +46,36 @@ describe("joining WAV pieces", () => {
     expect(joinWav([wrapPcmAsWav(pcm(10, 1), 24000, 1), wrapPcmAsWav(pcm(10, 1), 16000, 1)])).toBeUndefined();
     expect(joinWav([wrapPcmAsWav(pcm(10, 1), 24000, 1), Buffer.from("ID3 not a wav file at all")])).toBeUndefined();
     expect(joinWav([])).toBeUndefined();
+  });
+});
+
+describe("rate-aware WAV slicing", () => {
+  it("reads actual byteRate and dataOffset (including 16 kHz and LIST chunks) and slices cleanly", () => {
+    const samples = new Uint8Array(16_000 * 2 * 14); // 14 s at 16 kHz mono
+    // Put loud audio everywhere except a quiet 0.5 s gap around 10 s.
+    const view = new DataView(samples.buffer);
+    for (let i = 0; i < samples.length; i += 2) {
+      const sec = i / 32_000;
+      view.setInt16(i, sec >= 9.75 && sec <= 10.25 ? 0 : 4000, true);
+    }
+    const wav16 = Buffer.from(wrapPcmAsWav(samples, 16000, 1));
+    const list = Buffer.alloc(12);
+    list.write("LIST", 0, "latin1");
+    list.writeUInt32LE(4, 4);
+    list.write("INFO", 8, "latin1");
+    const withList = Buffer.concat([wav16.subarray(0, 36), list, wav16.subarray(36)]);
+    withList.writeUInt32LE(withList.length - 8, 4);
+
+    const info = wavPcmInfo(withList);
+    expect(info).toEqual({ dataOffset: 56, byteRate: 32_000, blockAlign: 2 });
+
+    const split = quietSplitByte(withList, info.dataOffset);
+    const splitSec = (split - info.dataOffset) / info.byteRate;
+    expect(splitSec).toBeGreaterThan(9.6);
+    expect(splitSec).toBeLessThan(10.4);
+
+    const sliced = sliceWav(withList, split);
+    expect(sliced.readUInt32LE(4)).toBe(sliced.length - 8);
+    expect(sliced.readUInt32LE(info.dataOffset - 4)).toBe(sliced.length - info.dataOffset);
   });
 });

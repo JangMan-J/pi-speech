@@ -9,10 +9,90 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { extname, join } from "node:path";
 import { createInterface } from "node:readline";
-import type { BridgeModels } from "../bridge/index";
-import { type BinaryChoice, findBinary } from "./binary";
+import { type BinaryChoice, ensureBinary, findBinary } from "./binary";
 import { childEnv, type Env } from "./env";
-import { TranscribeWorker } from "./transcribe-worker";
+import {
+  type Download,
+  type DownloadProgress,
+  type DownloadResult,
+  downloadResult,
+  type FollowedDownload,
+  followDownload,
+  type ModelBackend,
+} from "./model-backend";
+import { TranscribeWorker } from "./receiver-worker";
+import type { Device, Settings } from "./settings";
+
+export type { Download, DownloadProgress, DownloadResult, FollowedDownload };
+export { downloadResult, followDownload };
+
+/** Whether live typing into Pi's editor is available for the current transcription settings. */
+export function canLiveDictate(s: Pick<Settings, "transcriptionSource" | "localTranscriptionModel">): boolean {
+  return s.transcriptionSource === "local" && Boolean(s.localTranscriptionModel);
+}
+
+/** Whether a local STT model is fast enough (or true-streaming) for live typing into Pi's editor. */
+export function isLiveCapableLocalStt(modelOrId: LocalModel | string | undefined, device: Device): boolean {
+  if (!modelOrId) return false;
+  if (typeof modelOrId !== "string" && modelOrId.liveCapable) {
+    return modelOrId.liveCapable === "always" || (modelOrId.liveCapable === "gpu" && device === "gpu");
+  }
+  const id = typeof modelOrId === "string" ? modelOrId : modelOrId.id;
+  if (id.startsWith("nemotron-3.5-asr-")) return true;
+  if (
+    id.startsWith("parakeet-") ||
+    id.startsWith("sense-voice-") ||
+    id.startsWith("moonshine-") ||
+    id.startsWith("canary-180m-") ||
+    id.startsWith("dolphin-") ||
+    id.startsWith("whisper-tiny") ||
+    id.startsWith("whisper-base") ||
+    id.startsWith("whisper-small") ||
+    id.startsWith("whisper-distil-")
+  ) {
+    return true;
+  }
+  return device === "gpu" && id.startsWith("whisper-turbo");
+}
+
+export type LocalSttLanguage = { kind: "selectable" } | { kind: "auto" } | { kind: "fixed"; language: string };
+
+/**
+ * How a local transcription model handles the spoken-language setting: reads `languageMode` from the
+ * receiver's catalog metadata when present, falling back to ID heuristics for older receivers/stand-ins.
+ */
+export function localSttLanguage(
+  modelOrId: LocalModel | string | undefined,
+  languages?: readonly string[],
+): LocalSttLanguage {
+  if (!modelOrId) return { kind: "selectable" };
+  const model = typeof modelOrId === "string" ? undefined : modelOrId;
+  const id = typeof modelOrId === "string" ? modelOrId : modelOrId.id;
+  const langs = languages ?? model?.languages;
+  if (model?.languageMode) {
+    if (model.languageMode === "selectable") return { kind: "selectable" };
+    if (model.languageMode === "auto") return { kind: "auto" };
+    const moonshine = id.match(/^moonshine-(?:tiny|base)-([a-z]{2,3})(?:-|$)/);
+    const lang = moonshine?.[1] ?? (langs?.length === 1 && langs[0] !== "mul" ? langs[0] : "en");
+    return { kind: "fixed", language: lang };
+  }
+  if (id.startsWith("canary-") || id.startsWith("cohere-") || id.startsWith("nemotron-")) {
+    return { kind: "selectable" };
+  }
+  const moonshine = id.match(/^moonshine-(?:tiny|base)-([a-z]{2,3})(?:-|$)/);
+  if (moonshine) return { kind: "fixed", language: moonshine[1] };
+  if (
+    /\.en(?:-|$)|-en(?:-|$)/.test(id) ||
+    id.startsWith("parakeet-tdt-0.6b-v2") ||
+    id === "whisper-distil-large-v3.5"
+  ) {
+    return { kind: "fixed", language: "en" };
+  }
+  if (langs?.length === 1 && langs[0] !== "mul" && !id.startsWith("whisper-")) {
+    return { kind: "fixed", language: langs[0] };
+  }
+  return { kind: "auto" };
+}
 
 /** What a catalogue entry is: a model of each direction, or a runtime (the GPU runtime) the models run with. */
 export type ModelKind = "transcription" | "speech" | "runtime";
@@ -31,24 +111,19 @@ export interface LocalModel {
   partial: number;
   /** The shared lexicon the voice needs (an English Piper voice), and whether it is in the cache. */
   lexicon?: { name: string; size: number; downloaded: boolean };
+  /** All shared files (`lexicon`, `vocoder`) the model needs in the cache root. */
+  shared?: Array<{ name: string; size: number; downloaded: boolean }>;
   /** Where the model is, or will be once downloaded. */
   path: string;
+  /** Optional capability, grouping, and ranking metadata emitted by `models list`. */
+  group?: string;
+  speakers?: number;
+  liveCapable?: "always" | "gpu" | "never";
+  languageMode?: "selectable" | "auto" | "fixed";
+  tags?: string;
+  cpuRank?: number;
+  gpuRank?: number;
 }
-
-/**
- * A step of a download, in order: progress (repeated), verifying, unpacking; then, for a voice that needs a lexicon
- * not yet in the cache (an English Piper voice), progress of that file, named by `file`.
- */
-export type DownloadProgress =
-  | { phase: "progress"; done: number; total: number; file?: string }
-  | { phase: "verifying" }
-  | { phase: "unpacking" };
-
-export type DownloadResult =
-  /** The model is in the cache at `path`. */
-  | { status: "done"; path: string }
-  /** Stopped on request; `done` bytes are kept for the next download. */
-  | { status: "stopped"; done: number; total: number };
 
 export interface DownloadOptions {
   /** Called for each step, one at a time: the next waits for the promise the last returned. */
@@ -57,13 +132,6 @@ export interface DownloadOptions {
   signal?: AbortSignal;
   /** The binary's environment (default: this process's). */
   env?: NodeJS.ProcessEnv;
-}
-
-export interface Download {
-  /** Settles once the binary has exited and every progress callback has finished. Rejects on an error. */
-  readonly result: Promise<DownloadResult>;
-  /** Stop the download, leaving what has arrived to be resumed. */
-  cancel(): void;
 }
 
 /** How long a stopped download gets to exit before it is killed. */
@@ -118,9 +186,36 @@ function failure(stderr: string, code: number | null, message?: unknown): LocalM
 }
 
 function toModel(v: Record<string, unknown>): LocalModel | undefined {
-  const { id, kind, name, languages, size, downloaded, partial, path, lexicon } = v;
+  const {
+    id,
+    kind,
+    name,
+    languages,
+    size,
+    downloaded,
+    partial,
+    path,
+    lexicon,
+    shared,
+    group,
+    speakers,
+    live_capable,
+    language_mode,
+    tags,
+    cpu_rank,
+    gpu_rank,
+  } = v;
   const lex = lexicon && typeof lexicon === "object" ? (lexicon as Record<string, unknown>) : undefined;
   if (typeof id !== "string" || (kind !== "transcription" && kind !== "speech")) return undefined;
+  const sharedList = Array.isArray(shared)
+    ? shared.flatMap((item) => {
+        if (!item || typeof item !== "object") return [];
+        const o = item as Record<string, unknown>;
+        return typeof o.name === "string"
+          ? [{ name: o.name, size: typeof o.size === "number" ? o.size : 0, downloaded: o.downloaded === true }]
+          : [];
+      })
+    : undefined;
   return {
     id,
     kind,
@@ -139,6 +234,18 @@ function toModel(v: Record<string, unknown>): LocalModel | undefined {
           },
         }
       : {}),
+    ...(sharedList?.length ? { shared: sharedList } : {}),
+    ...(typeof group === "string" && group ? { group } : {}),
+    ...(typeof speakers === "number" ? { speakers } : {}),
+    ...(live_capable === "always" || live_capable === "gpu" || live_capable === "never"
+      ? { liveCapable: live_capable }
+      : {}),
+    ...(language_mode === "selectable" || language_mode === "auto" || language_mode === "fixed"
+      ? { languageMode: language_mode }
+      : {}),
+    ...(typeof tags === "string" && tags ? { tags } : {}),
+    ...(typeof cpu_rank === "number" ? { cpuRank: cpu_rank } : {}),
+    ...(typeof gpu_rank === "number" ? { gpuRank: gpu_rank } : {}),
   };
 }
 
@@ -209,69 +316,33 @@ export function downloadModel(binary: string, id: string, options: DownloadOptio
   return { result, cancel };
 }
 
-/** What a download's event lines said: how it ended, and how far it got. */
-export interface FollowedDownload {
-  last?: Record<string, unknown>;
-  done: number;
-  total: number;
+/** Synthetic family id grouping all Piper English models under one Speech model entry. */
+export const PIPER_EN_FAMILY = "piper-en";
+
+const PIPER_SPEAKER_COUNTS: Record<string, number> = {
+  "piper-en_US-libritts-high": 904,
+  "piper-en_GB-vctk-medium": 109,
+  "piper-en_GB-aru-medium": 12,
+  "piper-en_GB-semaine-medium": 4,
+};
+
+/** Whether `modelOrId` is a Piper archive grouped under `piper-en` in the Speech model picker. */
+export function isSingleVoicePiper(modelOrId: LocalModel | string | undefined): boolean {
+  if (!modelOrId) return false;
+  if (typeof modelOrId !== "string") {
+    return modelOrId.group ? modelOrId.group === PIPER_EN_FAMILY : modelOrId.id.startsWith("piper-");
+  }
+  return modelOrId.startsWith("piper-");
 }
 
-/**
- * Follow a download's event lines (`models download` prints them, and the receiver streams the same for the
- * Remote machine's), passing its progress on in order; resolves once the lines end and every callback has.
- */
-export async function followDownload(
-  lines: AsyncIterable<string>,
-  onProgress?: (p: DownloadProgress) => void | Promise<void>,
-): Promise<FollowedDownload> {
-  let delivered: Promise<void> = Promise.resolve();
-  let callbackError: unknown;
-  const deliver = (p: DownloadProgress) => {
-    if (!onProgress) return;
-    delivered = delivered.then(async () => {
-      if (callbackError !== undefined) return;
-      try {
-        await onProgress(p);
-      } catch (e) {
-        callbackError = e;
-      }
-    });
-  };
-  const out: FollowedDownload = { done: 0, total: 0 };
-  for await (const line of lines) {
-    const v = parse(line);
-    if (!v) continue;
-    if (v.event === "progress" && typeof v.done === "number" && typeof v.total === "number") {
-      out.done = v.done;
-      out.total = v.total;
-      const file = typeof v.file === "string" && v.file ? v.file : undefined;
-      deliver({ phase: "progress", done: out.done, total: out.total, ...(file ? { file } : {}) });
-    } else if (v.event === "verifying" || v.event === "unpacking") {
-      deliver({ phase: v.event });
-    } else if (v.event === "done" || v.event === "stopped" || v.event === "error") {
-      out.last = v;
-    }
-  }
-  await delivered;
-  if (callbackError !== undefined) throw callbackError;
-  return out;
-}
-
-/** How a followed download ended: done, stopped (asked to, or it said so), else the error `fail` makes. */
-export function downloadResult(
-  f: FollowedDownload,
-  stopping: boolean,
-  exitedOk: boolean,
-  fail: () => Error,
-): DownloadResult {
-  const last = f.last;
-  if (last?.event === "done" && typeof last.path === "string" && exitedOk) return { status: "done", path: last.path };
-  if (last?.event === "stopped" || (stopping && last?.event !== "error")) {
-    const kept = typeof last?.done === "number" ? last.done : f.done;
-    const of = typeof last?.total === "number" ? last.total : f.total;
-    return { status: "stopped", done: kept, total: of };
-  }
-  throw fail();
+/** Human-friendly voice name for a Piper archive (`piper-en_US-lessac-high` -> `lessac-high (US)`). */
+export function piperVoiceLabel(modelOrId: LocalModel | string): string {
+  const id = typeof modelOrId === "string" ? modelOrId : modelOrId.id;
+  const m = /^piper-en_(US|GB)-(.+)$/.exec(id);
+  if (!m) return id;
+  const count = (typeof modelOrId !== "string" ? modelOrId.speakers : undefined) ?? PIPER_SPEAKER_COUNTS[id];
+  const region = m[1] === "US" ? "US" : "UK";
+  return count ? `${m[2]} (${region}, ${count} voices)` : `${m[2]} (${region})`;
 }
 
 /** The audio a local model transcribes, by file extension. */
@@ -348,11 +419,12 @@ export interface GpuInfo {
   /** The CUDA runtime's major version, or null. */
   cuda: number | null;
   cudnn: boolean;
-  /** The catalogue id of the GPU runtime that fits, or null. */
-  runtime: string | null;
-  downloaded: boolean;
-  /** The GPU runtime's library directory. */
-  lib: string | null;
+  /** Whether compatible GPU hardware + system CUDA/cuDNN are present. */
+  hardware?: boolean;
+  /** Which receiver edition was probed (`cpu` or `gpu`). */
+  edition?: "cpu" | "gpu";
+  /** The GPU receiver target that fits this machine (`linux-x64-cuda13`), or null. */
+  target?: string | null;
   usable: boolean;
   /** Why the GPU cannot be used yet, when it cannot. */
   why: string | null;
@@ -372,18 +444,20 @@ export async function probeGpu(binary: string, env: NodeJS.ProcessEnv): Promise<
   });
   try {
     if (code !== 0) throw new Error();
-    return JSON.parse(out.trim().split("\n").at(-1) ?? "") as GpuInfo;
+    const parsed = JSON.parse(out.trim().split("\n").at(-1) ?? "") as GpuInfo;
+    if (parsed.hardware === undefined) {
+      parsed.hardware = parsed.driver && parsed.cuda !== null && parsed.cudnn;
+    }
+    return parsed;
   } catch {
     // An older receiver without `gpu`.
     return {
       driver: false,
       cuda: null,
       cudnn: false,
-      runtime: null,
-      downloaded: false,
-      lib: null,
+      hardware: false,
       usable: false,
-      why: "this pi-speech-receiver cannot run models on a GPU",
+      why: "this pi-speech-receiver cannot probe GPU hardware",
     };
   }
 }
@@ -399,65 +473,46 @@ export function remoteOnly(what: string, id: string): string {
  * on is Remote machine with the bridge in use), the catalogue and the runs are the receiver's there instead.
  */
 export class LocalModels {
-  /** The Remote machine's models when they are the ones to use; set by the engine. */
-  remote: () => BridgeModels | undefined = () => undefined;
+  /** The Remote machine's models when they are the ones to use. */
+  readonly remote: () => ModelBackend | undefined;
 
   /** The running `transcribe --serve`, which keeps the last model loaded between transcriptions. */
   private readonly worker: TranscribeWorker;
-  /** Where local models run; see `setDevice`. */
+  /** Which receiver edition (`cpu` or `gpu`) is active; see `setDevice`. */
   private device: "cpu" | "gpu" = "cpu";
-  /** What the worker runs with beyond the usual environment (the GPU runtime's), as it was started. */
-  private deviceEnv: NodeJS.ProcessEnv = {};
-  /** The last GPU probe, while it said usable (a usable GPU stays so; an unusable one is asked again). */
+  /** The last GPU probe. */
   private gpuInfo?: GpuInfo;
 
   constructor(
     private readonly env: Env,
-    private readonly locate: () => BinaryChoice = () => findBinary(env),
+    private readonly locate?: () => BinaryChoice,
+    remote: () => ModelBackend | undefined = () => undefined,
   ) {
+    this.remote = remote;
     this.worker = new TranscribeWorker(
       () => this.binary(),
-      () => ({ ...this.childEnv, ...this.deviceEnv }),
+      () => this.childEnv,
     );
   }
 
-  /** Run on-device models (transcription and speech) on the CPU or an NVIDIA GPU from their next run on. */
+  /** Run on-device models (transcription and speech) on the CPU or GPU receiver from their next run on. */
   setDevice(device: "cpu" | "gpu"): void {
     if (device === this.device) return;
     this.device = device;
     this.gpuInfo = undefined;
+    this.worker.close();
   }
 
   /**
-   * What this machine has for the GPU (`pi-speech-receiver gpu`): the driver, CUDA and cuDNN, and the GPU runtime
-   * that fits them, whether it is downloaded, and why the GPU cannot be used yet.
+   * What this machine has for the GPU (`pi-speech-receiver gpu`): driver, CUDA, cuDNN, matching target, and
+   * whether the active binary is the GPU edition.
    */
   async gpu(): Promise<GpuInfo> {
     if (this.gpuInfo?.usable) return this.gpuInfo;
-    const info = await probeGpu(this.binary(), this.childEnv);
-    if (info.usable) this.gpuInfo = info;
+    const bin = await this.ensureBinary();
+    const info = await probeGpu(bin, this.childEnv);
+    this.gpuInfo = info;
     return info;
-  }
-
-  /**
-   * What a model process needs in its environment, beyond the usual, to run on the chosen device: on a usable GPU,
-   * the GPU runtime first on the library path and the CUDA provider; else nothing (the CPU).
-   */
-  async deviceEnvironment(): Promise<NodeJS.ProcessEnv> {
-    if (this.device !== "gpu") return {};
-    const info = await this.gpu().catch(() => undefined);
-    if (!info?.usable || !info.lib) return {};
-    const prior = this.childEnv.LD_LIBRARY_PATH;
-    return { LD_LIBRARY_PATH: prior ? `${info.lib}:${prior}` : info.lib, PI_SPEECH_PROVIDER: "cuda" };
-  }
-
-  /** The environment the chosen device needs; restarts the worker when it changes. GPU unusable: the CPU. */
-  private async applyDevice(): Promise<void> {
-    const env = await this.deviceEnvironment();
-    if (JSON.stringify(env) !== JSON.stringify(this.deviceEnv)) {
-      this.worker.close();
-      this.deviceEnv = env;
-    }
   }
 
   /**
@@ -472,7 +527,7 @@ export class LocalModels {
       return;
     }
     const lang = language && language !== "auto" ? language : undefined;
-    void this.applyDevice().then(() => this.worker.load(id, lang));
+    this.worker.load(id, lang);
   }
 
   /** End the transcription worker, giving back the memory of the model it holds. */
@@ -480,9 +535,23 @@ export class LocalModels {
     this.worker.close();
   }
 
+  private binaryOpts() {
+    return {
+      device: this.device,
+      ...(this.gpuInfo?.target ? { gpuTarget: this.gpuInfo.target } : {}),
+    };
+  }
+
   /** The binary's path; throws why there is none. */
   binary(): string {
-    const b = this.locate();
+    const b = this.locate ? this.locate() : findBinary(this.env, this.binaryOpts());
+    if (!b.ok) throw new LocalModelsError(b.reason);
+    return b.path;
+  }
+
+  /** Ensure the binary is available on disk (downloading from the release manifest if needed). */
+  async ensureBinary(): Promise<string> {
+    const b = this.locate ? this.locate() : await ensureBinary(this.env, this.binaryOpts());
     if (!b.ok) throw new LocalModelsError(b.reason);
     return b.path;
   }
@@ -496,7 +565,7 @@ export class LocalModels {
     const remote = this.remote();
     const all = remote
       ? (await remote.list()).flatMap((v) => toModel(v) ?? [])
-      : await listModels(this.binary(), this.childEnv);
+      : await listModels(await this.ensureBinary(), this.childEnv);
     return kind ? all.filter((m) => m.kind === kind) : all;
   }
 
@@ -507,17 +576,30 @@ export class LocalModels {
       if (!remote.download) throw new LocalModelsError(remoteOnly("download", id));
       return remote.download(id, options);
     }
-    return downloadModel(this.binary(), id, { ...options, env: this.childEnv });
+    const existing = this.locate ? this.locate() : findBinary(this.env);
+    if (existing.ok) return downloadModel(existing.path, id, { ...options, env: this.childEnv });
+    let inner: Download | undefined;
+    let cancelled = false;
+    const cancel = () => {
+      cancelled = true;
+      inner?.cancel();
+    };
+    const result = this.ensureBinary().then((bin) => {
+      if (cancelled) return { status: "stopped" as const, done: 0, total: 0 };
+      inner = downloadModel(bin, id, { ...options, env: this.childEnv });
+      return inner.result;
+    });
+    return { result, cancel };
   }
 
   /** Delete a model, here or on the Remote machine as `download`; resolves to the bytes freed. */
-  delete(id: string): Promise<number> {
+  async delete(id: string): Promise<number> {
     const remote = this.remote();
     if (remote) {
-      if (!remote.delete) return Promise.reject(new LocalModelsError(remoteOnly("delete", id)));
+      if (!remote.delete) throw new LocalModelsError(remoteOnly("delete", id));
       return remote.delete(id);
     }
-    return deleteModel(this.binary(), id, this.childEnv);
+    return deleteModel(await this.ensureBinary(), id, this.childEnv);
   }
 
   /** Transcribe an audio file (WAV or MP3) with the downloaded model `id`. */
@@ -531,8 +613,7 @@ export class LocalModels {
     const remote = this.remote();
     const lang = language && language !== "auto" ? language : undefined;
     if (remote) return remote.transcribe(id, readFileSync(file), ext as "wav" | "mp3", signal, lang);
-    this.binary();
-    await this.applyDevice();
+    await this.ensureBinary();
     return this.worker.transcribe(id, file, lang, signal);
   }
 
@@ -554,8 +635,7 @@ export class LocalModels {
     try {
       const file = join(dir, `audio.${format}`);
       writeFileSync(file, audio, { mode: 0o600 });
-      this.binary();
-      await this.applyDevice();
+      await this.ensureBinary();
       return await this.worker.transcribe(id, file, lang, signal);
     } finally {
       rmSync(dir, { recursive: true, force: true });

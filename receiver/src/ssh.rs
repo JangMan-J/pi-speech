@@ -744,6 +744,20 @@ pub fn forwards(port: u16, spare: Option<u16>) -> Vec<String> {
         .collect()
 }
 
+/// Complete `ssh` argument vector for a bridged session: forwards, optional master options, and
+/// the user's original arguments.
+pub fn session_args(
+    port: u16,
+    spare: Option<u16>,
+    master_opts: &[String],
+    user_args: &[String],
+) -> Vec<String> {
+    let mut out = forwards(port, spare);
+    out.extend(master_opts.iter().cloned());
+    out.extend(user_args.iter().cloned());
+    out
+}
+
 /// Pair if needed, then run `ssh` with the shared receiver behind its forwards, holding a
 /// lease on it for as long as `ssh` runs.
 fn session(a: &SshArgs, args: &[String]) -> Result<ExitStatus, String> {
@@ -788,13 +802,19 @@ fn session(a: &SshArgs, args: &[String]) -> Result<ExitStatus, String> {
     if lease.spare.is_none() {
         say("every spare port is taken by another session: this one forwards 47613 only");
     }
+    let master_opts: Vec<String> = {
+        #[cfg(unix)]
+        {
+            master.as_ref().map(|m| m.options()).unwrap_or_default()
+        }
+        #[cfg(not(unix))]
+        {
+            Vec::new()
+        }
+    };
     let mut cmd = Command::new("ssh");
-    cmd.args(forwards(lease.port, lease.spare));
-    #[cfg(unix)]
-    if let Some(m) = &master {
-        cmd.args(m.options());
-    }
-    let result = cmd.args(args).spawn();
+    cmd.args(session_args(lease.port, lease.spare, &master_opts, args));
+    let result = cmd.spawn();
     let status = match result {
         Ok(mut child) => {
             let done = Arc::new(AtomicBool::new(false));
@@ -1164,5 +1184,30 @@ mod tests {
         assert_eq!(fingerprint("x"), fingerprint("x"));
         assert_ne!(fingerprint("x"), fingerprint("y"));
         assert_eq!(fingerprint("x").len(), 16);
+    }
+
+    #[test]
+    fn session_args_combines_forwards_master_options_and_user_args() {
+        let got = session_args(
+            50000,
+            Some(47614),
+            &v(&["-o", "ControlMaster=yes"]),
+            &v(&["-p", "2222", "box", "pi"]),
+        );
+        assert_eq!(
+            got,
+            v(&[
+                "-R",
+                "127.0.0.1:47613:127.0.0.1:50000",
+                "-R",
+                "127.0.0.1:47614:127.0.0.1:50000",
+                "-o",
+                "ControlMaster=yes",
+                "-p",
+                "2222",
+                "box",
+                "pi",
+            ])
+        );
     }
 }

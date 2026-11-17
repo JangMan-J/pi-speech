@@ -229,8 +229,30 @@ const CANARY_TOKEN: &str = "<|startofcontext|>";
 const MOONSHINE_ENCODER: &str = "encoder_model.ort";
 const MOONSHINE_DECODER: &str = "decoder_model_merged.ort";
 
-/// The model in `dir`.
+/// Which ONNX precision order to prefer when a directory holds multiple exports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Precision {
+    Cpu,
+    Gpu,
+}
+
+impl Precision {
+    pub fn from_provider(provider: &str) -> Self {
+        if provider.eq_ignore_ascii_case("cpu") {
+            Precision::Cpu
+        } else {
+            Precision::Gpu
+        }
+    }
+}
+
+/// The model in `dir` (preferring CPU precision order).
 pub fn detect(dir: &Path) -> Result<Model, String> {
+    detect_with(dir, Precision::Cpu)
+}
+
+/// The model in `dir`, choosing ONNX file precision according to `precision`.
+pub fn detect_with(dir: &Path, precision: Precision) -> Result<Model, String> {
     let shown = dir.display();
     let meta = fs::metadata(dir).map_err(|e| match e.kind() {
         io::ErrorKind::NotFound => format!("no model directory at {shown}"),
@@ -258,7 +280,7 @@ pub fn detect(dir: &Path) -> Result<Model, String> {
         }
     }
     let read_tokens = |name: &str| fs::read_to_string(dir.join(name)).ok();
-    let found = from_names(&names, read_tokens)
+    let found = from_names_with(&names, precision, read_tokens)
         .map_err(|why| format!("unrecognised model directory {shown}: {why}"))?;
     Ok(found.map(|n| dir.join(n.trim_end_matches('/'))))
 }
@@ -272,15 +294,15 @@ struct Part {
 
 /// The `.onnx` file for `role` (`encoder`, `model`...). Its stem is the role, or ends in `-role`
 /// or `_role`, then perhaps `.int8` or `.fp16`. Of several precisions, the CPU's best first
-/// (int8, then full, then fp16), or a GPU's ([`gpu_precision`]: fp16, full, int8).
-fn part(names: &[String], role: &str) -> Result<Option<Part>, String> {
+/// (int8, then full, then fp16), or a GPU's (fp16, full, int8).
+fn part(names: &[String], role: &str, precision: Precision) -> Result<Option<Part>, String> {
     // By precision: 0 int8, 1 full, 2 fp16.
     let mut by: [Vec<Part>; 3] = Default::default();
     for name in names {
         let Some(stem) = name.strip_suffix(".onnx") else {
             continue;
         };
-        let (stem, precision) = if let Some(s) = stem.strip_suffix(".int8") {
+        let (stem, prec) = if let Some(s) = stem.strip_suffix(".int8") {
             (s, 0)
         } else if let Some(s) = stem.strip_suffix(".fp16") {
             (s, 2)
@@ -293,15 +315,14 @@ fn part(names: &[String], role: &str) -> Result<Option<Part>, String> {
         if !(prefix.is_empty() || prefix.ends_with('-') || prefix.ends_with('_')) {
             continue;
         }
-        by[precision].push(Part {
+        by[prec].push(Part {
             name: name.clone(),
             prefix: prefix.to_string(),
         });
     }
-    let order = if gpu_precision() {
-        [2, 1, 0]
-    } else {
-        [0, 1, 2]
+    let order = match precision {
+        Precision::Gpu => [2, 1, 0],
+        Precision::Cpu => [0, 1, 2],
     };
     let Some(mut pick) = order
         .into_iter()
@@ -323,21 +344,24 @@ fn part(names: &[String], role: &str) -> Result<Option<Part>, String> {
     }
 }
 
-/// Whether models run on a GPU ([`crate::engines::recognize::PROVIDER_ENV`] names one), where
-/// fp16 and full-precision files run better than int8 ones.
-fn gpu_precision() -> bool {
-    std::env::var(crate::engines::recognize::PROVIDER_ENV)
-        .is_ok_and(|p| !p.trim().is_empty() && !p.trim().eq_ignore_ascii_case("cpu"))
-}
-
 fn has(names: &[String], name: &str) -> bool {
     names.iter().any(|n| n == name)
 }
 
-/// Tell the model from the names of the files in its directory (directories end in `/`).
-/// `read_tokens` reads a file of tokens, or the README, by name (`None` when it cannot be read).
+/// Tell the model from the names of the files in its directory (directories end in `/`),
+/// preferring CPU precision order.
 pub fn from_names(
     names: &[String],
+    read_tokens: impl Fn(&str) -> Option<String>,
+) -> Result<Found, String> {
+    from_names_with(names, Precision::Cpu, read_tokens)
+}
+
+/// Tell the model from the names of the files in its directory (directories end in `/`).
+/// `read_tokens` reads a file of tokens, or the README, by name (`None` when it cannot be read).
+pub fn from_names_with(
+    names: &[String],
+    precision: Precision,
     read_tokens: impl Fn(&str) -> Option<String>,
 ) -> Result<Found, String> {
     let need_tokens = |what: &str| -> Result<String, String> {
@@ -359,10 +383,10 @@ pub fn from_names(
             tokens: need_tokens("Moonshine's encoder and decoder")?,
         });
     }
-    let encoder = part(names, "encoder")?;
-    let decoder = part(names, "decoder")?;
-    let joiner = part(names, "joiner")?;
-    if let Some(front) = part(names, "conv_frontend")? {
+    let encoder = part(names, "encoder", precision)?;
+    let decoder = part(names, "decoder", precision)?;
+    let joiner = part(names, "joiner", precision)?;
+    if let Some(front) = part(names, "conv_frontend", precision)? {
         let (Some(e), Some(d)) = (encoder, decoder) else {
             return Err(format!(
                 "it has Qwen3-ASR's {} but not its encoder and decoder",
@@ -447,7 +471,7 @@ pub fn from_names(
             })
         }
         (None, None, None) => {
-            let model = part(names, "model")?.filter(|p| p.prefix.is_empty());
+            let model = part(names, "model", precision)?.filter(|p| p.prefix.is_empty());
             let Some(model) = model else {
                 return Err(format!("it has no model files; expected {SUPPORTED}"));
             };
@@ -589,6 +613,15 @@ mod tests {
         assert!(
             matches!(got, Ok(Found::Canary { ref encoder, .. }) if encoder == "encoder.fp16.onnx"),
             "{got:?}"
+        );
+        let gpu = from_names_with(
+            &names("encoder.fp16.onnx decoder.fp16.onnx encoder.int8.onnx decoder.int8.onnx tokens.txt"),
+            Precision::Gpu,
+            |_| Some("<|startofcontext|> 7\n".into()),
+        );
+        assert!(
+            matches!(gpu, Ok(Found::Canary { ref encoder, .. }) if encoder == "encoder.fp16.onnx"),
+            "{gpu:?}"
         );
     }
 

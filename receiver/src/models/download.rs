@@ -29,9 +29,9 @@ use super::cache;
 use super::catalog::{plain_relative, Entry, Lexicon};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// What a download reports as it goes.
@@ -74,7 +74,19 @@ impl From<String> for Failure {
 
 /// How often progress is reported, at most (the last byte is always reported).
 const PROGRESS_EVERY: Duration = Duration::from_millis(200);
-const CHUNK: usize = 64 * 1024;
+const CHUNK: usize = 512 * 1024;
+/// Files at or above this threshold download in parallel HTTP `Range` segments when supported.
+const PARALLEL_MIN: u64 = 8 * 1024 * 1024;
+const SEGMENTS: usize = 8;
+
+fn http_agent(allow_http: bool) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(30))
+        .timeout_read(Duration::from_secs(60))
+        .https_only(!allow_http)
+        .user_agent(&format!("pi-speech-receiver/{}", crate::VERSION))
+        .build()
+}
 
 /// Download `entry` into the cache at `root`. Plain `http://` only when `allow_http`.
 pub fn download(
@@ -138,8 +150,9 @@ pub fn download(
         emit(Event::Done { path: path.clone() });
         return Ok(path);
     }
+    let agent = http_agent(allow_http);
     let source = Source::archive(entry);
-    fetch(&source, &part, allow_http, stop, &mut |done, total| {
+    fetch(&agent, &source, &part, stop, &mut |done, total| {
         emit(Event::Progress { done, total })
     })?;
 
@@ -175,6 +188,7 @@ fn fetch_files(
         // An archive's part, from a catalogue of another time.
         let _ = fs::remove_file(part);
     }
+    let agent = http_agent(allow_http);
     let mut before = 0;
     for f in &entry.files {
         if !plain_relative(&f.name) {
@@ -200,7 +214,7 @@ fn fetch_files(
             size: f.size,
             sha256: &f.sha256,
         };
-        fetch(&source, &dest, allow_http, stop, &mut |done, _| {
+        fetch(&agent, &source, &dest, stop, &mut |done, _| {
             emit(Event::Progress {
                 done: before + done,
                 total: entry.size,
@@ -274,6 +288,7 @@ pub fn lexicon(
         }
         return Ok(target);
     }
+    let agent = http_agent(allow_http);
     let source = Source {
         what: format!("the lexicon {}", lexicon.name),
         file: format!("the lexicon {}", lexicon.name),
@@ -281,9 +296,7 @@ pub fn lexicon(
         size: lexicon.size,
         sha256: &lexicon.sha256,
     };
-    fetch(&source, &part, allow_http, stop, &mut |done, _| {
-        progress(done)
-    })?;
+    fetch(&agent, &source, &part, stop, &mut |done, _| progress(done))?;
     match fs::rename(&part, &target) {
         Ok(()) => Ok(target),
         // Another download got there first.
@@ -312,7 +325,9 @@ impl Drop for Lock {
         // names it (`names`), and opens the path again.
         #[cfg(unix)]
         let _ = fs::remove_file(&self.path);
-        drop(self.file.take());
+        if let Some(f) = self.file.take() {
+            let _ = f.unlock();
+        }
         // Nobody can remove a file someone has open here (see `open_lock`), so it is removed
         // once closed, and only if no other download has it open, waiting for it.
         #[cfg(not(unix))]
@@ -403,7 +418,7 @@ fn lock(
                 }
             }
         }
-        let done = fs::metadata(part).map_or(0, |m| m.len().min(total));
+        let done = part_progress(part, total);
         if stop.load(Ordering::SeqCst) {
             return Err(Failure::Stopped { done });
         }
@@ -486,21 +501,139 @@ fn open_part(part: &Path, size: u64, stop: &AtomicBool) -> Result<(File, u64, Sh
     Ok((file, len, hasher))
 }
 
-/// The response to a request for the archive from byte `from`: its body, and the byte it
-/// starts at (`from`, or 0 when the server sends the whole file).
-fn request(
+fn ranges_path(part: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.ranges", part.display()))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Segment {
+    start: u64,
+    cur: u64,
+    end: u64,
+}
+
+fn load_ranges(path: &Path, total: u64, sha256: &str) -> Option<Vec<Segment>> {
+    let text = fs::read_to_string(path).ok()?;
+    let mut lines = text.lines();
+    let head = lines.next()?;
+    let mut parts = head.split_whitespace();
+    let file_total: u64 = parts.next()?.parse().ok()?;
+    let file_sha = parts.next()?;
+    if file_total != total || file_sha != sha256 {
+        return None;
+    }
+    let mut segs = Vec::new();
+    for line in lines {
+        let mut cols = line.split_whitespace();
+        let start: u64 = cols.next()?.parse().ok()?;
+        let cur: u64 = cols.next()?.parse().ok()?;
+        let end: u64 = cols.next()?.parse().ok()?;
+        if start > cur || cur > end || end > total {
+            return None;
+        }
+        segs.push(Segment { start, cur, end });
+    }
+    if segs.is_empty() {
+        return None;
+    }
+    Some(segs)
+}
+
+fn save_ranges(path: &Path, total: u64, sha256: &str, segs: &[Segment]) {
+    let mut out = format!("{total} {sha256}\n");
+    for s in segs {
+        out.push_str(&format!("{} {} {}\n", s.start, s.cur, s.end));
+    }
+    let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+    if fs::write(&tmp, &out).is_ok() {
+        let _ = fs::rename(&tmp, path);
+    }
+}
+
+fn split_segments(from: u64, total: u64) -> Vec<Segment> {
+    let mut segs = Vec::with_capacity(SEGMENTS);
+    if from > 0 {
+        segs.push(Segment {
+            start: 0,
+            cur: from,
+            end: from,
+        });
+    }
+    let rem = total - from;
+    let count = SEGMENTS as u64;
+    let base = rem / count;
+    let extra = rem % count;
+    let mut pos = from;
+    for i in 0..count {
+        let len = base + u64::from(i < extra);
+        if len > 0 {
+            segs.push(Segment {
+                start: pos,
+                cur: pos,
+                end: pos + len,
+            });
+            pos += len;
+        }
+    }
+    segs
+}
+
+fn part_progress(part: &Path, total: u64) -> u64 {
+    let rpath = ranges_path(part);
+    if let Ok(text) = fs::read_to_string(&rpath) {
+        let sum: u64 = text
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                let mut cols = line.split_whitespace();
+                let start: u64 = cols.next()?.parse().ok()?;
+                let cur: u64 = cols.next()?.parse().ok()?;
+                Some(cur.saturating_sub(start))
+            })
+            .sum();
+        return sum.min(total);
+    }
+    fs::metadata(part).map_or(0, |m| m.len().min(total))
+}
+
+fn write_all_at(file: &File, offset: u64, buf: &[u8]) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut off = offset;
+        let mut rest = buf;
+        while !rest.is_empty() {
+            let n = file.seek_write(rest, off)?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                ));
+            }
+            rest = &rest[n..];
+            off += n as u64;
+        }
+        Ok(())
+    }
+}
+
+/// The response to a request for byte range `[from, end)`: its status (`206` vs `200`), body,
+/// and the starting byte (`from` for `206`, `0` for `200`).
+fn request_range(
+    agent: &ureq::Agent,
     entry: &Source,
     from: u64,
-    allow_http: bool,
-) -> Result<(Box<dyn Read + Send>, u64), Failure> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(30))
-        .timeout_read(Duration::from_secs(60))
-        .https_only(!allow_http)
-        .user_agent(concat!("pi-speech-receiver/", env!("CARGO_PKG_VERSION")))
-        .build();
+    end: Option<u64>,
+) -> Result<(u16, Box<dyn Read + Send>, u64), Failure> {
     let mut req = agent.get(entry.url);
-    if from > 0 {
+    if let Some(last) = end.and_then(|e| e.checked_sub(1)) {
+        req = req.set("Range", &format!("bytes={from}-{last}"));
+    } else if from > 0 {
         req = req.set("Range", &format!("bytes={from}-"));
     }
     let resp = match req.call() {
@@ -518,7 +651,8 @@ fn request(
             )))
         }
     };
-    let start = match resp.status() {
+    let status = resp.status();
+    let start = match status {
         206 => content_range_start(resp.header("Content-Range")).ok_or_else(|| {
             format!(
                 "cannot download {}: the server sent part of the file without saying which",
@@ -527,7 +661,7 @@ fn request(
         })?,
         _ => 0,
     };
-    Ok((Box::new(resp.into_reader()), start))
+    Ok((status, Box::new(resp.into_reader()), start))
 }
 
 /// The first byte of a `Content-Range: bytes <first>-<last>/<total>` header.
@@ -536,84 +670,158 @@ fn content_range_start(header: Option<&str>) -> Option<u64> {
     range.split('-').next()?.trim().parse().ok()
 }
 
+/// Fetch `url` into `part` with file locking, HTTP Range resume, parallel segments, and SHA-256
+/// verification.
+#[allow(clippy::too_many_arguments)]
+pub fn fetch_verified(
+    what: &str,
+    file_label: &str,
+    url: &str,
+    size: u64,
+    sha256: &str,
+    part: &Path,
+    lock_path: &Path,
+    allow_http: bool,
+    stop: &AtomicBool,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<(), Failure> {
+    if !allow_http && !url.starts_with("https://") {
+        return Err(Failure::Failed(format!(
+            "refusing to download {what} over plain HTTP: {url}"
+        )));
+    }
+    let (_lock, _) = lock(lock_path, part, size, stop, &mut |done| {
+        progress(done, size)
+    })?;
+    let agent = http_agent(allow_http);
+    let source = Source {
+        what: what.to_string(),
+        file: file_label.to_string(),
+        url,
+        size,
+        sha256,
+    };
+    fetch(&agent, &source, part, stop, progress)
+}
+
 fn fetch(
+    agent: &ureq::Agent,
     entry: &Source,
     part: &Path,
-    allow_http: bool,
+    stop: &AtomicBool,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<(), Failure> {
+    if entry.size >= PARALLEL_MIN {
+        return fetch_parallel(agent, entry, part, stop, progress);
+    }
+    fetch_single(agent, entry, part, stop, progress)
+}
+
+fn fetch_single(
+    agent: &ureq::Agent,
+    entry: &Source,
+    part: &Path,
+    stop: &AtomicBool,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<(), Failure> {
+    let total = entry.size;
+    let (file, done, hasher) = open_part(part, total, stop)?;
+    progress(done, total);
+    if done < total {
+        let (_, body, start) = request_range(agent, entry, done, None)?;
+        stream_from(entry, part, file, done, hasher, body, start, stop, progress)
+    } else {
+        drop(file);
+        verify_hash(entry, part, hasher)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_from(
+    entry: &Source,
+    part: &Path,
+    mut file: File,
+    mut done: u64,
+    mut hasher: Sha256,
+    mut body: Box<dyn Read + Send>,
+    start: u64,
     stop: &AtomicBool,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<(), Failure> {
     let total = entry.size;
     let shown = part.display();
-    let (mut file, mut done, mut hasher) = open_part(part, total, stop)?;
-    progress(done, total);
-    if done < total {
-        let (mut body, start) = request(entry, done, allow_http)?;
-        if start != done {
-            // The server sent the file from its start (or from elsewhere): begin again.
-            if start != 0 {
-                return Err(Failure::Failed(format!(
-                    "cannot download {}: the server sent bytes from {start}, not {done}",
-                    entry.what
-                )));
-            }
-            file.set_len(0)
-                .and_then(|()| file.seek(SeekFrom::Start(0)).map(drop))
-                .map_err(|e| format!("cannot truncate {shown}: {e}"))?;
-            done = 0;
-            hasher = Sha256::new();
-            progress(done, total);
-        }
-        let mut buf = vec![0u8; CHUNK];
-        let mut last = Instant::now();
-        loop {
-            if stop.load(Ordering::SeqCst) {
-                let _ = file.flush();
-                return Err(Failure::Stopped { done });
-            }
-            let n = match body.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => {
-                    let _ = file.flush();
-                    return Err(Failure::Failed(format!(
-                        "the download of {} broke off at {done} of {total} bytes ({e}); \
-                         run it again to resume",
-                        entry.what
-                    )));
-                }
-            };
-            if done + n as u64 > total {
-                drop(file);
-                let _ = fs::remove_file(part);
-                return Err(Failure::Failed(format!(
-                    "{} is larger than the catalogue's {total} bytes; the download was deleted",
-                    entry.file
-                )));
-            }
-            file.write_all(&buf[..n])
-                .map_err(|e| format!("cannot write {shown}: {e}"))?;
-            hasher.update(&buf[..n]);
-            done += n as u64;
-            if done == total || last.elapsed() >= PROGRESS_EVERY {
-                progress(done, total);
-                last = Instant::now();
-            }
-        }
-        file.flush()
-            .map_err(|e| format!("cannot write {shown}: {e}"))?;
-        if done < total {
+    if start != done {
+        if start != 0 {
             return Err(Failure::Failed(format!(
-                "the download of {} broke off at {done} of {total} bytes; run it again to resume",
+                "cannot download {}: the server sent bytes from {start}, not {done}",
                 entry.what
             )));
         }
+        file.set_len(0)
+            .and_then(|()| file.seek(SeekFrom::Start(0)).map(drop))
+            .map_err(|e| format!("cannot truncate {shown}: {e}"))?;
+        done = 0;
+        hasher = Sha256::new();
+        progress(done, total);
     }
-    drop(file);
+    let mut writer = BufWriter::with_capacity(64 * 1024, file);
+    let mut buf = vec![0u8; CHUNK];
+    let mut last = Instant::now();
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            let _ = writer.flush();
+            return Err(Failure::Stopped { done });
+        }
+        let n = match body.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                let _ = writer.flush();
+                return Err(Failure::Failed(format!(
+                    "the download of {} broke off at {done} of {total} bytes ({e}); \
+                     run it again to resume",
+                    entry.what
+                )));
+            }
+        };
+        if done + n as u64 > total {
+            drop(writer);
+            let _ = fs::remove_file(part);
+            return Err(Failure::Failed(format!(
+                "{} is larger than the catalogue's {total} bytes; the download was deleted",
+                entry.file
+            )));
+        }
+        writer
+            .write_all(&buf[..n])
+            .map_err(|e| format!("cannot write {shown}: {e}"))?;
+        hasher.update(&buf[..n]);
+        done += n as u64;
+        if done == total || last.elapsed() >= PROGRESS_EVERY {
+            let _ = writer.flush();
+            progress(done, total);
+            last = Instant::now();
+        }
+    }
+    writer
+        .flush()
+        .map_err(|e| format!("cannot write {shown}: {e}"))?;
+    drop(writer);
+    if done < total {
+        return Err(Failure::Failed(format!(
+            "the download of {} broke off at {done} of {total} bytes; run it again to resume",
+            entry.what
+        )));
+    }
+    verify_hash(entry, part, hasher)
+}
+
+fn verify_hash(entry: &Source, part: &Path, hasher: Sha256) -> Result<(), Failure> {
     let got = hex(&hasher.finalize());
     if got != entry.sha256 {
         let _ = fs::remove_file(part);
+        let _ = fs::remove_file(ranges_path(part));
         return Err(Failure::Failed(format!(
             "{} does not match the catalogue's checksum (SHA-256 {got}, expected {}); \
              the download was deleted",
@@ -621,6 +829,250 @@ fn fetch(
         )));
     }
     Ok(())
+}
+
+fn hash_file(part: &Path, total: u64, stop: &AtomicBool) -> Result<Sha256, Failure> {
+    let shown = part.display();
+    let f = File::open(part).map_err(|e| format!("cannot read {shown}: {e}"))?;
+    let mut reader = BufReader::with_capacity(1024 * 1024, f);
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut hasher = Sha256::new();
+    let mut read = 0u64;
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return Err(Failure::Stopped { done: total });
+        }
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| format!("cannot read {shown}: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        read += n as u64;
+    }
+    if read != total {
+        return Err(Failure::Failed(format!(
+            "cannot verify {shown}: expected {total} bytes, got {read}"
+        )));
+    }
+    Ok(hasher)
+}
+
+fn sum_segs(segs: &[Segment]) -> u64 {
+    segs.iter().map(|s| s.cur - s.start).sum()
+}
+
+fn fetch_parallel(
+    agent: &ureq::Agent,
+    entry: &Source,
+    part: &Path,
+    stop: &AtomicBool,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<(), Failure> {
+    let total = entry.size;
+    let shown = part.display();
+    let rpath = ranges_path(part);
+
+    let mut segs = match load_ranges(&rpath, total, entry.sha256) {
+        Some(s) if part.is_file() => s,
+        _ => {
+            let existing = fs::metadata(part).map_or(0, |m| m.len());
+            if existing > 0 && existing < total {
+                split_segments(existing, total)
+            } else {
+                split_segments(0, total)
+            }
+        }
+    };
+    progress(sum_segs(&segs), total);
+
+    let pending: Vec<usize> = segs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| (s.cur < s.end).then_some(i))
+        .collect();
+
+    if !pending.is_empty() {
+        let first_idx = pending[0];
+        let first_seg = segs[first_idx];
+        let (status, first_body, start) =
+            request_range(agent, entry, first_seg.cur, Some(first_seg.end))?;
+        if status != 206 {
+            // Server does not honour Range: stream the entire body sequentially.
+            let _ = fs::remove_file(&rpath);
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(part)
+                .map_err(|e| format!("cannot open {shown}: {e}"))?;
+            return stream_from(
+                entry,
+                part,
+                file,
+                0,
+                Sha256::new(),
+                first_body,
+                start,
+                stop,
+                progress,
+            );
+        }
+        if start != first_seg.cur {
+            return Err(Failure::Failed(format!(
+                "cannot download {}: the server sent bytes from {start}, not {}",
+                entry.what, first_seg.cur
+            )));
+        }
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(part)
+            .map_err(|e| format!("cannot open {shown}: {e}"))?;
+        file.set_len(total)
+            .map_err(|e| format!("cannot size {shown}: {e}"))?;
+        save_ranges(&rpath, total, entry.sha256, &segs);
+
+        let seg_curs: Vec<AtomicU64> = segs.iter().map(|s| AtomicU64::new(s.cur)).collect();
+        let snapshot_segs = || -> Vec<Segment> {
+            segs.iter()
+                .enumerate()
+                .map(|(i, s)| Segment {
+                    start: s.start,
+                    cur: seg_curs[i].load(Ordering::Relaxed),
+                    end: s.end,
+                })
+                .collect()
+        };
+        let total_done = || -> u64 {
+            segs.iter()
+                .enumerate()
+                .map(|(i, s)| seg_curs[i].load(Ordering::Relaxed) - s.start)
+                .sum()
+        };
+
+        let abort = AtomicBool::new(false);
+        let active = AtomicUsize::new(pending.len());
+        let first_err: std::sync::Mutex<Option<Failure>> = std::sync::Mutex::new(None);
+        let record_err = |err: Failure| {
+            abort.store(true, Ordering::SeqCst);
+            let mut slot = first_err.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(err);
+            }
+        };
+
+        let stream_seg = |idx: usize, mut body: Box<dyn Read + Send>| {
+            let mut cur = segs[idx].cur;
+            let end = segs[idx].end;
+            let mut buf = vec![0u8; CHUNK];
+            while cur < end {
+                if stop.load(Ordering::SeqCst) || abort.load(Ordering::Relaxed) {
+                    return Err(Failure::Stopped { done: cur });
+                }
+                let want = ((end - cur) as usize).min(buf.len());
+                let n = match body.read(&mut buf[..want]) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => {
+                        return Err(Failure::Failed(format!(
+                            "the download of {} broke off at {cur} of {total} bytes ({e}); \
+                             run it again to resume",
+                            entry.what
+                        )));
+                    }
+                };
+                if let Err(e) = write_all_at(&file, cur, &buf[..n]) {
+                    return Err(Failure::Failed(format!("cannot write {shown}: {e}")));
+                }
+                cur += n as u64;
+                seg_curs[idx].store(cur, Ordering::Relaxed);
+            }
+            if cur < end {
+                return Err(Failure::Failed(format!(
+                    "the download of {} broke off at {cur} of {total} bytes; run it again to resume",
+                    entry.what
+                )));
+            }
+            Ok(())
+        };
+
+        let stream_seg_ref = &stream_seg;
+        let record_err_ref = &record_err;
+        let active_ref = &active;
+
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                if let Err(err) = stream_seg_ref(first_idx, first_body) {
+                    record_err_ref(err);
+                }
+                active_ref.fetch_sub(1, Ordering::Release);
+            });
+            for &idx in &pending[1..] {
+                let seg = segs[idx];
+                s.spawn(move || {
+                    let res = request_range(agent, entry, seg.cur, Some(seg.end)).and_then(
+                        |(st, body, got_start)| {
+                            if st != 206 || got_start != seg.cur {
+                                return Err(Failure::Failed(format!(
+                                    "cannot download {}: expected 206 at byte {}, got {st} at {got_start}",
+                                    entry.what, seg.cur
+                                )));
+                            }
+                            stream_seg_ref(idx, body)
+                        },
+                    );
+                    if let Err(err) = res {
+                        record_err_ref(err);
+                    }
+                    active_ref.fetch_sub(1, Ordering::Release);
+                });
+            }
+
+            let mut last_emit = Instant::now();
+            let mut last_save = Instant::now();
+            while active.load(Ordering::Acquire) > 0 {
+                if last_emit.elapsed() >= PROGRESS_EVERY {
+                    progress(total_done(), total);
+                    last_emit = Instant::now();
+                }
+                if last_save.elapsed() >= Duration::from_secs(1) {
+                    save_ranges(&rpath, total, entry.sha256, &snapshot_segs());
+                    last_save = Instant::now();
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        });
+
+        segs = snapshot_segs();
+        if let Some(err) = first_err.into_inner().unwrap() {
+            save_ranges(&rpath, total, entry.sha256, &segs);
+            return Err(match err {
+                Failure::Stopped { .. } => Failure::Stopped {
+                    done: sum_segs(&segs),
+                },
+                e => e,
+            });
+        }
+        if stop.load(Ordering::SeqCst) {
+            save_ranges(&rpath, total, entry.sha256, &segs);
+            return Err(Failure::Stopped {
+                done: sum_segs(&segs),
+            });
+        }
+        progress(total, total);
+        drop(file);
+    }
+
+    let _ = fs::remove_file(&rpath);
+    let hasher = hash_file(part, total, stop)?;
+    verify_hash(entry, part, hasher)
 }
 
 /// Unpack the checked archive at `part` and rename the model into place.
@@ -656,7 +1108,7 @@ fn unpack_into(entry: &Entry, part: &Path, tmp: &Path, stop: &AtomicBool) -> Res
     };
     fs::create_dir(tmp).map_err(failed)?;
     let file = File::open(part).map_err(failed)?;
-    let bz = bzip2::read::MultiBzDecoder::new(BufReader::new(file));
+    let bz = bzip2::read::MultiBzDecoder::new(BufReader::with_capacity(CHUNK, file));
     let mut archive = tar::Archive::new(bz);
     for item in archive.entries().map_err(failed)? {
         if stop.load(Ordering::SeqCst) {
@@ -932,6 +1384,8 @@ mod tests {
             sha256,
             dir: "m-dir".into(),
             files: Vec::new(),
+            shared: Vec::new(),
+            meta: Default::default(),
         }
     }
 
@@ -1185,5 +1639,135 @@ mod tests {
         fs::write(tmp.join("loose.txt"), "x").unwrap();
         assert_eq!(model_root(&tmp, "m"), tmp);
         fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// Serve `body` with HTTP `Range` (`206 Partial Content`) support and record request count.
+    fn serve_ranged(body: Vec<u8>) -> (String, std::sync::Arc<AtomicUsize>) {
+        use std::io::{BufRead, BufReader};
+        use std::sync::Arc;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = Arc::new(body);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_bg = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let body = Arc::clone(&body);
+                let hits = Arc::clone(&hits_bg);
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut range_hdr: Option<String> = None;
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+                        if let Some(rest) = line
+                            .strip_prefix("Range:")
+                            .or_else(|| line.strip_prefix("range:"))
+                        {
+                            range_hdr = Some(rest.trim().to_string());
+                        }
+                        line.clear();
+                    }
+                    hits.fetch_add(1, Ordering::Relaxed);
+                    let mut stream = stream;
+                    if let Some(r) =
+                        range_hdr.and_then(|s| s.strip_prefix("bytes=").map(str::to_string))
+                    {
+                        let (a, b) = r.split_once('-').unwrap_or(("0", ""));
+                        let start: usize = a.parse().unwrap_or(0);
+                        let end: usize = b.parse().unwrap_or(body.len() - 1).min(body.len() - 1);
+                        let slice = &body[start..=end];
+                        let head = format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len(),
+                            slice.len()
+                        );
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.write_all(slice);
+                    } else {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.write_all(&body);
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}/blob.bin"), hits)
+    }
+
+    #[test]
+    fn parallel_range_fetch_splits_large_file_across_segments_and_verifies_sha256() {
+        let data = noise(9 * 1024 * 1024 + 123, 42);
+        let total = data.len() as u64;
+        let sha = hex(&Sha256::digest(&data));
+        let (url, hits) = serve_ranged(data.clone());
+        let root = scratch("parallel-range");
+        fs::create_dir_all(&root).unwrap();
+        let part = root.join("blob.part");
+        let agent = http_agent(true);
+        let src = Source {
+            what: "m".into(),
+            file: "blob".into(),
+            url: &url,
+            size: total,
+            sha256: &sha,
+        };
+        let stop = AtomicBool::new(false);
+        let mut last = 0;
+        fetch(&agent, &src, &part, &stop, &mut |done, tot| {
+            assert_eq!(tot, total);
+            last = done;
+        })
+        .unwrap();
+        assert_eq!(last, total);
+        assert_eq!(hits.load(Ordering::Relaxed), SEGMENTS);
+        assert_eq!(fs::read(&part).unwrap(), data);
+        assert!(!ranges_path(&part).exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn parallel_range_fetch_falls_back_to_single_stream_when_server_returns_200() {
+        let data = noise(8 * 1024 * 1024 + 7, 99);
+        let total = data.len() as u64;
+        let sha = hex(&Sha256::digest(&data));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let data_bg = data.clone();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+            if let Some(mut stream) = listener.incoming().flatten().next() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+                    line.clear();
+                }
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    data_bg.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&data_bg);
+            }
+        });
+        let url = format!("http://{addr}/blob.bin");
+        let root = scratch("parallel-200");
+        fs::create_dir_all(&root).unwrap();
+        let part = root.join("blob.part");
+        let agent = http_agent(true);
+        let src = Source {
+            what: "m".into(),
+            file: "blob".into(),
+            url: &url,
+            size: total,
+            sha256: &sha,
+        };
+        let stop = AtomicBool::new(false);
+        fetch(&agent, &src, &part, &stop, &mut |_, _| {}).unwrap();
+        assert_eq!(fs::read(&part).unwrap(), data);
+        assert!(!ranges_path(&part).exists());
+        fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -136,9 +136,9 @@ pub fn lexicon_lock_path(root: &Path, lexicon: &Lexicon) -> PathBuf {
     root.join(format!("{}.lock", lexicon.name))
 }
 
-/// Whether `entry` can be used: it is downloaded, and so is the lexicon it needs, if any.
-pub fn is_ready(root: &Path, entry: &Entry, lexicon: Option<&Lexicon>) -> bool {
-    is_downloaded(root, entry) && lexicon.is_none_or(|l| lexicon_path(root, l).is_file())
+/// Whether `entry` can be used: it is downloaded, and so are all shared files (lexicon, vocoder) it needs.
+pub fn is_all_ready(root: &Path, entry: &Entry, shared: &[&Lexicon]) -> bool {
+    is_downloaded(root, entry) && shared.iter().all(|l| lexicon_path(root, l).is_file())
 }
 
 /// The bytes of `entry`'s interrupted download, if any.
@@ -197,7 +197,9 @@ pub fn remove(path: &Path) -> io::Result<()> {
 /// lexicon stays, even after the last voice that needs it: other voices (and voices put in the
 /// cache by hand) may use it, and the next download of such a voice finds it there.
 pub fn delete(root: &Path, entry: &Entry) -> Result<u64, String> {
-    let mut paths = vec![model_path(root, entry), part_path(root, entry)];
+    let part = part_path(root, entry);
+    let ranges = PathBuf::from(format!("{}.ranges", part.display()));
+    let mut paths = vec![model_path(root, entry), part, ranges];
     paths.extend(unpack_leftovers(root, entry));
     let mut freed = 0;
     for p in paths {
@@ -241,6 +243,8 @@ mod tests {
             sha256: "00".into(),
             dir: "v".into(),
             files: Vec::new(),
+            shared: Vec::new(),
+            meta: Default::default(),
         };
         let lexicon = Lexicon {
             name: "lexicon-en-us.txt".into(),
@@ -248,20 +252,20 @@ mod tests {
             size: 1,
             sha256: "00".into(),
         };
-        assert!(!is_ready(&root, &entry, None));
+        assert!(!is_all_ready(&root, &entry, &[]));
         fs::create_dir_all(root.join("v")).unwrap();
-        assert!(is_ready(&root, &entry, None));
-        assert!(!is_ready(&root, &entry, Some(&lexicon)));
+        assert!(is_all_ready(&root, &entry, &[]));
+        assert!(!is_all_ready(&root, &entry, &[&lexicon]));
         fs::write(lexicon_part_path(&root, &lexicon), "x").unwrap();
-        assert!(!is_ready(&root, &entry, Some(&lexicon)));
+        assert!(!is_all_ready(&root, &entry, &[&lexicon]));
         fs::write(lexicon_path(&root, &lexicon), "x").unwrap();
-        assert!(is_ready(&root, &entry, Some(&lexicon)));
+        assert!(is_all_ready(&root, &entry, &[&lexicon]));
         fs::write(model_lock_path(&root, &entry), "").unwrap();
         // Deleting the voice leaves the shared lexicon, and the lock file (of a download).
         delete(&root, &entry).unwrap();
         assert!(lexicon_path(&root, &lexicon).is_file());
         assert!(model_lock_path(&root, &entry).is_file());
-        assert!(!is_ready(&root, &entry, None));
+        assert!(!is_all_ready(&root, &entry, &[]));
         fs::remove_dir_all(&root).unwrap();
     }
 

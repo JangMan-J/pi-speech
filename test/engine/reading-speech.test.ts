@@ -2,7 +2,7 @@ import { readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { READING_MIN_CHARS } from "../../src/engine/pieces";
+import { READING_MIN_CHARS, ReadingFailed } from "../../src/engine/reading";
 import { Surface } from "../../src/engine/surface";
 import { fakeOpenRouter, makeEngine as makeFixtureEngine, scriptedUi } from "./fixtures";
 
@@ -230,5 +230,16 @@ describe("playback-only speech of a long text", () => {
       /^Speech stopped: HTTP 503: upstream down\. The text was not saved; try \/speech --replay/,
     );
     expect(ui.notes).toEqual([]);
+  });
+
+  it("short-text Speech.say() throws ReadingFailed consistently with long-text Readings", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("upstream down", { status: 503 })),
+    );
+    const { engine } = makeEngine();
+    const err = await engine.speech.say("Short text.").catch((e) => e);
+    expect(err).toBeInstanceOf(ReadingFailed);
+    expect(err.reason).toMatch(/HTTP 503: upstream down/);
   });
 });

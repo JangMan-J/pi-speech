@@ -7,8 +7,9 @@
 //! ends (the SSH connection, or the Pi session, is gone) or a signal comes. The shared
 //! receiver stops once no lease is held, so it lives as long as the last Pi talking to it.
 
+use crate::proc::watch_stdin_eof;
 use crate::{shared, signals, token};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::mpsc;
@@ -44,7 +45,8 @@ fn lease() -> Result<(), String> {
         "event": "ready",
         "port": lease.port,
         "token": token,
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": crate::VERSION,
+        "edition": crate::EDITION,
     });
     let mut out = io::stdout();
     writeln!(out, "{ready}")
@@ -57,10 +59,7 @@ fn lease() -> Result<(), String> {
         let _ = on_signal.send(());
     })
     .map_err(|e| format!("cannot handle signals: {e}"))?;
-    std::thread::spawn(move || {
-        let mut sink = [0u8; 256];
-        let mut stdin = io::stdin();
-        while matches!(stdin.read(&mut sink), Ok(n) if n > 0) {}
+    let _ = watch_stdin_eof(move || {
         let _ = tx.send(());
     });
     let _ = rx.recv();

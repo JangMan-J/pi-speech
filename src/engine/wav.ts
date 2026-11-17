@@ -1,9 +1,61 @@
+/**
+ * Single RIFF/WAVE parser, joiner, and rate-aware slicer used by streaming audio, history, and live dictation.
+ */
+
 /** The chunks of a WAV file that matter here: the format and the audio data. */
 interface WavChunks {
   /** Body of the `fmt ` chunk. */
   fmt: Buffer;
   /** The audio data. */
   data: Buffer;
+}
+
+export type WavHeader =
+  /** The header is not complete yet. */
+  | { state: "more" }
+  /** 16-bit PCM: the samples start at `dataOffset`. */
+  | { state: "pcm"; rate: number; channels: number; byteRate: number; dataOffset: number; dataLength: number }
+  /** Another encoding or non-WAV bytes. */
+  | { state: "other" };
+
+/**
+ * Inspect as much of a WAV header as has arrived; sizes may be left open (`0` or `0xFFFFFFFF`).
+ * Returns `"more"` when the header is incomplete, `"pcm"` for 16-bit PCM, or `"other"` for another encoding.
+ */
+export function parseWavHeader(bytes: Uint8Array): WavHeader {
+  const b = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (b.length < 12) return { state: "more" };
+  if (b.toString("latin1", 0, 4) !== "RIFF" || b.toString("latin1", 8, 12) !== "WAVE") {
+    return { state: "other" };
+  }
+  let fmt: { tag: number; channels: number; rate: number; byteRate: number; bits: number } | undefined;
+  let pos = 12;
+  while (pos + 8 <= b.length) {
+    const id = b.toString("latin1", pos, pos + 4);
+    const declared = b.readUInt32LE(pos + 4);
+    const body = pos + 8;
+    if (id === "data") {
+      if (!fmt) return { state: "other" };
+      const pcm = (fmt.tag === 1 || fmt.tag === 0xfffe) && fmt.bits === 16;
+      if (!pcm) return { state: "other" };
+      const available = b.length - body;
+      const dataLength = declared === 0 || declared > available ? available : declared;
+      const byteRate = fmt.byteRate || fmt.rate * fmt.channels * 2;
+      return { state: "pcm", rate: fmt.rate, channels: fmt.channels, byteRate, dataOffset: body, dataLength };
+    }
+    if (id === "fmt ") {
+      if (body + 16 > b.length) return { state: "more" };
+      fmt = {
+        tag: b.readUInt16LE(body),
+        channels: b.readUInt16LE(body + 2),
+        rate: b.readUInt32LE(body + 4),
+        byteRate: b.readUInt32LE(body + 8),
+        bits: b.readUInt16LE(body + 14),
+      };
+    }
+    pos = body + declared + (declared % 2);
+  }
+  return { state: "more" };
 }
 
 /** The format and data of a RIFF/WAVE file, or undefined when it is not one. */
@@ -42,6 +94,68 @@ export function wavSeconds(wav: Buffer): number | undefined {
   const w = readWav(wav);
   const byteRate = w ? w.fmt.readUInt32LE(8) : 0;
   return w && byteRate > 0 ? w.data.length / byteRate : undefined;
+}
+
+export interface WavPcmInfo {
+  dataOffset: number;
+  byteRate: number;
+  blockAlign: number;
+}
+
+const DEFAULT_WAV_INFO: WavPcmInfo = { dataOffset: 44, byteRate: 48_000, blockAlign: 2 };
+
+/** Data offset, byte rate, and sample-frame alignment of a 16-bit PCM WAV (falls back to 24 kHz mono). */
+export function wavPcmInfo(wav: Uint8Array): WavPcmInfo {
+  const h = parseWavHeader(wav);
+  if (h.state === "pcm" && h.byteRate > 0 && h.channels > 0) {
+    return { dataOffset: h.dataOffset, byteRate: h.byteRate, blockAlign: Math.max(2, h.channels * 2) };
+  }
+  return DEFAULT_WAV_INFO;
+}
+
+const alignDown = (n: number, align: number) => n - (n % align);
+
+/** Build an in-memory WAV containing only the PCM slice from `startByte` to `endByte` (preserving header chunks). */
+export function sliceWav(wav: Buffer, startByte: number, endByte = wav.length): Buffer {
+  const { dataOffset, blockAlign } = wavPcmInfo(wav);
+  const start = dataOffset + alignDown(Math.max(0, startByte - dataOffset), blockAlign);
+  const end =
+    dataOffset + alignDown(Math.max(start - dataOffset, Math.min(wav.length, endByte) - dataOffset), blockAlign);
+  const pcm = wav.subarray(start, end);
+  const out = Buffer.allocUnsafe(dataOffset + pcm.length);
+  wav.copy(out, 0, 0, dataOffset);
+  pcm.copy(out, dataOffset);
+  if (dataOffset >= 8) {
+    out.writeUInt32LE(dataOffset - 8 + pcm.length, 4);
+    out.writeUInt32LE(pcm.length, dataOffset - 4);
+  }
+  return out;
+}
+
+/** Find the quietest 0.25 s boundary between `minSec` and `maxSec` past `fromByte` using the WAV's actual rate. */
+export function quietSplitByte(wav: Buffer, fromByte: number, minSec = 8, maxSec = 13): number {
+  const { dataOffset, byteRate, blockAlign } = wavPcmInfo(wav);
+  const minBytes = alignDown(Math.round(minSec * byteRate), blockAlign);
+  const maxBytes = alignDown(Math.round(maxSec * byteRate), blockAlign);
+  const searchStart = Math.max(dataOffset, fromByte + minBytes);
+  const searchEnd = Math.min(wav.length, fromByte + maxBytes);
+  const winBytes = Math.max(blockAlign, alignDown(Math.round(byteRate * 0.25), blockAlign));
+  const step = Math.max(blockAlign, alignDown(Math.round(byteRate * 0.05), blockAlign));
+  if (searchEnd - searchStart <= winBytes)
+    return dataOffset + alignDown(Math.max(0, searchEnd - dataOffset), blockAlign);
+  let bestAt = searchStart;
+  let bestEnergy = Number.POSITIVE_INFINITY;
+  for (let off = searchStart; off + winBytes <= searchEnd; off += step) {
+    let energy = 0;
+    for (let i = off; i + 2 <= off + winBytes; i += 4) {
+      energy += Math.abs(wav.readInt16LE(i));
+    }
+    if (energy < bestEnergy) {
+      bestEnergy = energy;
+      bestAt = off + Math.floor(winBytes / 2);
+    }
+  }
+  return dataOffset + alignDown(Math.max(0, bestAt - dataOffset), blockAlign);
 }
 
 /**

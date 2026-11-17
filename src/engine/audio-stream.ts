@@ -9,7 +9,7 @@
 
 import { errorMessage } from "./env";
 import type { AudioStream, PcmFormat, StreamFormat, SynthesizedAudio } from "./provider";
-import { joinWav, wrapPcmAsWav } from "./wav";
+import { joinWav, parseWavHeader, wrapPcmAsWav } from "./wav";
 
 /** The chunks of a response body as they arrive. A body that breaks off throws "`who` stopped sending audio: …". */
 export async function* bodyChunks(body: ReadableStream<Uint8Array>, who: string): AsyncGenerator<Uint8Array> {
@@ -43,41 +43,6 @@ const isMp3 = (b: Uint8Array) =>
 
 /** Bytes held before giving up on finding where a WAV header ends. */
 const MAX_HEAD = 64 * 1024;
-
-type WavHead =
-  /** The header is not complete yet. */
-  | { state: "more" }
-  /** 16-bit PCM: the samples start at `data`. */
-  | { state: "pcm"; rate: number; channels: number; data: number }
-  /** Another encoding: the player decodes the file. */
-  | { state: "other" };
-
-/** Where the samples of a WAV start, from as much of its head as has arrived; sizes may be left open. */
-function wavHead(b: Buffer): WavHead {
-  let fmt: { tag: number; channels: number; rate: number; bits: number } | undefined;
-  let pos = 12;
-  while (pos + 8 <= b.length) {
-    const id = b.toString("latin1", pos, pos + 4);
-    const size = b.readUInt32LE(pos + 4);
-    const body = pos + 8;
-    if (id === "data") {
-      if (!fmt) return { state: "other" };
-      const pcm = (fmt.tag === 1 || fmt.tag === 0xfffe) && fmt.bits === 16;
-      return pcm ? { state: "pcm", rate: fmt.rate, channels: fmt.channels, data: body } : { state: "other" };
-    }
-    if (id === "fmt ") {
-      if (body + 16 > b.length) return { state: "more" };
-      fmt = {
-        tag: b.readUInt16LE(body),
-        channels: b.readUInt16LE(body + 2),
-        rate: b.readUInt32LE(body + 4),
-        bits: b.readUInt16LE(body + 14),
-      };
-    }
-    pos = body + size + (size % 2);
-  }
-  return { state: "more" };
-}
 
 /**
  * A speech response as a Stream: raw PCM when its Content-Type says so (`audio/pcm` or `audio/l16`, rate and
@@ -123,10 +88,10 @@ export async function streamFromBody(
   while (head.length < 12 && (await more()));
   if (head.length === 0) fail(`${who} returned no audio`);
   if (head.toString("latin1", 0, 4) === "RIFF" && head.toString("latin1", 8, 12) === "WAVE") {
-    let w = wavHead(head);
-    while (w.state === "more" && head.length < MAX_HEAD && (await more())) w = wavHead(head);
+    let w = parseWavHeader(head);
+    while (w.state === "more" && head.length < MAX_HEAD && (await more())) w = parseWavHeader(head);
     if (w.state === "pcm")
-      return { format: { codec: "pcm", rate: w.rate, channels: w.channels }, chunks: rest(w.data) };
+      return { format: { codec: "pcm", rate: w.rate, channels: w.channels }, chunks: rest(w.dataOffset) };
     if (w.state === "other") return { format: { codec: "wav" }, chunks: rest(0) };
     return fail(`${who} sent a WAV whose header never ended`);
   }

@@ -4,7 +4,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createBridgeAudio, probeBridge } from "../../src/bridge/index";
+import { createBridgeAudio, probeBridge } from "../../src/bridge/client";
 
 const TOKEN = "t".repeat(40);
 
@@ -779,6 +779,49 @@ describe("the ssh forwards", () => {
     } finally {
       second.server.closeAllConnections();
       await new Promise((r) => second.server.close(r));
+    }
+  });
+
+  it("models.speak fails over to a spare port when the active forward drops", async () => {
+    const modelsHealth = { ...HEALTH, capabilities: ["play", "record", "stream", "models"] };
+    handler = (req, res) => {
+      if (req.url === "/v1/health") return send(res, 200, modelsHealth);
+      send(res, 404, { error: "not found" });
+    };
+    const second = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        if (req.url === "/v1/health") return send(res, 200, modelsHealth);
+        if (req.url === "/v1/speak") {
+          res.writeHead(200, {
+            "Content-Type": "application/octet-stream",
+            "X-Pi-Speech-Format": "pcm",
+            "X-Pi-Speech-Rate": "24000",
+            "X-Pi-Speech-Channels": "1",
+          });
+          res.end(Buffer.from([1, 2, 3, 4]));
+          return;
+        }
+        send(res, 404, { error: "not found" });
+      });
+    });
+    await new Promise<void>((r) => second.listen(0, "127.0.0.1", r));
+    const secondPort = (second.address() as AddressInfo).port;
+    try {
+      const b = createBridgeAudio({ url, token: TOKEN, ports: [secondPort] });
+      expect(await b.health()).toMatchObject({ ok: true });
+      server.closeAllConnections();
+      await new Promise((r) => server.close(r));
+      const stream = await b.models!.speak("kokoro", "Hi.");
+      expect(stream.format).toEqual({ codec: "pcm", rate: 24000, channels: 1 });
+      const got: Uint8Array[] = [];
+      for await (const c of stream.chunks) got.push(c);
+      expect(Buffer.concat(got)).toEqual(Buffer.from([1, 2, 3, 4]));
+      expect(b.at?.()).toBe(`http://127.0.0.1:${secondPort}`);
+      server = createServer();
+    } finally {
+      second.closeAllConnections();
+      await new Promise((r) => second.close(r));
     }
   });
 });

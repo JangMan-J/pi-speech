@@ -34,8 +34,15 @@
  * Audio sent as server-sent events comes as 16-bit PCM only (OpenAI refuses every other format then), 24 kHz mono.
  */
 
+import { clipOf, collect } from "./audio-stream";
 import { bearer, errorText, failure } from "./http";
-import type { AudioStream, SynthesizedAudio } from "./provider";
+import {
+  type AudioStream,
+  DEFAULT_VOICE,
+  type SynthesisRequest,
+  type SynthesizedAudio,
+  type TranscriptionRequest,
+} from "./provider";
 import { wrapPcmAsWav } from "./wav";
 
 /** Where the requests go: a base URL that has /chat/completions, and its key. */
@@ -340,4 +347,42 @@ export async function chatTranscribe(
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   return content.map((part) => (typeof part?.text === "string" ? part.text : "")).join("");
+}
+
+/** Shared chat-vs-audio dispatch for OpenAI-compatible providers (OpenRouter and Endpoints). */
+export async function dispatchSynthesize(
+  target: ChatTarget,
+  req: SynthesisRequest,
+  model: string,
+  audioStream: () => Promise<AudioStream>,
+): Promise<SynthesizedAudio> {
+  if (req.via === "chat") {
+    const voice = req.voice && req.voice !== DEFAULT_VOICE ? req.voice : undefined;
+    return chatSynthesize(target, { text: req.text, model, voice }, req.signal);
+  }
+  const stream = await audioStream();
+  return clipOf(stream.format, await collect(stream.chunks), target.title);
+}
+
+export async function dispatchSynthesizeStream(
+  target: ChatTarget,
+  req: SynthesisRequest,
+  model: string,
+  audioStream: () => Promise<AudioStream>,
+): Promise<AudioStream> {
+  if (req.via === "chat") {
+    const voice = req.voice && req.voice !== DEFAULT_VOICE ? req.voice : undefined;
+    return chatSynthesizeStream(target, { text: req.text, model, voice }, req.signal);
+  }
+  return audioStream();
+}
+
+export async function dispatchTranscribe(
+  target: ChatTarget,
+  req: TranscriptionRequest,
+  model: string,
+  audioTranscribe: () => Promise<string>,
+): Promise<string> {
+  if (req.via === "chat") return chatTranscribe(target, { ...req, model }, req.signal);
+  return audioTranscribe();
 }

@@ -6,8 +6,10 @@
 
 import { clipOf, collect, streamFromBody } from "./audio-stream";
 import { type KeyRegistry, resolveXaiToken } from "./credentials";
+import { bearer, errorText } from "./http";
 import type {
   AudioStream,
+  ModelOption,
   PcmFormat,
   SpeechProvider,
   SynthesisRequest,
@@ -24,6 +26,21 @@ export const XAI_MODEL = "xai";
 export const XAI_PRICE = "included with your xAI plan (price unknown)";
 
 export const XAI_NO_LOGIN = "No xAI login in Pi: log in to xAI in Pi (/login) to use xai";
+
+/** The xAI choice as a catalog model option, offered while Pi holds an xAI login. */
+export const XAI_OPTION: ModelOption = {
+  id: XAI_MODEL,
+  label: "xAI Grok",
+  shortLabel: "xAI Grok",
+  price: XAI_PRICE,
+  priceLabel: "subscription",
+  pickerNote: "xAI login",
+  unpricedExempt: true,
+  voicesUnknown: true,
+  vendor: "xAI",
+  features: ["tags", "multilingual"],
+  description: "Speech through your xAI login in Pi; xAI publishes no price.",
+};
 
 /** A voice as the xAI voice list describes it; `language` is provider metadata. */
 export interface XaiVoice {
@@ -51,18 +68,10 @@ const MIME: Record<string, string> = {
 /** A 400 whose message is about the credential is a rejected login too. */
 const CREDENTIAL_TROUBLE = /api[ -]?key|token|credential|unauthori[sz]ed|authenticat/i;
 
-const headers = (token: string) => ({ Authorization: `Bearer ${token}` });
-
 /** A readable error for a failed reply: a rejected login, or the status and message. Never shows the token. */
 async function failure(res: Response, token: string): Promise<Error> {
-  let text = await res.text().catch(() => "");
-  try {
-    const error = (JSON.parse(text) as { error?: unknown }).error;
-    if (typeof error === "string" && error) text = error;
-  } catch {
-    /* not JSON: the text as is */
-  }
-  text = text.split(token).join("[token]").trim().slice(0, 300);
+  const raw = await res.text().catch(() => "");
+  const text = errorText(raw, token, 300);
   if (res.status === 401 || res.status === 403 || (res.status === 400 && CREDENTIAL_TROUBLE.test(text))) {
     return new Error(`the xAI login was rejected (HTTP ${res.status}); log in to xAI again in Pi (/login)`);
   }
@@ -73,7 +82,7 @@ async function failure(res: Response, token: string): Promise<Error> {
 export async function listXaiVoices(token: string, signal?: AbortSignal): Promise<XaiVoice[]> {
   const res = await fetch(`${XAI_API}/tts/voices`, {
     method: "GET",
-    headers: headers(token),
+    headers: bearer(token),
     signal: signal ?? AbortSignal.timeout(15000),
   });
   if (!res.ok) throw await failure(res, token);
@@ -104,7 +113,7 @@ export async function xaiSynthesizeStream(
 ): Promise<AudioStream> {
   const res = await fetch(`${XAI_API}/tts`, {
     method: "POST",
-    headers: { ...headers(token), "Content-Type": "application/json" },
+    headers: { ...bearer(token), "Content-Type": "application/json" },
     body: JSON.stringify({ text: req.text, voice_id: req.voice, language: req.language, output_format: OUTPUT_FORMAT }),
     signal,
   });
@@ -136,7 +145,7 @@ export async function xaiTranscribe(
   const bytes = new Uint8Array(audio.byteLength);
   bytes.set(audio);
   form.append("file", new Blob([bytes], { type: MIME[format] ?? "application/octet-stream" }), `audio.${format}`);
-  const res = await fetch(`${XAI_API}/stt`, { method: "POST", headers: headers(token), body: form, signal });
+  const res = await fetch(`${XAI_API}/stt`, { method: "POST", headers: bearer(token), body: form, signal });
   if (!res.ok) throw await failure(res, token);
   const data = (await res.json()) as { text?: unknown };
   return typeof data.text === "string" ? data.text : "";
@@ -145,9 +154,23 @@ export async function xaiTranscribe(
 /** xAI as a speech provider: offered only while Pi holds an xAI credential. */
 export class XaiProvider implements SpeechProvider {
   readonly name = "xAI";
+  readonly defaultVoice = "eve";
+  readonly emptyVoicesReason = "xAI lists no voices";
   private cache?: XaiVoice[];
 
   constructor(private readonly registry: () => KeyRegistry | undefined) {}
+
+  ownsModel(model: string): boolean {
+    return model === XAI_MODEL;
+  }
+
+  modelLabel(): string {
+    return "xAI Grok";
+  }
+
+  missingModelNote(): string {
+    return "✗ xAI: no login";
+  }
 
   /** The token now, or undefined without an xAI login. */
   token(): Promise<string | undefined> {
@@ -156,6 +179,10 @@ export class XaiProvider implements SpeechProvider {
 
   async available(): Promise<boolean> {
     return (await this.token()) !== undefined;
+  }
+
+  async catalogOptions(): Promise<ModelOption[]> {
+    return (await this.available()) ? [XAI_OPTION] : [];
   }
 
   private async requireToken(): Promise<string> {
@@ -180,9 +207,22 @@ export class XaiProvider implements SpeechProvider {
     return this.cache;
   }
 
+  async voicesFor(): Promise<string[]> {
+    return (await this.voices()).map((v) => v.id);
+  }
+
   /** The voice list from the last successful fetch, if any. */
   cachedVoices(): XaiVoice[] | undefined {
     return this.cache;
+  }
+
+  voiceLanguageMetadata(_model: string, voice: string): { language?: string } | undefined {
+    const language = this.cache?.find((v) => v.id === voice)?.language;
+    return language ? { language } : undefined;
+  }
+
+  enrichOption(option: ModelOption): ModelOption {
+    return { ...XAI_OPTION, ...option };
   }
 
   forget(): void {

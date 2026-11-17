@@ -6,7 +6,7 @@ use crate::http::{answer_nonblocking, json_str, BodyFault, Conn, Framing, Reques
 use crate::pair::{self, Notice, Pairing};
 use crate::private;
 use crate::proc::{self, lock, start_thread, Exit, ProcCtl};
-use crate::remote_models::{self, Jobs, MODELS_ENV};
+use crate::remote_models::{self, InProcessHost, Jobs, ModelHost, SubprocessHost, MODELS_ENV};
 use crate::stream::{self, Format};
 use crate::token::{ct_eq, random_hex};
 use crate::wav;
@@ -61,8 +61,12 @@ pub struct Config {
     /// Recorder executable from the environment; `None` means the built-in engine.
     pub recorder: Option<PathBuf>,
     /// The program that runs local models (`models list`, `speak`, `transcribe`) for the
-    /// model endpoints; `None` means this program (the built-in engine).
+    /// model endpoints when `PI_SPEECH_RECEIVER_MODELS` is set; `None` uses the warm
+    /// in-process host.
     pub models: Option<PathBuf>,
+    /// Optional custom [`ModelHost`] (for in-process tests); overrides `models` and the
+    /// default [`InProcessHost`].
+    pub model_host: Option<Arc<dyn ModelHost>>,
     /// The built-in audio engine: this program, run as `<engine> play ...` and
     /// `<engine> record <file>`. `None` when it cannot be found.
     pub engine: Option<PathBuf>,
@@ -98,6 +102,7 @@ impl Config {
             stream_player: from_env(STREAM_PLAYER_ENV),
             recorder: from_env(RECORDER_ENV),
             models: from_env(MODELS_ENV),
+            model_host: None,
             engine: std::env::current_exe().ok(),
             max_body: MAX_BODY,
             max_record_seconds: MAX_RECORD_SECONDS,
@@ -140,7 +145,7 @@ pub fn private_tmp_dir() -> io::Result<PathBuf> {
     Ok(dir)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PlayState {
     Playing,
     Completed,
@@ -222,6 +227,134 @@ struct Inner {
     recs: Vec<Rec>,
 }
 
+impl Inner {
+    /// Forget the oldest ended playbacks beyond `KEPT_PLAYBACKS`.
+    fn prune_plays(&mut self) {
+        while self.plays.len() > KEPT_PLAYBACKS {
+            match self
+                .plays
+                .iter()
+                .position(|p| p.state != PlayState::Playing)
+            {
+                Some(i) => {
+                    self.plays.remove(i);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// Mark playback `id` ended and return any levels file path to remove.
+    fn mark_play_ended(
+        &mut self,
+        id: &str,
+        state: PlayState,
+        error: Option<String>,
+    ) -> Option<PathBuf> {
+        let p = self.plays.iter_mut().find(|p| p.id == id)?;
+        p.state = state;
+        p.error = error;
+        if let Feed::Waiting(_) = p.feed {
+            p.feed = Feed::Taken;
+        }
+        p.levels.take()
+    }
+
+    /// Mark recording `id` ended and return `(failed, audio_path, levels_path)` for cleanup.
+    fn mark_rec_ended(
+        &mut self,
+        id: &str,
+        error: Option<String>,
+        note: String,
+        now: Instant,
+    ) -> Option<(bool, PathBuf, Option<PathBuf>)> {
+        let r = self.recs.iter_mut().find(|r| r.id == id)?;
+        r.phase = RecPhase::Ended;
+        r.input = None;
+        r.finished = Some(now);
+        let failed = error.is_some();
+        r.error = error;
+        r.note = note;
+        Some((failed, r.path.clone(), r.levels.take()))
+    }
+
+    /// Remove ended recordings whose pickup window has elapsed, returning their paths to delete.
+    fn take_expired_recordings(&mut self, now: Instant, pickup: Duration) -> Vec<PathBuf> {
+        let mut remove = Vec::new();
+        self.recs.retain(|r| {
+            let expired = r.phase == RecPhase::Ended
+                && r.finished.is_some_and(|t| now.duration_since(t) >= pickup);
+            if expired {
+                remove.push(r.path.clone());
+                if let Some(p) = &r.levels {
+                    remove.push(p.clone());
+                }
+            }
+            !expired
+        });
+        remove
+    }
+
+    /// Active recording and playback spectrum level paths for `client`.
+    fn active_level_paths(&self, client: Option<&str>) -> (Option<PathBuf>, Option<PathBuf>) {
+        let rec = self
+            .recs
+            .iter()
+            .find(|r| r.phase == RecPhase::Recording)
+            .and_then(|r| r.levels.clone());
+        let play = self
+            .plays
+            .iter()
+            .rev()
+            .find(|p| {
+                p.state == PlayState::Playing && (client.is_none() || p.client.as_deref() == client)
+            })
+            .and_then(|p| p.levels.clone());
+        (rec, play)
+    }
+
+    fn all_settled(&self) -> bool {
+        self.plays.iter().all(|p| p.state != PlayState::Playing)
+            && self.recs.iter().all(|r| r.phase != RecPhase::Recording)
+    }
+}
+
+fn play_outcome_from_exit(exit: &Exit) -> (PlayState, Option<String>) {
+    if let Some(why) = &exit.failure {
+        (PlayState::Failed, Some(why.clone()))
+    } else if exit.stop_requested {
+        (PlayState::Cancelled, None)
+    } else if exit.success() {
+        (PlayState::Completed, None)
+    } else {
+        (
+            PlayState::Failed,
+            Some(with_note(
+                &format!("player {}", exit.describe()),
+                &exit.stderr_tail,
+            )),
+        )
+    }
+}
+
+fn rec_outcome_from_exit(exit: &Exit) -> (Option<String>, String) {
+    let failed = exit.killed || (!exit.stop_requested && !exit.success());
+    let note = with_note(&format!("recorder {}", exit.describe()), &exit.stderr_tail);
+    let error = if exit.killed {
+        Some("the recorder did not stop when asked and was killed".to_string())
+    } else if failed {
+        Some(note.clone())
+    } else {
+        None
+    };
+    let short_note = if exit.stderr_tail.is_empty() {
+        exit.describe()
+    } else {
+        exit.stderr_tail.clone()
+    };
+    (error, short_note)
+}
+
 struct Shared {
     cfg: Config,
     inner: Mutex<Inner>,
@@ -232,6 +365,7 @@ struct Shared {
     conns: AtomicUsize,
     /// The one model run (transcription or speech) at a time, and those waiting for it.
     jobs: Jobs,
+    model_host: Arc<dyn ModelHost>,
     pairing: Pairing,
 }
 
@@ -249,6 +383,15 @@ impl Server {
         let listener = TcpListener::bind(cfg.listen)?;
         let addr = listener.local_addr()?;
         let pairing = Pairing::new(cfg.pair_ttl, Arc::clone(&cfg.notice));
+        let model_host: Arc<dyn ModelHost> = cfg
+            .model_host
+            .clone()
+            .or_else(|| {
+                cfg.models
+                    .as_ref()
+                    .map(|p| Arc::new(SubprocessHost::new(p.clone())) as Arc<dyn ModelHost>)
+            })
+            .unwrap_or_else(|| Arc::new(InProcessHost::new()));
         let shared = Arc::new(Shared {
             pairing,
             cfg,
@@ -259,6 +402,7 @@ impl Server {
             down: AtomicBool::new(false),
             conns: AtomicUsize::new(0),
             jobs: Jobs::default(),
+            model_host,
         });
         let sh = Arc::clone(&shared);
         let started = start_thread("accept", move || accept_loop(sh, listener)).and_then(|_| {
@@ -327,20 +471,10 @@ fn hand_off(sh: &Arc<Shared>, ready: Ready) {
 fn janitor(sh: Arc<Shared>) {
     while !sh.down.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_millis(200));
-        let mut g = lock(&sh.inner);
-        let now = Instant::now();
-        g.recs.retain(|r| {
-            let expired = r.phase == RecPhase::Ended
-                && r.finished
-                    .is_some_and(|t| now.duration_since(t) >= sh.cfg.pickup);
-            if expired {
-                let _ = fs::remove_file(&r.path);
-                if let Some(p) = &r.levels {
-                    let _ = fs::remove_file(p);
-                }
-            }
-            !expired
-        });
+        let expired = lock(&sh.inner).take_expired_recordings(Instant::now(), sh.cfg.pickup);
+        for path in expired {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
@@ -393,18 +527,6 @@ fn client_of(req: &Request) -> Result<Option<String>, Response> {
             400,
             "X-Pi-Speech-Client must be 1 to 64 letters, digits, -, _ or .",
         )),
-    }
-}
-
-/// Forget the oldest ended playbacks beyond the ones kept.
-fn prune(g: &mut Inner) {
-    while g.plays.len() > KEPT_PLAYBACKS {
-        match g.plays.iter().position(|p| p.state != PlayState::Playing) {
-            Some(i) => {
-                g.plays.remove(i);
-            }
-            None => break,
-        }
     }
 }
 
@@ -668,17 +790,9 @@ impl Shared {
         ok && !presented.is_empty()
     }
 
-    /// Answer with `f` given the program that runs local models, or 503 without one.
-    fn with_models(&self, f: impl FnOnce(&Path) -> Response) -> Response {
-        match self.cfg.models.as_ref().or(self.cfg.engine.as_ref()) {
-            Some(p) => f(p),
-            None => Response::error(503, NO_ENGINE),
-        }
-    }
-
-    fn models_ctx<'a>(&'a self, program: &'a Path) -> remote_models::Ctx<'a> {
+    fn models_ctx(&self) -> remote_models::Ctx<'_> {
         remote_models::Ctx {
-            program,
+            host: self.model_host.as_ref(),
             tmp_dir: &self.cfg.tmp_dir,
             max_body: self.cfg.max_body,
             idle: self.cfg.stream_idle,
@@ -693,10 +807,12 @@ impl Shared {
             ("GET", ["v1", "health"]) => Response::json(
                 200,
                 format!(
-                    "{{\"protocol\": 1, \"name\": \"pi-speech-receiver\", \"version\": {}, \"capabilities\": [\"play\", \"record\", \"stream\", \"models\"]}}",
-                    json_str(env!("CARGO_PKG_VERSION"))
+                    "{{\"protocol\": 1, \"name\": \"pi-speech-receiver\", \"version\": {}, \"edition\": {}, \"capabilities\": [\"play\", \"record\", \"stream\", \"models\"]}}",
+                    json_str(crate::VERSION),
+                    json_str(crate::EDITION)
                 ),
             ),
+            ("GET", ["v1", "gpu"]) => Response::json(200, crate::gpu::probe().to_string()),
             ("POST", ["v1", "play", "stream"]) => self.play_stream(conn, req),
             ("POST", ["v1", "play", id, "audio"]) => self.stream_audio(conn, req, id),
             ("GET", ["v1", "play", id]) => match query_wait(req.query.as_deref()) {
@@ -722,20 +838,18 @@ impl Shared {
             ("POST", ["v1", "record", "start"]) => self.start_recording(),
             ("POST", ["v1", "record", id, "stop"]) => self.stop_recording(id),
             ("POST", ["v1", "record", id, "cancel"]) => self.cancel_recording(id),
-            ("GET", ["v1", "models"]) => self.with_models(remote_models::list),
+            ("GET", ["v1", "models"]) => remote_models::list(self.model_host.as_ref()),
             ("POST", ["v1", "models", "download"]) => {
-                self.with_models(|p| remote_models::download(&self.models_ctx(p), conn, req))
+                remote_models::download(&self.models_ctx(), conn, req)
             }
             ("POST", ["v1", "models", "delete"]) => {
-                self.with_models(|p| remote_models::delete(&self.models_ctx(p), req))
+                remote_models::delete(&self.models_ctx(), req)
             }
-            ("GET", ["v1", "voices"]) => self.with_models(|p| remote_models::voices(p, req)),
+            ("GET", ["v1", "voices"]) => remote_models::voices(self.model_host.as_ref(), req),
             ("POST", ["v1", "transcribe"]) => {
-                self.with_models(|p| remote_models::transcribe(&self.models_ctx(p), conn, req))
+                remote_models::transcribe(&self.models_ctx(), conn, req)
             }
-            ("POST", ["v1", "speak"]) => {
-                self.with_models(|p| remote_models::speak(&self.models_ctx(p), conn, req))
-            }
+            ("POST", ["v1", "speak"]) => remote_models::speak(&self.models_ctx(), conn, req),
             _ => not_found(),
         }
     }
@@ -744,33 +858,13 @@ impl Shared {
 
     /// Mark playback `id` by how its player ended.
     fn player_ended(&self, id: &str, exit: &Exit) {
-        let (state, error) = if let Some(why) = &exit.failure {
-            (PlayState::Failed, Some(why.clone()))
-        } else if exit.stop_requested {
-            (PlayState::Cancelled, None)
-        } else if exit.success() {
-            (PlayState::Completed, None)
-        } else {
-            (
-                PlayState::Failed,
-                Some(with_note(
-                    &format!("player {}", exit.describe()),
-                    &exit.stderr_tail,
-                )),
-            )
+        let (state, error) = play_outcome_from_exit(exit);
+        let removed_levels = {
+            let mut g = lock(&self.inner);
+            let removed = g.mark_play_ended(id, state, error);
+            self.cv.notify_all();
+            removed
         };
-        let mut removed_levels = None;
-        let mut g = lock(&self.inner);
-        if let Some(p) = g.plays.iter_mut().find(|p| p.id == id) {
-            p.state = state;
-            p.error = error;
-            removed_levels = p.levels.take();
-            if let Feed::Waiting(_) = p.feed {
-                p.feed = Feed::Taken; // closes the input nobody will write to now
-            }
-        }
-        self.cv.notify_all();
-        drop(g);
         if let Some(path) = removed_levels {
             let _ = fs::remove_file(path);
         }
@@ -781,21 +875,7 @@ impl Shared {
             Ok(c) => c,
             Err(resp) => return resp,
         };
-        let (rec_levels, play_levels) = {
-            let g = lock(&self.inner);
-            let rec = g
-                .recs
-                .iter()
-                .find(|r| r.phase == RecPhase::Recording)
-                .and_then(|r| r.levels.clone());
-            let play = g
-                .plays
-                .iter()
-                .rev()
-                .find(|p| p.state == PlayState::Playing && (client.is_none() || p.client == client))
-                .and_then(|p| p.levels.clone());
-            (rec, play)
-        };
+        let (rec_levels, play_levels) = lock(&self.inner).active_level_paths(client.as_deref());
         let rec = rec_levels.as_deref().and_then(spectrum::read_levels);
         let play = play_levels.as_deref().and_then(spectrum::read_levels);
         let fmt_bands = |b: &[u8; spectrum::BANDS]| {
@@ -946,7 +1026,7 @@ impl Shared {
             feed: Feed::Waiting(input),
             levels,
         });
-        prune(&mut g);
+        g.prune_plays();
         Response::json(202, format!("{{\"id\": {}}}", json_str(&id)))
     }
 
@@ -1272,35 +1352,21 @@ impl Shared {
     }
 
     fn recorder_ended(&self, id: &str, exit: &Exit) {
-        let failed = exit.killed || (!exit.stop_requested && !exit.success());
-        let note = with_note(&format!("recorder {}", exit.describe()), &exit.stderr_tail);
-        let error = if exit.killed {
-            Some("the recorder did not stop when asked and was killed".to_string())
-        } else if failed {
-            Some(note.clone())
-        } else {
-            None
+        let (error, note) = rec_outcome_from_exit(exit);
+        let ended = {
+            let mut g = lock(&self.inner);
+            let res = g.mark_rec_ended(id, error, note, Instant::now());
+            self.cv.notify_all();
+            res
         };
-        let mut g = lock(&self.inner);
-        if let Some(r) = g.recs.iter_mut().find(|r| r.id == id) {
-            r.phase = RecPhase::Ended;
-            r.input = None;
-            r.finished = Some(Instant::now());
-            if error.is_some() {
-                let _ = fs::remove_file(&r.path);
+        if let Some((failed, audio_path, levels_path)) = ended {
+            if failed {
+                let _ = fs::remove_file(audio_path);
             }
-            if let Some(lp) = r.levels.take() {
+            if let Some(lp) = levels_path {
                 let _ = fs::remove_file(lp);
             }
-            r.error = error;
-            // At start-up the recorder's own words are the reason; keep just those.
-            r.note = if exit.stderr_tail.is_empty() {
-                exit.describe()
-            } else {
-                exit.stderr_tail.clone()
-            };
         }
-        self.cv.notify_all();
     }
 
     /// Stop the recorder of recording `id`, wait for it to end, and take the entry out.
@@ -1380,7 +1446,7 @@ impl Shared {
 
     fn shutdown(&self) {
         self.down.store(true, Ordering::SeqCst);
-        self.jobs.stop();
+        self.model_host.stop();
         let _p = lock(&self.play_lock);
         let _r = lock(&self.rec_lock);
         let ctls: Vec<Arc<ProcCtl>> = {
@@ -1392,10 +1458,7 @@ impl Shared {
                 .collect()
         };
         stop_all(&ctls);
-        self.settle(|g| {
-            g.plays.iter().all(|p| p.state != PlayState::Playing)
-                && g.recs.iter().all(|r| r.phase != RecPhase::Recording)
-        });
+        self.settle(Inner::all_settled);
         let _ = fs::remove_dir_all(&self.cfg.tmp_dir);
         self.cv.notify_all();
     }
@@ -1421,4 +1484,82 @@ fn stop_all(ctls: &[Arc<ProcCtl>]) -> usize {
                 .filter(|&was| was)
                 .count()
     })
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    #[test]
+    fn exit_outcomes_map_cleanly_to_play_and_rec_states() {
+        let ok = Exit {
+            status: None,
+            stop_requested: false,
+            killed: false,
+            failure: None,
+            stderr_tail: String::new(),
+        };
+        assert_eq!(play_outcome_from_exit(&ok).0.name(), "failed");
+        let cancelled = Exit {
+            status: None,
+            stop_requested: true,
+            killed: false,
+            failure: None,
+            stderr_tail: String::new(),
+        };
+        assert_eq!(play_outcome_from_exit(&cancelled).0.name(), "cancelled");
+        let failed = Exit {
+            status: None,
+            stop_requested: true,
+            killed: false,
+            failure: Some("no audio arrived".into()),
+            stderr_tail: String::new(),
+        };
+        assert_eq!(
+            play_outcome_from_exit(&failed),
+            (PlayState::Failed, Some("no audio arrived".into()))
+        );
+
+        let rec_killed = Exit {
+            status: None,
+            stop_requested: true,
+            killed: true,
+            failure: None,
+            stderr_tail: "mic busy".into(),
+        };
+        let (err, note) = rec_outcome_from_exit(&rec_killed);
+        assert!(err.unwrap().contains("killed"));
+        assert_eq!(note, "mic busy");
+    }
+
+    #[test]
+    fn expired_recordings_are_collected_only_after_pickup_window() {
+        let mut inner = Inner::default();
+        let t0 = Instant::now();
+        let ctl = proc::spawn(Command::new("true"), |_| {}).unwrap();
+        inner.recs.push(Rec {
+            id: "r1".into(),
+            path: PathBuf::from("/tmp/r1.wav"),
+            levels: Some(PathBuf::from("/tmp/r1.levels")),
+            ctl,
+            input: None,
+            phase: RecPhase::Ended,
+            error: None,
+            note: String::new(),
+            finished: Some(t0),
+        });
+        assert!(inner
+            .take_expired_recordings(t0 + Duration::from_secs(5), Duration::from_secs(60))
+            .is_empty());
+        let expired =
+            inner.take_expired_recordings(t0 + Duration::from_secs(61), Duration::from_secs(60));
+        assert_eq!(
+            expired,
+            vec![
+                PathBuf::from("/tmp/r1.wav"),
+                PathBuf::from("/tmp/r1.levels")
+            ]
+        );
+        assert!(inner.recs.is_empty());
+    }
 }

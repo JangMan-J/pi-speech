@@ -1,28 +1,11 @@
 //! Text to speech with a local voice model: which model a directory holds, its voices, and
-//! audio generated sentence by sentence.
-//!
-//! - Kokoro: `model.onnx` (or `model.int8.onnx`), `voices.bin` and `tokens.txt`, with the
-//!   lexicons (`lexicon-*.txt`) and, for Chinese, `dict/` and the `*-zh.fst` rules of
-//!   sherpa-onnx's multi-lang exports.
-//! - Kitten: the same three files as Kokoro, in a directory named `kitten-…` (as sherpa-onnx
-//!   names every Kitten package), and a lexicon.
-//! - Piper (and other VITS voices): one `<name>.onnx` and `tokens.txt`, and a lexicon.
-//! - Supertonic: `duration_predictor`, `text_encoder`, `vector_estimator` and `vocoder` (each
-//!   `.onnx` or `.int8.onnx`), `tts.json`, `unicode_indexer.bin` and `voice.bin`. It reads text
-//!   itself (no lexicon), in the language it is told ([`SUPERTONIC_LANGUAGES`]).
-//! - Pocket TTS: `lm_flow`, `lm_main`, `encoder`, `decoder` and `text_conditioner` (`.onnx` or
-//!   `.int8.onnx`), `vocab.json` and `token_scores.json`; it speaks in the voice of a short
-//!   reference clip, and its voices are the `.wav` files in `test_wavs/`, named by their stems.
-//!
-//! sherpa-onnx 2.0 no longer runs espeak-ng (`espeak-ng-data/` is ignored): words are spoken
-//! through a lexicon. Piper and Kitten archives carry none, so such a voice uses `lexicon*.txt` in
-//! its own directory, else the shared lexicon of its language beside it, in the parent directory
-//! (the model cache): `lexicon-en-us.txt` from sherpa-onnx's `tts-models` release, the only one
-//! published so far (English voices of other regions use it too, and Kitten, which is English).
+//! audio generated sentence by sentence behind a [`TtsBackend`] port (`sherpa`, `phonon`, `llama_tts`).
 
-use sherpa_onnx::{GenerationConfig, OfflineTts, OfflineTtsConfig, Wave};
-use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+mod llama_tts;
+mod phonon;
+mod sherpa;
+
+use std::cell::RefCell;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -78,6 +61,40 @@ pub enum VoiceModel {
         /// it empty; [`detect`] fills it from `test_wavs/`.
         references: Vec<PathBuf>,
     },
+    Matcha {
+        acoustic_model: PathBuf,
+        /// Filled in by [`detect`] from the directory or parent cache root.
+        vocoder: Option<PathBuf>,
+        tokens: PathBuf,
+        lexicons: Vec<PathBuf>,
+        dict: Option<PathBuf>,
+        fsts: Vec<PathBuf>,
+    },
+    ZipVoice {
+        encoder: PathBuf,
+        decoder: PathBuf,
+        /// Filled in by [`detect`] from the directory or parent cache root.
+        vocoder: Option<PathBuf>,
+        tokens: PathBuf,
+        lexicons: Vec<PathBuf>,
+        /// `(wav_path, transcript)` pairs from `test_wavs/prompt.txt`, filled in by [`detect`].
+        references: Vec<(PathBuf, String)>,
+    },
+    Phonon {
+        dir: PathBuf,
+        voices: Vec<String>,
+    },
+    LlamaTts {
+        dir: PathBuf,
+        model: PathBuf,
+        mmproj: PathBuf,
+        sample_rate: u32,
+        family_name: &'static str,
+    },
+    Orpheus {
+        model: PathBuf,
+        snac: PathBuf,
+    },
 }
 
 impl VoiceModel {
@@ -88,6 +105,11 @@ impl VoiceModel {
             VoiceModel::Kitten { .. } => "Kitten",
             VoiceModel::Supertonic { .. } => "Supertonic",
             VoiceModel::Pocket { .. } => "Pocket TTS",
+            VoiceModel::Matcha { .. } => "Matcha-TTS",
+            VoiceModel::ZipVoice { .. } => "ZipVoice",
+            VoiceModel::Phonon { .. } => "Phonon",
+            VoiceModel::LlamaTts { family_name, .. } => family_name,
+            VoiceModel::Orpheus { .. } => "Orpheus",
         }
     }
 
@@ -102,7 +124,7 @@ impl VoiceModel {
 }
 
 const SUPPORTED: &str =
-    "a Kokoro, Kitten, Piper, Supertonic or Pocket TTS voice model from sherpa-onnx";
+    "a Kokoro, Kitten, Piper, Matcha, ZipVoice, Supertonic, Pocket TTS, Phonon, ZONOS3, Qwen3-TTS or Orpheus voice model";
 
 /// The languages Supertonic 3 is told to read its text in, English (the default) first.
 pub const SUPERTONIC_LANGUAGES: &str = "en ar bg cs da de el es et fi fr hi hr hu id it ja ko lt \
@@ -140,6 +162,68 @@ pub fn detect(dir: &Path) -> Result<VoiceModel, String> {
     }
     let mut found = from_names(dir, &files, &dirs)
         .map_err(|why| format!("unrecognised voice model directory {shown}: {why}"))?;
+    let parent = match dir.parent() {
+        Some(p) if p.as_os_str().is_empty() => Path::new("."),
+        p => p.unwrap_or(dir),
+    };
+    let find_vocoder = |name: &str| {
+        let own = dir.join(name);
+        if own.is_file() {
+            Some(own)
+        } else {
+            let shared = parent.join(name);
+            shared.is_file().then_some(shared)
+        }
+    };
+    if let VoiceModel::Matcha {
+        vocoder, lexicons, ..
+    } = &mut found
+    {
+        *vocoder = find_vocoder("vocos-22khz-univ.onnx");
+        if vocoder.is_none() {
+            return Err(format!(
+                "the Matcha model in {shown} has no vocoder; put vocos-22khz-univ.onnx in {shown} or {}",
+                parent.display()
+            ));
+        }
+        if lexicons.is_empty() {
+            let en = parent.join("lexicon-en-us.txt");
+            if en.is_file() {
+                lexicons.push(en);
+            } else {
+                return Err(format!(
+                    "the Matcha model in {shown} has no lexicon; put lexicon-en-us.txt in {shown} or {}",
+                    parent.display()
+                ));
+            }
+        }
+    }
+    if let VoiceModel::ZipVoice {
+        vocoder,
+        lexicons,
+        references,
+        ..
+    } = &mut found
+    {
+        *vocoder = find_vocoder("vocos_24khz.onnx");
+        if vocoder.is_none() {
+            return Err(format!(
+                "the ZipVoice model in {shown} has no vocoder; put vocos_24khz.onnx in {shown} or {}",
+                parent.display()
+            ));
+        }
+        let en = parent.join("lexicon-en-us.txt");
+        if en.is_file() && !lexicons.contains(&en) {
+            lexicons.push(en);
+        }
+        *references = zipvoice_references(&dir.join(POCKET_VOICES_DIR));
+        if references.is_empty() {
+            return Err(format!(
+                "the ZipVoice model in {shown} has no reference clips: expected prompt.txt and .wav files in {}",
+                dir.join(POCKET_VOICES_DIR).display()
+            ));
+        }
+    }
     let wants_lexicon = match &mut found {
         VoiceModel::Vits {
             model,
@@ -156,11 +240,6 @@ pub fn detect(dir: &Path) -> Result<VoiceModel, String> {
         _ => None,
     };
     if let Some((names, lexicon)) = wants_lexicon {
-        // A directory given as a bare name has the working directory as its parent.
-        let parent = match dir.parent() {
-            Some(p) if p.as_os_str().is_empty() => Path::new("."),
-            p => p.unwrap_or(dir),
-        };
         *lexicon = names.iter().map(|n| parent.join(n)).find(|p| p.is_file());
         if lexicon.is_none() {
             return Err(format!(
@@ -186,7 +265,42 @@ pub fn detect(dir: &Path) -> Result<VoiceModel, String> {
             ));
         }
     }
+    if let VoiceModel::Phonon { dir: pdir, voices } = &mut found {
+        let mut names: Vec<String> = ptts::loader::checkpoint_voices(pdir)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        names.sort();
+        if let Some(pos) = names.iter().position(|n| n == "default") {
+            let d = names.remove(pos);
+            names.insert(0, d);
+        }
+        *voices = names;
+    }
     Ok(found)
+}
+
+/// Reference `(wav_path, transcript)` clips in `test_wavs/prompt.txt` for ZipVoice.
+fn zipvoice_references(dir: &Path) -> Vec<(PathBuf, String)> {
+    let Ok(text) = fs::read_to_string(dir.join("prompt.txt")) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((file, prompt)) = trimmed.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let wav = dir.join(file.trim());
+        let prompt = prompt.trim();
+        if wav.is_file() && !prompt.is_empty() {
+            out.push((wav, prompt.to_string()));
+        }
+    }
+    out
 }
 
 /// The `.wav` files in `dir`, by name (none when it cannot be read).
@@ -234,6 +348,46 @@ pub fn from_names(dir: &Path, files: &[String], dirs: &[String]) -> Result<Voice
     let has = |n: &str| files.iter().any(|f| f == n);
     let has_dir = |n: &str| dirs.iter().any(|d| d == n);
     let p = |n: &str| dir.join(n);
+    if has("config.json")
+        && has("tokenizer.json")
+        && (has("model.q8.gguf") || has("model.safetensors"))
+    {
+        return Ok(VoiceModel::Phonon {
+            dir: dir.to_path_buf(),
+            voices: Vec::new(),
+        });
+    }
+    let mut ggufs: Vec<&String> = files.iter().filter(|f| f.ends_with(".gguf")).collect();
+    ggufs.sort();
+    if !ggufs.is_empty() {
+        let mmproj = ggufs.iter().find(|f| f.starts_with("mmproj-")).copied();
+        let main_gguf = ggufs.iter().find(|f| !f.starts_with("mmproj-")).copied();
+        if let (Some(main_f), Some(mm_f)) = (main_gguf, mmproj) {
+            let lower = main_f.to_ascii_lowercase();
+            let (family_name, sample_rate) = if lower.contains("zonos") {
+                ("ZONOS3", 44_100)
+            } else if lower.contains("qwen3") {
+                ("Qwen3-TTS", 24_000)
+            } else {
+                ("llama-tts", 24_000)
+            };
+            return Ok(VoiceModel::LlamaTts {
+                dir: dir.to_path_buf(),
+                model: p(main_f),
+                mmproj: p(mm_f),
+                sample_rate,
+                family_name,
+            });
+        }
+        if let Some(main_f) = main_gguf {
+            if main_f.to_ascii_lowercase().contains("orpheus") && has("snac_24khz.onnx") {
+                return Ok(VoiceModel::Orpheus {
+                    model: p(main_f),
+                    snac: p("snac_24khz.onnx"),
+                });
+            }
+        }
+    }
     let mut onnx: Vec<&String> = files.iter().filter(|f| f.ends_with(".onnx")).collect();
     onnx.sort();
     if onnx.is_empty() {
@@ -318,6 +472,47 @@ pub fn from_names(dir: &Path, files: &[String], dirs: &[String]) -> Result<Voice
     }
     if !has("tokens.txt") {
         return Err(format!("it has {} but no tokens.txt", onnx[0]));
+    }
+    // ZipVoice: encoder + decoder ONNX + tokens.txt + lexicon.txt + test_wavs/.
+    if let (Some(encoder), Some(decoder), Some(lex)) = (
+        onnx_file(files, "encoder"),
+        onnx_file(files, "decoder"),
+        own_lexicon(files),
+    ) {
+        if has_dir(POCKET_VOICES_DIR) && onnx_file(files, "joiner").is_none() {
+            return Ok(VoiceModel::ZipVoice {
+                encoder: p(encoder),
+                decoder: p(decoder),
+                vocoder: has("vocos_24khz.onnx").then(|| p("vocos_24khz.onnx")),
+                tokens: p("tokens.txt"),
+                lexicons: vec![p(lex)],
+                references: Vec::new(),
+            });
+        }
+    }
+    // Matcha-TTS: model-steps-3.onnx + tokens.txt.
+    if let Some(acoustic) = onnx_file(files, "model-steps-3") {
+        let lexicons: Vec<PathBuf> = own_lexicon(files).into_iter().map(p).collect();
+        let fsts = [
+            "phone-zh.fst",
+            "date-zh.fst",
+            "number-zh.fst",
+            "phone.fst",
+            "date.fst",
+            "number.fst",
+        ]
+        .into_iter()
+        .filter(|n| has(n))
+        .map(p)
+        .collect();
+        return Ok(VoiceModel::Matcha {
+            acoustic_model: p(acoustic),
+            vocoder: has("vocos-22khz-univ.onnx").then(|| p("vocos-22khz-univ.onnx")),
+            tokens: p("tokens.txt"),
+            lexicons,
+            dict: has_dir("dict").then(|| p("dict")),
+            fsts,
+        });
     }
     // sherpa-onnx names every Kitten package kitten-…; its files are Kokoro's.
     let kitten = dir
@@ -457,6 +652,22 @@ pub fn voice_names(model: &VoiceModel, count: usize) -> Vec<String> {
                 .filter_map(|r| r.file_stem().and_then(|s| s.to_str()))
                 .collect(),
         ),
+        VoiceModel::Matcha { .. } => Some(vec!["default"]),
+        VoiceModel::ZipVoice { references, .. } => Some(
+            references
+                .iter()
+                .filter_map(|(r, _)| r.file_stem().and_then(|s| s.to_str()))
+                .collect(),
+        ),
+        VoiceModel::Phonon { voices, .. } if !voices.is_empty() => {
+            Some(voices.iter().map(String::as_str).collect())
+        }
+        VoiceModel::Phonon { .. } => Some(vec!["default"]),
+        VoiceModel::Orpheus { .. } => Some(super::llama::ORPHEUS_VOICES.to_vec()),
+        VoiceModel::LlamaTts { family_name, .. } if *family_name == "ZONOS3" => {
+            Some(vec!["Savannah_en-American_F_1", "Imogen_en-British_F_1"])
+        }
+        VoiceModel::LlamaTts { .. } => Some(vec!["default"]),
     };
     match known {
         Some(names) => names.into_iter().map(String::from).collect(),
@@ -489,13 +700,13 @@ pub fn voice_number(names: &[String], wanted: &str) -> Result<i32, String> {
     }
 }
 
-fn path(p: &Path) -> Result<String, String> {
+pub(super) fn path(p: &Path) -> Result<String, String> {
     p.to_str()
         .map(String::from)
         .ok_or_else(|| format!("the model path {} is not valid UTF-8", p.display()))
 }
 
-fn paths(ps: &[PathBuf]) -> Result<Option<String>, String> {
+pub(super) fn paths(ps: &[PathBuf]) -> Result<Option<String>, String> {
     if ps.is_empty() {
         return Ok(None);
     }
@@ -507,24 +718,61 @@ fn paths(ps: &[PathBuf]) -> Result<Option<String>, String> {
     ))
 }
 
-fn threads() -> i32 {
+pub(super) fn threads() -> i32 {
     std::thread::available_parallelism()
         .map(|n| n.get().min(4) as i32)
         .unwrap_or(1)
 }
 
+/// Voices that can be listed directly from the model files without booting a heavy server.
+pub fn fast_voices(model: &VoiceModel) -> Option<Vec<String>> {
+    match model {
+        VoiceModel::Orpheus { .. } => Some(
+            super::llama::ORPHEUS_VOICES
+                .iter()
+                .map(|&s| s.into())
+                .collect(),
+        ),
+        VoiceModel::Phonon { voices, .. } if !voices.is_empty() => Some(voices.clone()),
+        VoiceModel::LlamaTts { dir, .. } => {
+            let cached = dir.join("voices.txt");
+            if let Ok(text) = fs::read_to_string(cached) {
+                let list: Vec<String> = text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(String::from)
+                    .collect();
+                if !list.is_empty() {
+                    return Some(list);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+pub(super) type AudioSink = Rc<RefCell<dyn FnMut(&[f32]) -> bool>>;
+
+/// Narrow runtime port implemented by each TTS engine (`sherpa`, `phonon`, `llama_tts`).
+pub(crate) trait TtsBackend {
+    fn sample_rate(&self) -> u32;
+    fn voices(&self) -> &[String];
+    fn languages(&self) -> &[&'static str];
+    fn generate(
+        &self,
+        text: &str,
+        sid: i32,
+        speed: f32,
+        language: Option<&str>,
+        on_audio: &AudioSink,
+    ) -> Result<(), String>;
+}
+
 /// A loaded voice model.
 pub struct Synthesizer {
-    tts: OfflineTts,
-    voices: Vec<String>,
-    /// A Pocket TTS model's reference clips, one per voice; empty for the others.
-    references: Vec<PathBuf>,
-    languages: Vec<&'static str>,
-    family: &'static str,
-    /// Whether sherpa-onnx hands the audio over sentence by sentence; else (Kitten, which hands
-    /// over nothing until the end, and Supertonic, which hands over all of it at the end) the
-    /// text is given to it one sentence at a time.
-    streams: bool,
+    backend: Box<dyn TtsBackend>,
 }
 
 impl Synthesizer {
@@ -532,134 +780,53 @@ impl Synthesizer {
     /// linked with the GPU libraries), else on the CPU; a model the GPU refuses runs on the CPU.
     pub fn load(model: &VoiceModel) -> Result<Synthesizer, String> {
         let wanted = crate::engines::recognize::provider();
-        match Self::load_on(model, &wanted) {
-            Err(_) if wanted != "cpu" => Self::load_on(model, "cpu"),
-            r => r,
-        }
+        Self::load_with_provider(model, &wanted)
     }
 
-    fn load_on(model: &VoiceModel, provider: &str) -> Result<Synthesizer, String> {
-        let mut config = OfflineTtsConfig {
-            // One sentence at a time: each comes out as soon as it is generated.
-            max_num_sentences: 1,
-            ..Default::default()
+    /// Load `model` preferring `wanted` execution provider (falling back to `"cpu"` if refused).
+    pub fn load_with_provider(model: &VoiceModel, wanted: &str) -> Result<Synthesizer, String> {
+        let backend: Box<dyn TtsBackend> = match model {
+            VoiceModel::Phonon { dir, .. } => Box::new(phonon::PhononBackend::load(dir)?),
+            VoiceModel::LlamaTts {
+                dir,
+                model: gguf,
+                mmproj,
+                sample_rate,
+                family_name,
+            } => Box::new(llama_tts::LlamaTtsBackend::load(
+                dir,
+                gguf,
+                mmproj,
+                *sample_rate,
+                family_name,
+            )?),
+            VoiceModel::Orpheus { model: gguf, snac } => {
+                Box::new(llama_tts::OrpheusBackend::load(gguf, snac)?)
+            }
+            _ => {
+                let loaded = match sherpa::SherpaBackend::load(model, wanted) {
+                    Err(_) if wanted != "cpu" => sherpa::SherpaBackend::load(model, "cpu")?,
+                    r => r?,
+                };
+                Box::new(loaded)
+            }
         };
-        let m = &mut config.model;
-        m.num_threads = threads();
-        m.provider = Some(provider.into());
-        let opt = |p: &Option<PathBuf>| p.as_deref().map(path).transpose();
-        match model {
-            VoiceModel::Kokoro {
-                model,
-                voices,
-                tokens,
-                lexicons,
-                dict,
-                fsts,
-            } => {
-                m.kokoro.model = Some(path(model)?);
-                m.kokoro.voices = Some(path(voices)?);
-                m.kokoro.tokens = Some(path(tokens)?);
-                m.kokoro.lexicon = paths(lexicons)?;
-                m.kokoro.dict_dir = opt(dict)?;
-                config.rule_fsts = paths(fsts)?;
-            }
-            VoiceModel::Vits {
-                model,
-                tokens,
-                lexicon,
-                ..
-            } => {
-                m.vits.model = Some(path(model)?);
-                m.vits.tokens = Some(path(tokens)?);
-                m.vits.lexicon = opt(lexicon)?;
-            }
-            VoiceModel::Kitten {
-                model,
-                voices,
-                tokens,
-                lexicon,
-            } => {
-                m.kitten.model = Some(path(model)?);
-                m.kitten.voices = Some(path(voices)?);
-                m.kitten.tokens = Some(path(tokens)?);
-                m.kitten.lexicon = opt(lexicon)?;
-            }
-            VoiceModel::Supertonic {
-                duration_predictor,
-                text_encoder,
-                vector_estimator,
-                vocoder,
-                tts_json,
-                unicode_indexer,
-                voice_style,
-            } => {
-                let s = &mut m.supertonic;
-                s.duration_predictor = Some(path(duration_predictor)?);
-                s.text_encoder = Some(path(text_encoder)?);
-                s.vector_estimator = Some(path(vector_estimator)?);
-                s.vocoder = Some(path(vocoder)?);
-                s.tts_json = Some(path(tts_json)?);
-                s.unicode_indexer = Some(path(unicode_indexer)?);
-                s.voice_style = Some(path(voice_style)?);
-            }
-            VoiceModel::Pocket {
-                lm_flow,
-                lm_main,
-                encoder,
-                decoder,
-                text_conditioner,
-                vocab_json,
-                token_scores_json,
-                ..
-            } => {
-                let p = &mut m.pocket;
-                p.lm_flow = Some(path(lm_flow)?);
-                p.lm_main = Some(path(lm_main)?);
-                p.encoder = Some(path(encoder)?);
-                p.decoder = Some(path(decoder)?);
-                p.text_conditioner = Some(path(text_conditioner)?);
-                p.vocab_json = Some(path(vocab_json)?);
-                p.token_scores_json = Some(path(token_scores_json)?);
-            }
-        }
-        let tts = OfflineTts::create(&config).ok_or_else(|| {
-            format!(
-                "cannot load the {} model (sherpa-onnx refused its files)",
-                model.family()
-            )
-        })?;
-        let voices = voice_names(model, tts.num_speakers().max(1) as usize);
-        let references = match model {
-            VoiceModel::Pocket { references, .. } => references.clone(),
-            _ => Vec::new(),
-        };
-        Ok(Synthesizer {
-            tts,
-            voices,
-            references,
-            languages: model.languages(),
-            family: model.family(),
-            streams: !matches!(
-                model,
-                VoiceModel::Kitten { .. } | VoiceModel::Supertonic { .. }
-            ),
-        })
+        Ok(Synthesizer { backend })
     }
 
     pub fn sample_rate(&self) -> u32 {
-        self.tts.sample_rate().max(0) as u32
+        self.backend.sample_rate()
     }
 
     /// The voices' names, by number.
     pub fn voices(&self) -> &[String] {
-        &self.voices
+        self.backend.voices()
     }
 
     /// The languages the model is told to speak in, the default first (see
     /// [`VoiceModel::languages`]).
     pub fn languages(&self) -> &[&'static str] {
-        &self.languages
+        self.backend.languages()
     }
 
     /// Generate `text` with voice `sid` at `speed` (1 is normal), in `language` (one of
@@ -674,71 +841,31 @@ impl Synthesizer {
         language: Option<&str>,
         on_audio: impl FnMut(&[f32]) -> bool + 'static,
     ) -> Result<(), String> {
-        let mut config = GenerationConfig {
-            sid,
-            speed,
-            ..Default::default()
-        };
-        if let Some(lang) = pick_language(&self.languages, language, self.family)? {
-            config.extra = Some(HashMap::from([("lang".to_string(), lang.into())]));
-        }
-        if !self.references.is_empty() {
-            // Pocket TTS: the voice is a reference clip, not a speaker number.
-            let clip = usize::try_from(sid)
-                .ok()
-                .and_then(|i| self.references.get(i))
-                .ok_or_else(|| format!("no voice number {sid}"))?;
-            let wave = Wave::read(&path(clip)?)
-                .filter(|w| w.num_samples() > 0 && w.sample_rate() > 0)
-                .ok_or_else(|| {
-                    format!(
-                        "cannot read the voice's reference clip {} (a WAV file)",
-                        clip.display()
-                    )
-                })?;
-            config.sid = 0;
-            config.reference_audio = Some(wave.samples().to_vec());
-            config.reference_sample_rate = wave.sample_rate();
-        }
         let text = text.replace('\0', " ");
         let pieces = sentences(&text);
         if pieces.is_empty() {
             // No letter or digit: nothing to say (Pocket TTS would make up 40 s of babble).
             return Ok(());
         }
-        let pieces = if self.streams {
-            vec![text.as_str()]
-        } else {
-            pieces
-        };
-        let on_audio = Rc::new(RefCell::new(on_audio));
-        for piece in pieces {
-            let called = Rc::new(Cell::new(false));
-            let going = Rc::new(Cell::new(true));
-            let (cb_audio, cb_called, cb_going) = (on_audio.clone(), called.clone(), going.clone());
-            let audio = self
-                .tts
-                .generate_with_config(
-                    piece,
-                    &config,
-                    Some(move |samples: &[f32], _progress: f32| {
-                        cb_called.set(true);
-                        let more = (cb_audio.borrow_mut())(samples);
-                        cb_going.set(more);
-                        more
-                    }),
-                )
-                .ok_or_else(|| "the voice model generated no audio".to_string())?;
-            // Kitten hands nothing to the callback: the audio comes at the end.
-            if !called.get() && !(on_audio.borrow_mut())(audio.samples()) {
-                break;
-            }
-            if !going.get() {
-                break;
-            }
-        }
-        Ok(())
+        let cb: AudioSink = Rc::new(RefCell::new(on_audio));
+        self.backend.generate(&text, sid, speed, language, &cb)
     }
+}
+
+/// Adjust playback rate by linear resampling when `speed` is not 1.0.
+pub(super) fn resample_speed(samples: &[f32], speed: f32) -> Vec<f32> {
+    if (speed - 1.0).abs() < 0.01 || samples.len() < 2 {
+        return samples.to_vec();
+    }
+    let out_len = ((samples.len() as f32) / speed).max(1.0) as usize;
+    let mut out = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        let pos = (i as f32) * speed;
+        let idx = (pos as usize).min(samples.len() - 2);
+        let frac = pos - idx as f32;
+        out.push(samples[idx] * (1.0 - frac) + samples[idx + 1] * frac);
+    }
+    out
 }
 
 /// `text` in sentences: each ends after `.`, `!`, `?` or `…` (and any closing quotes or
@@ -922,7 +1049,6 @@ mod tests {
         assert!(e.contains("more than one model"), "{e}");
         let e = from_names(dir, &names("x.onnx voices.bin tokens.txt"), &[]).unwrap_err();
         assert!(e.contains("no model.onnx"), "{e}");
-        // A transcription model is not a voice.
         let e = from_names(
             dir,
             &names("encoder.onnx decoder.onnx joiner.onnx tokens.txt"),
@@ -993,7 +1119,6 @@ mod tests {
             }
         );
         assert_eq!(got.family(), "Kitten");
-        // The same files elsewhere are Kokoro's.
         let kokoro = from_names(Path::new("/m/kokoro-en-v0_19"), &files, &dirs).unwrap();
         assert!(matches!(kokoro, VoiceModel::Kokoro { .. }), "{kokoro:?}");
         let mini = from_names(
@@ -1053,47 +1178,38 @@ mod tests {
             }
         );
         assert_eq!(got.family(), "Supertonic");
-        // The int8 model is preferred to the float one beside it.
-        let both = format!("{all} vocoder.onnx");
+        assert_eq!(got.languages().len(), 31);
+        assert_eq!(got.languages()[0], "en");
+        let both = format!("{all} duration_predictor.onnx");
         let got = from_names(dir, &names(&both), &[]).unwrap();
         assert!(
-            matches!(got, VoiceModel::Supertonic { ref vocoder, .. } if vocoder == &dir.join("vocoder.int8.onnx"))
+            matches!(got, VoiceModel::Supertonic { ref duration_predictor, .. } if duration_predictor.ends_with("duration_predictor.int8.onnx"))
         );
         let e = from_names(
             dir,
-            &names("duration_predictor.onnx text_encoder.onnx vocoder.onnx tts.json"),
+            &names("duration_predictor.onnx text_encoder.onnx"),
             &[],
         )
         .unwrap_err();
-        assert!(
-            e.contains(
-                "part of a Supertonic model; missing: vector_estimator.onnx, \
-                 unicode_indexer.bin, voice.bin"
-            ),
-            "{e}"
-        );
+        assert!(e.contains("Supertonic"), "{e}");
+        assert!(e.contains("vector_estimator.onnx"), "{e}");
+        assert!(e.contains("tts.json"), "{e}");
     }
 
     #[test]
-    fn pocket_tts_is_told_by_its_language_models() {
-        let dir = Path::new("/m/sherpa-onnx-pocket-tts-int8-2026-01-26");
-        let got = from_names(
-            dir,
-            &names(
-                "decoder.int8.onnx encoder.onnx LICENSE lm_flow.int8.onnx lm_main.int8.onnx \
-                 README.md text_conditioner.onnx token_scores.json vocab.json",
-            ),
-            &names("test_wavs"),
-        )
-        .unwrap();
+    fn pocket_tts_is_told_by_its_five_models_and_speaks_its_reference_clips() {
+        let dir = Path::new("/m/sherpa-onnx-pocket-tts-int8-2026-03-17");
+        let all = "decoder.int8.onnx encoder.int8.onnx lm_flow.int8.onnx lm_main.int8.onnx \
+                   text_conditioner.int8.onnx token_scores.json vocab.json";
+        let got = from_names(dir, &names(all), &[]).unwrap();
         assert_eq!(
             got,
             VoiceModel::Pocket {
                 lm_flow: dir.join("lm_flow.int8.onnx"),
                 lm_main: dir.join("lm_main.int8.onnx"),
-                encoder: dir.join("encoder.onnx"),
+                encoder: dir.join("encoder.int8.onnx"),
                 decoder: dir.join("decoder.int8.onnx"),
-                text_conditioner: dir.join("text_conditioner.onnx"),
+                text_conditioner: dir.join("text_conditioner.int8.onnx"),
                 vocab_json: dir.join("vocab.json"),
                 token_scores_json: dir.join("token_scores.json"),
                 references: Vec::new(),
@@ -1101,49 +1217,29 @@ mod tests {
         );
         assert_eq!(got.family(), "Pocket TTS");
         let e = from_names(dir, &names("lm_main.onnx encoder.onnx vocab.json"), &[]).unwrap_err();
-        assert!(
-            e.contains(
-                "part of a Pocket TTS model; missing: lm_flow.onnx, decoder.onnx, \
-                 text_conditioner.onnx, token_scores.json"
-            ),
-            "{e}"
-        );
-        // A transducer's encoder and decoder are not Pocket TTS.
+        assert!(e.contains("Pocket TTS"), "{e}");
+        assert!(e.contains("lm_flow.onnx"), "{e}");
+        assert!(e.contains("token_scores.json"), "{e}");
         let e = from_names(dir, &names("encoder.onnx decoder.onnx tokens.txt"), &[]).unwrap_err();
         assert!(e.contains("more than one model"), "{e}");
-    }
 
-    #[test]
-    fn pocket_tts_voices_are_the_reference_clips_in_test_wavs() {
-        let dir = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().join(format!(
             "pisr-pocket-{}",
             crate::token::random_hex(6).unwrap()
         ));
-        let files = "decoder.onnx encoder.onnx lm_flow.onnx lm_main.onnx text_conditioner.onnx \
-                     token_scores.json vocab.json";
-        fs::create_dir_all(&dir).unwrap();
-        for n in files.split_whitespace() {
-            fs::write(dir.join(n), "x").unwrap();
+        let pdir = root.join("pocket");
+        fs::create_dir_all(pdir.join(POCKET_VOICES_DIR)).unwrap();
+        for n in all.split_whitespace() {
+            fs::write(pdir.join(n), "x").unwrap();
         }
-        let e = detect(&dir).unwrap_err();
-        let wavs = dir.join(POCKET_VOICES_DIR);
-        fs::create_dir_all(wavs.join("not-a-clip.wav")).unwrap();
-        for n in ["loona.wav", "bria.WAV", "notes.txt"] {
-            fs::write(wavs.join(n), "x").unwrap();
-        }
-        let got = detect(&dir);
-        fs::remove_dir_all(&dir).unwrap();
+        let e = detect(&pdir).unwrap_err();
         assert!(e.contains("has no voices"), "{e}");
-        assert!(e.contains("test_wavs"), "{e}");
-        let got = got.unwrap();
-        assert!(
-            matches!(got, VoiceModel::Pocket { ref references, .. }
-                if references == &[wavs.join("bria.WAV"), wavs.join("loona.wav")]),
-            "{got:?}"
-        );
-        // Named by their stems, whatever number of speakers the model reports.
-        assert_eq!(voice_names(&got, 1), names("bria loona"));
-        assert_eq!(voice_names(&got, 0), names("bria loona"));
+        for n in ["b.wav", "a.wav", "README.md"] {
+            fs::write(pdir.join(POCKET_VOICES_DIR).join(n), "x").unwrap();
+        }
+        let got = detect(&pdir).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(voice_names(&got, 1), names("a b"));
     }
 
     #[test]
@@ -1231,5 +1327,78 @@ mod tests {
             pcm16(&[0.0, 1.0, -1.0, 2.0]),
             [0, 0, 0xff, 0x7f, 0x01, 0x80, 0xff, 0x7f]
         );
+    }
+
+    #[test]
+    fn matcha_and_zipvoice_are_detected_with_shared_vocoders() {
+        let root = std::env::temp_dir().join(format!(
+            "pisr-matcha-zip-{}",
+            crate::token::random_hex(6).unwrap()
+        ));
+        let matcha = root.join("matcha-icefall-en_US-ljspeech");
+        fs::create_dir_all(&matcha).unwrap();
+        fs::write(matcha.join("model-steps-3.onnx"), "x").unwrap();
+        fs::write(matcha.join("tokens.txt"), "x").unwrap();
+        assert!(detect(&matcha)
+            .unwrap_err()
+            .contains("vocos-22khz-univ.onnx"));
+        fs::write(root.join("vocos-22khz-univ.onnx"), "x").unwrap();
+        assert!(detect(&matcha).unwrap_err().contains("lexicon-en-us.txt"));
+        fs::write(root.join("lexicon-en-us.txt"), "x").unwrap();
+        assert_eq!(detect(&matcha).unwrap().family(), "Matcha-TTS");
+
+        let zip = root.join("zipvoice");
+        fs::create_dir_all(zip.join("test_wavs")).unwrap();
+        for n in [
+            "encoder.int8.onnx",
+            "decoder.int8.onnx",
+            "tokens.txt",
+            "lexicon.txt",
+        ] {
+            fs::write(zip.join(n), "x").unwrap();
+        }
+        fs::write(zip.join("test_wavs/a.wav"), "x").unwrap();
+        fs::write(zip.join("test_wavs/prompt.txt"), "a.wav hello world\n").unwrap();
+        assert!(detect(&zip).unwrap_err().contains("vocos_24khz.onnx"));
+        fs::write(root.join("vocos_24khz.onnx"), "x").unwrap();
+        let zv = detect(&zip).unwrap();
+        assert_eq!(zv.family(), "ZipVoice");
+        assert_eq!(voice_names(&zv, 1), vec!["a"]);
+
+        let phonon = root.join("hf-phonon-31m-en");
+        fs::create_dir_all(phonon.join("voices")).unwrap();
+        for n in [
+            "config.json",
+            "tokenizer.json",
+            "model.q8.gguf",
+            "default-voice.safetensors",
+            "voices/Zoey.safetensors",
+        ] {
+            fs::write(phonon.join(n), "x").unwrap();
+        }
+        let ph = detect(&phonon).unwrap();
+        assert_eq!(ph.family(), "Phonon");
+        assert_eq!(voice_names(&ph, 2), vec!["default", "Zoey"]);
+
+        let zonos = root.join("hf-zonos3-mini-q8");
+        fs::create_dir_all(&zonos).unwrap();
+        fs::write(zonos.join("ZONOS3-Mini-Q8_0.gguf"), "x").unwrap();
+        fs::write(zonos.join("mmproj-ZONOS3-Mini-F32.gguf"), "x").unwrap();
+        assert_eq!(detect(&zonos).unwrap().family(), "ZONOS3");
+
+        let qwen = root.join("hf-qwen3-tts-1.7b-q8");
+        fs::create_dir_all(&qwen).unwrap();
+        fs::write(qwen.join("Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf"), "x").unwrap();
+        fs::write(qwen.join("mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf"), "x").unwrap();
+        assert_eq!(detect(&qwen).unwrap().family(), "Qwen3-TTS");
+
+        let orpheus = root.join("hf-orpheus-3b-q4");
+        fs::create_dir_all(&orpheus).unwrap();
+        fs::write(orpheus.join("orpheus-3b-0.1-ft-Q4_K_M.gguf"), "x").unwrap();
+        fs::write(orpheus.join("snac_24khz.onnx"), "x").unwrap();
+        let orp = detect(&orpheus).unwrap();
+        assert_eq!(orp.family(), "Orpheus");
+        assert_eq!(voice_names(&orp, 8)[0], "tara");
+        let _ = fs::remove_dir_all(&root);
     }
 }

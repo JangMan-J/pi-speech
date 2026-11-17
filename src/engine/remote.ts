@@ -20,6 +20,7 @@ import { createServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
+import { isReceiverOutdated, parseReceiverVersion } from "./binary";
 
 export interface RemotePrompts {
   /** The password for `who`; undefined when the user does not give one. */
@@ -36,8 +37,14 @@ export interface RemoteLink {
   /** Where the bridge reaches the receiver: `127.0.0.1:<forwarded port>`. */
   readonly address: string;
   readonly token: string;
-  /** The receiver's version there. */
+  /** The receiver's version there (from /v1/health, or lease ready). */
   readonly version: string;
+  /** The receiver's edition (`cpu` or `gpu`), when reported. */
+  readonly edition?: "cpu" | "gpu";
+  /** Whether the running receiver there is older than the extension's expected version. */
+  readonly outdated?: boolean;
+  /** The remote machine's system (`linux-x64`), when known. */
+  readonly platform?: string;
   /** The connection is up and the lease held. */
   alive(): boolean;
   /** Called once when the connection ends without close(). */
@@ -48,11 +55,45 @@ export interface RemoteLink {
 
 export interface ConnectOptions {
   env?: NodeJS.ProcessEnv;
-  /** The bundled receiver for a system, `linux-x64` and so on; undefined when this install has none. */
-  binaryFor(platform: string): string | undefined;
-  /** The receiver version this extension carries, for the install prompt. */
+  /** Ensure the bundled or release receiver for `platform` (`linux-x64`) is on disk and return its path. */
+  binaryFor(platform: string): Promise<string | undefined> | string | undefined;
+  /** Whether a receiver is available (on disk or downloadable) for `platform` before fetching it. */
+  hasBinaryFor?(platform: string): boolean;
+  /** Expected download/install size in bytes for `platform`, for the install prompt. */
+  binarySizeFor?(platform: string): number | undefined;
+  /** The receiver version this extension carries, for verifying and updating the remote binary. */
   version?: string;
+  /** Update an existing remote receiver without prompting (`force`), or prompt when outdated (default). */
+  update?: boolean | "force";
+  /** Target platform override when installing/updating a specific edition (e.g. `linux-x64-cuda13`). */
+  targetOverride?: string;
   signal?: AbortSignal;
+}
+
+export type RemoteInstallPlan =
+  | { action: "none" }
+  | { action: "install"; reason: "missing" | "too-old" }
+  | { action: "update"; reason: "outdated" | "forced"; confirm: boolean };
+
+/**
+ * Decide whether the remote receiver should be kept, installed (required), or updated (optional unless forced).
+ */
+export function planRemoteReceiver(opts: {
+  hasPath: boolean;
+  canLease: boolean;
+  remoteVersion?: string;
+  expectedVersion?: string;
+  hasBinary: boolean;
+  forceUpdate?: boolean;
+}): RemoteInstallPlan {
+  if (!opts.hasPath) return { action: "install", reason: "missing" };
+  if (!opts.canLease) return { action: "install", reason: "too-old" };
+  if (!opts.hasBinary) return { action: "none" };
+  if (opts.forceUpdate) return { action: "update", reason: "forced", confirm: false };
+  if (opts.expectedVersion && (!opts.remoteVersion || isReceiverOutdated(opts.remoteVersion, opts.expectedVersion))) {
+    return { action: "update", reason: "outdated", confirm: true };
+  }
+  return { action: "none" };
 }
 
 export class RemoteError extends Error {
@@ -262,56 +303,105 @@ export async function connectRemote(dest: string, prompts: RemotePrompts, opts: 
       .map((l) => l.trim())
       .filter(Boolean);
     const uname = lines.find((l) => l.startsWith("uname: "))?.slice(7) ?? "";
+    const platform = platformOf(uname);
     let path = lines.find((l) => !l.startsWith("uname: "));
     let canLease = false;
+    let remoteVersion: string | undefined;
     if (path) {
       // A receiver that knows `lease` answers its usage for an argument it does not take; an older one does not.
-      const probe = await sh(`${shQuote(path)} lease --probe`);
-      canLease = /usage: pi-speech-receiver lease/.test(probe.stderr);
+      // Check `--version` in the same round-trip (older binaries exit non-zero and print nothing to stdout).
+      const probe = await sh(
+        `${shQuote(path)} lease --probe 2>&1; printf '\\n__VER__:'; ${shQuote(path)} --version 2>/dev/null || true`,
+      );
+      canLease = /usage: pi-speech-receiver lease/.test(probe.stdout);
+      const verPart = probe.stdout.split("__VER__:")[1]?.trim() ?? "";
+      remoteVersion = parseReceiverVersion(verPart);
     }
-    if (!path || !canLease) {
-      const platform = platformOf(uname);
-      const binary = platform ? opts.binaryFor(platform) : undefined;
-      if (!platform || !binary) {
-        throw new RemoteError(
-          `${dest} has ${path ? "a pi-speech-receiver too old to connect to" : "no pi-speech-receiver"}, and this install has none for ${uname || "its system"}: install pi-speech there`,
+    const targetPlatform = (opts.targetOverride ?? platform) || undefined;
+    let binary = targetPlatform && !opts.hasBinaryFor ? await opts.binaryFor(targetPlatform) : undefined;
+    const hasBinary = targetPlatform ? (opts.hasBinaryFor ? opts.hasBinaryFor(targetPlatform) : !!binary) : false;
+    const plan = planRemoteReceiver({
+      hasPath: !!path,
+      canLease,
+      remoteVersion,
+      expectedVersion: opts.version,
+      hasBinary,
+      forceUpdate: opts.update === "force",
+    });
+    if (plan.action === "install" && (!targetPlatform || !hasBinary)) {
+      throw new RemoteError(
+        `${dest} has ${path ? "a pi-speech-receiver too old to connect to" : "no pi-speech-receiver"}, and this install has none for ${uname || "its system"}: install pi-speech there`,
+      );
+    }
+    let updated = false;
+    if (plan.action !== "none" && targetPlatform && hasBinary) {
+      const knownBytes = opts.binarySizeFor?.(targetPlatform);
+      const sizeNote = knownBytes ? ` (${Math.round(knownBytes / 1e6)} MB)` : "";
+      let ok = true;
+      if (plan.action === "install") {
+        ok = await prompts.confirm(
+          `${dest} has ${path ? "an older pi-speech-receiver" : "no pi-speech-receiver"}. Install ${opts.version ? `version ${opts.version} ` : ""}for ${targetPlatform} in ~/.local/bin there${sizeNote}?`,
+        );
+        if (!ok) throw new RemoteError(`not connected: ${dest} needs pi-speech-receiver`);
+      } else if (plan.confirm) {
+        const current = remoteVersion ?? "an older build";
+        ok = await prompts.confirm(
+          `${dest} has pi-speech-receiver ${current}${opts.version ? ` (this extension carries ${opts.version})` : ""}. Update it in ~/.local/bin there${sizeNote}?`,
         );
       }
-      // The binary and the shared libraries beside it (Linux x64 carries sherpa-onnx's and ONNX Runtime's),
-      // installed together in ~/.local/lib/pi-speech-receiver, the binary linked from ~/.local/bin: it finds
-      // the libraries beside its real path.
-      const files = [binary, ...libraries(binary)];
-      const size = files.reduce((n, f) => n + statSync(f).size, 0);
-      const mb = Math.round(size / 1e6);
-      const ok = await prompts.confirm(
-        `${dest} has ${path ? "an older pi-speech-receiver" : "no pi-speech-receiver"}. Install ${opts.version ? `version ${opts.version} ` : ""}for ${platform} in ~/.local/bin there (${mb} MB)?`,
-      );
-      if (!ok) throw new RemoteError(`not connected: ${dest} needs pi-speech-receiver`);
-      prompts.progress(`… installing pi-speech-receiver on ${dest} (${mb} MB)`);
-      const home = `$HOME/.local/lib/${RECEIVER}`;
-      for (const file of files) {
-        const name = basename(file);
-        const mode = file === binary ? 755 : 644;
-        const put = await sh(
-          `mkdir -p "${home}" && cat > "${home}/${name}.new" && chmod ${mode} "${home}/${name}.new" && mv -f "${home}/${name}.new" "${home}/${name}"`,
-          createReadStream(file),
-        );
-        if (put.code !== 0)
-          throw new RemoteError(`cannot install pi-speech-receiver on ${dest}: ${sshWhy(put.stderr)}`);
+      if (ok) {
+        if (!binary) {
+          prompts.progress(`… fetching pi-speech-receiver for ${targetPlatform}`);
+          binary = await opts.binaryFor(targetPlatform);
+          if (!binary) {
+            if (plan.action === "install") {
+              throw new RemoteError(`cannot obtain pi-speech-receiver for ${targetPlatform}`);
+            }
+          }
+        }
+        if (binary) {
+          // The binary and the shared libraries beside it (Linux x64 carries sherpa-onnx's and ONNX Runtime's),
+          // installed together in ~/.local/lib/pi-speech-receiver, the binary linked from ~/.local/bin: it finds
+          // the libraries beside its real path.
+          const files = [binary, ...libraries(binary)];
+          const size = files.reduce((n, f) => n + statSync(f).size, 0);
+          const mb = Math.round(size / 1e6);
+          prompts.progress(
+            `… ${plan.action === "update" ? "updating" : "installing"} pi-speech-receiver on ${dest} (${mb} MB)`,
+          );
+          const home = `$HOME/.local/lib/${RECEIVER}`;
+          for (const file of files) {
+            const name = basename(file);
+            const mode = file === binary ? 755 : 644;
+            const put = await sh(
+              `mkdir -p "${home}" && cat > "${home}/${name}.new" && chmod ${mode} "${home}/${name}.new" && mv -f "${home}/${name}.new" "${home}/${name}"`,
+              createReadStream(file),
+            );
+            if (put.code !== 0)
+              throw new RemoteError(`cannot install pi-speech-receiver on ${dest}: ${sshWhy(put.stderr)}`);
+          }
+          const target = `$HOME/.local/bin/${RECEIVER}`;
+          const link = await sh(
+            `mkdir -p "$HOME/.local/bin" && ln -sf "${home}/${basename(binary)}" "${target}" && echo "${target}"`,
+          );
+          if (link.code !== 0)
+            throw new RemoteError(`cannot install pi-speech-receiver on ${dest}: ${sshWhy(link.stderr)}`);
+          path = link.stdout.trim().split(/\r?\n/).at(-1);
+          if (!path) throw new RemoteError(`cannot install pi-speech-receiver on ${dest}`);
+          updated = true;
+        }
       }
-      const target = `$HOME/.local/bin/${RECEIVER}`;
-      const link = await sh(
-        `mkdir -p "$HOME/.local/bin" && ln -sf "${home}/${basename(binary)}" "${target}" && echo "${target}"`,
-      );
-      if (link.code !== 0)
-        throw new RemoteError(`cannot install pi-speech-receiver on ${dest}: ${sshWhy(link.stderr)}`);
-      path = link.stdout.trim().split(/\r?\n/).at(-1);
-      if (!path) throw new RemoteError(`cannot install pi-speech-receiver on ${dest}`);
+    }
+    if (updated) {
+      // Give a just-released shared receiver a moment to exit before starting lease on the new binary.
+      await sh(
+        'i=0; while [ -e "$HOME/.config/pi-speech/receiver.port" ] && [ "$i" -lt 6 ]; do sleep 0.1; i=$((i+1)); done',
+      ).catch(() => {});
     }
 
     // ── The lease, and the forward ───────────────────────────────────────
     prompts.progress(`… starting the receiver on ${dest}`);
-    const child = spawn("ssh", [...via, "--", dest, `sh -c ${shQuote(`exec ${shQuote(path)} lease`)}`], {
+    const child = spawn("ssh", [...via, "--", dest, `sh -c ${shQuote(`exec ${shQuote(path!)} lease`)}`], {
       env,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
@@ -348,12 +438,34 @@ export async function connectRemote(dest: string, prompts: RemotePrompts, opts: 
     );
     if (fwd.code !== 0) throw new RemoteError(`cannot forward a port to ${dest}: ${sshWhy(fwd.stderr)}`);
 
+    // Read the running shared receiver's version and edition from /v1/health.
+    let runningVersion = String(ready.version ?? "");
+    let runningEdition: "cpu" | "gpu" | undefined =
+      ready.edition === "cpu" || ready.edition === "gpu" ? ready.edition : undefined;
+    try {
+      const res = await fetch(`http://127.0.0.1:${localPort}/v1/health`, {
+        headers: { Authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(2000),
+      });
+      if (res.ok) {
+        const h = (await res.json()) as { version?: unknown; edition?: unknown };
+        if (typeof h.version === "string" && h.version) runningVersion = h.version;
+        if (h.edition === "cpu" || h.edition === "gpu") runningEdition = h.edition;
+      }
+    } catch {
+      /* keep lease ready version */
+    }
+    const outdated = opts.version ? isReceiverOutdated(runningVersion || remoteVersion, opts.version) : false;
+
     let closed = false;
     const link: RemoteLink = {
       dest,
       address: `127.0.0.1:${localPort}`,
       token,
-      version: String(ready.version ?? ""),
+      version: runningVersion,
+      ...(runningEdition ? { edition: runningEdition } : {}),
+      outdated,
+      platform,
       alive: () => !closed && child.exitCode === null && child.signalCode === null,
       async close() {
         if (closed) return;

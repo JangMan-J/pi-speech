@@ -74,12 +74,28 @@ export interface FrameStyle {
 	border(text: string): string;
 }
 
+export type SortDir = "asc" | "desc";
+
+/** Sort direction arrow for column headers (`"▲"` ascending, `"▼"` descending). */
+export function sortArrow(dir: SortDir): "▲" | "▼" {
+	return dir === "desc" ? "▼" : "▲";
+}
+
+export interface FrameSort {
+	/** Human label for the active sort order (`"Price"`, `"Alphabetical"`, `"Recommended"`, `"Size"`, `"Downloaded"`). */
+	label: string;
+	/** Width in columns of the longest label in this picker, anchoring `Sort:` so the largest value ends at the right edge. */
+	maxLabelWidth?: number;
+}
+
 export interface FrameParts {
 	/** Plain text. */
 	title: string;
 	/** A short state on the right of the title line, already styled. Dropped when the line is too narrow for it. */
 	badge?: string;
 	tabs: string;
+	/** Active sort order, cut into the top rule at the right edge of `width` when present. */
+	sort?: FrameSort;
 	/** The one text field: a search, or whatever the tool's main input is. */
 	input: string;
 	header: string;
@@ -110,18 +126,37 @@ export function spread(left: string, right: string, width: number, measure: Meas
 	return gap >= NOTE_GAP ? left + " ".repeat(gap) + right : undefined;
 }
 
-/** The top rule with the title set into it: `─ Title ──────── badge ─`. The rule runs on to the terminal's edge. */
+/** The top rule with the title (`─ Title`) and optional `badge` and `Sort: <label>` cut in. */
 function titleLine(p: FrameParts, width: number, termWidth: number, style: FrameStyle, measure: Measure): string {
 	const lead = "─ ";
 	const rule = (n: number) => (n > 0 ? style.accent("─".repeat(n)) : "");
 	const title = measure.truncate(p.title, Math.max(1, width - lead.length));
 	const used = lead.length + measure.width(title);
 	const start = style.accent(lead) + style.bold(style.accent(title));
-	const badgeEnd = width - NOTE_GAP;
-	const fill = p.badge ? badgeEnd - measure.width(p.badge) - 1 - (used + 1) : 0;
-	// A rule shorter than this between the title and the badge would read as a dash, so the badge goes instead.
-	if (!p.badge || fill < 3) return used + 1 < termWidth ? `${start} ${rule(termWidth - used - 1)}` : start;
-	return `${start} ${rule(fill)} ${p.badge} ${rule(termWidth - badgeEnd - 1)}`;
+	const sort = p.sort?.label ? p.sort : undefined;
+	const prefix = "Sort: ";
+	const labelW = sort ? measure.width(sort.label) : 0;
+	const maxLabelW = sort ? Math.max(labelW, sort.maxLabelWidth ?? 0) : 0;
+	const sortStart = sort ? width - (measure.width(prefix) + maxLabelW) : width;
+	const sortFits = sort !== undefined && sortStart - 1 - (used + 1) >= 3;
+
+	const badgeEnd = sortFits ? sortStart - 1 - NOTE_GAP : width - NOTE_GAP;
+	const badgeFill = p.badge ? badgeEnd - measure.width(p.badge) - 1 - (used + 1) : 0;
+	const showBadge = Boolean(p.badge && badgeFill >= 3);
+
+	if (sortFits && sort) {
+		const sortText = `${style.border(prefix)}${style.bold(style.accent(sort.label))}`;
+		const sortUsed = sortStart + measure.width(prefix) + labelW;
+		const tail = Math.max(0, termWidth - sortUsed);
+		const trail = tail === 0 ? "" : tail === 1 ? " " : ` ${rule(tail - 1)}`;
+		if (showBadge && p.badge) {
+			return `${start} ${rule(badgeFill)} ${p.badge} ${rule(NOTE_GAP - 1)} ${sortText}${trail}`;
+		}
+		const fill = sortStart - 1 - (used + 1);
+		return `${start} ${rule(fill)} ${sortText}${trail}`;
+	}
+	if (!showBadge || !p.badge) return used + 1 < termWidth ? `${start} ${rule(termWidth - used - 1)}` : start;
+	return `${start} ${rule(badgeFill)} ${p.badge} ${rule(termWidth - badgeEnd - 1)}`;
 }
 
 /**

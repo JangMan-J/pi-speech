@@ -41,6 +41,25 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Watch standard input on a background thread and invoke `on_eof` once it closes or errors.
+pub(crate) fn watch_stdin_eof(
+    on_eof: impl FnOnce() + Send + 'static,
+) -> io::Result<thread::JoinHandle<()>> {
+    start_thread("stdin", move || {
+        let mut buf = [0u8; 256];
+        let mut stdin = io::stdin();
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        on_eof();
+    })
+}
+
 #[derive(Default)]
 struct St {
     exited: bool,

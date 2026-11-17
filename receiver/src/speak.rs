@@ -160,12 +160,17 @@ pub fn resolve_voice_dir(arg: &str) -> Result<PathBuf, String> {
              `pi-speech-receiver models download {arg}`"
         ));
     }
-    if let Some(l) = catalog.lexicon(entry) {
-        if !cache::is_ready(&root, entry, Some(l)) {
+    for dep in catalog.shared(entry) {
+        if !cache::lexicon_path(&root, dep).is_file() {
+            let what = if dep.name.starts_with("lexicon") {
+                "lexicon"
+            } else {
+                "vocoder"
+            };
             return Err(format!(
-                "the voice {arg} needs the lexicon {}, which is not in the model cache; \
+                "the voice {arg} needs the {what} {}, which is not in the model cache; \
                  download it with `pi-speech-receiver models download {arg}`",
-                l.name
+                dep.name
             ));
         }
     }
@@ -225,12 +230,20 @@ fn watch_stdout() {
 #[cfg(not(unix))]
 fn watch_stdout() {}
 
-fn list_voices(model: &str) -> Result<(), String> {
+/// Voice names of a downloaded speech model, in voice-number order.
+pub fn list_voices_of(model: &str) -> Result<Vec<String>, String> {
     let dir = resolve_voice_dir(model)?;
     let found = synthesize::detect(&dir)?;
-    let synth = Synthesizer::load(&found)?;
+    match synthesize::fast_voices(&found) {
+        Some(v) => Ok(v),
+        None => Ok(Synthesizer::load(&found)?.voices().to_vec()),
+    }
+}
+
+fn list_voices(model: &str) -> Result<(), String> {
+    let names = list_voices_of(model)?;
     let mut out = io::stdout().lock();
-    for (number, name) in synth.voices().iter().enumerate() {
+    for (number, name) in names.iter().enumerate() {
         writeln!(out, "{}", json!({"name": name, "number": number}))
             .map_err(|e| format!("cannot write the voices: {e}"))?;
     }
@@ -275,8 +288,26 @@ fn speak(model: &str, voice: Option<&str>, speed: f32, lang: Option<&str>) -> Re
     Ok(())
 }
 
-/// The kept voice model of `serve`: its directory and the loaded model.
-type Kept = Option<(PathBuf, Synthesizer)>;
+/// Keeps the last loaded voice model warm across requests.
+#[derive(Default)]
+pub struct WarmSynthesizer(Option<(PathBuf, Synthesizer)>);
+
+impl WarmSynthesizer {
+    pub fn new() -> Self {
+        Self(None)
+    }
+
+    /// The voice model `model` names, loaded (reusing the kept one when it matches).
+    pub fn get(&mut self, model: &str) -> Result<&Synthesizer, String> {
+        let dir = resolve_voice_dir(model)?;
+        if !self.0.as_ref().is_some_and(|(d, _)| *d == dir) {
+            self.0 = None;
+            let found = synthesize::detect(&dir)?;
+            self.0 = Some((dir, Synthesizer::load(&found)?));
+        }
+        Ok(&self.0.as_ref().expect("kept above").1)
+    }
+}
 
 /// The frames of `serve` on standard output.
 struct Frames(io::Stdout);
@@ -303,20 +334,9 @@ impl Frames {
     }
 }
 
-/// The voice model `model` names, loaded (the kept one when it is that one).
-fn synthesizer<'a>(kept: &'a mut Kept, model: &str) -> Result<&'a Synthesizer, String> {
-    let dir = resolve_voice_dir(model)?;
-    if !kept.as_ref().is_some_and(|(d, _)| *d == dir) {
-        *kept = None;
-        let found = synthesize::detect(&dir)?;
-        *kept = Some((dir, Synthesizer::load(&found)?));
-    }
-    Ok(&kept.as_ref().expect("kept above").1)
-}
-
 /// One request of `serve`, answered.
 fn answer(
-    kept: &mut Kept,
+    kept: &mut WarmSynthesizer,
     req: &Value,
     frames: &Arc<Frames>,
     cancel: &Arc<std::sync::atomic::AtomicI64>,
@@ -328,7 +348,7 @@ fn answer(
         return fail("the request names no model".into());
     };
     if req.get("load").and_then(Value::as_bool) == Some(true) {
-        match synthesizer(kept, model) {
+        match kept.get(model) {
             Ok(_) => frames.event(json!({"id": id, "event": "loaded"})),
             Err(e) => fail(e),
         }
@@ -343,7 +363,7 @@ fn answer(
         return fail(format!("speed must be from {MIN_SPEED} to {MAX_SPEED}"));
     }
     let lang = s("lang");
-    let synth = match synthesizer(kept, model) {
+    let synth = match kept.get(model) {
         Ok(s) => s,
         Err(e) => return fail(e),
     };
@@ -399,7 +419,7 @@ pub fn serve() -> ExitCode {
         frames.event(json!({"event": "error", "message": format!("cannot read requests: {e}")}));
         return ExitCode::from(1);
     }
-    let mut kept: Kept = None;
+    let mut kept = WarmSynthesizer::new();
     for req in rx {
         answer(&mut kept, &req, &frames, &cancel);
     }

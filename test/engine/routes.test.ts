@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { BridgeAudio, BridgeHealth } from "../../src/bridge/index";
-import type { AudioInput, AudioOutput } from "../../src/engine/audio";
+import type { BridgeAudio, BridgeHealth } from "../../src/bridge/client";
+import type { AudioInput, AudioOutput, StreamOptions } from "../../src/engine/audio";
 import { Routes } from "../../src/engine/routes";
 import type { BridgeMode } from "../../src/engine/settings";
 
@@ -112,5 +112,39 @@ describe("routes", () => {
     expect(r.message).toMatch(/SSH/);
     expect(r.message).toContain("http://127.0.0.1:47613");
     expect(r.message).toContain("0.1.0");
+  });
+
+  it("plainOutput forwards fadeMs options when Play audio on is This machine over bridge", async () => {
+    const seenOpts: Array<StreamOptions | undefined> = [];
+    const r = new Routes({
+      env: SSH,
+      mode: "on",
+      directions: () => ({ playOn: "this", recordOn: "remote", modelsOn: "remote" }),
+      bridge: {
+        output: { name: "bridge", playStream: async () => ({ ok: false, reason: "unused" }), stop: async () => {} },
+        input: {
+          name: "bridge",
+          start: async () => {
+            throw new Error("unused");
+          },
+        },
+        health: async () => ({ ok: true, version: "0.2.5" }),
+      },
+      localOutput: {
+        name: "local",
+        playStream: async (_stream, _kind, opts) => {
+          seenOpts.push(opts);
+          return { ok: false, reason: "no player" };
+        },
+        stop: async () => {},
+      },
+    });
+    const started = await r
+      .output()
+      .playStream({ format: { codec: "mp3" }, chunks: (async function* () {})() }, "message", {
+        fadeMs: 400,
+      });
+    expect(seenOpts).toEqual([{ fadeMs: 400 }]);
+    expect(started).toMatchObject({ ok: false, reason: expect.stringContaining("Play audio on is This machine") });
   });
 });

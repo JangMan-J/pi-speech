@@ -56,7 +56,13 @@ pub(crate) fn provider() -> String {
         .ok()
         .map(|p| p.trim().to_ascii_lowercase())
         .filter(|p| !p.is_empty())
-        .unwrap_or_else(|| "cpu".into())
+        .unwrap_or_else(|| {
+            if cfg!(feature = "shared") {
+                "cuda".into()
+            } else {
+                "cpu".into()
+            }
+        })
 }
 
 fn threads() -> i32 {

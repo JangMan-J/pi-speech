@@ -15,28 +15,61 @@ concurrency:
 
 jobs:
   # The floors live in package.json: engines.node and the pi-coding-agent peer range.
+  # On PRs and branch pushes, also determine which suites need to run (workflow_call always runs all).
   floors:
     runs-on: ubuntu-latest
     outputs:
       node: ${{ steps.read.outputs.node }}
       pi: ${{ steps.read.outputs.pi }}
+      run_extension: ${{ steps.read.outputs.run_extension }}
+      run_receiver: ${{ steps.read.outputs.run_receiver }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
       - id: read
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
         run: |
           node -e '
+            const { execFileSync } = require("child_process");
             const pkg = require("./package.json");
             const floor = (range, what) => {
               const m = /^>=\s*(\d+\.\d+\.\d+)$/.exec(range ?? "");
               if (!m) { console.error(what + " must be \">=X.Y.Z\" in package.json, got " + JSON.stringify(range)); process.exit(1); }
               return m[1];
             };
-            console.log("node=" + floor(pkg.engines?.node, "engines.node"));
-            console.log("pi=" + floor(pkg.peerDependencies?.["@earendil-works/pi-coding-agent"], "the @earendil-works/pi-coding-agent peer range"));
-          ' >> "$GITHUB_OUTPUT"
+            let runExt = true;
+            let runRcv = true;
+            if (process.env.EVENT_NAME === "push" || process.env.EVENT_NAME === "pull_request") {
+              try {
+                const base = process.env.PR_BASE || "HEAD^";
+                const changed = execFileSync("git", ["diff", "--name-only", base, "HEAD"], { encoding: "utf8" })
+                  .split(/\r?\n/).filter(Boolean);
+                if (changed.length > 0) {
+                  const extPattern = /^(index\.ts|package(-lock)?\.json|tsconfig\.json|biome\.json|vitest\.config\.ts|src\/|test\/|scripts\/|npm\/|\.github\/workflows\/ci\.yml)/;
+                  const rcvPattern = /^(receiver\/|package\.json|\.github\/workflows\/ci\.yml|npm\/platforms\.mjs|e2e\/fixtures\/)/;
+                  runExt = changed.some((f) => extPattern.test(f));
+                  runRcv = changed.some((f) => rcvPattern.test(f));
+                }
+              } catch {
+                runExt = true;
+                runRcv = true;
+              }
+            }
+            const out = [
+              "node=" + floor(pkg.engines?.node, "engines.node"),
+              "pi=" + floor(pkg.peerDependencies?.["@earendil-works/pi-coding-agent"], "the @earendil-works/pi-coding-agent peer range"),
+              "run_extension=" + runExt,
+              "run_receiver=" + runRcv,
+            ].join("\n") + "\n";
+            require("fs").appendFileSync(process.env.GITHUB_OUTPUT, out);
+          '
 
   check:
     needs: floors
+    if: needs.floors.outputs.run_extension == 'true'
     name: Node ${{ matrix.node }} / Pi ${{ matrix.pi }}
     runs-on: ubuntu-latest
     strategy:
@@ -69,6 +102,8 @@ jobs:
 
   # The extension on the other desktop systems (the Node and Pi matrix above runs on Linux).
   check-os:
+    needs: floors
+    if: needs.floors.outputs.run_extension == 'true'
     name: Extension on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -86,11 +121,11 @@ jobs:
       - run: npm test
 
   # The receiver, its audio engine and its speech engines (Rust), on every desktop system it ships
-  # for. sherpa-onnx-sys's build script downloads sherpa-onnx's static libraries (ONNX Runtime
-  # included) into target/sherpa-onnx-prebuilt/; the archive is cached, keyed by the lock file that
-  # pins its version. On Windows it is the static-MT archive, matching .cargo/config.toml's
-  # +crt-static.
+  # for. Compiled artifacts and sherpa-onnx's prebuilt archive are cached across CI runs; release
+  # builds in publish.yml remain uncached.
   receiver:
+    needs: floors
+    if: needs.floors.outputs.run_receiver == 'true'
     name: Receiver on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -102,6 +137,8 @@ jobs:
       PI_SPEECH_AUDIO_NULL: "1"
       # A real recording through a real model (Parakeet v3 int8, about 465 MB, cached).
       TEST_MODEL: sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8
+      GPU_BUNDLE: sherpa-onnx-v2.0.1-cuda-13.x-cudnn-9.x-onnxruntime1.28.2-linux-x64-gpu
+      GPU_BUNDLE_SHA256: 40ca5c7730a349258f23e9a7bf5c3cbf69f13c498cc50387e8f9f06924a554f8
     defaults:
       run:
         working-directory: receiver
@@ -111,15 +148,16 @@ jobs:
       - name: Install the ALSA development library (the audio engine links it)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - name: Cache the crates and sherpa-onnx's prebuilt archive
+      - name: Cache sherpa-onnx's prebuilt archive
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            receiver/target/sherpa-onnx-prebuilt/*.tar.bz2
-          key: receiver-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('receiver/Cargo.lock') }}
-          restore-keys: receiver-${{ runner.os }}-${{ runner.arch }}-
+          path: receiver/target/sherpa-onnx-prebuilt/*.tar.bz2
+          key: prebuilt-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('receiver/Cargo.lock') }}
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: receiver
+          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'pull_request' }}
       - name: Cache the test model
         id: model-cache
         uses: actions/cache@v4
@@ -136,9 +174,8 @@ jobs:
       - run: cargo fmt --check
         if: runner.os == 'Linux'
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
-      - name: Build the release binary
-        run: cargo build --release
+      - name: Run Rust tests and build the release binary
+        run: cargo test --release && cargo build --release
       - name: Report the release binary's size
         run: |
           bin=target/release/pi-speech-receiver
@@ -180,20 +217,26 @@ jobs:
         env:
           PI_SPEECH_TEST_MODELS: ${{ github.workspace }}/test-models
         run: cargo test --release --test transcribe -- --nocapture
+      - name: Cache sherpa-onnx's Linux x64 shared-library bundle
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        id: gpu-bundle-cache
+        uses: actions/cache@v4
+        with:
+          path: receiver/gpu.tar.bz2
+          key: gpu-bundle-${{ env.GPU_BUNDLE_SHA256 }}
       # The published Linux x64 receiver links sherpa-onnx's shared libraries (publish.yml): build it
       # that way too, and transcribe with it with only its libraries beside it.
       - name: Build and run the shared-library receiver (Linux x64, as published)
         if: runner.os == 'Linux' && runner.arch == 'X64'
-        env:
-          GPU_BUNDLE: sherpa-onnx-v2.0.1-cuda-13.x-cudnn-9.x-onnxruntime1.28.2-linux-x64-gpu
-          GPU_BUNDLE_SHA256: 40ca5c7730a349258f23e9a7bf5c3cbf69f13c498cc50387e8f9f06924a554f8
         run: |
-          curl -fsSL --retry 3 "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/$GPU_BUNDLE.tar.bz2" -o gpu.tar.bz2
+          if [ ! -f gpu.tar.bz2 ]; then
+            curl -fsSL --retry 3 "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/$GPU_BUNDLE.tar.bz2" -o gpu.tar.bz2
+          fi
           echo "$GPU_BUNDLE_SHA256  gpu.tar.bz2" | sha256sum -c -
           tar -xjf gpu.tar.bz2
           SHERPA_ONNX_LIB_DIR="$PWD/$GPU_BUNDLE/lib" CARGO_TARGET_DIR=target-shared \
             cargo build --release --no-default-features --features shared
-          mkdir shared && cp target-shared/release/pi-speech-receiver shared/
+          mkdir -p shared && cp target-shared/release/pi-speech-receiver shared/
           for lib in libsherpa-onnx-c-api.so libonnxruntime.so libonnxruntime_providers_shared.so; do
             cp "$GPU_BUNDLE/lib/$lib" shared/
           done

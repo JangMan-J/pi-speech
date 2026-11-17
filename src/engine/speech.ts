@@ -17,24 +17,30 @@ import { featureLine } from "./features";
 import { History, type HistoryMessage, historyDir, type SavedMessage } from "./history";
 import { type LocalModel, LocalModels } from "./local-models";
 import { LocalSpeechProvider, localSpeechLanguage } from "./local-speech";
+import type { ModelBackend } from "./model-backend";
+import { OpenAiPricingCache } from "./openai-pricing";
+import { fetchSpeechCatalog, OpenRouterProvider } from "./openrouter";
+import { type Player, REPLACED, streamAndPlay } from "./player";
 import {
   DEFAULT_VOICE,
-  fetchSpeechCatalog,
   type ModelOption,
-  OpenRouterProvider,
   type SpeechCatalog,
-} from "./openrouter";
-import { READING_MIN_CHARS, splitForSpeech } from "./pieces";
-import { type Player, REPLACED } from "./player";
-import type { SpeechProvider, SynthesisRequest } from "./provider";
-import type { ReadingResult } from "./reading";
-import { streamReading } from "./reading-stream";
-import { DEFAULT_SETTINGS, type ModelSort, type Settings, type SettingsFile, SOURCES, type Source } from "./settings";
-import { streamAndPlay } from "./stream-play";
-import { XAI_MODEL, XAI_PRICE, XaiProvider } from "./xai";
-
-/** The xAI choice as a model option, offered while Pi holds an xAI login. */
-const XAI_OPTION: ModelOption = { id: XAI_MODEL, label: "xAI", price: XAI_PRICE };
+  type SpeechProvider,
+  type SynthesisRequest,
+} from "./provider";
+import { READING_MIN_CHARS, ReadingFailed, type ReadingResult, splitForSpeech, streamReading } from "./reading";
+import {
+  DEFAULT_SETTINGS,
+  type Hotkeys,
+  type LocalModelSort,
+  type ModelSort,
+  type OsdStyle,
+  type Settings,
+  type SettingsFile,
+  SOURCES,
+  type Source,
+} from "./settings";
+import { XaiProvider } from "./xai";
 
 /** Used only while the catalog cannot be loaded. */
 const FALLBACK_CATALOG: SpeechCatalog = {
@@ -73,7 +79,8 @@ export type SettingName =
   | "stt-model"
   | "stt-language"
   | "tools"
-  | "dictation-output"
+  | "dictation-live"
+  | "submit-word"
   | "tts-source"
   | "stt-source"
   | "device";
@@ -83,7 +90,8 @@ export const SETTING_NAMES: SettingName[] = [
   "stt-model",
   "stt-language",
   "tools",
-  "dictation-output",
+  "dictation-live",
+  "submit-word",
   "tts-source",
   "stt-source",
   "device",
@@ -134,6 +142,8 @@ export interface SpeechOptions {
   fetchCatalog?: () => Promise<SpeechCatalog>;
   /** The on-device models (default: through the bundled binary). */
   local?: LocalModels;
+  /** Remote model backend selector (from Routes), used when constructing the default LocalModels. */
+  remoteModels?: () => ModelBackend | undefined;
 }
 
 /** A local voice for display: its name or number, or "default" for the model's first voice. */
@@ -183,6 +193,7 @@ export class Speech {
   private readonly fetchCatalog: () => Promise<SpeechCatalog>;
   private readonly openrouter: OpenRouterProvider;
   private readonly xai: XaiProvider;
+  private readonly pricingCache = new OpenAiPricingCache();
   /** Speech by the on-device voice models, through the bundled binary's `speak`. */
   private readonly localSpeech: LocalSpeechProvider;
   private readonly env: Env;
@@ -203,12 +214,12 @@ export class Speech {
     this.player = opts.player;
     this.history = new History(historyDir(opts.env, opts.home ?? homedir()));
     this.fetchCatalog = opts.fetchCatalog ?? (() => fetchSpeechCatalog());
-    this.local = opts.local ?? new LocalModels(opts.env);
+    this.local = opts.local ?? new LocalModels(opts.env, undefined, opts.remoteModels);
     this.localSpeech = new LocalSpeechProvider(
       () => this.local.binary(),
       () => childEnv(opts.env),
       () => this.local.remote(),
-      () => this.local.deviceEnvironment(),
+      () => this.local.ensureBinary(),
     );
     this.settings = this.store.load();
     this.local.setDevice(this.settings.localDevice);
@@ -229,6 +240,14 @@ export class Speech {
     this.resetEndpoints();
   }
 
+  /** Switch the local receiver edition (`cpu` or `gpu`), closing running workers and saving. */
+  setDevice(device: "cpu" | "gpu"): void {
+    this.settings.localDevice = device;
+    this.local.setDevice(device);
+    this.localSpeech.close();
+    this.save();
+  }
+
   /** Settles when the catalog is loaded (or could not be); retries a failed load now and then. */
   async ready(): Promise<void> {
     await this.loading;
@@ -244,7 +263,7 @@ export class Speech {
 
   /** Rebuild the endpoints from the settings; their models load at the next ready(). */
   private resetEndpoints(): void {
-    this.endpoints = buildEndpoints(this.settings.endpoints, () => this.registry, this.env);
+    this.endpoints = buildEndpoints(this.settings.endpoints, () => this.registry, this.env, this.pricingCache);
     this.served = { tts: [], stt: [] };
     this.endpointState.clear();
     this.endpointsLoading = undefined;
@@ -288,7 +307,7 @@ export class Speech {
 
   /** A model OpenRouter's catalog does not decide: xai, or one of an endpoint. */
   private outside(model: string): boolean {
-    return model === XAI_MODEL || this.endpointOf(model) !== undefined;
+    return this.provider(model) !== this.openrouter;
   }
 
   /** Every listed model: OpenRouter's and the endpoints'. */
@@ -328,18 +347,20 @@ export class Speech {
     const s = this.settings;
     const fixed: string[] = [];
     const { tts, stt } = this.catalog;
-    // xai and the endpoints' models are not in OpenRouter's catalog; such a saved choice stays and is checked when used.
+    // Providers outside OpenRouter's catalog keep their saved choice and are checked when used.
     if (!this.outside(s.speechModel)) {
       if (!tts.some((m) => m.id === s.speechModel)) {
         const next = tts.find((m) => m.id === DEFAULT_SETTINGS.speechModel)?.id ?? tts[0].id;
         fixed.push(`speech model ${s.speechModel} → ${next}`);
         s.speechModel = next;
       }
-      const voices = this.voicesOf(s.speechModel);
-      if (!voices.includes(s.voice)) {
-        const next = keepVoice(voices, s.voice, DEFAULT_SETTINGS.voice);
-        fixed.push(`voice ${s.voice} → ${next}`);
-        s.voice = next;
+      if (!this.anyVoice(s.speechModel)) {
+        const voices = this.voicesOf(s.speechModel);
+        if (!voices.includes(s.voice)) {
+          const next = keepVoice(voices, s.voice, DEFAULT_SETTINGS.voice);
+          fixed.push(`voice ${s.voice} → ${next}`);
+          s.voice = next;
+        }
       }
     }
     if (!this.outside(s.transcriptionModel) && !stt.some((m) => m.id === s.transcriptionModel)) {
@@ -355,12 +376,37 @@ export class Speech {
 
   /** The provider of a model: xAI for xai, its endpoint for `<endpoint>:<model>`, OpenRouter for every other id. */
   private provider(model: string): SpeechProvider {
-    return model === XAI_MODEL ? this.xai : (this.endpointOf(model) ?? this.openrouter);
+    return this.xai.ownsModel(model) ? this.xai : (this.endpointOf(model) ?? this.openrouter);
   }
 
   /** The name of a model's speech provider, for display. */
   providerName(model: string): string {
     return this.provider(model).name;
+  }
+
+  /** Display label for a provider model id. */
+  modelLabel(id: string): string {
+    return this.provider(id).modelLabel?.(id) ?? id;
+  }
+
+  /** Alert note when `id` is missing from the active catalog. */
+  missingModelNote(id: string): string {
+    return this.provider(id).missingModelNote?.(id) ?? "✗ not offered";
+  }
+
+  /** Reason shown when `model` returns an empty voice list. */
+  emptyVoicesReason(model: string): string {
+    return this.provider(model).emptyVoicesReason ?? "no voices listed";
+  }
+
+  /** Whether `model` accepts arbitrary voice names (endpoint or chat model without a fixed voice list). */
+  allowsAnyVoice(model: string): boolean {
+    return this.anyVoice(model);
+  }
+
+  /** Fill in provider-owned display defaults for a catalog option. */
+  enrichModel(option: ModelOption): ModelOption {
+    return this.provider(option.id).enrichOption?.(option) ?? option;
   }
 
   /** Whether OpenRouter's catalog is loaded; false while it loads and after a failed load (built-in lists). */
@@ -374,22 +420,27 @@ export class Speech {
   }
 
   /** The models offered now: OpenRouter's catalog, the endpoints' models, and xai while Pi holds an xAI login. */
-  async models(): Promise<SpeechCatalog> {
+  async models(opts?: { refresh?: boolean }): Promise<SpeechCatalog> {
+    if (opts?.refresh) {
+      if (!this.live) this.loading = this.load();
+      this.endpointsLoading = undefined;
+    }
     await this.ready();
-    const xai = (await this.xai.available()) ? [XAI_OPTION] : [];
+    const extra = await this.xai.catalogOptions();
     const { tts, stt } = this.listed;
-    return { tts: [...tts, ...xai], stt: [...stt, ...xai] };
+    return { tts: [...tts, ...extra], stt: [...stt, ...extra] };
   }
 
-  /** Voices of a catalog speech model; [DEFAULT_VOICE] for one without voices or not listed. Not for xai. */
+  /** Voices of a catalog speech model; [DEFAULT_VOICE] for one without voices or not listed. */
   voicesOf(model: string): string[] {
     const m = this.listed.tts.find((x) => x.id === model);
     return m?.voices?.length ? m.voices : [DEFAULT_VOICE];
   }
 
-  /** Voices of a speech model; for xai the xAI voice list (which may be empty), and it throws on failure. */
+  /** Voices of a speech model; dynamic providers fetch their own list and throw on failure. */
   async voicesFor(model: string): Promise<string[]> {
-    if (model === XAI_MODEL) return (await this.xai.voices()).map((v) => v.id);
+    const p = this.provider(model);
+    if (p.voicesFor) return p.voicesFor(model);
     await this.ready();
     return this.voicesOf(model);
   }
@@ -483,7 +534,7 @@ export class Speech {
     const { tts, stt } = await this.models();
     const line = (m: ModelOption, current: string) => {
       const features = featureLine(m);
-      return `${m.id}  ${m.price ?? "price unknown"}${features ? `  ${features}` : ""}${m.id === current ? "  (selected)" : ""}`;
+      return `${m.id}  ${m.price ?? "unknown"}${features ? `  ${features}` : ""}${m.id === current ? "  (selected)" : ""}`;
     };
     return [
       "Speech models, price per minute of audio (~ marks an estimate):",
@@ -541,7 +592,8 @@ export class Speech {
     switch (name) {
       case "tts-model": {
         await this.requireOffered(value);
-        if (value !== XAI_MODEL && !this.isSpeechModel(value)) {
+        const p = this.provider(value);
+        if (!p.ownsModel?.(value) && !this.isSpeechModel(value)) {
           const offered = (await this.models()).tts.map((m) => m.id);
           throw new Error(`${value || "(empty)"} is not a speech model; choose one of: ${list(offered)}`);
         }
@@ -549,10 +601,11 @@ export class Speech {
         if (voices.length === 0) {
           s.speechModel = value;
           this.save();
-          return `Speech model: ${value}; xAI lists no voices, so nothing can be spoken with it now`;
+          const why = p.emptyVoicesReason ?? `${value} lists no voices`;
+          return `Speech model: ${value}; ${why}, so nothing can be spoken with it now`;
         }
         s.speechModel = value;
-        s.voice = keepVoice(voices, s.voice, value === XAI_MODEL ? "eve" : DEFAULT_SETTINGS.voice);
+        s.voice = keepVoice(voices, s.voice, p.defaultVoice ?? DEFAULT_SETTINGS.voice);
         this.save();
         return `Speech model: ${s.speechModel}, voice: ${s.voice}`;
       }
@@ -568,7 +621,8 @@ export class Speech {
       }
       case "stt-model": {
         await this.requireOffered(value);
-        if (value !== XAI_MODEL && !this.listed.stt.some((m) => m.id === value)) {
+        const p = this.provider(value);
+        if (!p.ownsModel?.(value) && !this.listed.stt.some((m) => m.id === value)) {
           const offered = (await this.models()).stt.map((m) => m.id);
           throw new Error(`${value || "(empty)"} is not a transcription model; choose one of: ${list(offered)}`);
         }
@@ -597,24 +651,25 @@ export class Speech {
       }
       case "device": {
         if (value !== "cpu" && value !== "gpu") throw new Error(`device must be cpu or gpu, not ${value || "empty"}`);
-        s.localDevice = value;
-        this.local.setDevice(value);
-        this.save();
+        this.setDevice(value);
         if (value === "cpu") return "Local models run on: CPU";
         const gpu = await this.local.gpu().catch((e) => ({ usable: false, why: errorMessage(e) }));
         return gpu.usable ? "Local models run on: GPU" : `Local models run on: GPU (on the CPU until then: ${gpu.why})`;
       }
-      case "dictation-output": {
-        const cmd = value.trim();
-        if (cmd) {
-          s.dictationOutput = cmd;
-          s.dictationOutputMode = "command";
-        } else {
-          delete s.dictationOutput;
-          s.dictationOutputMode = "pi";
-        }
+      case "dictation-live": {
+        if (value !== "on" && value !== "off")
+          throw new Error(`dictation-live must be on or off, not ${value || "empty"}`);
+        if (value === "on") s.dictationLive = true;
+        else delete s.dictationLive;
         this.save();
-        return `Dictation output: ${cmd ? "your command" : "Pi"}`;
+        return `Live dictation: ${value}`;
+      }
+      case "submit-word": {
+        const w = value.trim();
+        if (w) s.dictationSubmitWord = w;
+        else delete s.dictationSubmitWord;
+        this.save();
+        return w ? `Submit word: ${w}` : "Submit word: off";
       }
       default:
         throw new Error(`unknown setting ${name || "(none)"}; choose one of: ${list(SETTING_NAMES)}`);
@@ -712,14 +767,14 @@ export class Speech {
     }
   }
 
-  /** The voice language; for xai from the language the xAI voice list gives (once it is loaded). */
+  /** The voice language, including provider-supplied metadata when available. */
   languageOf(model: string, voice: string): VoiceLanguage {
-    const language = model === XAI_MODEL ? this.xai.cachedVoices()?.find((v) => v.id === voice)?.language : undefined;
+    const metadata = this.provider(model).voiceLanguageMetadata?.(model, voice);
     return voiceLanguage({
       model,
       voice,
       override: this.override(model, voice),
-      ...(language ? { metadata: { language } } : {}),
+      ...(metadata?.language ? { metadata: { language: metadata.language } } : {}),
     });
   }
 
@@ -734,7 +789,7 @@ export class Speech {
   async languagesReport(): Promise<string> {
     const model = this.settings.speechModel;
     const voices = await this.voicesFor(model);
-    if (voices.length === 0) return `Voice languages of ${model}:\n(xAI lists no voices)`;
+    if (voices.length === 0) return `Voice languages of ${model}:\n(${this.emptyVoicesReason(model)})`;
     const lines = voices.map((voice) => {
       const vl = this.languageOf(model, voice);
       return `${voice}: ${languageLabel(vl)} (${languageSource(vl)})`;
@@ -772,14 +827,18 @@ export class Speech {
 
   // ── Operations ──────────────────────────────────────────────────────────
 
-  /** Model and voice for one synthesis, checked against the catalog or the xAI voice list. */
+  /** Model and voice for one synthesis, checked against the catalog or dynamic provider voice list. */
   private async choose(model?: string, voice?: string): Promise<{ model: string; voice: string }> {
     await this.ready();
     const m = model || this.settings.speechModel;
-    if (m === XAI_MODEL) {
-      const voices = await this.voicesFor(m);
-      if (voices.length === 0) throw new Error("xAI lists no voices; nothing can be spoken with xai now");
-      const v = voice || keepVoice(voices, this.settings.voice, "eve");
+    const p = this.provider(m);
+    if (p.voicesFor) {
+      const voices = await p.voicesFor(m);
+      if (voices.length === 0) {
+        const why = p.emptyVoicesReason ?? `${m} lists no voices`;
+        throw new Error(`${why}; nothing can be spoken with ${m} now`);
+      }
+      const v = voice || keepVoice(voices, this.settings.voice, p.defaultVoice ?? DEFAULT_SETTINGS.voice);
       await this.requireVoice(m, v);
       return { model: m, voice: v };
     }
@@ -849,12 +908,22 @@ export class Speech {
   /**
    * Playback-only speech (read-aloud, /speech <text>): a text longer than READING_MIN_CHARS is a Reading, spoken
    * in pieces played as one Stream, and saved as one message; a shorter one as `speak`.
-   * Stopped before every piece was synthesized, it saves nothing and is `stopped`. A failed request throws
-   * ReadingFailed with the provider's message.
+   * Stopped before every piece was synthesized, it saves nothing and is `stopped`. A failed synthesis throws
+   * ReadingFailed with the provider's message regardless of text length.
    */
   async say(text: string, opts: CallOptions = {}): Promise<SpeechResult> {
     const target = this.localTarget();
-    if (text.trim().length <= READING_MIN_CHARS) return this.speak(text, opts);
+    if (text.trim().length <= READING_MIN_CHARS) {
+      try {
+        return await this.speak(text, opts);
+      } catch (err) {
+        if (err instanceof ReadingFailed) throw err;
+        const msg = errorMessage(err);
+        const prefix = "Speech synthesis failed: ";
+        if (msg.startsWith(prefix)) throw new ReadingFailed(msg.slice(prefix.length));
+        throw err;
+      }
+    }
     if (target) {
       // One `speak` for the whole text: the model loads once and generates it sentence by sentence, so the
       // Reading is one piece that streams from its first sentence.
@@ -982,6 +1051,53 @@ export class Speech {
     this.save();
   }
 
+  /** How the panel orders its local model lists; saved. */
+  setLocalModelSort(sort: LocalModelSort): void {
+    this.settings.localModelSort = sort;
+    this.save();
+  }
+
+  setOsdStyle(style: OsdStyle): void {
+    this.settings.osdStyle = style;
+    this.save();
+  }
+
+  setShowUnpricedModels(show: boolean): void {
+    if (show) this.settings.showUnpricedModels = true;
+    else delete this.settings.showUnpricedModels;
+    this.save();
+  }
+
+  setHotkeys(hotkeys: Hotkeys): void {
+    this.settings.hotkeys = hotkeys;
+    this.save();
+  }
+
+  setDictationLive(live: boolean): void {
+    if (live) this.settings.dictationLive = true;
+    else delete this.settings.dictationLive;
+    this.save();
+  }
+
+  setDictationSubmitWord(word: string | undefined): void {
+    const trimmed = word?.trim();
+    if (trimmed) this.settings.dictationSubmitWord = trimmed;
+    else delete this.settings.dictationSubmitWord;
+    this.save();
+  }
+
+  setDictationVocabulary(lines: string[]): void {
+    if (lines.length) this.settings.dictationVocabulary = lines;
+    else delete this.settings.dictationVocabulary;
+    this.save();
+  }
+
+  setDictationCommands(lines: string[]): void {
+    if (lines.length) this.settings.dictationCommands = lines;
+    else delete this.settings.dictationCommands;
+    this.save();
+  }
+
   /** The last spoken message on disk: from this session, else the newest in the history. */
   lastMessage(): string | undefined {
     return this.lastSaved?.find((f) => existsSync(f)) ?? this.history.newest();
@@ -1004,7 +1120,7 @@ export class Speech {
       // On This machine: the binary reads the file; nothing goes over the network.
       const id = this.localTranscription(opts.model);
       try {
-        return await this.local.transcribeFile(id, full, opts.signal);
+        return await this.local.transcribeFile(id, full, opts.signal, opts.language);
       } catch (err) {
         throw new Error(`Transcription failed: ${errorMessage(err)}`);
       }

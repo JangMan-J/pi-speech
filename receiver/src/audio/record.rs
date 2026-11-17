@@ -18,10 +18,9 @@ use super::device::{Format, Input};
 use super::fail;
 use super::ring::{self, Consumer, Producer};
 use super::spectrum::Meter;
-use crate::proc::start_thread;
+use crate::proc::{start_thread, watch_stdin_eof};
 use crate::signals;
 use crate::wav;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -225,32 +224,36 @@ fn write_wav(
     let mut meter = Meter::new(RATE);
     let mut buf = vec![0.0f32; format.samples_in(POLL * 4).max(format.channels)];
     let (mut mono, mut pcm) = (Vec::new(), Vec::new());
-    let mut write = |samples: &[f32], conv: &mut Converter, end: bool| {
-        mono.clear();
-        conv.push(samples, &mut mono);
-        if end {
-            conv.finish(&mut mono);
-        }
-        if !mono.is_empty() {
-            meter.update(&mono);
-        }
-        pcm.clear();
-        pcm.extend(
-            mono.iter()
-                .map(|s| (s.clamp(-1.0, 1.0) * 32767.0).round() as i16),
-        );
-        file.write(&pcm)
-            .map_err(|e| format!("cannot write the recording: {e}"))
-    };
+    let mut last_flush = std::time::Instant::now();
     loop {
         // Read before draining: once it is set, all the device captured is in the ring.
         let closed = device_closed.load(Ordering::Acquire);
+        let mut wrote = false;
         loop {
             let n = ring.pop(&mut buf);
             if n == 0 {
                 break;
             }
-            write(&buf[..n], &mut conv, false)?;
+            mono.clear();
+            conv.push(&buf[..n], &mut mono);
+            if !mono.is_empty() {
+                meter.update(&mono);
+            }
+            pcm.clear();
+            pcm.extend(
+                mono.iter()
+                    .map(|s| (s.clamp(-1.0, 1.0) * 32767.0).round() as i16),
+            );
+            file.write(&pcm)
+                .map_err(|e| format!("cannot write the recording: {e}"))?;
+            wrote = true;
+        }
+        if !wrote && meter.enabled() {
+            meter.decay();
+        }
+        if wrote && last_flush.elapsed() >= Duration::from_millis(200) {
+            let _ = file.flush();
+            last_flush = std::time::Instant::now();
         }
         if closed {
             break;
@@ -261,11 +264,32 @@ fn write_wav(
     buf.fill(0.0);
     while owed > 0 {
         let n = owed.min(buf.len());
-        write(&buf[..n], &mut conv, false)?;
+        mono.clear();
+        conv.push(&buf[..n], &mut mono);
+        if !mono.is_empty() {
+            meter.update(&mono);
+        }
+        pcm.clear();
+        pcm.extend(
+            mono.iter()
+                .map(|s| (s.clamp(-1.0, 1.0) * 32767.0).round() as i16),
+        );
+        file.write(&pcm)
+            .map_err(|e| format!("cannot write the recording: {e}"))?;
         owed -= n;
     }
-    write(&[], &mut conv, true)?;
-    drop(write);
+    mono.clear();
+    conv.finish(&mut mono);
+    if !mono.is_empty() {
+        meter.update(&mono);
+    }
+    pcm.clear();
+    pcm.extend(
+        mono.iter()
+            .map(|s| (s.clamp(-1.0, 1.0) * 32767.0).round() as i16),
+    );
+    file.write(&pcm)
+        .map_err(|e| format!("cannot write the recording: {e}"))?;
     file.finish()
         .map_err(|e| format!("cannot finish the recording: {e}"))
 }
@@ -284,17 +308,7 @@ pub fn main(args: &[String]) -> ExitCode {
         return fail(&format!("cannot handle signals: {e}"), 1);
     }
     let on_eof = tx.clone();
-    let watch = start_thread("stdin", move || {
-        let mut buf = [0u8; 256];
-        let mut stdin = std::io::stdin();
-        loop {
-            match stdin.read(&mut buf) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => break,
-            }
-        }
+    let watch = watch_stdin_eof(move || {
         let _ = on_eof.send(Event::Stop);
     });
     if let Err(e) = watch {

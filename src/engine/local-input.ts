@@ -14,7 +14,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AudioInput, Recording } from "./audio";
-import { type BinaryChoice, findBinary } from "./binary";
+import { type BinaryChoice, ensureBinary, findBinary } from "./binary";
 import { childEnv, type Env, findExecutable, overSsh } from "./env";
 import { LEVELS_ENV, levelsFile, readLevels, removeLevels } from "./levels";
 import { wavSeconds } from "./wav";
@@ -160,6 +160,24 @@ class LocalRecording implements Recording {
     }
   }
 
+  async snapshot(): Promise<{ audio: Buffer; format: "wav" } | undefined> {
+    if (this.finished) return undefined;
+    let raw: Buffer;
+    try {
+      raw = readFileSync(this.file);
+    } catch {
+      return undefined;
+    }
+    if (raw.length < 44 + 4800) return undefined;
+    // Align to 2-byte mono s16le frame boundary and patch RIFF/data sizes in-memory.
+    const dataLen = (raw.length - 44) & ~1;
+    const wav = raw.subarray(0, 44 + dataLen);
+    const out = Buffer.from(wav);
+    out.writeUInt32LE(36 + dataLen, 4);
+    out.writeUInt32LE(dataLen, 40);
+    return { audio: out, format: "wav" };
+  }
+
   async cancel(): Promise<void> {
     if (this.finished) return;
     this.finished = true;
@@ -203,6 +221,10 @@ export class LocalInput implements AudioInput {
           "Use the playback bridge (/speech --bridge on, or --bridge auto) to record on your own machine, " +
           "or set PI_SPEECH_LOCAL_MIC=1 if this host's microphone is yours.",
       );
+    }
+    if (!this.opts.binary && !this.env.PI_SPEECH_RECORDER) {
+      const current = findBinary(this.env);
+      if (!current.ok && !current.chosen) await ensureBinary(this.env);
     }
     const choice = chooseRecorder(this.env, this.opts.binary);
     if (!choice.ok) throw new Error(choice.reason);

@@ -85,9 +85,9 @@ describe("synthesize", () => {
     expect(r.format).toBe("mp3");
   });
 
-  it("throws a readable error on other failures", async () => {
-    stubFetch(() => new Response("nope", { status: 500 }));
-    await expect(synthesize("k", "t", "m", "v")).rejects.toThrow(/500.*nope/);
+  it("throws a readable error on other failures and scrubs the API key", async () => {
+    stubFetch(() => new Response("bad key sk-secret-123", { status: 500 }));
+    await expect(synthesize("sk-secret-123", "t", "m", "v")).rejects.toThrow(/500.*bad key \[key\]/);
   });
 });
 

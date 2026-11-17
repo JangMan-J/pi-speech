@@ -49,6 +49,11 @@ export interface Recording {
   /** Stop recording and discard the audio. */
   cancel(): Promise<void>;
   /**
+   * Optional: read the audio recorded so far without stopping, for live streaming transcription.
+   * Returns undefined when nothing usable has been written yet.
+   */
+  snapshot?(): Promise<{ audio: Buffer; format: "wav" } | undefined>;
+  /**
    * Optional: settles when the recording ends by itself before `stop()` or `cancel()` (for example the
    * recorder crashed), with a readable reason. It never settles for a recording that is stopped or cancelled.
    */

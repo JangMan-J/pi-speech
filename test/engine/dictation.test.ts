@@ -104,35 +104,61 @@ describe("Dictation toggle", () => {
     expect(d.state).toBe("idle");
   });
 
-  it("sends the transcript to the output command when one is configured, not to the editor", async () => {
+  it("streams live snapshots into Pi's editor and finalizes with submit word or voice command", async () => {
     const h = harness();
-    const got: string[] = [];
-    const d = h.make({ outputConfigured: () => true, output: async (t) => void got.push(t) });
-    await d.toggle(h.ctx);
-    await d.toggle(h.ctx);
-    expect(got).toEqual(["hello there"]);
-    expect(h.pasted).toEqual([]);
-    expect(h.notes).toEqual([]);
-  });
-
-  it("falls back to the editor and warns when the output command fails, so the text is never lost", async () => {
-    const h = harness();
+    const editor = { text: "prefix" };
+    const submitted: string[] = [];
+    const commands: string[] = [];
+    const wavHeader = Buffer.alloc(44);
+    wavHeader.write("RIFF", 0);
+    wavHeader.write("WAVE", 8);
+    let snapCalls = 0;
+    const rec = {
+      snapshot: async () => {
+        snapCalls++;
+        return { audio: Buffer.concat([wavHeader, Buffer.alloc(9600)]), format: "wav" as const };
+      },
+      stop: async () => ({ audio: Buffer.concat([wavHeader, Buffer.alloc(9600)]), format: "wav" as const }),
+      cancel: async () => {},
+    };
+    h.service.transcribeAudio = async () => (snapCalls ? "hello world over." : "hello");
     const d = h.make({
-      outputConfigured: () => true,
-      output: async () => Promise.reject(new Error("command not found")),
+      input: () => ({ name: "local", start: async () => rec }),
+      liveEnabled: () => true,
+      liveCapable: () => true,
+      liveMs: 10,
+      previewTransform: (t) => t.replace("hello", "Hello"),
+      finalize: (t) => (t.endsWith("over.") ? { text: t.replace(/,?\s*over\.?$/, ""), submit: true } : { text: t }),
     });
-    await d.toggle(h.ctx);
-    await d.toggle(h.ctx);
-    expect(h.pasted).toEqual(["hello there"]);
-    expect(h.notes).toEqual([{ message: expect.stringContaining("command not found"), type: "warning" }]);
+    const ui = {
+      ...h.ctx,
+      getEditor: () => editor.text,
+      setEditor: (t: string) => {
+        editor.text = t;
+      },
+      submit: (t: string) => submitted.push(t),
+      runCommand: (c: string) => commands.push(c),
+    };
+    await d.toggle(ui);
+    await new Promise((r) => setTimeout(r, 35));
+    expect(editor.text).toContain("prefix Hello world");
+    await d.toggle(ui);
+    expect(submitted).toEqual(["hello world"]);
+    expect(editor.text).toBe("prefix");
+    expect(commands).toEqual([]);
   });
 
-  it("pastes to the editor when a command is set but no command is configured right now", async () => {
+  it("runs a sole-word voice command instead of pasting or submitting text", async () => {
     const h = harness();
-    const d = h.make({ outputConfigured: () => false, output: async () => undefined });
-    await d.toggle(h.ctx);
-    await d.toggle(h.ctx);
-    expect(h.pasted).toEqual(["hello there"]);
+    const commands: string[] = [];
+    h.service.transcribeAudio = async () => "compact.";
+    const d = h.make({
+      finalize: () => ({ text: "compact.", command: "/compact" }),
+    });
+    await d.toggle({ ...h.ctx, runCommand: (c) => commands.push(c) });
+    await d.toggle({ ...h.ctx, runCommand: (c) => commands.push(c) });
+    expect(commands).toEqual(["/compact"]);
+    expect(h.pasted).toEqual([]);
   });
 
   it("shows a transcribing indicator while the transcript is pending", async () => {

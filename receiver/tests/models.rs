@@ -645,6 +645,8 @@ fn plain_http_is_refused_unless_the_catalogue_is_a_test_one() {
         sha256: "00".into(),
         dir: "m".into(),
         files: Vec::new(),
+        shared: Vec::new(),
+        meta: Default::default(),
     };
     let stop = AtomicBool::new(false);
     match download::download(&entry, &root, false, &stop, &mut |_| {}) {

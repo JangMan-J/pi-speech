@@ -123,8 +123,8 @@ describe("xai with an xAI login", () => {
     const models = (await run("--models")).text;
     const xaiLines = lines(models).filter((l) => /^xai\b/.test(l));
     expect(xaiLines).toEqual([
-      "xai  included with your xAI plan (price unknown)  (selected)",
-      "xai  included with your xAI plan (price unknown)",
+      "xai  included with your xAI plan (price unknown)  tags · multilingual  (selected)",
+      "xai  included with your xAI plan (price unknown)  tags · multilingual",
     ]);
     const speechHeader = lines(models).findIndex((l) => l.startsWith("Speech models"));
     const sttHeader = lines(models).findIndex((l) => l.startsWith("Transcription models"));

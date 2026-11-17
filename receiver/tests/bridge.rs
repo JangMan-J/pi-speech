@@ -481,8 +481,10 @@ fn shutdown_stops_players_and_recorders_and_removes_the_directory() {
 #[test]
 fn only_loopback_addresses_are_accepted() {
     for a in ["0.0.0.0:0", "192.168.1.5:0", "127.0.0.2:0", "[::]:0"] {
-        let cfg = Config::new(a.parse().unwrap(), TOKEN.into(), scratch("lb"));
+        let dir = scratch("lb");
+        let cfg = Config::new(a.parse().unwrap(), TOKEN.into(), dir.clone());
         assert!(Server::start(cfg).is_err(), "{a}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

@@ -26,12 +26,12 @@ pub mod cache;
 pub mod catalog;
 pub mod download;
 
-use crate::proc::{lock, start_thread};
+use crate::proc::{lock, start_thread, watch_stdin_eof};
 use crate::signals;
 use catalog::{Catalog, Entry, Kind, Lexicon};
 use download::{Event, Failure};
 use serde_json::{json, Value};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -97,25 +97,64 @@ fn path_str(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
-/// A catalogue entry, with the lexicon it needs if any, and its state in the cache `root`, as
+/// A catalogue entry, with the shared files (lexicon/vocoder) it needs if any, and its state in the cache `root`, as
 /// `list` prints it.
-pub fn list_line(entry: &Entry, lexicon: Option<&Lexicon>, root: &Path) -> Value {
+pub fn list_line(entry: &Entry, shared: &[&Lexicon], root: &Path) -> Value {
     let mut v = json!({
         "id": entry.id,
         "kind": entry.kind.as_str(),
         "name": entry.name,
         "languages": entry.languages,
         "size": entry.size,
-        "downloaded": cache::is_ready(root, entry, lexicon),
+        "downloaded": cache::is_all_ready(root, entry, shared),
         "partial": cache::partial_bytes(root, entry),
         "path": path_str(&cache::model_path(root, entry)),
     });
-    if let Some(l) = lexicon {
+    if let Some(l) = shared.first() {
         v["lexicon"] = json!({
             "name": l.name,
             "size": l.size,
             "downloaded": cache::lexicon_path(root, l).is_file(),
         });
+    }
+    if !shared.is_empty() {
+        v["shared"] = Value::Array(
+            shared
+                .iter()
+                .map(|l| {
+                    json!({
+                        "name": l.name,
+                        "size": l.size,
+                        "downloaded": cache::lexicon_path(root, l).is_file(),
+                    })
+                })
+                .collect(),
+        );
+    }
+    let m = &entry.meta;
+    if let Some(r) = &m.runtime {
+        v["runtime"] = json!(r);
+    }
+    if let Some(g) = &m.group {
+        v["group"] = json!(g);
+    }
+    if let Some(s) = m.speakers {
+        v["speakers"] = json!(s);
+    }
+    if let Some(lc) = m.live_capable {
+        v["live_capable"] = json!(lc.as_str());
+    }
+    if let Some(lm) = m.language_mode {
+        v["language_mode"] = json!(lm.as_str());
+    }
+    if let Some(t) = &m.tags {
+        v["tags"] = json!(t);
+    }
+    if let Some(r) = m.cpu_rank {
+        v["cpu_rank"] = json!(r);
+    }
+    if let Some(r) = m.gpu_rank {
+        v["gpu_rank"] = json!(r);
     }
     v
 }
@@ -137,6 +176,64 @@ fn fail(id: Option<&str>, message: &str) -> ExitCode {
     ExitCode::from(1)
 }
 
+/// List every catalogue entry with its cache state as JSON objects.
+pub fn list_all() -> Result<Vec<Value>, String> {
+    let catalog = Catalog::load()?;
+    let root = cache::models_dir()?;
+    Ok(catalog
+        .entries
+        .iter()
+        .map(|entry| {
+            let shared = catalog.shared(entry);
+            list_line(entry, &shared, &root)
+        })
+        .collect())
+}
+
+/// Delete `id` and any partial download from the cache, returning freed bytes.
+pub fn delete_model(id: &str) -> Result<u64, String> {
+    let catalog = Catalog::load()?;
+    let root = cache::models_dir()?;
+    let entry = find(&catalog, id)?;
+    cache::delete(&root, entry)
+}
+
+/// Download `id` (plus any shared files and llama runtime) into the cache, emitting JSON events.
+pub fn download_model(
+    id: &str,
+    stop: &AtomicBool,
+    emit: &mut dyn FnMut(Value),
+) -> Result<PathBuf, Failure> {
+    let catalog = Catalog::load().map_err(Failure::Failed)?;
+    let root = cache::models_dir().map_err(Failure::Failed)?;
+    let entry = find(&catalog, id).map_err(Failure::Failed)?.clone();
+    let shared: Vec<Lexicon> = catalog.shared(&entry).into_iter().cloned().collect();
+    let mut on_event = |event: Event| {
+        let line = match event {
+            Event::Progress { done, total } => {
+                json!({"event": "progress", "id": id, "done": done, "total": total})
+            }
+            Event::LexiconProgress { name, done, total } => {
+                json!({"event": "progress", "id": id, "file": name, "done": done, "total": total})
+            }
+            Event::Verifying => json!({"event": "verifying", "id": id}),
+            Event::Unpacking => json!({"event": "unpacking", "id": id}),
+            Event::Done { .. } => return,
+        };
+        emit(line);
+    };
+    let needs_llama = entry.meta.runtime.as_deref() == Some("llama");
+    download::download(&entry, &root, catalog.allow_http, stop, &mut on_event).and_then(|path| {
+        for dep in &shared {
+            download::lexicon(dep, &root, catalog.allow_http, stop, &mut on_event)?;
+        }
+        if needs_llama {
+            crate::engines::llama::ensure_server(&root, stop, &mut on_event)?;
+        }
+        Ok(path)
+    })
+}
+
 pub fn main(args: &[String]) -> ExitCode {
     let command = match parse_args(args) {
         Ok(Command::Help) => {
@@ -149,39 +246,36 @@ pub fn main(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let setup = Catalog::load().and_then(|c| cache::models_dir().map(|root| (c, root)));
-    let (catalog, root) = match setup {
-        Ok(x) => x,
-        Err(e) => return fail(None, &e),
-    };
     match command {
         Command::Help => ExitCode::SUCCESS,
-        Command::List => {
-            for entry in &catalog.entries {
-                print_line(&list_line(entry, catalog.lexicon(entry), &root));
+        Command::List => match list_all() {
+            Ok(lines) => {
+                for line in lines {
+                    print_line(&line);
+                }
+                ExitCode::SUCCESS
             }
-            ExitCode::SUCCESS
-        }
-        Command::Delete(id) => {
-            let entry = match find(&catalog, &id) {
-                Ok(e) => e,
+            Err(e) => fail(None, &e),
+        },
+        Command::Delete(id) => match delete_model(&id) {
+            Ok(freed) => {
+                print_last(&json!({"event": "deleted", "id": id, "freed": freed}));
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(Some(&id), &e),
+        },
+        Command::Download(id) => {
+            let setup = Catalog::load().and_then(|c| cache::models_dir().map(|root| (c, root)));
+            let (catalog, root) = match setup {
+                Ok(x) => x,
                 Err(e) => return fail(Some(&id), &e),
             };
-            match cache::delete(&root, entry) {
-                Ok(freed) => {
-                    print_last(&json!({"event": "deleted", "id": id, "freed": freed}));
-                    ExitCode::SUCCESS
-                }
-                Err(e) => fail(Some(&id), &e),
-            }
-        }
-        Command::Download(id) => {
             let entry = match find(&catalog, &id) {
                 Ok(e) => e.clone(),
                 Err(e) => return fail(Some(&id), &e),
             };
-            let lexicon = catalog.lexicon(&entry).cloned();
-            run_download(&entry, lexicon.as_ref(), &root, catalog.allow_http)
+            let shared: Vec<Lexicon> = catalog.shared(&entry).into_iter().cloned().collect();
+            run_download(&entry, &shared, &root, catalog.allow_http)
         }
     }
 }
@@ -204,12 +298,7 @@ fn stopped_line(id: &str, at: &At) -> Value {
     v
 }
 
-fn run_download(
-    entry: &Entry,
-    lexicon: Option<&Lexicon>,
-    root: &Path,
-    allow_http: bool,
-) -> ExitCode {
+fn run_download(entry: &Entry, shared: &[Lexicon], root: &Path, allow_http: bool) -> ExitCode {
     let stop = Arc::new(AtomicBool::new(false));
     let at = Arc::new(Mutex::new(At {
         total: entry.size,
@@ -235,19 +324,7 @@ fn run_download(
         return fail(Some(&entry.id), &format!("cannot handle signals: {e}"));
     }
     let on_eof = on_stop.clone();
-    let watch = start_thread("stdin", move || {
-        let mut buf = [0u8; 256];
-        let mut stdin = std::io::stdin();
-        loop {
-            match stdin.read(&mut buf) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => break,
-            }
-        }
-        on_eof();
-    });
+    let watch = watch_stdin_eof(move || on_eof());
     if let Err(e) = watch {
         return fail(Some(&entry.id), &format!("cannot watch the input: {e}"));
     }
@@ -277,13 +354,16 @@ fn run_download(
         };
         print_line(&line);
     };
-    let result =
-        download::download(entry, root, allow_http, &stop, &mut emit).and_then(
-            |path| match lexicon {
-                Some(l) => download::lexicon(l, root, allow_http, &stop, &mut emit).map(|_| path),
-                None => Ok(path),
-            },
-        );
+    let needs_llama = entry.meta.runtime.as_deref() == Some("llama");
+    let result = download::download(entry, root, allow_http, &stop, &mut emit).and_then(|path| {
+        for dep in shared {
+            download::lexicon(dep, root, allow_http, &stop, &mut emit)?;
+        }
+        if needs_llama {
+            crate::engines::llama::ensure_server(root, &stop, &mut emit)?;
+        }
+        Ok(path)
+    });
     match result {
         Ok(path) => {
             print_last(&json!({"event": "done", "id": id, "path": path_str(&path)}));

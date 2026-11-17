@@ -30,8 +30,9 @@ const MAIN_ROWS: PanelRow[] = [
   { id: "voice", label: "Voice", value: "eve", opens: true },
   { id: "transcriptionSource", label: "Transcription source", value: "Provider" },
   { id: "transcription", label: "Transcription model", value: "openai/whisper-large-v3-turbo", opens: true },
-  { id: "language", label: "Dictation language", value: "auto" },
-  { id: "output", label: "Dictation output", value: "Pi" },
+  { id: "dictation", label: "Dictation options", value: "Filled", note: "auto", opens: true },
+  { id: "hotkeys", label: "Hotkeys", value: "Alt+S · Alt+Z", opens: true },
+  { id: "bridge", label: "Receivers", value: "Local", opens: true },
   { id: "osdStyle", label: "Spectrum OSD", value: "Braille" },
 ];
 
@@ -45,9 +46,6 @@ const HOTKEY_ROWS: PanelRow[] = [
     note: "hold to dictate (Kitty key-release)",
     short: "hold to dictate",
   },
-  { id: "replay", label: "Replay last" },
-  { id: "history", label: "History…", opens: true },
-  { id: "stop", label: "Stop" },
 ];
 
 function fixture(over: Partial<PanelView> & { tab?: TabId } = {}): PanelView {
@@ -74,8 +72,9 @@ function modelPicker(over: Partial<PickerView> = {}): PickerView {
   const items: PickerItem[] = Array.from({ length: 25 }, (_, i) => ({
     id: `vendor-${i}/model-${i}`,
     label: `model-${i}`,
+    provider: i % 2 === 0 ? "OpenRouter" : "xAI",
     price: `~$0.0${10 + i}/min`,
-    cols: [i % 2 === 0 ? "OpenRouter" : "xAI", `${2 + i} voices`],
+    cols: [`${2 + i} voices`, ""],
     current: i === 2,
   }));
   return {
@@ -83,6 +82,9 @@ function modelPicker(over: Partial<PickerView> = {}): PickerView {
     sort: "price",
     detail: "Gemini 3.8 Flash TTS is a low-latency text-to-speech model with inline audio tags and 20+ languages.",
     noun: "models",
+    nounHeader: "Model",
+    providerHeader: "Provider",
+    columns: [{ header: "Price", sortKey: "price" }, { header: "Voices" }, { header: "Tags" }],
     query: "",
     cursor: 0,
     items,
@@ -110,7 +112,7 @@ describe("renderPanel in the shared 19-line frame", () => {
     const input = renderPanel(
       fixture({
         tab: "bridge",
-        rows: [{ id: "remoteMachine", label: "Remote machine", value: "not connected" }],
+        rows: [{ id: "device", label: "Device", value: "Local" }],
         input: { label: "Connect to", value: "alice@box", cursor: 9, placeholder: "user@host" },
       }),
       100,
@@ -121,7 +123,7 @@ describe("renderPanel in the shared 19-line frame", () => {
       expect(lines[0]).toMatch(/^─ Speech ─+/);
     }
     expect(main[3]).toMatch(/^ {2}Speak: > +type a message/);
-    expect(main[4]).toMatch(/^ {2}Setting +Value$/);
+    expect(main[4]).toBe("  Setting");
     expect(main.join("\n")).not.toMatch(/SPEAK \(|LISTEN \(|SETTINGS/);
     expect(picker[3]).toBe("  Search: >  ");
     expect(menu[3]).toBe("");
@@ -142,7 +144,7 @@ describe("renderPanel in the shared 19-line frame", () => {
 
     const lastNarrow = renderPanel(fixture({ tab: "bridge" }), 60);
     expect(lastNarrow[1]).toContain("<< ");
-    expect(lastNarrow[1]).toContain("Bridge");
+    expect(lastNarrow[1]).toContain("Receivers");
     expect(lastNarrow[1]).not.toContain(" >>");
   });
 
@@ -165,6 +167,7 @@ describe("renderPanel in the shared 19-line frame", () => {
       fixture({ tab: "speechModel", picker: modelPicker({ sort: "price", selected: 12 }) }),
       100,
     );
+    expect(byPrice[0]).toMatch(/^─ Speech ─+ Sort: Price ─+$/);
     expect(byPrice[4]).toMatch(/Model +Provider +Price ▲ +Voices$/);
     // 10 rows centred around item 12 (indices 7..16)
     expect(byPrice.slice(5, 15).filter((l) => /model-\d+/.test(l))).toHaveLength(10);
@@ -174,8 +177,28 @@ describe("renderPanel in the shared 19-line frame", () => {
       fixture({ tab: "speechModel", picker: modelPicker({ sort: "newest", selected: 2 }) }),
       100,
     );
-    expect(byNewest[4]).toMatch(/Model +Provider +Sort: newest +Price +Voices$/);
+    expect(byNewest[0]).toMatch(/^─ Speech ─+ Sort: Newest ─+$/);
+    expect(byNewest[4]).toMatch(/Model +Provider +Price +Voices$/);
     expect(byNewest.slice(5, 15).find((l) => l.includes("model-2"))).toMatch(/^▶ model-2 ●/);
+
+    const byName = renderPanel(
+      fixture({ tab: "speechModel", picker: modelPicker({ sort: "name-desc", selected: 0 }) }),
+      100,
+    );
+    expect(byName[0]).toMatch(/^─ Speech ─+ Sort: Alphabetical$/);
+    expect(byName[0].indexOf("Sort:")).toBe(byPrice[0].indexOf("Sort:"));
+    expect(byName[4]).toMatch(/Model ▼ +Provider +Price +Voices$/);
+
+    const byPriceDesc = renderPanel(
+      fixture({ tab: "speechModel", picker: modelPicker({ sort: "price-desc", selected: 0 }) }),
+      100,
+    );
+    expect(byPriceDesc[0]).toMatch(/^─ Speech ─+ Sort: Price ─+$/);
+    expect(byPriceDesc[4]).toMatch(/Model +Provider +Price ▼ +Voices$/);
+
+    const wide = renderPanel(fixture({ tab: "speechModel", picker: modelPicker({ sort: "name", selected: 0 }) }), 180);
+    expect(wide[0]).toMatch(/^─ Speech ─+ Sort: Alphabetical ─+$/);
+    expect(wide[0].indexOf("Alphabetical") + "Alphabetical".length).toBeLessThan(180);
 
     const empty = renderPanel(
       fixture({ tab: "voice", picker: modelPicker({ items: [], total: 0, empty: "xAI lists no voices" }) }),
@@ -191,7 +214,7 @@ describe("renderPanel in the shared 19-line frame", () => {
     expect(visibleWidth(picker[15])).toBeLessThanOrEqual(90);
 
     const form = renderPanel(fixture({ tab: "main", selected: 3 }), 90);
-    expect(form[15]).toBe("  (4/9) Voice");
+    expect(form[15]).toBe("  (4/10) Voice");
 
     const toned = renderPanel(fixture({ status: { tone: "error", text: "✗ Playback failed: boom" } }), 90, TAGGED);
     expect(toned[15]).toBe("  \x1b[31m✗ Playback failed: boom\x1b[39m");
@@ -235,17 +258,16 @@ describe("renderPanel in the shared 19-line frame", () => {
     expect(renderPanel(fixture({ hints }), 60)[17]).toBe("  Enter pick · Ctrl+P sample · type to filter · Esc back");
     expect(renderPanel(fixture({ hints }), 45)[17]).toBe("  Enter pick · type to filter · Esc back");
 
-    // Dictation output edits in place on Main: the rows stay and the field sits under its row.
-    const outputInput = renderPanel(
+    // Inline language / submit-word field sits under its row.
+    const submitInput = renderPanel(
       fixture({
         tab: "main",
-        selected: MAIN_ROWS.findIndex((r) => r.id === "output"),
-        input: { label: "Dictation output", value: "", cursor: 0, placeholder: "a command", under: "output" },
+        selected: MAIN_ROWS.findIndex((r) => r.id === "dictation"),
+        input: { label: "Submit word", value: "", cursor: 0, placeholder: "over", under: "dictation" },
       }),
       100,
     );
-    expect(outputInput.join("\n")).toContain("a command");
-    expect(outputInput.join("\n")).toContain("Dictation output");
+    expect(submitInput.join("\n")).toContain("Submit word");
   });
 
   it("returns one narrow-terminal line below MIN_WIDTH and never exceeds termWidth", () => {
@@ -265,5 +287,26 @@ describe("renderPanel in the shared 19-line frame", () => {
         expect(Math.max(...lines.map((l) => visibleWidth(l))), `width ${w}`).toBeLessThanOrEqual(w);
       }
     }
+  });
+
+  it("renders disabled rows dimmed even when focused, and muted rows dimmed until focused", () => {
+    const rows: PanelRow[] = [
+      { id: "readMode", label: "Read", value: "Off" },
+      { id: "summaryLength", label: "Length", value: "Minimum ~15 s", muted: true },
+      { id: "dictationLive", label: "Output", value: "Filled", note: "Local STT only", disabled: true },
+    ];
+    const onFirst = renderPanel(fixture({ tab: "readAloud", rows, selected: 0 }), 80, TAGGED);
+    expect(onFirst[5]).toContain("\x1b[1mOff\x1b[22m"); // active selected: bold
+    expect(onFirst[6]).toContain("\x1b[2mMinimum ~15 s\x1b[22m"); // muted unselected: dim
+    expect(onFirst[7]).toContain("\x1b[2mFilled\x1b[22m"); // disabled unselected: dim
+
+    const onMuted = renderPanel(fixture({ tab: "readAloud", rows, selected: 1 }), 80, TAGGED);
+    expect(onMuted[6]).toContain("Minimum ~15 s");
+    expect(onMuted[6]).not.toContain("\x1b[2mMinimum ~15 s\x1b[22m"); // muted selected: normal (editable)
+    expect(onMuted[6]).not.toContain("\x1b[1mMinimum ~15 s\x1b[22m");
+
+    const onDisabled = renderPanel(fixture({ tab: "readAloud", rows, selected: 2 }), 80, TAGGED);
+    expect(onDisabled[7]).toContain("\x1b[36m\x1b[1mOutput"); // focused label stays accented+bold
+    expect(onDisabled[7]).toContain("\x1b[2mFilled\x1b[22m"); // disabled value stays dim
   });
 });

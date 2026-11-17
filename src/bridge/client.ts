@@ -1,8 +1,8 @@
 /**
- * HTTP client for pi-speech-receiver on the Remote machine (protocol/bridge.md): the bridge's AudioOutput and
- * AudioInput. Every playback is a Stream (`POST /v1/play/stream`); a receiver without the `stream` capability
- * is an error that says to update it. The token is sent only in the Authorization header and is scrubbed from
- * every message produced here.
+ * HTTP client and configuration for pi-speech-receiver on the Remote machine (protocol/bridge.md):
+ * the bridge's AudioOutput, AudioInput, and ModelBackend. Every playback is a Stream (`POST /v1/play/stream`);
+ * a receiver without the `stream` capability is an error that says to update it. The token is sent only in
+ * the Authorization header and is scrubbed from every message produced here.
  *
  * Every request names this Pi process (`X-Pi-Speech-Client`, random per process), so the receiver replaces and
  * stops only this process's plays and leaves those of the user's other Pi sessions playing. With spare ports
@@ -11,6 +11,9 @@
  */
 
 import { randomBytes } from "node:crypto";
+import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import type {
   AudioInput,
   AudioOutput,
@@ -20,14 +23,105 @@ import type {
   Recording,
   StreamOptions,
 } from "../engine/audio";
-import {
-  type Download,
-  type DownloadProgress,
-  type DownloadResult,
-  downloadResult,
-  followDownload,
-} from "../engine/local-models";
+import { type DownloadResult, downloadResult, followDownload, type ModelBackend } from "../engine/model-backend";
 import type { AudioStream, StreamFormat } from "../engine/provider";
+
+export type { BridgeVoice, ModelBackend as BridgeModels } from "../engine/model-backend";
+
+type Env = Record<string, string | undefined>;
+
+export const DEFAULT_PORT = 47613;
+export const DEFAULT_URL = `http://127.0.0.1:${DEFAULT_PORT}`;
+/** The spare ports `pi-speech-receiver ssh` forwards, one per session, tried after 47613. */
+export const SPARE_PORTS: readonly number[] = Array.from({ length: 20 }, (_, i) => DEFAULT_PORT + 1 + i);
+
+export function bridgeUrl(env: Env): string {
+  return env.PI_SPEECH_BRIDGE_URL?.trim() || DEFAULT_URL;
+}
+
+/** Where the receiver is, without the token. `from` says where the address came from. */
+export interface BridgeTarget {
+  url: string;
+  ports?: number[];
+  network?: boolean;
+  from: "pairing" | "env" | "default";
+}
+
+/**
+ * An address as the user types it (`host:port`, `host`, `[::1]:47613`, or an http URL) as a base URL; the port
+ * is 47613 when it has none. Throws a readable Error for anything else.
+ */
+export function addressUrl(address: string): string {
+  const a = address.trim();
+  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(a) ? a : `http://${a}`;
+  let u: URL;
+  try {
+    u = new URL(withScheme);
+  } catch {
+    throw new Error(`not an address: ${a} (use host:port, such as 100.64.0.2:47613)`);
+  }
+  if (u.protocol !== "http:") throw new Error(`the bridge is plain http, not ${u.protocol}//`);
+  if (!u.hostname || u.username || u.password || (u.pathname !== "/" && u.pathname !== "")) {
+    throw new Error(`not an address: ${a} (use host:port, such as 100.64.0.2:47613)`);
+  }
+  if (!u.port) u.port = String(DEFAULT_PORT);
+  return u.origin;
+}
+
+/** The host:port of a base URL, as the panel shows it. */
+export function addressOf(url: string): string {
+  const u = new URL(url);
+  return `${u.hostname}:${u.port || 80}`;
+}
+
+/** Where the receiver is: a saved address, else PI_SPEECH_BRIDGE_URL, else 127.0.0.1:47613 and the spare ports. */
+export function bridgeTarget(env: Env, address?: string): BridgeTarget {
+  if (address?.trim()) return { url: addressUrl(address), network: true, from: "pairing" };
+  const url = env.PI_SPEECH_BRIDGE_URL?.trim();
+  if (url) return { url, from: "env" };
+  return { url: DEFAULT_URL, ports: [...SPARE_PORTS], from: "default" };
+}
+
+/** The token file: PI_SPEECH_BRIDGE_TOKEN_FILE, else ~/.config/pi-speech/bridge.token. */
+export function bridgeTokenFile(env: Env): string {
+  return env.PI_SPEECH_BRIDGE_TOKEN_FILE || join(env.HOME || homedir(), ".config", "pi-speech", "bridge.token");
+}
+
+/** Token from PI_SPEECH_BRIDGE_TOKEN, else the file PI_SPEECH_BRIDGE_TOKEN_FILE, else ~/.config/pi-speech/bridge.token. */
+export function bridgeToken(env: Env): string {
+  const direct = env.PI_SPEECH_BRIDGE_TOKEN?.trim();
+  if (direct) return direct;
+  const file = bridgeTokenFile(env);
+  let text: string;
+  try {
+    text = readFileSync(file, "utf8");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code ?? "unreadable";
+    throw new Error(
+      `no bridge token: set PI_SPEECH_BRIDGE_TOKEN, or put it in ${file} (${code}; PI_SPEECH_BRIDGE_TOKEN_FILE names another file)`,
+    );
+  }
+  const token = text.split(/\r?\n/)[0].trim();
+  if (!token) throw new Error(`no bridge token: ${file} is empty`);
+  return token;
+}
+
+/** Save a token from pairing as the token file (mode 0600, its directory 0700), whole or not at all; its path. */
+export function saveBridgeToken(env: Env, token: string): string {
+  const file = bridgeTokenFile(env);
+  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+  const tmp = `${file}.${process.pid}.tmp`;
+  writeFileSync(tmp, `${token}\n`, { mode: 0o600 });
+  chmodSync(tmp, 0o600);
+  renameSync(tmp, file);
+  return file;
+}
+
+/** The bridge's target and token; `token` (a Remote machine's over SSH, held in memory) before the configured one. */
+export function bridgeConfig(env: Env, address?: string, token?: string): BridgeConfig {
+  const { from: _from, ...target } = bridgeTarget(env, address);
+  return { ...target, token: token || bridgeToken(env) };
+}
 
 export interface BridgeConfig {
   url: string;
@@ -39,51 +133,13 @@ export interface BridgeConfig {
 }
 
 /** A failure carries the receiver's HTTP status when it answered (401: the token is not its token). */
-export type BridgeHealth = { ok: true; version: string } | { ok: false; reason: string; status?: number };
+export type BridgeHealth =
+  | { ok: true; version: string; edition?: "cpu" | "gpu" }
+  | { ok: false; reason: string; status?: number };
 
 /** This Pi process, as the receiver tells its clients apart. */
 export const CLIENT_ID = randomBytes(8).toString("hex");
 const CLIENT_HEADER = "X-Pi-Speech-Client";
-
-/** A voice of a speech model, as `speak <id> --list-voices` names it. */
-export interface BridgeVoice {
-  name: string;
-  number: number;
-}
-
-/**
- * Local models run by the receiver on the Remote machine (protocol/bridge.md, "Running local models"). The
- * receiver runs one transcription or speech at a time; these calls wait for each other, so only another
- * client's run is refused.
- */
-export interface BridgeModels {
-  /** The catalogue with each model's state on the Remote machine, as `models list` prints it. */
-  list(): Promise<Record<string, unknown>[]>;
-  voices(id: string, signal?: AbortSignal): Promise<BridgeVoice[]>;
-  transcribe(
-    id: string,
-    audio: Buffer,
-    format: "wav" | "mp3",
-    signal?: AbortSignal,
-    language?: string,
-  ): Promise<string>;
-  /**
-   * Download a model into the Remote machine's cache, its progress as the local download gives it; cancelling
-   * stops it there, keeping what arrived. Absent in stand-ins that cannot.
-   */
-  download?(
-    id: string,
-    options?: { onProgress?: (p: DownloadProgress) => void | Promise<void>; signal?: AbortSignal },
-  ): Download;
-  /** Delete a model on the Remote machine; resolves to the bytes freed. */
-  delete?(id: string): Promise<number>;
-  /** Resolves once the model has loaded there; the chunks are the PCM as it is generated. */
-  speak(
-    id: string,
-    text: string,
-    opts?: { voice?: string; speed?: number; signal?: AbortSignal },
-  ): Promise<AudioStream>;
-}
 
 export interface BridgeLevels {
   recording?: number[];
@@ -94,10 +150,12 @@ export interface BridgeAudio {
   output: AudioOutput;
   input: AudioInput;
   health(): Promise<BridgeHealth>;
+  /** Probe the Remote machine's GPU hardware and receiver edition (`GET /v1/gpu`). */
+  gpu?(): Promise<Record<string, unknown> | undefined>;
   /** Live 12-band spectrum levels (`0..100`) when supported; undefined when older/unreachable. */
   levels?(): Promise<BridgeLevels | undefined>;
   /** Local models run on the Remote machine; absent in stand-ins that have none. */
-  models?: BridgeModels;
+  models?: ModelBackend;
   /** The base URL requests go to now (a spare port once found); undefined before the first. */
   at?(): string | undefined;
 }
@@ -258,18 +316,25 @@ export function createBridgeAudioFrom(getConfig: () => BridgeConfig, opts: { cli
     return true;
   }
 
-  async function call(
+  interface OpenOptions {
+    body?: Buffer;
+    contentType?: string;
+    headers?: Record<string, string>;
+    /** Timeout for the request; pass `null` for long-lived streams controlled only by `signal`. */
+    timeoutMs?: number | null;
+    signal?: AbortSignal;
+  }
+
+  /**
+   * Unified HTTP transport with spare-port failover, token scrubbing, and structured ReceiverError parsing.
+   * Used by buffered `call()` and streaming endpoints (`models.download`, `models.speak`, `levels`).
+   */
+  async function openResponse(
     method: "GET" | "POST",
     path: string,
-    opts: {
-      body?: Buffer;
-      contentType?: string;
-      headers?: Record<string, string>;
-      timeoutMs?: number;
-      signal?: AbortSignal;
-    } = {},
+    opts: OpenOptions = {},
     retried = false,
-  ): Promise<Reply> {
+  ): Promise<{ res: Response; base: string; scrub: (s: string) => string }> {
     const { base, token, scrub } = await target();
     const headers: Record<string, string> = {
       Authorization: `Bearer ${token}`,
@@ -277,33 +342,31 @@ export function createBridgeAudioFrom(getConfig: () => BridgeConfig, opts: { cli
       ...opts.headers,
     };
     if (opts.contentType) headers["Content-Type"] = opts.contentType;
+    const signals: AbortSignal[] = [];
+    if (opts.timeoutMs !== null) signals.push(AbortSignal.timeout(opts.timeoutMs ?? CONTROL_TIMEOUT_MS));
+    if (opts.signal) signals.push(opts.signal);
+    const signal = signals.length === 1 ? signals[0] : signals.length > 1 ? AbortSignal.any(signals) : undefined;
     let res: Response;
-    let body: Buffer;
     try {
       res = await fetch(base + path, {
         method,
         headers,
         body: opts.body ? new Uint8Array(opts.body) : undefined,
         redirect: "error",
-        signal: AbortSignal.any([
-          AbortSignal.timeout(opts.timeoutMs ?? CONTROL_TIMEOUT_MS),
-          ...(opts.signal ? [opts.signal] : []),
-        ]),
+        signal,
       });
-      body = Buffer.from(await res.arrayBuffer());
     } catch (err) {
       opts.signal?.throwIfAborted();
-      // The forward it went through has gone (its ssh session ended): once more, through another that answers.
-      if (!retried && lost(base)) return call(method, path, opts, true);
+      if (!retried && lost(base)) return openResponse(method, path, opts, true);
       throw new ReceiverError(
         scrub(`the playback receiver is not reachable at ${displayUrl(base)}: ${describeError(err)}`),
       );
     }
-    const type = res.headers.get("content-type") ?? "";
     if (res.status >= 400) {
+      const raw = Buffer.from(await res.arrayBuffer().catch(() => new ArrayBuffer(0)));
       let message = res.statusText || "request failed";
       try {
-        const parsed = JSON.parse(body.toString("utf8")) as { error?: unknown };
+        const parsed = JSON.parse(raw.toString("utf8")) as { error?: unknown };
         if (typeof parsed.error === "string" && parsed.error) message = parsed.error;
       } catch {
         /* not JSON: keep the status text */
@@ -315,7 +378,27 @@ export function createBridgeAudioFrom(getConfig: () => BridgeConfig, opts: { cli
         scrub(message),
       );
     }
-    return { status: res.status, type, body, base };
+    return { res, base, scrub };
+  }
+
+  async function call(
+    method: "GET" | "POST",
+    path: string,
+    opts: Omit<OpenOptions, "timeoutMs"> & { timeoutMs?: number } = {},
+    retried = false,
+  ): Promise<Reply> {
+    const { res, base, scrub } = await openResponse(method, path, opts, retried);
+    let body: Buffer;
+    try {
+      body = Buffer.from(await res.arrayBuffer());
+    } catch (err) {
+      opts.signal?.throwIfAborted();
+      if (!retried && lost(base)) return call(method, path, opts, true);
+      throw new ReceiverError(
+        scrub(`the playback receiver is not reachable at ${displayUrl(base)}: ${describeError(err)}`),
+      );
+    }
+    return { status: res.status, type: res.headers.get("content-type") ?? "", body, base };
   }
 
   async function json<T>(reply: Reply): Promise<T> {
@@ -336,7 +419,13 @@ export function createBridgeAudioFrom(getConfig: () => BridgeConfig, opts: { cli
   async function health(): Promise<BridgeHealth> {
     try {
       const reply = await call("GET", "/v1/health");
-      const h = await json<{ protocol?: number; name?: string; version?: string; capabilities?: unknown }>(reply);
+      const h = await json<{
+        protocol?: number;
+        name?: string;
+        version?: string;
+        edition?: unknown;
+        capabilities?: unknown;
+      }>(reply);
       const stream = Array.isArray(h.capabilities) && h.capabilities.includes("stream");
       streamCapable.set(reply.base, stream);
       if (h.name !== "pi-speech-receiver") return { ok: false, reason: "the server there is not a pi-speech-receiver" };
@@ -344,7 +433,8 @@ export function createBridgeAudioFrom(getConfig: () => BridgeConfig, opts: { cli
         return { ok: false, reason: `the receiver speaks bridge protocol ${String(h.protocol)}, not 1` };
       }
       if (!stream) return { ok: false, reason: TOO_OLD };
-      return { ok: true, version: String(h.version ?? "unknown") };
+      const edition = h.edition === "cpu" || h.edition === "gpu" ? h.edition : undefined;
+      return { ok: true, version: String(h.version ?? "unknown"), ...(edition ? { edition } : {}) };
     } catch (err) {
       const status = err instanceof ReceiverError ? err.status : undefined;
       return { ok: false, reason: message(err), ...(status ? { status } : {}) };
@@ -519,15 +609,14 @@ export function createBridgeAudioFrom(getConfig: () => BridgeConfig, opts: { cli
           return { audio: r.body, format: "wav" as const };
         },
         async cancel() {
-          await call("POST", `${path}/cancel`);
+          await call("POST", `${path}/cancel`).catch(() => {});
         },
       };
     },
   };
 
-  // ── Local models on the Remote machine ─────────────────────────────────
+  // ── Local models on the Remote machine ──────────────────────────────────
 
-  /** Whether the receiver at a base URL runs models (its health lists `models`). */
   const modelsCapable = new Map<string, boolean>();
   const MODELS_TOO_OLD =
     "the receiver on the Remote machine is too old to run models: update pi-speech-receiver there and restart it, or set Run models on to This machine";
@@ -586,7 +675,7 @@ export function createBridgeAudioFrom(getConfig: () => BridgeConfig, opts: { cli
     }
   }
 
-  const models: BridgeModels = {
+  const models: ModelBackend = {
     download(id, options = {}) {
       const ending = new AbortController();
       let stopping = false;
@@ -599,38 +688,29 @@ export function createBridgeAudioFrom(getConfig: () => BridgeConfig, opts: { cli
       const stopped = (): DownloadResult => ({ status: "stopped", done: 0, total: 0 });
       const result = (async (): Promise<DownloadResult> => {
         await requireModels();
-        const { base: at, token, scrub } = await target();
         let res: Response;
+        let scrub: (s: string) => string;
         try {
-          res = await fetch(`${at}/v1/models/download?model=${encodeURIComponent(id)}`, {
-            method: "POST",
-            headers: { Authorization: `Bearer ${token}`, [CLIENT_HEADER]: clientId },
-            redirect: "error",
+          const opened = await openResponse("POST", `/v1/models/download?model=${encodeURIComponent(id)}`, {
+            timeoutMs: null,
             signal: ending.signal,
           });
+          res = opened.res;
+          scrub = opened.scrub;
         } catch (err) {
           if (stopping) return stopped();
-          lost(at);
-          throw new Error(scrub(`the playback receiver is not reachable at ${displayUrl(at)}: ${describeError(err)}`));
-        }
-        if (!res.ok || !res.body) {
-          if (res.status === 404) {
-            throw new Error(
-              `the receiver on the Remote machine is from before model downloads: update it, or run pi-speech-receiver models download ${id} there`,
-            );
+          if (err instanceof ReceiverError) {
+            if (err.status === 404) {
+              throw new Error(
+                `the receiver on the Remote machine is from before model downloads: update it, or run pi-speech-receiver models download ${id} there`,
+              );
+            }
+            if (err.status === 409 && err.detail) throw new Error(`on the Remote machine: ${err.detail}`);
+            throw modelError(err);
           }
-          let detail = res.statusText || "the download failed";
-          try {
-            const parsed = (await res.json()) as { error?: unknown };
-            if (typeof parsed.error === "string" && parsed.error) detail = parsed.error;
-          } catch {
-            /* keep the status text */
-          }
-          if (res.status === 409) throw new Error(`on the Remote machine: ${scrub(detail)}`);
-          throw modelError(
-            new ReceiverError(`the playback receiver answered ${res.status}: ${detail}`, res.status, scrub(detail)),
-          );
+          throw err;
         }
+        if (!res.body) throw new Error("on the Remote machine: the download failed");
         let followed: Awaited<ReturnType<typeof followDownload>>;
         try {
           followed = await followDownload(bodyLines(res.body), options.onProgress);
@@ -638,15 +718,13 @@ export function createBridgeAudioFrom(getConfig: () => BridgeConfig, opts: { cli
           if (stopping) return stopped();
           throw err;
         }
-        const message = followed.last?.message;
+        const msg = followed.last?.message;
         return downloadResult(
           followed,
           stopping,
           true,
           () =>
-            new Error(
-              `on the Remote machine: ${typeof message === "string" && message ? scrub(message) : "the download failed"}`,
-            ),
+            new Error(`on the Remote machine: ${typeof msg === "string" && msg ? scrub(msg) : "the download failed"}`),
         );
       })();
       return { result, cancel };
@@ -741,39 +819,21 @@ export function createBridgeAudioFrom(getConfig: () => BridgeConfig, opts: { cli
       let res: Response;
       try {
         await requireModels();
-        const { base: at, token, scrub } = await target();
-        try {
-          res = await fetch(`${at}/v1/speak`, {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${token}`,
-              [CLIENT_HEADER]: clientId,
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
+        const opened = await openResponse("POST", "/v1/speak", {
+          body: Buffer.from(
+            JSON.stringify({
               model: id,
               text,
               ...(opts.voice ? { voice: opts.voice } : {}),
               ...(opts.speed !== undefined && opts.speed !== 1 ? { speed: opts.speed } : {}),
+              ...(opts.lang ? { lang: opts.lang } : {}),
             }),
-            redirect: "error",
-            signal: ending.signal,
-          });
-        } catch (err) {
-          signal?.throwIfAborted();
-          lost(at);
-          throw new Error(scrub(`the playback receiver is not reachable at ${displayUrl(at)}: ${describeError(err)}`));
-        }
-        if (!res.ok) {
-          let detail = res.statusText || "speak failed";
-          try {
-            const parsed = (await res.json()) as { error?: unknown };
-            if (typeof parsed.error === "string" && parsed.error) detail = parsed.error;
-          } catch {
-            /* keep the status text */
-          }
-          throw new ReceiverError(`the playback receiver answered ${res.status}: ${detail}`, res.status, scrub(detail));
-        }
+          ),
+          contentType: "application/json",
+          timeoutMs: null,
+          signal: ending.signal,
+        });
+        res = opened.res;
       } catch (err) {
         finish();
         throw modelError(err);
@@ -808,13 +868,7 @@ export function createBridgeAudioFrom(getConfig: () => BridgeConfig, opts: { cli
 
   const levels = async (): Promise<BridgeLevels | undefined> => {
     try {
-      const { base: at, token } = await target();
-      const res = await fetch(`${at}/v1/levels`, {
-        headers: { Authorization: `Bearer ${token}`, [CLIENT_HEADER]: clientId },
-        redirect: "error",
-        signal: AbortSignal.timeout(500),
-      });
-      if (!res.ok) return undefined;
+      const { res } = await openResponse("GET", "/v1/levels", { timeoutMs: 500 });
       const body = (await res.json()) as { recording?: unknown; playing?: unknown };
       const clean = (v: unknown) =>
         Array.isArray(v)
@@ -826,7 +880,16 @@ export function createBridgeAudioFrom(getConfig: () => BridgeConfig, opts: { cli
     }
   };
 
-  return { output, input, health, levels, models, at: () => last };
+  const gpu = async (): Promise<Record<string, unknown> | undefined> => {
+    try {
+      const reply = await call("GET", "/v1/gpu");
+      return await json<Record<string, unknown>>(reply);
+    } catch {
+      return undefined;
+    }
+  };
+
+  return { output, input, health, gpu, levels, models, at: () => last };
 }
 
 export function createBridgeAudio(config: BridgeConfig, opts: { clientId?: string } = {}): BridgeAudio {

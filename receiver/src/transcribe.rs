@@ -17,8 +17,8 @@
 
 use crate::audio::convert::Converter;
 use crate::audio::decode::{Decode, WavOrMp3};
-use crate::engines::model;
-use crate::engines::recognize::{Recognizer, SAMPLE_RATE};
+use crate::engines::model::{self, Precision};
+use crate::engines::recognize::{self, Recognizer, SAMPLE_RATE};
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -116,7 +116,8 @@ pub fn transcribe(
         Some(arg) => crate::models::resolve_model_dir(arg)?,
         None => model_dir.to_path_buf(),
     };
-    let model = model::detect(&model_dir)?;
+    let precision = Precision::from_provider(&recognize::provider());
+    let model = model::detect_with(&model_dir, precision)?;
     let samples = load_audio(audio)?;
     Recognizer::load(&model, language)?.transcribe(&samples)
 }
@@ -129,35 +130,43 @@ struct Kept {
     recognizer: Recognizer,
 }
 
-/// The recogniser for `model` and `language`: the kept one when it is that, else a new one,
-/// kept in its place (the old one is dropped first, so two large models are never held).
-fn recognizer<'a>(
-    kept: &'a mut Option<Kept>,
-    model: &str,
-    language: Option<&str>,
-) -> Result<&'a Recognizer, String> {
-    let dir = crate::models::resolve_model_dir(model)?;
-    let found = model::detect(&dir)?;
-    let language = Recognizer::language_matters(found.kind())
-        .then(|| language.map(String::from))
-        .flatten();
-    let same = kept
-        .as_ref()
-        .is_some_and(|k| k.dir == dir && k.language == language);
-    if !same {
-        *kept = None;
-        let recognizer = Recognizer::load(&found, language.as_deref())?;
-        *kept = Some(Kept {
-            dir,
-            language,
-            recognizer,
-        });
+/// Keeps the last loaded transcription model warm across requests.
+#[derive(Default)]
+pub struct WarmRecognizer(Option<Kept>);
+
+impl WarmRecognizer {
+    pub fn new() -> Self {
+        Self(None)
     }
-    Ok(&kept.as_ref().expect("kept above").recognizer)
+
+    /// The recogniser for `model` and `language`: the kept one when it matches, else a new one,
+    /// dropping the old one first so two large models are never held at once.
+    pub fn get(&mut self, model: &str, language: Option<&str>) -> Result<&Recognizer, String> {
+        let dir = crate::models::resolve_model_dir(model)?;
+        let precision = Precision::from_provider(&recognize::provider());
+        let found = model::detect_with(&dir, precision)?;
+        let language = Recognizer::language_matters(found.kind())
+            .then(|| language.map(String::from))
+            .flatten();
+        let same = self
+            .0
+            .as_ref()
+            .is_some_and(|k| k.dir == dir && k.language == language);
+        if !same {
+            self.0 = None;
+            let recognizer = Recognizer::load(&found, language.as_deref())?;
+            self.0 = Some(Kept {
+                dir,
+                language,
+                recognizer,
+            });
+        }
+        Ok(&self.0.as_ref().expect("kept above").recognizer)
+    }
 }
 
 /// One request of `serve`, answered.
-fn answer(kept: &mut Option<Kept>, line: &str) -> serde_json::Value {
+fn answer(kept: &mut WarmRecognizer, line: &str) -> serde_json::Value {
     use serde_json::{json, Value};
     let req: Value = match serde_json::from_str(line) {
         Ok(v) => v,
@@ -170,13 +179,13 @@ fn answer(kept: &mut Option<Kept>, line: &str) -> serde_json::Value {
     let language = s("language").filter(|l| *l != "auto");
     let mut run = || -> Result<Value, String> {
         if req.get("load").and_then(Value::as_bool) == Some(true) {
-            recognizer(kept, model, language)?;
+            kept.get(model, language)?;
             return Ok(json!({ "loaded": true }));
         }
         let audio = s("audio").ok_or("the request names no audio file")?;
         // The audio first: a bad file fails before a large model is loaded.
         let samples = load_audio(Path::new(audio))?;
-        let text = recognizer(kept, model, language)?.transcribe(&samples)?;
+        let text = kept.get(model, language)?.transcribe(&samples)?;
         Ok(json!({ "text": text }))
     };
     run().unwrap_or_else(|e| json!({ "error": e }))
@@ -185,7 +194,7 @@ fn answer(kept: &mut Option<Kept>, line: &str) -> serde_json::Value {
 /// `transcribe --serve`: requests on standard input, answers on standard output.
 pub fn serve() -> ExitCode {
     use std::io::{BufRead, Write};
-    let mut kept = None;
+    let mut kept = WarmRecognizer::new();
     let stdout = io::stdout();
     for line in io::stdin().lock().lines() {
         let Ok(line) = line else { break };

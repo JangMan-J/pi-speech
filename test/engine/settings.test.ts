@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DEFAULT_SETTINGS, hotkeyId, keyLabel, pttHotkeyId, SettingsFile } from "../../src/engine/settings";
 
@@ -8,7 +8,7 @@ let dir: string;
 beforeEach(() => {
   dir = join(mkdtempSync(join(tmpdir(), "pi-speech-settings-")), "pi-speech");
 });
-afterEach(() => rmSync(dir, { recursive: true, force: true }));
+afterEach(() => rmSync(dirname(dir), { recursive: true, force: true }));
 
 describe("the settings file", () => {
   it("gives the defaults when nothing is saved", () => {
@@ -20,7 +20,8 @@ describe("the settings file", () => {
       tools: true,
       bridge: "auto",
       languages: {},
-      modelSort: "price",
+      modelSort: "name",
+      localModelSort: "name",
       endpoints: {},
       hotkeys: { speak: "alt+s", dictate: "alt+z" },
       readAloud: { length: "minimum", truncate: 0 },
@@ -30,7 +31,7 @@ describe("the settings file", () => {
       playOn: "remote",
       recordOn: "remote",
       modelsOn: "remote",
-      osdStyle: "braille",
+      osdStyle: "line",
     });
   });
 
@@ -45,11 +46,11 @@ describe("the settings file", () => {
     const f = new SettingsFile(dir);
     const s = f.load();
     s.hotkeys = { ...s.hotkeys, ptt: "f8" };
-    s.osdStyle = "mirror";
+    s.osdStyle = "wave";
     f.save(s);
     const reloaded = f.load();
     expect(reloaded.hotkeys.ptt).toBe("f8");
-    expect(reloaded.osdStyle).toBe("mirror");
+    expect(reloaded.osdStyle).toBe("wave");
 
     // Colliding PTT with speak/dictate is ignored on load.
     s.hotkeys.ptt = "alt+z";
@@ -190,27 +191,40 @@ describe("the settings file", () => {
     expect(f.load()).toEqual({ ...DEFAULT_SETTINGS, languages: {} });
   });
 
-  it("dictation output: a stored command alone is Pi; the mode is saved only as User-defined", () => {
-    mkdirSync(dir, { recursive: true });
-    // An existing config holding only a command (from before the mode existed).
-    writeFileSync(join(dir, "settings.json"), JSON.stringify({ version: 1, dictationOutput: "wl-copy %s" }));
+  it("persists dictationLive, dictationSubmitWord, dictationVocabulary, and dictationCommands only when set", () => {
     const f = new SettingsFile(dir);
-    expect(f.load()).toMatchObject({ dictationOutput: "wl-copy %s" });
-    expect(f.load().dictationOutputMode).toBeUndefined();
-    expect(new SettingsFile(join(dir, "fresh")).load().dictationOutputMode).toBeUndefined();
-    f.save({ ...f.load(), dictationOutputMode: "command" });
-    expect(JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"))).toMatchObject({
-      dictationOutput: "wl-copy %s",
-      dictationOutputMode: "command",
+    f.save({
+      ...f.load(),
+      dictationLive: true,
+      dictationSubmitWord: "over",
+      dictationVocabulary: ["Pi", "zelij, Zellij"],
+      dictationCommands: ["/compact"],
     });
-    expect(f.load().dictationOutputMode).toBe("command");
-    // Back to Pi: the command stays in the file, the mode does not.
-    f.save({ ...f.load(), dictationOutputMode: "pi" });
     const raw = JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"));
-    expect(raw.dictationOutput).toBe("wl-copy %s");
-    expect(raw).not.toHaveProperty("dictationOutputMode");
-    writeFileSync(join(dir, "settings.json"), JSON.stringify({ version: 1, dictationOutputMode: "bogus" }));
-    expect(f.load().dictationOutputMode).toBeUndefined();
+    expect(raw).toMatchObject({
+      dictationLive: true,
+      dictationSubmitWord: "over",
+      dictationVocabulary: ["Pi", "zelij, Zellij"],
+      dictationCommands: ["/compact"],
+    });
+    expect(f.load()).toMatchObject({
+      dictationLive: true,
+      dictationSubmitWord: "over",
+      dictationVocabulary: ["Pi", "zelij, Zellij"],
+      dictationCommands: ["/compact"],
+    });
+    f.save({
+      ...f.load(),
+      dictationLive: false,
+      dictationSubmitWord: undefined,
+      dictationVocabulary: [],
+      dictationCommands: [],
+    });
+    const cleared = JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"));
+    expect(cleared).not.toHaveProperty("dictationLive");
+    expect(cleared).not.toHaveProperty("dictationSubmitWord");
+    expect(cleared).not.toHaveProperty("dictationVocabulary");
+    expect(cleared).not.toHaveProperty("dictationCommands");
   });
 
   it("writes nothing when there is nothing to migrate", () => {

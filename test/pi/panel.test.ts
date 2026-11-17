@@ -114,6 +114,7 @@ describe("frame key alignment and KeyDecoder", () => {
     expect(d.decode("\x0c")).toEqual([{ combo: "ctrl+l" }]);
     expect(d.decode("\x0e")).toEqual([{ combo: "ctrl+n" }]);
     expect(d.decode("\x14")).toEqual([{ combo: "ctrl+t" }]);
+    expect(d.decode("\x1bo")).toEqual([{ combo: "alt+o" }]);
     expect(d.decode("\x1b[5~")).toEqual([{ combo: "pageUp" }]);
     expect(d.decode("\x1b[6~")).toEqual([{ combo: "pageDown" }]);
     expect(d.decode("\x1b[1;2A")).toEqual([{ combo: "shift+up" }]);
@@ -128,6 +129,7 @@ describe("frame key alignment and KeyDecoder", () => {
     expect(d.decode("\x1b[100;5u")).toEqual([{ combo: "ctrl+d" }]);
     expect(d.decode("\x1b[112;5u")).toEqual([{ combo: "ctrl+p" }]);
     expect(d.decode("\x1b[111;5u")).toEqual([{ combo: "ctrl+o" }]);
+    expect(d.decode("\x1b[111;3u")).toEqual([{ combo: "alt+o" }]);
     expect(d.decode("\x1b[5;1:1~")).toEqual([{ combo: "pageUp" }]);
     expect(d.decode("\x1b[6;1:1~")).toEqual([{ combo: "pageDown" }]);
     expect(d.decode("\x1b[1;2:1A")).toEqual([{ combo: "shift+up" }]);
@@ -330,6 +332,7 @@ describe("floating panes and dock in Pi's TUI", () => {
     await f.emit("session_start");
 
     const done = f.commands.get("speech").handler("", f.ctx);
+    await vi.waitFor(() => expect(f.dock()).toBeDefined());
     expect(f.dock().options).toBeUndefined();
     const lines = f.dock().component.render(100);
     expect(lines).toHaveLength(19);

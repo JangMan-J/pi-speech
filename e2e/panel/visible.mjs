@@ -41,12 +41,13 @@ try {
   await selectRow(t,'Speech model'); await t.key('Enter'); await t.until(s=>/kokoro-multi-lang/.test(s));
   check(/kokoro-multi-lang.*MB.*not downloaded/.test(shot()),'local speech models show size and state');
   await t.key('Escape'); await selectRow(t,'Speech source'); await t.key('Left');
-  await selectRow(t,'Transcription source'); await t.key('Right'); await selectRow(t,'Transcription model'); await t.key('Enter'); await t.until(s=>/whisper-small/.test(s));
+  await selectRow(t,'Transcription source'); await t.key('Right'); await selectRow(t,'Transcription model'); await t.key('Enter');
+  await t.until(s=>/Model ▲/.test(s)); await t.key('ctrl+s',2); await t.until(s=>/whisper-small/.test(s));
   let s = shot();
   check(/whisper-small.*MB.*downloaded/.test(s) && /parakeet.*MB.*not downloaded/.test(s),'local transcription sizes and states');
-  check(/Ctrl\+O download.*Ctrl\+T delete/.test(s),'local list uses chord actions');
-  await t.key('Enter'); check(/not downloaded.*Enter downloads/.test(shot()),'undownloaded selection offers download');
-  await t.key('Down'); await t.key('ctrl+o');
+  check(/Ctrl\+O download.*Alt\+O uninstall.*Ctrl\+T provider/.test(s),'local list uses chord actions');
+  await t.key('Down'); await t.key('Enter'); check(/not downloaded.*Enter downloads/.test(shot()),'undownloaded selection offers download');
+  await t.key('Up'); await t.key('ctrl+o');
   check(/whisper-small is already downloaded/.test(shot()) && !fs.readdirSync(modelsDir).some(f=>/parakeet/.test(f)), 'Ctrl+O reports already downloaded without fetching');
   await t.key('Enter');
   check(/whisper-small/.test(shot()) && saved().localTranscriptionModel === 'whisper-small','downloaded model selection saves');
@@ -56,9 +57,9 @@ try {
   check(/Search: > leda/i.test(shot()),'voice tab filters'); await t.key('Enter');
   check(saved().voice === 'Leda' && /Voice\s+Leda/.test(shot()),'voice choice persists');
   await selectRow(t,'Speech model'); await t.key('Enter');
-  check(/Price ▲/.test(shot()),'model list has price sort'); await t.key('ctrl+s');
-  check(/Provider ▲/.test(shot()),'Ctrl+S sorts'); await t.key('ctrl+d');
-  check(/any key closes/.test(shot()) && /text-to-speech model/.test(t.screen()),'detail overlay renders full description'); await t.key('Escape'); await t.key('Escape');
+  check(/Model ▲/.test(shot()),'model list defaults to alphabetical sort'); await t.key('ctrl+s',2);
+  check(/Price ▲/.test(shot()),'Ctrl+S sorts'); await t.key('Down',2); await t.key('ctrl+d');
+  check(/any key closes/.test(shot()) && /open-weight text-to-speech/.test(t.screen()),'detail overlay renders full description'); await t.key('Escape'); await t.key('Escape');
   // Main's field speaks repeatedly; Ctrl chords run replay/history/stop/transcribe.
   t.type('panel hello'); await t.key('Enter'); await sleep(1500);
   t.type('second panel message'); await t.key('Enter'); await sleep(1500);

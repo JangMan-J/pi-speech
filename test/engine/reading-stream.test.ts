@@ -4,8 +4,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { SavedMessage } from "../../src/engine/history";
 import { Player } from "../../src/engine/player";
 import type { AudioStream, StreamFormat, SynthesizedAudio } from "../../src/engine/provider";
-import { ReadingFailed } from "../../src/engine/reading";
-import { IN_FLIGHT, streamReading } from "../../src/engine/reading-stream";
+import { IN_FLIGHT, ReadingFailed, streamReading } from "../../src/engine/reading";
 import { wrapPcmAsWav } from "../../src/engine/wav";
 import { fakeOutput, pcmBytes, until } from "./fixtures";
 

@@ -225,23 +225,23 @@ describe.skipIf(!STAND_IN_BINARY)("LocalSpeechProvider", () => {
     provider.close();
   });
 
-  it("runs the worker with what the chosen device needs, and restarts it when that changes", async () => {
-    const bin = fakeSpeak();
-    let device: NodeJS.ProcessEnv = { PI_SPEECH_PROVIDER: "cuda" };
+  it("restarts the worker when closed after switching receiver binaries", async () => {
+    const binA = fakeSpeak();
+    const binB = fakeSpeak();
+    let active = binA;
     const provider = new LocalSpeechProvider(
-      () => bin,
+      () => active,
       () => process.env,
       () => undefined,
-      async () => device,
+      async () => active,
     );
     const logged = () => JSON.parse(readFileSync(join(dir, "log.json"), "utf8"));
     await provider.synthesize({ text: "Hi.", model: "ok", voice: "", language: "auto" });
-    const gpu = logged();
-    expect(gpu.provider).toBe("cuda");
-    device = {};
+    const first = logged();
+    active = binB;
+    provider.close();
     await provider.synthesize({ text: "Hi.", model: "ok", voice: "", language: "auto" });
-    expect(logged().provider).toBeNull();
-    expect(logged().pid).not.toBe(gpu.pid);
+    expect(logged().pid).not.toBe(first.pid);
     provider.close();
   });
 

@@ -10,9 +10,9 @@ async function scenario(options, run, terminal = {}) {
 const screen = t => capture(t).join('\n');
 await scenario({},async t=>{
   check(!/idle/i.test(screen(t).split('\n')[0]),'idle title has no badge');
-  await t.key('Tab',6); check(/Remote machine/.test(screen(t)),'Shift/Tab navigation reaches Bridge');
+  await t.key('Tab',6); check(/Device/.test(screen(t)),'Shift/Tab navigation reaches Receivers');
   await t.key('Tab'); check(/Speak: >/.test(screen(t)),'Tab wraps to Main');
-  await t.key('shift+tab'); check(/Remote machine/.test(screen(t)),'Shift+Tab wraps to Bridge');
+  await t.key('shift+tab'); check(/Device/.test(screen(t)),'Shift+Tab wraps to Receivers');
   await t.key('Escape'); check(/Speak: >/.test(screen(t)),'Esc on tab returns to Main');
   t.type('rhst'); check(/Speak: > rhst/.test(screen(t)),'bare action letters are text on Main');
 });

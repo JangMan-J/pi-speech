@@ -6,6 +6,7 @@
 
 import type { AudioInput, Recording } from "./audio";
 import { errorMessage } from "./env";
+import { quietSplitByte, sliceWav, wavPcmInfo } from "./wav";
 
 /** A recording stops by itself, and is transcribed, after this long. */
 export const MAX_RECORDING_MS = 5 * 60 * 1000;
@@ -16,6 +17,19 @@ export interface DictationUi {
   notify(message: string, level: "info" | "warning" | "error"): void;
   /** Insert at the cursor without submitting. */
   paste(text: string): void;
+  /** Live typing / cleanup: read and replace the editor box text natively. */
+  getEditor?(): string;
+  setEditor?(text: string): void;
+  /** Submit a message directly in Pi (triggered by trailing submit word). */
+  submit?(text: string): void;
+  /** Run a slash command directly in Pi (triggered by a sole-word voice command). */
+  runCommand?(command: string): void;
+}
+
+export interface DictationOutcome {
+  text: string;
+  submit?: boolean;
+  command?: string;
 }
 
 export interface DictationDeps {
@@ -25,14 +39,39 @@ export interface DictationDeps {
   defaultLanguage?(): string | undefined;
   /** Recording has started: get the transcription ready (load a local model) while the user speaks. */
   prepare?(language?: string): void;
-  /** Whether a user-defined output command is configured; when false the transcript goes to the editor. */
-  outputConfigured?(): boolean;
-  /** Run the user-defined output command with the transcript; rejects when it fails. */
-  output?(text: string): Promise<void>;
+  /** Whether live typing while speaking is enabled by the user. */
+  liveEnabled?(): boolean;
+  /** Whether the active STT model/route supports fast live chunking. */
+  liveCapable?(): boolean;
+  /** Poll interval (ms) for live typing snapshots. */
+  liveMs?: number;
+  /** Transform live preview text (e.g. apply vocabulary casing/replacements). */
+  previewTransform?(text: string): string;
+  /** Finalize transcript: apply vocabulary, detect sole voice command, and check trailing submit word. */
+  finalize?(text: string): DictationOutcome;
   /** The state changed, or the recording clock ticked. */
   onChange?(): void;
   maxMs?: number;
   tickMs?: number;
+}
+
+const LIVE_WINDOW_MAX_SEC = 15;
+const LIVE_COMMIT_MIN_SEC = 8;
+const LIVE_COMMIT_MAX_SEC = 13;
+const LIVE_MIN_DELTA_SEC = 0.05;
+
+function joinEditorText(base: string, spoken: string): string {
+  if (!spoken) return base;
+  if (!base) return spoken;
+  return /\s$/.test(base) ? `${base}${spoken}` : `${base} ${spoken}`;
+}
+
+function joinTranscript(a: string, b: string): string {
+  const left = a.trim();
+  const right = b.trim();
+  if (!left) return right;
+  if (!right) return left;
+  return `${left} ${right}`;
 }
 
 const clock = (ms: number) => `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, "0")}`;
@@ -55,12 +94,25 @@ export class Dictation {
   /** Language captured when this recording started; the stopping toggle does not need to repeat it. */
   private language?: string;
   private tick?: ReturnType<typeof setInterval>;
+  private liveTimer?: ReturnType<typeof setInterval>;
   private limit?: ReturnType<typeof setTimeout>;
+  private liveActive = false;
+  private baseEditor = "";
+  private committedByte = 0;
+  private committedText = "";
+  private lastSnapBytes = 0;
+  private liveAbort?: AbortController;
+  private liveInFlight?: Promise<void>;
 
   constructor(private readonly deps: DictationDeps) {}
 
   get state(): DictationState {
     return this.current;
+  }
+
+  /** Structured dictation phase when active, or undefined when idle. */
+  phase(): "starting" | "recording" | "transcribing" | undefined {
+    return this.current === "idle" ? undefined : this.current;
   }
 
   /** The status indicator text, or undefined when idle. */
@@ -100,8 +152,14 @@ export class Dictation {
     const recording = this.recording;
     if (this.current !== "recording" || !recording) return;
     this.recording = undefined;
+    const wasLive = this.liveActive;
+    const base = this.baseEditor;
+    const ui = this.ui;
     this.endTimers();
+    this.liveAbort?.abort();
+    this.resetLive();
     this.set("idle");
+    if (wasLive) ui?.setEditor?.(base);
     await recording.cancel().catch(() => {});
   }
 
@@ -147,6 +205,15 @@ export class Dictation {
       }, this.deps.maxMs ?? MAX_RECORDING_MS);
       this.tick.unref?.();
       this.limit.unref?.();
+      this.resetLive();
+      if (this.deps.liveEnabled?.() && this.deps.liveCapable?.() && recording.snapshot && ui.setEditor) {
+        this.liveActive = true;
+        this.baseEditor = ui.getEditor?.() ?? "";
+        this.liveTimer = setInterval(() => {
+          void this.pollLive(recording, ui);
+        }, this.deps.liveMs ?? 650);
+        this.liveTimer.unref?.();
+      }
       void recording.ended?.then((reason) => this.ended(recording, reason, ui));
       if (this.stopRequested) {
         this.stopRequested = false;
@@ -158,12 +225,82 @@ export class Dictation {
     }
   }
 
+  private resetLive(): void {
+    this.liveActive = false;
+    this.baseEditor = "";
+    this.committedByte = 0;
+    this.committedText = "";
+    this.lastSnapBytes = 0;
+    this.liveAbort = undefined;
+    this.liveInFlight = undefined;
+  }
+
+  private async pollLive(recording: Recording, ui: DictationUi): Promise<void> {
+    if (!this.liveActive || this.current !== "recording" || this.liveInFlight || this.recording !== recording) return;
+    const run = (async () => {
+      const snap = await recording.snapshot?.();
+      if (!snap || !this.liveActive || this.current !== "recording") return;
+      const wav = snap.audio;
+      const { dataOffset, byteRate } = wavPcmInfo(wav);
+      if (this.committedByte < dataOffset) this.committedByte = dataOffset;
+      if (this.lastSnapBytes < dataOffset) this.lastSnapBytes = dataOffset;
+      const minDelta = Math.max(2, Math.round(byteRate * LIVE_MIN_DELTA_SEC));
+      if (this.lastSnapBytes > dataOffset) {
+        if (wav.length <= this.lastSnapBytes + minDelta) return;
+        let sum = 0;
+        let count = 0;
+        for (let i = Math.max(dataOffset, this.lastSnapBytes & ~1); i + 2 <= wav.length; i += 8) {
+          sum += Math.abs(wav.readInt16LE(i));
+          count++;
+        }
+        if (count > 0 && sum / count < 90) {
+          this.lastSnapBytes = wav.length;
+          return;
+        }
+      }
+      this.lastSnapBytes = wav.length;
+      const ac = new AbortController();
+      this.liveAbort = ac;
+      try {
+        const maxWindowBytes = Math.round(LIVE_WINDOW_MAX_SEC * byteRate);
+        if (wav.length - this.committedByte > maxWindowBytes) {
+          const splitAt = quietSplitByte(wav, this.committedByte, LIVE_COMMIT_MIN_SEC, LIVE_COMMIT_MAX_SEC);
+          if (splitAt > this.committedByte) {
+            const headWav = sliceWav(wav, this.committedByte, splitAt);
+            const headText = (await this.deps.transcribe(headWav, snap.format, ac.signal, this.language)).trim();
+            if (ac.signal.aborted || !this.liveActive) return;
+            this.committedText = joinTranscript(this.committedText, headText);
+            this.committedByte = splitAt;
+          }
+        }
+        const tailWav = this.committedByte > dataOffset ? sliceWav(wav, this.committedByte) : wav;
+        const partial = (await this.deps.transcribe(tailWav, snap.format, ac.signal, this.language)).trim();
+        if (ac.signal.aborted || !this.liveActive || this.current !== "recording") return;
+        const combined = joinTranscript(this.committedText, partial);
+        const preview = this.deps.previewTransform ? this.deps.previewTransform(combined) : combined;
+        ui.setEditor?.(joinEditorText(this.baseEditor, preview));
+      } catch {
+        /* transient partial errors are ignored; final pass resolves cleanly */
+      } finally {
+        if (this.liveAbort === ac) this.liveAbort = undefined;
+      }
+    })();
+    this.liveInFlight = run;
+    await run;
+    if (this.liveInFlight === run) this.liveInFlight = undefined;
+  }
+
   /** The recorder ended by itself while recording: report it now and return to idle. */
   private async ended(recording: Recording, reason: string, ui: DictationUi): Promise<void> {
     if (this.recording !== recording) return;
     this.recording = undefined;
+    const wasLive = this.liveActive;
+    const base = this.baseEditor;
     this.endTimers();
+    this.liveAbort?.abort();
+    this.resetLive();
     this.set("idle");
+    if (wasLive) ui.setEditor?.(base);
     this.notify(ui, report("Dictation failed", reason), "error");
     await recording.cancel().catch(() => {});
   }
@@ -172,18 +309,34 @@ export class Dictation {
     const recording = this.recording;
     if (!recording) return;
     this.recording = undefined;
+    const wasLive = this.liveActive;
+    const base = this.baseEditor;
+    const committedByte = this.committedByte;
+    const committedText = this.committedText;
     this.endTimers();
+    this.liveAbort?.abort();
+    if (this.liveInFlight) await this.liveInFlight.catch(() => {});
+    this.resetLive();
     this.set("transcribing");
     const abort = new AbortController();
     this.transcription = abort;
     try {
       const { audio, format } = await recording.stop();
       if (abort.signal.aborted) return;
-      const text = (await this.deps.transcribe(audio, format, abort.signal, this.language)).trim();
+      let rawText: string;
+      const dataOffset = format === "wav" ? wavPcmInfo(audio).dataOffset : 0;
+      if (wasLive && committedByte > dataOffset && format === "wav" && audio.length > committedByte) {
+        const tailWav = sliceWav(audio, committedByte);
+        const tailText = (await this.deps.transcribe(tailWav, format, abort.signal, this.language)).trim();
+        rawText = joinTranscript(committedText, tailText);
+      } else {
+        rawText = (await this.deps.transcribe(audio, format, abort.signal, this.language)).trim();
+      }
       if (abort.signal.aborted) return;
-      if (!text) throw new Error("no speech was recognized in the recording");
-      await this.deliver(ui, text);
+      if (!rawText) throw new Error("no speech was recognized in the recording");
+      await this.deliver(ui, rawText, wasLive, base);
     } catch (err) {
+      if (wasLive) ui.setEditor?.(base);
       if (!abort.signal.aborted) this.notify(ui, report("Dictation failed", err), "error");
     } finally {
       this.transcription = undefined;
@@ -192,23 +345,34 @@ export class Dictation {
     }
   }
 
-  /** Send the transcript to the user's output command, falling back to the editor when none is set or it fails. */
-  private async deliver(ui: DictationUi, text: string): Promise<void> {
-    if (this.deps.outputConfigured?.() && this.deps.output) {
-      try {
-        await this.deps.output(text);
-        return;
-      } catch (err) {
-        this.notify(ui, `${report("Dictation output failed", err)}; put in the editor instead`, "warning");
-      }
+  /** Apply vocabulary, voice command, or submit-word handling and deliver cleanly into Pi. */
+  private async deliver(ui: DictationUi, rawText: string, wasLive: boolean, base: string): Promise<void> {
+    const outcome = this.deps.finalize ? this.deps.finalize(rawText) : { text: rawText };
+    if (outcome.command) {
+      if (wasLive) ui.setEditor?.(base);
+      if (ui.runCommand) ui.runCommand(outcome.command);
+      else if (ui.submit) ui.submit(outcome.command);
+      else ui.paste(outcome.command);
+      return;
     }
-    ui.paste(text);
+    if (outcome.submit) {
+      if (wasLive) ui.setEditor?.(base);
+      if (ui.submit) ui.submit(outcome.text);
+      else ui.paste(outcome.text);
+      return;
+    }
+    if (wasLive && ui.setEditor) {
+      ui.setEditor(joinEditorText(base, outcome.text));
+      return;
+    }
+    ui.paste(outcome.text);
   }
 
   private endTimers(): void {
     if (this.tick) clearInterval(this.tick);
+    if (this.liveTimer) clearInterval(this.liveTimer);
     if (this.limit) clearTimeout(this.limit);
-    this.tick = this.limit = undefined;
+    this.tick = this.liveTimer = this.limit = undefined;
   }
 
   private notify(ui: DictationUi, text: string, level: "error" | "warning"): void {

@@ -79,8 +79,31 @@ const out = (v) => process.stdout.write(JSON.stringify(v) + '\\n');
 if (cmd === 'models') {
   out({ id: 'kokoro', kind: 'speech', name: 'Kokoro', languages: ['en'], size: 1, downloaded: true, partial: 0, path: '/m/k' });
   out({ id: 'parakeet', kind: 'transcription', name: 'Parakeet', languages: ['en'], size: 1, downloaded: true, partial: 0, path: '/m/p' });
+} else if (cmd === 'transcribe' && sub === '--serve') {
+  require('node:readline').createInterface({ input: process.stdin }).on('line', (line) => {
+    const r = JSON.parse(line);
+    if (r.load) return out({ loaded: true });
+    fs.appendFileSync(${JSON.stringify(log)}, 'transcribe ' + r.model + ' ' + r.audio + '\\n');
+    out({ text: '${where} words from ' + r.model });
+  });
 } else if (cmd === 'transcribe') {
   process.stdout.write('${where} words from ' + sub + '\\n');
+} else if (cmd === 'speak' && sub === '--serve') {
+  const frame = (kind, body) => {
+    const head = Buffer.alloc(5);
+    head[0] = kind.charCodeAt(0);
+    head.writeUInt32LE(body.length, 1);
+    process.stdout.write(Buffer.concat([head, body]));
+  };
+  require('node:readline').createInterface({ input: process.stdin }).on('line', (line) => {
+    const r = JSON.parse(line);
+    if (r.cancel !== undefined) return;
+    if (r.load) return frame('J', Buffer.from(JSON.stringify({ id: r.id, event: 'loaded' })));
+    fs.appendFileSync(${JSON.stringify(log)}, 'speak ' + r.model + '\\n');
+    frame('J', Buffer.from(JSON.stringify({ id: r.id, event: 'format', rate: 24000, channels: 1 })));
+    frame('A', Buffer.alloc(9600, 3));
+    frame('J', Buffer.from(JSON.stringify({ id: r.id, event: 'done' })));
+  });
 } else if (cmd === 'speak') {
   if (process.argv.includes('--list-voices')) { out({ name: 'af_sol', number: 0 }); process.exit(0); }
   process.stdin.resume();

@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFil
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { BridgeModels } from "../../src/bridge/index";
+import type { BridgeModels } from "../../src/bridge/client";
 import type { AudioInput } from "../../src/engine/audio";
 import type { Machine } from "../../src/engine/settings";
 import { LOCAL_SPEECH_UNAVAILABLE } from "../../src/engine/speech";
@@ -17,7 +17,7 @@ describe("the engine", () => {
     fakeOpenRouter();
     const { engine, local } = makeEngine();
     const statuses: Array<string | undefined> = [];
-    engine.indicator.attach((t) => statuses.push(t));
+    engine.indicator.attach((_s, t) => statuses.push(t));
     const s = new Surface(engine);
     await s.run("hello", scriptedUi().ui);
     expect(statuses.at(-1)).toBe("▶ speaking");
@@ -113,7 +113,7 @@ describe("the engine", () => {
       },
     );
     const statuses: Array<string | undefined> = [];
-    engine.indicator.attach((t) => statuses.push(t));
+    engine.indicator.attach((_s, t) => statuses.push(t));
     const { ui, pasted } = scriptedUi();
     await engine.dictation.toggle(ui);
     expect(statuses.at(-1)).toMatch(/^● REC 0:0\d$/);
@@ -124,36 +124,28 @@ describe("the engine", () => {
     expect(existsSync(join(work, "history"))).toBe(false);
   });
 
-  it("Pi dictation output does not run a stored command; User-defined does", async () => {
-    fakeOpenRouter("dictated words");
+  it("applies vocabulary, sole voice commands, and trailing submit word natively through Pi", async () => {
+    fakeOpenRouter("open zelij, over.");
     const wav = Buffer.concat([Buffer.from("RIFF"), Buffer.alloc(4), Buffer.from("WAVE")]);
-    const { engine, work } = makeEngine(
+    const { engine } = makeEngine(
       {},
       {
         name: "local",
         start: async () => ({ stop: async () => ({ audio: wav, format: "wav" as const }), cancel: async () => {} }),
       },
     );
-    const out = join(work, "out.txt");
-    const cmd = process.platform === "win32" ? `$env:DICTATION_TEXT | Set-Content -NoNewline '${out}'` : `cat > ${out}`;
-    // A legacy config: a command stored, no mode picked — Pi mode, so it pastes and never runs it.
-    engine.speech.settings.dictationOutput = cmd;
+    engine.speech.settings.dictationVocabulary = ["zelij, Zellij"];
+    engine.speech.settings.dictationSubmitWord = "over";
+    engine.speech.settings.dictationCommands = ["/compact"];
+    const submitted: string[] = [];
+    const commands: string[] = [];
     const { ui, pasted } = scriptedUi();
-    await engine.dictation.toggle(ui);
-    await engine.dictation.toggle(ui);
-    expect(pasted).toEqual(["dictated words"]);
-    expect(existsSync(out)).toBe(false);
-    // Choosing it (as --dictation-output does) runs it instead of pasting.
-    await engine.speech.set("dictation-output", cmd);
-    expect(engine.speech.settings.dictationOutputMode).toBe("command");
-    await engine.dictation.toggle(ui);
-    await engine.dictation.toggle(ui);
-    expect(existsSync(out)).toBe(true);
-    expect(readFileSync(out, "utf8")).toContain("dictated");
-    expect(pasted).toEqual(["dictated words"]);
-    // An empty --dictation-output returns to Pi.
-    await engine.speech.set("dictation-output", "");
-    expect(engine.speech.settings.dictationOutputMode).toBe("pi");
+    const richUi = { ...ui, submit: (t: string) => submitted.push(t), runCommand: (c: string) => commands.push(c) };
+    await engine.dictation.toggle(richUi);
+    await engine.dictation.toggle(richUi);
+    expect(submitted).toEqual(["open Zellij"]);
+    expect(pasted).toEqual([]);
+    expect(commands).toEqual([]);
   });
 
   it("the saved dictation language goes with every dictation; a toggle may name another, or auto", async () => {
@@ -348,10 +340,11 @@ describe.skipIf(!STAND_IN_BINARY)("Speech source and Transcription source in one
     await vi.waitFor(() => expect(pasted).toEqual(["local words from parakeet-v3"]));
     expect(requests.length).toBe(before);
     expect(calls().at(-1)).toMatch(/^transcribe parakeet-v3 .*audio.wav$/);
-    // Transcribe file… too, from the file itself.
+    // Transcribe file… too, from the file itself, forwarding language.
     const file = join(engine.speech.historyDir, "..", "note.wav");
     writeFileSync(file, wavFixture());
-    expect(await engine.speech.transcribeFile(file, { cwd: "/" })).toBe("local words from parakeet-v3");
+    expect(await engine.speech.transcribeFile(file, { cwd: "/", language: "ja" })).toBe("local words from parakeet-v3");
+    expect(calls().at(-1)).toMatch(/^transcribe parakeet-v3 .*note\.wav --language ja$/);
     expect(requests.length).toBe(before);
     // Provider speech in the same session.
     const r = await engine.speech.speak("still spoken by the provider");
@@ -386,5 +379,17 @@ describe.skipIf(!STAND_IN_BINARY)("Speech source and Transcription source in one
     const status = await engine.status();
     expect(status).toMatch(/Speech model: none chosen \(local\)\n/);
     expect(status).not.toMatch(/not available/);
+  });
+});
+
+describe("receiver version verification in Engine.announce", () => {
+  it("warns once over SSH when the running receiver is older than the extension", async () => {
+    fakeOpenRouter();
+    const made = makeEngine({ SSH_CONNECTION: "1 2 3 4" });
+    made.engine.routes.bridge.health = async () => ({ ok: true, version: "0.3.0" });
+    const notice = await made.engine.announce();
+    expect(notice?.level).toBe("warning");
+    expect(notice?.message).toMatch(/Receiver is 0\.3\.0.*expects/);
+    expect(await made.engine.announce()).toBeUndefined();
   });
 });

@@ -8,7 +8,7 @@ import {
   MIN_WORDS,
   Narrator,
   type NarratorDeps,
-} from "../../src/engine/narration";
+} from "../../src/engine/read-aloud";
 
 /** A clock and timers the test moves by hand. */
 function clock() {

@@ -88,8 +88,8 @@ describe("the Pi adapter", () => {
     expect(osd[2]).toEqual({ placement: "aboveEditor" });
     const widget = (osd[1] as (tui: unknown) => { render(width: number): string[] })({ requestRender() {} });
     const lines = widget.render(60);
-    expect(lines).toHaveLength(3);
-    expect(lines[0].startsWith(" ".repeat(20))).toBe(true);
+    expect(lines).toHaveLength(5);
+    expect(lines[0].startsWith(" ".repeat(12))).toBe(true);
   });
 
   it("--type inserts literal text into the editor without speaking or submitting it", async () => {
@@ -327,7 +327,7 @@ describe("the Pi adapter", () => {
       await vi.waitFor(() => expect(engine.dictation.state).toBe("recording"));
       expect(widgets.at(-1)?.[0]).toBe("pi-speech-osd");
       const osd = widgets.at(-1)?.[1] as unknown as (tui: unknown) => { render(width: number): string[] };
-      expect(osd({ requestRender() {} }).render(80)).toHaveLength(3);
+      expect(osd({ requestRender() {} }).render(80)).toHaveLength(5);
       expect(widgets.at(-1)?.[2]).toEqual({ placement: "aboveEditor" });
 
       // Repeat F8 while held is consumed without stopping

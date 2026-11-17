@@ -819,3 +819,18 @@ fn levels_endpoint_reports_active_recording_and_playback_bands() {
     assert!(temp_entries(&dir).is_empty());
     std::fs::remove_dir_all(dir).ok();
 }
+
+#[test]
+fn version_flag_reports_the_receiver_version() {
+    let dir = scratch("cli-version");
+    for flag in ["--version", "-V"] {
+        let out = command(&dir, &[flag]).output().unwrap();
+        assert_eq!(out.status.code(), Some(0));
+        let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(
+            line,
+            format!("pi-speech-receiver {}", pi_speech_receiver::VERSION)
+        );
+    }
+    std::fs::remove_dir_all(dir).ok();
+}

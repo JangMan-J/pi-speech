@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cutForSpeech, finalAssistantText, MAX_SPOKEN_CHARS, speakable } from "../../src/engine/readable";
+import { finalAssistantText, speakable } from "../../src/engine/read-aloud";
 
 describe("speakable text", () => {
   it("leaves plain text as it is", () => {
@@ -32,32 +32,6 @@ describe("speakable text", () => {
 
   it("keeps underscores inside words", () => {
     expect(speakable("Use snake_case_names here.")).toBe("Use snake_case_names here.");
-  });
-});
-
-describe("cutting long replies", () => {
-  it("keeps short text whole", () => {
-    expect(cutForSpeech("Short. Text.")).toEqual({ text: "Short. Text.", cut: false });
-  });
-
-  it("cuts at the last sentence boundary within the limit", () => {
-    const long = Array.from({ length: 70 }, (_, i) => `This is sentence number ${i + 1} of a very long reply.`).join(
-      " ",
-    );
-    const r = cutForSpeech(long);
-    expect(r.cut).toBe(true);
-    expect(r.text.length).toBeLessThanOrEqual(MAX_SPOKEN_CHARS);
-    expect(r.text.length).toBeGreaterThan(1900);
-    expect(r.text.endsWith(".")).toBe(true);
-    expect(long.startsWith(r.text)).toBe(true);
-  });
-
-  it("cuts at a word when there is no sentence boundary", () => {
-    const words = "word ".repeat(600);
-    const r = cutForSpeech(words, 100);
-    expect(r.cut).toBe(true);
-    expect(r.text.length).toBeLessThanOrEqual(100);
-    expect(r.text.endsWith("word")).toBe(true);
   });
 });
 

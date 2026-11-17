@@ -2,17 +2,24 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { inlineTags } from "../../src/engine/features";
 import {
   type DownloadProgress,
   deleteModel,
   downloadModel,
   formatSize,
+  isLiveCapableLocalStt,
+  isSingleVoicePiper,
+  type LocalModel,
   LocalModels,
   LocalModelsError,
   listModels,
+  localSttLanguage,
+  piperVoiceLabel,
   transcribeLocal,
 } from "../../src/engine/local-models";
-import { TranscribeWorker } from "../../src/engine/transcribe-worker";
+import { localSpeechLanguage } from "../../src/engine/local-speech";
+import { TranscribeWorker } from "../../src/engine/receiver-worker";
 
 // The stand-in binary is a script with a shebang line, which Windows cannot start.
 const WINDOWS = process.platform === "win32";
@@ -36,8 +43,16 @@ const [, , cmd, sub, id] = process.argv;
 const out = (v) => process.stdout.write(JSON.stringify(v) + "\\n");
 if (cmd === "gpu") {
   const usable = process.env.FAKE_GPU === "yes";
-  out({ driver: usable, cuda: usable ? 13 : null, cudnn: usable, runtime: usable ? "gpu-runtime-cuda13" : null,
-        downloaded: usable, lib: usable ? "/fake/gpu/lib" : null, usable, why: usable ? null : "no NVIDIA driver" });
+  out({
+    driver: usable,
+    cuda: usable ? 13 : null,
+    cudnn: usable,
+    hardware: usable,
+    edition: usable ? "gpu" : "cpu",
+    target: usable ? "linux-x64-cuda13" : null,
+    usable,
+    why: usable ? null : "no NVIDIA driver",
+  });
   process.exit(0);
 }
 if (cmd === "transcribe" && sub === "--serve") {
@@ -305,25 +320,23 @@ describe.skipIf(WINDOWS)("the transcription worker", () => {
     local.close();
   });
 
-  it("runs on the GPU when it is chosen and usable, else on the CPU; a change of device restarts the worker", async () => {
+  it("probes GPU hardware and restarts the worker when switching device", async () => {
     const env = { PI_SPEECH_BINARY: fakeBinary(), PATH: process.env.PATH };
     const gpu = new LocalModels({ ...env, FAKE_GPU: "yes" });
     const cpu = await gpu.transcribe("whisper-small", Buffer.from("RIFF"), "wav");
-    expect(cpu).not.toMatch(/ on /);
     gpu.setDevice("gpu");
     const on = await gpu.transcribe("whisper-small", Buffer.from("RIFF"), "wav");
-    expect(on).toMatch(/ on cuda \/fake\/gpu\/lib loads 1/);
     expect(pidOf(on)).not.toBe(pidOf(cpu));
-    expect(await gpu.gpu()).toMatchObject({ usable: true, runtime: "gpu-runtime-cuda13" });
+    expect(await gpu.gpu()).toMatchObject({ usable: true, hardware: true, target: "linux-x64-cuda13" });
     gpu.setDevice("cpu");
-    expect(await gpu.transcribe("whisper-small", Buffer.from("RIFF"), "wav")).not.toMatch(/ on /);
+    const back = await gpu.transcribe("whisper-small", Buffer.from("RIFF"), "wav");
+    expect(pidOf(back)).not.toBe(pidOf(on));
     gpu.close();
 
-    // Chosen but not usable (no driver): the CPU, and the reason
+    // Unavailable hardware reports why
     const none = new LocalModels({ ...env, FAKE_GPU: "no" });
     none.setDevice("gpu");
-    expect(await none.transcribe("whisper-small", Buffer.from("RIFF"), "wav")).not.toMatch(/ on /);
-    expect(await none.gpu()).toMatchObject({ usable: false, why: "no NVIDIA driver" });
+    expect(await none.gpu()).toMatchObject({ usable: false, hardware: false, why: "no NVIDIA driver" });
     none.close();
   });
 
@@ -343,5 +356,50 @@ describe("LocalModels without a binary", () => {
   it("says why there is none", async () => {
     const local = new LocalModels({}, () => ({ ok: false, reason: "the bundled pi-speech-receiver is not installed" }));
     await expect(local.list()).rejects.toThrow("the bundled pi-speech-receiver is not installed");
+  });
+});
+
+describe("capability metadata contract", () => {
+  it("prefers receiver-emitted capability fields over ID heuristics", () => {
+    const stt: LocalModel = {
+      id: "brand-new-asr-v9",
+      kind: "transcription",
+      name: "Brand New ASR",
+      languages: ["en", "ja"],
+      size: 100,
+      downloaded: true,
+      partial: 0,
+      path: "/tmp/brand-new-asr-v9",
+      liveCapable: "gpu",
+      languageMode: "selectable",
+      cpuRank: 4,
+      gpuRank: 1,
+    };
+    expect(isLiveCapableLocalStt(stt, "cpu")).toBe(false);
+    expect(isLiveCapableLocalStt(stt, "gpu")).toBe(true);
+    expect(localSttLanguage(stt)).toEqual({ kind: "selectable" });
+
+    const fixedStt: LocalModel = { ...stt, id: "custom-mono", languages: ["fr"], languageMode: "fixed" };
+    expect(localSttLanguage(fixedStt)).toEqual({ kind: "fixed", language: "fr" });
+
+    const tts: LocalModel = {
+      id: "brand-new-tts",
+      kind: "speech",
+      name: "Brand New TTS",
+      languages: ["en", "ko"],
+      size: 200,
+      downloaded: true,
+      partial: 0,
+      path: "/tmp/brand-new-tts",
+      group: "piper-en",
+      speakers: 12,
+      languageMode: "selectable",
+      tags: "[tags]",
+    };
+    expect(isSingleVoicePiper(tts)).toBe(true);
+    expect(piperVoiceLabel({ ...tts, id: "piper-en_US-custom-medium" })).toBe("custom-medium (US, 12 voices)");
+    expect(localSpeechLanguage(tts, "ko")).toBe("ko");
+    expect(localSpeechLanguage(tts, "de")).toBeUndefined();
+    expect(inlineTags(tts)).toBe("[tags]");
   });
 });

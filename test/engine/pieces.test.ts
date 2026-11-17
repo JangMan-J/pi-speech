@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { FIRST_PIECE_MAX, FIRST_PIECE_MIN, PIECE_MAX, splitForSpeech } from "../../src/engine/pieces";
+import { FIRST_PIECE_MAX, FIRST_PIECE_MIN, PIECE_MAX, splitForSpeech } from "../../src/engine/reading";
 
 const norm = (t: string) => t.replace(/\s+/g, " ").trim();
 const squash = (t: string) => t.replace(/\s+/g, "");

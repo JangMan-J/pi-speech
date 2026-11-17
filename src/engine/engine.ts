@@ -3,6 +3,7 @@
  * indicator, wired together. The Pi adapter (src/pi/) maps Pi's events, UI, and tools onto it.
  */
 
+import { statSync } from "node:fs";
 import { join } from "node:path";
 import {
   addressOf,
@@ -16,19 +17,27 @@ import {
   requestPairingCode,
   saveBridgeToken,
   sendPairingCode,
-} from "../bridge/index";
+} from "../bridge/client";
 import type { AudioInput, AudioOutput } from "./audio";
-import { binaryFor } from "./binary";
+import {
+  binaryFor,
+  ensureBinaryFor,
+  hasBinaryFor,
+  isReceiverOutdated,
+  packageVersion,
+  releaseAssetSize,
+} from "./binary";
 import { Dictation } from "./dictation";
-import { runDictationOutput } from "./dictation-output";
+import { DictationRuleCache } from "./dictation-rules";
 import { Downloads } from "./downloads";
 import { type Env, errorMessage } from "./env";
 import { Indicator } from "./indicator";
-import type { LocalModels } from "./local-models";
-import type { SpeechCatalog } from "./openrouter";
+import { canLiveDictate, type LocalModels } from "./local-models";
 import { Player } from "./player";
-import { type Notify, ReadAloud, type ReadAloudOptions, type ReadMode } from "./read-aloud";
-import { connectRemote, type RemoteLink, type RemotePrompts } from "./remote";
+import type { SpeechCatalog } from "./provider";
+import { type Notify, ReadAloud, type ReadAloudHost, type ReadAloudOptions, type ReadMode } from "./read-aloud";
+import { ReceiverControl } from "./receiver-control";
+import { connectRemote, libraries, type RemoteLink, type RemotePrompts } from "./remote";
 import { DIRECTION_LABELS, type Notice, Routes } from "./routes";
 import { type BridgeMode, type DirectionSetting, type Machine, SettingsFile } from "./settings";
 import { Speech } from "./speech";
@@ -44,6 +53,10 @@ export interface EngineOptions {
   localInput?: AudioInput;
   /** The on-device models (default: through the bundled binary). */
   local?: LocalModels;
+  /** Host callbacks for ReadAloud (Pi models, current model, summarizer). */
+  readAloudHost?: Partial<ReadAloudHost>;
+  /** The expected receiver version (default: this package's version). */
+  receiverVersion?: string;
 }
 
 /** What Enter on an address in Pairing led to: the receiver takes the token, or it shows a pairing code. */
@@ -60,6 +73,7 @@ export class Engine {
   /** The on-device model download in progress; it outlives the settings panel that started it. */
   readonly downloads: Downloads;
   readonly indicator: Indicator;
+  readonly receivers: ReceiverControl;
   /** Where notifications go; the adapter points it at the current session's UI. */
   notify: Notify = () => {};
   /** Called after the tools setting changed. */
@@ -68,9 +82,12 @@ export class Engine {
   /** Probe the receiver once, as the configuration stands now (the Pairing row of Bridge connection). */
   probeBridge: () => Promise<BridgeProbe>;
   readonly env: Env;
+  /** The receiver version this extension expects. */
+  readonly receiverVersion: string | undefined;
 
   constructor(opts: EngineOptions) {
     this.env = opts.env;
+    this.receiverVersion = opts.receiverVersion ?? packageVersion();
     this.probeBridge = () => probeBridge(() => bridgeConfig(opts.env, this.bridgeAddress(), this.linkToken()));
     const settingsFile = new SettingsFile(join(opts.agentDir, "pi-speech"));
     const mode = settingsFile.load().bridge;
@@ -86,6 +103,7 @@ export class Engine {
     });
     this.indicator = new Indicator(() => ({
       dictation: this.dictation.indicator(),
+      dictationPhase: this.dictation.phase(),
       playing: this.player.playing,
       route: this.routes.route,
     }));
@@ -105,24 +123,22 @@ export class Engine {
       home: opts.home,
       fetchCatalog: opts.fetchCatalog,
       local: opts.local,
+      remoteModels: () => this.routes.remoteModels(),
     });
     this.speech.onWarning = (message) => this.notify(message, "warning");
-    // Run models on: Local sources run on the Remote machine while the bridge is in use and it says so.
-    this.speech.local.remote = () => {
-      if (this.routes.modelsRoute !== "bridge") return undefined;
-      const models = this.routes.bridge.models;
-      if (models) return models;
-      const no = () => Promise.reject(new Error("this bridge cannot run models on the Remote machine"));
-      return { list: no, voices: no, transcribe: no, speak: no };
-    };
+    const rules = new DictationRuleCache();
     this.dictation = new Dictation({
       input: () => this.routes.input(),
       transcribe: (audio, format, signal, language) => this.speech.transcribeAudio(audio, format, { signal, language }),
       defaultLanguage: () => this.speech.settings.dictationLanguage,
       prepare: (language) => this.speech.prepareTranscription(language),
-      outputConfigured: () =>
-        this.speech.settings.dictationOutputMode === "command" && !!this.speech.settings.dictationOutput,
-      output: (text) => runDictationOutput(this.speech.settings.dictationOutput ?? "", text, opts.env),
+      liveEnabled: () => Boolean(this.speech.settings.dictationLive),
+      liveCapable: () => canLiveDictate(this.speech.settings),
+      previewTransform: (text) => rules.preview(text, this.speech.settings.dictationVocabulary),
+      finalize: (rawText) => {
+        const s = this.speech.settings;
+        return rules.finalize(rawText, s.dictationVocabulary, s.dictationCommands, s.dictationSubmitWord);
+      },
       onChange: () => this.indicator.update(),
     });
     this.downloads = new Downloads(
@@ -134,7 +150,9 @@ export class Engine {
       (m, l) => this.notify(m, l),
       () => this.speech.settings.readAloud,
       { speaking: () => this.player.playing },
+      opts.readAloudHost,
     );
+    this.receivers = new ReceiverControl(this);
   }
 
   // ── The Remote machine over SSH (Connect) ──────────────────────────────
@@ -162,6 +180,29 @@ export class Engine {
     return this.link?.dest ?? this.speech.settings.remoteHost;
   }
 
+  /** The connected Remote machine's running receiver version, when connected over SSH. */
+  get remoteVersion(): string | undefined {
+    return this.link?.version;
+  }
+
+  /** The connected Remote machine's running receiver edition (`cpu` or `gpu`), when known. */
+  get remoteEdition(): "cpu" | "gpu" | undefined {
+    return this.link?.edition;
+  }
+
+  /** The connected Remote machine's OS/arch (`linux-x64`), when known. */
+  get remotePlatform(): string | undefined {
+    return this.link?.platform;
+  }
+
+  /** Whether the connected Remote machine's running receiver is older than this extension's. */
+  get remoteOutdated(): boolean {
+    return (
+      this.remoteState === "connected" &&
+      (this.link?.outdated === true || isReceiverOutdated(this.link?.version, this.receiverVersion))
+    );
+  }
+
   private setRemote(state: Engine["remoteState"], error?: string): void {
     this.remoteState = state;
     this.remoteError = error;
@@ -173,14 +214,27 @@ export class Engine {
    * the models there unless Pi runs over SSH. Remembered, and reconnected to at the next session start. Throws
    * what failed.
    */
-  async connectRemote(dest: string, prompts: RemotePrompts): Promise<RemoteLink> {
-    await this.disconnectRemote(false);
+  async connectRemote(
+    dest: string,
+    prompts: RemotePrompts,
+    opts: { update?: boolean | "force"; targetOverride?: string } = {},
+  ): Promise<RemoteLink> {
+    await this.disconnectRemote(false, { keepBridge: true });
     this.setRemote("connecting");
     let link: RemoteLink;
     try {
       link = await connectRemote(dest, prompts, {
         env: this.env as NodeJS.ProcessEnv,
-        binaryFor: (platform) => binaryFor(platform, this.env),
+        binaryFor: (platform) => ensureBinaryFor(platform, this.env),
+        hasBinaryFor: (platform) => hasBinaryFor(platform, this.env),
+        binarySizeFor: (platform) => {
+          const onDisk = binaryFor(platform, this.env);
+          if (onDisk) return [onDisk, ...libraries(onDisk)].reduce((n, f) => n + statSync(f).size, 0);
+          return releaseAssetSize(platform);
+        },
+        version: this.receiverVersion,
+        ...(opts.update !== undefined ? { update: opts.update } : {}),
+        ...(opts.targetOverride !== undefined ? { targetOverride: opts.targetOverride } : {}),
       });
     } catch (err) {
       this.setRemote("failed", errorMessage(err));
@@ -215,27 +269,66 @@ export class Engine {
     return link;
   }
 
-  /** Close the SSH connection; with `forget`, also forget the machine and stop using the bridge. */
-  async disconnectRemote(forget = true): Promise<void> {
+  /**
+   * Close the SSH connection and stop routing through its bridge (unless `keepBridge` is set for session teardown
+   * or reconnect replacement). With `forget`, also remove `remoteHost` from settings.
+   */
+  async disconnectRemote(forget = true, opts: { keepBridge?: boolean } = {}): Promise<void> {
     const link = this.link;
     this.link = undefined;
     if (link) await link.close();
     if (forget) {
       delete this.speech.settings.remoteHost;
       this.speech.save();
-      if (this.routes.mode === "on" && !this.routes.ssh) await this.setBridge("auto").catch(() => {});
+    }
+    if (!opts.keepBridge && this.routes.mode === "on" && !this.routes.ssh) {
+      await this.setBridge("auto").catch(() => {});
     }
     this.setRemote("off");
   }
 
-  /** At a session start: reconnect to the machine remembered, without asking anything (keys or agent only). */
+  /** Re-install the bundled receiver binary on the connected Remote machine over SSH and reconnect. */
+  async updateRemoteReceiver(prompts: RemotePrompts, opts: { targetOverride?: string } = {}): Promise<RemoteLink> {
+    const host = this.remoteHost;
+    if (!host) throw new Error("not connected to a Remote machine");
+    return this.connectRemote(host, prompts, { update: "force", ...opts });
+  }
+
+  /** At a session start: reconnect to the machine remembered when Device was left Remote, without prompting. */
   private reconnect(): void {
     const dest = this.speech.settings.remoteHost;
-    if (!dest || this.link || this.remoteState === "connecting" || this.routes.ssh) return;
+    if (
+      !dest ||
+      this.speech.settings.bridge !== "on" ||
+      this.link ||
+      this.remoteState === "connecting" ||
+      this.routes.ssh
+    )
+      return;
     const quiet: RemotePrompts = { password: async () => undefined, confirm: async () => false, progress: () => {} };
-    this.connectRemote(dest, quiet).catch(() => {
-      // remoteError says why; the panel offers Connect.
-    });
+    this.connectRemote(dest, quiet)
+      .then((link) => {
+        if (link.outdated || isReceiverOutdated(link.version, this.receiverVersion)) {
+          const ver = link.version || "an older version";
+          const exp = this.receiverVersion ? ` (this extension expects ${this.receiverVersion})` : "";
+          this.notify(
+            `pi-speech-receiver on ${link.dest} is ${ver}${exp}: open /speech > Receivers and press u on Receiver to update`,
+            "warning",
+          );
+        }
+      })
+      .catch(() => {
+        // Without a live SSH link or manual bridge URL, do not strand this session on a tokenless localhost bridge.
+        if (
+          this.routes.mode === "on" &&
+          !this.speech.settings.bridgeAddress &&
+          !this.env.PI_SPEECH_BRIDGE_URL?.trim() &&
+          !this.routes.ssh
+        ) {
+          this.routes.mode = "auto";
+          this.indicator.update();
+        }
+      });
   }
 
   /** A session starts: reload the settings, load the catalog, and turn read-aloud off. */
@@ -248,11 +341,21 @@ export class Engine {
     this.reconnect();
   }
 
-  /** The automatic bridge over SSH, announced once per session. */
+  /** The automatic bridge over SSH, announced once per session (warning if the receiver is outdated). */
   async announce(): Promise<Notice | undefined> {
     if (this.announced) return undefined;
     this.announced = true;
-    return this.routes.announcement();
+    const notice = await this.routes.announcement();
+    if (notice?.level === "info" && this.receiverVersion) {
+      const h = await this.routes.bridge.health().catch(() => undefined);
+      if (h?.ok && isReceiverOutdated(h.version, this.receiverVersion)) {
+        return {
+          message: `${notice.message} Receiver is ${h.version} (this extension expects ${this.receiverVersion}): update pi-speech-receiver on your machine.`,
+          level: "warning",
+        };
+      }
+    }
+    return notice;
   }
 
   async setBridge(mode: BridgeMode): Promise<Notice> {
@@ -366,6 +469,15 @@ export class Engine {
     return summary;
   }
 
+  /** Replay the last spoken message from history; returns its file path or throws why it could not start. */
+  async replay(): Promise<string> {
+    const file = this.speech.lastMessage();
+    if (!file) throw new Error("Nothing to replay: no spoken message in the history yet");
+    const started = await this.player.play(file, "message");
+    if (!started.ok) throw new Error(`Replay did not start: ${started.reason}`);
+    return file;
+  }
+
   /** The full status, one line per item. */
   async status(): Promise<string> {
     const d = this.dictation.state;
@@ -381,7 +493,7 @@ export class Engine {
   async shutdown(): Promise<void> {
     await this.dictation.cancel();
     await this.player.stop();
-    await this.disconnectRemote(false);
+    await this.disconnectRemote(false, { keepBridge: true });
     this.speech.closeWorkers();
   }
 }

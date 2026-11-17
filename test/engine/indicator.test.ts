@@ -17,21 +17,24 @@ describe("the status indicator", () => {
     expect(indicatorText({ dictation: "… transcribing", playing: false, route: "local" })).toBe("… transcribing");
   });
 
-  it("sends only changes, and the current text to a new sink", () => {
+  it("sends only changes, and the current state and text to a new sink", () => {
     const state: IndicatorState = { playing: false, route: "local" };
-    const sent: Array<string | undefined> = [];
+    const sent: Array<{ state: IndicatorState; text: string | undefined }> = [];
     const ind = new Indicator(
-      () => state,
-      (t) => sent.push(t),
+      () => ({ ...state }),
+      (s, t) => sent.push({ state: s, text: t }),
     );
     ind.update();
     ind.update();
     state.playing = true;
     ind.update();
     ind.update();
-    expect(sent).toEqual([undefined, "▶ speaking"]);
+    expect(sent).toEqual([
+      { state: { playing: false, route: "local" }, text: undefined },
+      { state: { playing: true, route: "local" }, text: "▶ speaking" },
+    ]);
     const other: Array<string | undefined> = [];
-    ind.attach((t) => other.push(t));
+    ind.attach((_s, t) => other.push(t));
     expect(other).toEqual(["▶ speaking"]);
     ind.refresh();
     expect(other).toEqual(["▶ speaking", "▶ speaking"]);
@@ -53,12 +56,12 @@ describe("the footer status", () => {
   });
 
   it("shows the recording dot and timer in red, transcribing in yellow, speaking in the accent", () => {
-    expect(statusLine({ dictation: "● REC 0:08", playing: false, route: "local" }, true)).toBe(
-      "\x1b[38;5;203m● REC 0:08\x1b[0m",
-    );
-    expect(statusLine({ dictation: "… transcribing", playing: true, route: "local" }, true)).toBe(
-      "\x1b[38;5;214m… transcribing\x1b[0m",
-    );
+    expect(
+      statusLine({ dictation: "● REC 0:08", dictationPhase: "recording", playing: false, route: "local" }, true),
+    ).toBe("\x1b[38;5;203m● REC 0:08\x1b[0m");
+    expect(
+      statusLine({ dictation: "… transcribing", dictationPhase: "transcribing", playing: true, route: "local" }, true),
+    ).toBe("\x1b[38;5;214m… transcribing\x1b[0m");
     expect(statusLine({ playing: true, route: "local" }, true)).toBe("\x1b[38;5;45m▶ speaking\x1b[0m");
     expect(statusLine({ dictation: "● REC 0:08", playing: false, route: "local" }, false)).toBe("● REC 0:08");
   });

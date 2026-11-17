@@ -9,12 +9,13 @@
  * - Streaming narrates a spoken summary of each reasoning block as it finishes streaming, through a separate Pi
  *   model (the main model is busy, so Same model is not offered).
  * - Truncate at stops reading at the last sentence end before the limit, in every mode.
+ *
+ * Absorbs markdown-to-speech cleanup (`speakable`, `finalAssistantText`) and adaptive narration pacing
+ * (`Narrator`) behind a constructor `ReadAloudHost` port.
  */
 
 import { errorMessage } from "./env";
-import { FADE_MS, Narrator, type NarratorDeps } from "./narration";
 import { REPLACED } from "./player";
-import { finalAssistantText, speakable } from "./readable";
 import { ReadingFailed, readingFailedMessage } from "./reading";
 import type { Speech } from "./speech";
 
@@ -53,6 +54,264 @@ export const GUIDELINE_PREFIX = "pi-speech read-aloud:";
 
 /** Asks another model for a summary: resolves to its answer's text. */
 export type Summarize = (model: string, prompt: string, signal?: AbortSignal) => Promise<string>;
+
+/** Host capabilities injected into ReadAloud at construction time. */
+export interface ReadAloudHost {
+  /** The user's Pi models (`provider/id`), for the Summarized by picker. */
+  models(): string[];
+  /** The Pi model of the session now (`provider/id`), if any. */
+  currentModel(): string | undefined;
+  /** Asks another Pi model for a summary. */
+  summarize?: Summarize;
+}
+
+// ── Markdown-to-speech cleanup ──────────────────────────────────────────────
+
+const FENCE = /^\s*(```|~~~)/;
+const RULE = /^\s*([-*_])(\s*\1){2,}\s*$/;
+const TABLE_SEPARATOR = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$/;
+const HEADING = /^\s{0,3}#{1,6}\s+(.*?)\s*#*\s*$/;
+const QUOTE = /^\s*>\s?/;
+const LIST_MARKER = /^\s*(?:[-*+]|\d+[.)])\s+/;
+const TABLE_ROW = /^\s*\|.*\|\s*$/;
+const ENDS_SENTENCE = /[.!?…:;。！？]["'”’)\]]*$/;
+
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return "";
+  }
+}
+
+function inline(line: string): string {
+  return line
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/\[([^\]]+)\]\[[^\]]*\]/g, "$1")
+    .replace(/<(https?:\/\/[^>\s]+)>/g, (_m, url: string) => hostOf(url))
+    .replace(/https?:\/\/[^\s<>()]+/g, (url) => {
+      const trail = /[.,;:!?'"”’]+$/.exec(url)?.[0] ?? "";
+      return hostOf(url.slice(0, url.length - trail.length)) + trail;
+    })
+    .replace(/`([^`]*)`/g, "$1")
+    .replace(/\*\*(\S(?:.*?\S)?)\*\*/g, "$1")
+    .replace(/(?<![\w_])__(\S(?:.*?\S)?)__(?![\w_])/g, "$1")
+    .replace(/\*(\S(?:.*?\S)?)\*/g, "$1")
+    .replace(/(?<![\w_])_(\S(?:.*?\S)?)_(?![\w_])/g, "$1")
+    .replace(/~~(\S(?:.*?\S)?)~~/g, "$1")
+    .replace(/<\/?[A-Za-z][^>]*>/g, "");
+}
+
+/** The words of a markdown reply, as they should be spoken. */
+export function speakable(markdown: string): string {
+  const out: string[] = [];
+  let fenced = false;
+  for (const raw of markdown.split(/\r?\n/)) {
+    if (FENCE.test(raw)) {
+      fenced = !fenced;
+      continue;
+    }
+    if (fenced || RULE.test(raw) || TABLE_SEPARATOR.test(raw)) continue;
+    let line = raw;
+    const heading = HEADING.exec(line);
+    if (heading) {
+      const text = inline(heading[1]);
+      out.push(text && !ENDS_SENTENCE.test(text) ? `${text}.` : text);
+      continue;
+    }
+    while (QUOTE.test(line)) line = line.replace(QUOTE, "");
+    line = line.replace(LIST_MARKER, "");
+    if (TABLE_ROW.test(line)) {
+      line = line
+        .trim()
+        .replace(/^\||\|$/g, "")
+        .split("|")
+        .map((cell) => cell.trim())
+        .filter(Boolean)
+        .join(", ");
+    }
+    out.push(inline(line));
+  }
+  return out
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/** Text parts of the final assistant message in a run; "" when there is none. */
+export function finalAssistantText(messages: readonly unknown[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i] as { role?: string; content?: unknown };
+    if (m?.role !== "assistant") continue;
+    if (typeof m.content === "string") return m.content;
+    if (!Array.isArray(m.content)) return "";
+    return m.content
+      .filter((p: { type?: string; text?: unknown }) => p?.type === "text" && typeof p.text === "string")
+      .map((p: { text: string }) => p.text)
+      .join("\n");
+  }
+  return "";
+}
+
+// ── Adaptive narration pacing ───────────────────────────────────────────────
+
+/** The shortest summary asked for. */
+export const MIN_WORDS = 6;
+/** Text gathered that is summarized without waiting for more. */
+export const HOLD_CHARS = 400;
+/** How long a lone thought is held for the next, as a multiple of the usual gap, within these bounds. */
+export const HOLD_GAPS = 1.5;
+export const MIN_HOLD_MS = 1500;
+export const MAX_HOLD_MS = 8000;
+/** The hold before the cadence is known. */
+export const FIRST_HOLD_MS = 3000;
+/** Crossfade length when narration catches up. */
+export const FADE_MS = 500;
+/** Weight of the newest sample in each moving average. */
+const ALPHA = 0.3;
+/** How often a summary that waits for the one speaking looks again. */
+const QUIET_POLL_MS = 100;
+
+export interface NarratorDeps {
+  now(): number;
+  /** Run `fn` after `ms`; returns what cancels it. */
+  after(ms: number, fn: () => void): () => void;
+  /** A spoken summary of `text` in about `words` words; undefined when there is nothing to say. */
+  summarize(text: string, words: number, signal?: AbortSignal): Promise<string | undefined>;
+  /** Speak `text`, crossfading over what plays when `fade`; resolves once its audio has arrived. */
+  speak(text: string, fade: boolean, signal?: AbortSignal): Promise<void>;
+  /** Something is playing now. */
+  speaking(): boolean;
+  /** The longest summary, in words (the Length setting). */
+  maxWords(): number;
+}
+
+/** A moving average; undefined until its first sample. */
+class Average {
+  value?: number;
+  add(x: number): void {
+    this.value = this.value === undefined ? x : this.value + ALPHA * (x - this.value);
+  }
+}
+
+export class Narrator {
+  /** Time between the ends of consecutive thoughts, in ms. */
+  readonly gap = new Average();
+  /** Characters per thought. */
+  readonly size = new Average();
+  /** How long a summary takes, in ms. */
+  readonly latency = new Average();
+
+  private pending: string[] = [];
+  private lastAt?: number;
+  private cancelHold?: () => void;
+  /** A summary is being made or spoken. */
+  private busy = false;
+  /** The run ended: say what is held at once. */
+  private ending = false;
+  private signal?: AbortSignal;
+  /** Bumped by `reset`: work of an earlier run stops. */
+  private run = 0;
+
+  constructor(private readonly d: NarratorDeps) {}
+
+  /** A run starts: forget what is held. The cadence learned so far stays (the model rarely changes). */
+  reset(): void {
+    this.run++;
+    this.cancelHold?.();
+    this.cancelHold = undefined;
+    this.pending = [];
+    this.lastAt = undefined;
+    this.ending = false;
+    this.busy = false;
+  }
+
+  /** A reasoning block has finished. */
+  thought(text: string, signal?: AbortSignal): void {
+    const t = text.trim();
+    if (!t) return;
+    this.signal = signal;
+    const now = this.d.now();
+    if (this.lastAt !== undefined) this.gap.add(now - this.lastAt);
+    this.lastAt = now;
+    this.size.add(t.length);
+    this.pending.push(t);
+    if (this.held() >= HOLD_CHARS) this.flush();
+    else this.hold();
+  }
+
+  /** The run ended: whatever is held is summarized now. */
+  end(): void {
+    this.ending = true;
+    this.flush();
+  }
+
+  /** Characters held now. */
+  held(): number {
+    return this.pending.reduce((n, t) => n + t.length, 0);
+  }
+
+  /** How long a lone thought waits for the next before it is summarized alone. */
+  holdMs(): number {
+    if (this.gap.value === undefined) return FIRST_HOLD_MS;
+    return Math.min(MAX_HOLD_MS, Math.max(MIN_HOLD_MS, HOLD_GAPS * this.gap.value));
+  }
+
+  /** The words the next summary is asked for: what fits before the next thought, within the bounds. */
+  words(): number {
+    const max = Math.max(MIN_WORDS, this.d.maxWords());
+    if (this.gap.value === undefined) return max;
+    const ms = this.gap.value - (this.latency.value ?? 0);
+    return Math.min(max, Math.max(MIN_WORDS, Math.round((WORDS_PER_SECOND * ms) / 1000)));
+  }
+
+  private hold(): void {
+    this.cancelHold?.();
+    this.cancelHold = this.d.after(this.holdMs(), () => {
+      this.cancelHold = undefined;
+      this.flush();
+    });
+  }
+
+  private flush(): void {
+    this.cancelHold?.();
+    this.cancelHold = undefined;
+    if (!this.busy && this.pending.length) void this.work(this.run);
+  }
+
+  /** Summarize and speak what is held, and again while more comes, until nothing is held. */
+  private async work(run: number): Promise<void> {
+    this.busy = true;
+    try {
+      while (this.pending.length && run === this.run && !this.signal?.aborted) {
+        const text = this.pending.join("\n\n");
+        this.pending = [];
+        const started = this.d.now();
+        const summary = await this.d.summarize(text, this.words(), this.signal);
+        this.latency.add(this.d.now() - started);
+        if (run !== this.run || this.signal?.aborted) return;
+        if (summary) {
+          while (this.d.speaking() && !this.pending.length && run === this.run) await this.sleep(QUIET_POLL_MS);
+          if (run !== this.run) return;
+          await this.d.speak(summary, this.d.speaking(), this.signal);
+        }
+        if (this.pending.length && !this.ending && this.held() < HOLD_CHARS) {
+          this.hold();
+          return;
+        }
+      }
+    } finally {
+      if (run === this.run) this.busy = false;
+    }
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((r) => this.d.after(ms, r));
+  }
+}
+
+// ── Prompts & summary extraction ────────────────────────────────────────────
 
 const LOREM =
   "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat".split(
@@ -159,22 +418,7 @@ type Part = { type?: string; text?: unknown; thinking?: unknown };
 export class ReadAloud {
   /** Starts off in every session. */
   mode: ReadMode = "off";
-  /** Asks another Pi model for a summary; set by the adapter. */
-  summarize?: Summarize;
-  /** The user's Pi models (`provider/id`), for the Summarized by picker; set by the adapter. */
-  models: () => string[] = () => [];
-  /** The Pi model of the session now (`provider/id`), if any; set by the adapter. */
-  currentModel: () => string | undefined = () => undefined;
-
-  /**
-   * The model Streaming takes when none is chosen: the session's model (asked in a request of its own, which is
-   * all Streaming needs), else the first of the user's models; undefined when there are none.
-   */
-  defaultSummarizer(): string | undefined {
-    const models = this.models();
-    const current = this.currentModel();
-    return current && models.includes(current) ? current : models[0];
-  }
+  private host: ReadAloudHost;
   /** The summary taken from the marked block of this run's reply. */
   private taken?: string;
   /** Streaming: paces the summaries of the reasoning to how the model thinks. */
@@ -188,7 +432,13 @@ export class ReadAloud {
     private readonly options: () => ReadAloudOptions = () => DEFAULT_READ_ALOUD,
     /** Something plays now; and the clock and timers, replaceable for tests. */
     narration: Partial<Pick<NarratorDeps, "speaking" | "now" | "after">> = {},
+    host: Partial<ReadAloudHost> = {},
   ) {
+    this.host = {
+      models: host.models ?? (() => []),
+      currentModel: host.currentModel ?? (() => undefined),
+      summarize: host.summarize,
+    };
     this.narrator = new Narrator({
       now: narration.now ?? (() => Date.now()),
       after:
@@ -202,6 +452,31 @@ export class ReadAloud {
       summarize: (text, words, signal) => this.narrationSummary(text, words, signal),
       speak: (text, fade, signal) => this.narrate(text, fade, signal),
     });
+  }
+
+  /** Update the host callbacks (used by tests or late-bound adapters). */
+  attachHost(patch: Partial<ReadAloudHost>): void {
+    this.host = { ...this.host, ...patch };
+  }
+
+  /** The user's Pi models (`provider/id`), for the Summarized by picker. */
+  models(): string[] {
+    return this.host.models();
+  }
+
+  /** The Pi model of the session now (`provider/id`), if any. */
+  currentModel(): string | undefined {
+    return this.host.currentModel();
+  }
+
+  /**
+   * The model Streaming takes when none is chosen: the session's model (asked in a request of its own, which is
+   * all Streaming needs), else the first of the user's models; undefined when there are none.
+   */
+  defaultSummarizer(): string | undefined {
+    const models = this.models();
+    const current = this.currentModel();
+    return current && models.includes(current) ? current : models[0];
   }
 
   /** On: reading a spoken summary of the reply, unless Streaming is chosen. */
@@ -278,11 +553,12 @@ export class ReadAloud {
     if (!text) return;
     if (opts.truncate) text = truncateToSeconds(text, opts.truncate).text;
     try {
-      const r = await this.speech.say(text);
+      const r = await this.speech.say(text, { signal });
       if (!r.stopped && !r.player && r.notPlayed !== REPLACED) {
         this.notify(`Read-aloud could not play the reply: ${r.notPlayed ?? "unknown reason"}`, "error");
       }
     } catch (err) {
+      if (signal?.aborted) return;
       if (err instanceof ReadingFailed) this.notify(readingFailedMessage("Read-aloud", "reply", err.reason), "error");
       else this.notify(`Read-aloud failed: ${errorMessage(err)}`, "error");
     }
@@ -297,7 +573,7 @@ export class ReadAloud {
   /** Streaming: the spoken summary of reasoning gathered, about `words` long; undefined when none. */
   private async narrationSummary(text: string, words: number, signal?: AbortSignal): Promise<string | undefined> {
     const opts = this.options();
-    if (!opts.summarizer || !this.summarize) {
+    if (!opts.summarizer || !this.host.summarize) {
       if (!this.warned) {
         this.warned = true;
         this.notify("Streaming needs a separate Summarized by model (Same model cannot summarize mid-run)", "warning");
@@ -305,7 +581,7 @@ export class ReadAloud {
       return undefined;
     }
     try {
-      const answer = await this.summarize(opts.summarizer, streamingPrompt(words, text), signal);
+      const answer = await this.host.summarize(opts.summarizer, streamingPrompt(words, text), signal);
       const marked = splitSummary(answer).summary;
       const spoken = speakable((marked ?? answer).trim());
       if (!spoken) return undefined;
@@ -350,12 +626,12 @@ export class ReadAloud {
     }
     const reply = splitSummary(final).reply;
     if (!reply.trim()) return undefined;
-    if (!this.summarize) {
+    if (!this.host.summarize) {
       this.notify(`Read-aloud: cannot ask ${opts.summarizer} for a summary here`, "error");
       return undefined;
     }
     try {
-      const answer = await this.summarize(opts.summarizer, summaryPrompt(opts.length, reply), signal);
+      const answer = await this.host.summarize(opts.summarizer, summaryPrompt(opts.length, reply), signal);
       // A model that marked its answer anyway: only the marked part.
       const marked = splitSummary(answer).summary;
       return (marked ?? answer).trim() || undefined;

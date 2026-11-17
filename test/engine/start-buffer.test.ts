@@ -1,5 +1,4 @@
 import { describe, expect, it } from "vitest";
-import type { StreamFormat } from "../../src/engine/provider";
 import {
   bufferStart,
   bytesPerSecond,
@@ -8,7 +7,8 @@ import {
   mp3BytesPerSecond,
   RATE_WINDOW_MS,
   StartBuffer,
-} from "../../src/engine/start-buffer";
+} from "../../src/engine/player";
+import type { StreamFormat } from "../../src/engine/provider";
 
 const PCM: StreamFormat = { codec: "pcm", rate: 24000, channels: 1 };
 const PER_SECOND = 48000;

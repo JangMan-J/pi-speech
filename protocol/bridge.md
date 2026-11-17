@@ -224,7 +224,8 @@ connection while it waits leaves the queue. Listing models and voices is not a r
 #### `GET /v1/models`
 
 `200 {"models": [...]}`: the objects `pi-speech-receiver models list` prints, one per model
-(see "Subcommand notes: `models`"), `lexicon` included.
+(see "Subcommand notes: `models`"), including `lexicon`, `shared`, and optional capability/ranking
+metadata (`runtime`, `group`, `speakers`, `live_capable`, `language_mode`, `tags`, `cpu_rank`, `gpu_rank`).
 
 #### `POST /v1/models/download?model=<id>`
 
@@ -257,8 +258,8 @@ Deletes a model and any interrupted download of it. `200 {"id": "...", "freed": 
 
 #### `POST /v1/speak`
 
-- Body: JSON `{"model": "<id>", "text": "...", "voice": "<name or number>", "speed": <0.25..4>}`
-  (`voice` and `speed` optional), at most 1 MiB.
+- Body: JSON `{"model": "<id>", "text": "...", "voice": "<name or number>", "speed": <0.25..4>, "lang": "<code>"}`
+  (`voice`, `speed`, and `lang` optional), at most 1 MiB.
 - Response, once the model has loaded: `200`, `Transfer-Encoding: chunked`, headers
   `X-Pi-Speech-Format: pcm`, `X-Pi-Speech-Rate: <Hz>`, `X-Pi-Speech-Channels: 1`; body: raw
   signed 16-bit little-endian PCM, sent as it is generated. The body ends with the last chunk
