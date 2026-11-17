@@ -12,6 +12,7 @@
       "!scripts/init-package.mjs",
       "!scripts/smoke-pack.mjs",
       "!GLOSSARY.md",
+      "!.github/ISSUE_TEMPLATE",
       "!src/pi/frame.ts"
     ]
   },
