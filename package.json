@@ -1,6 +1,6 @@
 {
   "name": "@jangmanj/pi-speech",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "Text-to-speech and speech-to-text for Pi: read replies aloud, dictate prompts (Alt+Z), transcribe audio. OpenRouter, xAI, OpenAI-compatible endpoints or local on-device models (Whisper, Parakeet, Kokoro), with playback on a remote machine over SSH",
   "license": "MIT",
   "author": "JangMan-J",
