@@ -909,28 +909,32 @@ describe("the panel view model: Device and Receiver, on this machine", () => {
     },
   );
 
-  it("Local Receiver reports unavailable GPU hardware cleanly when switching CPU → GPU", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "pi-speech-nogpu-"));
-    const bin = join(dir, "fake-receiver");
-    writeFileSync(
-      bin,
-      `#!${process.execPath}
+  // The stand-in receiver is a script with a shebang, which Windows does not run.
+  it.skipIf(!STAND_IN_BINARY)(
+    "Local Receiver reports unavailable GPU hardware cleanly when switching CPU → GPU",
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), "pi-speech-nogpu-"));
+      const bin = join(dir, "fake-receiver");
+      writeFileSync(
+        bin,
+        `#!${process.execPath}
 const cmd = process.argv[2];
 if (cmd === "--version") { console.log("pi-speech-receiver ${packageVersion()}"); process.exit(0); }
 if (cmd === "gpu") { console.log(JSON.stringify({ driver: false, cuda: null, cudnn: false, hardware: false, edition: "cpu", target: null, usable: false, why: "no NVIDIA driver (libcuda.so.1 does not load)" })); process.exit(0); }
 `,
-      { mode: 0o755 },
-    );
-    const p = open({ PI_SPEECH_BINARY: bin });
-    await p.goTo("Receivers");
-    await p.press("enter");
-    await p.press("down"); // Receiver
-    expect(p.row("Receiver")).toMatchObject({ value: `CPU v${packageVersion()}`, note: "env" });
-    await p.press("right");
-    expect(p.panel.view().status?.text).toMatch(/GPU unavailable: no NVIDIA driver/);
-    expect(p.engine.speech.settings.localDevice).toBe("cpu");
-    rmSync(dir, { recursive: true, force: true });
-  });
+        { mode: 0o755 },
+      );
+      const p = open({ PI_SPEECH_BINARY: bin });
+      await p.goTo("Receivers");
+      await p.press("enter");
+      await p.press("down"); // Receiver
+      expect(p.row("Receiver")).toMatchObject({ value: `CPU v${packageVersion()}`, note: "env" });
+      await p.press("right");
+      expect(p.panel.view().status?.text).toMatch(/GPU unavailable: no NVIDIA driver/);
+      expect(p.engine.speech.settings.localDevice).toBe("cpu");
+      rmSync(dir, { recursive: true, force: true });
+    },
+  );
 
   it("Esc on a question or the password declines it, and the connection says why", async () => {
     const p = open(
