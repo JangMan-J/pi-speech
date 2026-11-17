@@ -5,6 +5,15 @@ on:
     branches: [main]
   pull_request:
   workflow_call:
+    inputs:
+      # A called workflow sees the caller's event (a tag push is a "push"), so it is told it was called.
+      called:
+        type: boolean
+        default: true
+      base:
+        description: "A commit already checked in full (the last release's tag); only suites whose files changed since it run. Empty: everything runs."
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -15,7 +24,8 @@ concurrency:
 
 jobs:
   # The floors live in package.json: engines.node and the pi-coding-agent peer range.
-  # On PRs and branch pushes, also determine which suites need to run (workflow_call always runs all).
+  # Also determine which suites need to run: on PRs and branch pushes from the files changed, and from a
+  # release (workflow_call) from the files changed since the last release's tag; with no base, everything.
   floors:
     runs-on: ubuntu-latest
     outputs:
@@ -26,11 +36,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 2
+          fetch-depth: ${{ inputs.base && '0' || '2' }}
       - id: read
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
+          CALLED: ${{ inputs.called }}
+          CALL_BASE: ${{ inputs.base }}
         run: |
           node -e '
             const { execFileSync } = require("child_process");
@@ -42,14 +54,17 @@ jobs:
             };
             let runExt = true;
             let runRcv = true;
-            if (process.env.EVENT_NAME === "push" || process.env.EVENT_NAME === "pull_request") {
+            const called = process.env.CALLED === "true";
+            const callBase = process.env.CALL_BASE;
+            if (called ? callBase : process.env.EVENT_NAME === "push" || process.env.EVENT_NAME === "pull_request") {
               try {
-                const base = process.env.PR_BASE || "HEAD^";
+                const base = called ? callBase : process.env.PR_BASE || "HEAD^";
                 const changed = execFileSync("git", ["diff", "--name-only", base, "HEAD"], { encoding: "utf8" })
                   .split(/\r?\n/).filter(Boolean);
                 if (changed.length > 0) {
                   const extPattern = /^(index\.ts|package(-lock)?\.json|tsconfig\.json|biome\.json|vitest\.config\.ts|src\/|test\/|scripts\/|npm\/|\.github\/workflows\/ci\.yml)/;
-                  const rcvPattern = /^(receiver\/|package\.json|\.github\/workflows\/ci\.yml|npm\/platforms\.mjs|e2e\/fixtures\/)/;
+                  // package.json only gives the receiver its version string: a version bump needs no receiver suites.
+                  const rcvPattern = /^(receiver\/|\.github\/workflows\/ci\.yml|npm\/platforms\.mjs|e2e\/fixtures\/)/;
                   runExt = changed.some((f) => extPattern.test(f));
                   runRcv = changed.some((f) => rcvPattern.test(f));
                 }

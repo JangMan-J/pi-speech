@@ -8,6 +8,7 @@ import {
   binaryFor,
   ensureBinary,
   ensureBinaryFor,
+  expectedReceiverVersion,
   extractTarGz,
   findBinary,
   hasBinaryFor,
@@ -238,6 +239,20 @@ describe("in this checkout", () => {
     const r = findBinary({});
     if (r.ok) expect(r.path).toMatch(/receiver[\\/]target[\\/](release|debug)[\\/]pi-speech-receiver/);
     else expect(r.reason).toMatch(/not installed/);
+  });
+
+  it("expects the receiver version receivers.json names, else the package version", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-speech-expect-"));
+    try {
+      writeFileSync(join(root, "package.json"), JSON.stringify({ version: "0.2.7" }));
+      expect(expectedReceiverVersion(root)).toBe("0.2.7");
+      // A release whose receiver did not change reuses 0.2.6's binaries, which report 0.2.6.
+      const manifest = { version: "0.2.6", repo: "JangMan-J/pi-speech", tag: "v0.2.6", assets: {} };
+      writeFileSync(join(root, "receivers.json"), JSON.stringify(manifest));
+      expect(expectedReceiverVersion(root)).toBe("0.2.6");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("reads the package version and compares receiver versions", () => {

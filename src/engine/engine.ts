@@ -22,9 +22,9 @@ import type { AudioInput, AudioOutput } from "./audio";
 import {
   binaryFor,
   ensureBinaryFor,
+  expectedReceiverVersion,
   hasBinaryFor,
   isReceiverOutdated,
-  packageVersion,
   releaseAssetSize,
 } from "./binary";
 import { Dictation } from "./dictation";
@@ -87,7 +87,7 @@ export class Engine {
 
   constructor(opts: EngineOptions) {
     this.env = opts.env;
-    this.receiverVersion = opts.receiverVersion ?? packageVersion();
+    this.receiverVersion = opts.receiverVersion ?? expectedReceiverVersion();
     this.probeBridge = () => probeBridge(() => bridgeConfig(opts.env, this.bridgeAddress(), this.linkToken()));
     const settingsFile = new SettingsFile(join(opts.agentDir, "pi-speech"));
     const mode = settingsFile.load().bridge;

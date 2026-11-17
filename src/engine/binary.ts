@@ -379,6 +379,15 @@ export function packageVersion(root = ROOT): string | undefined {
   }
 }
 
+/**
+ * The receiver version this package expects: the version its `receivers.json` names (a release whose
+ * receiver did not change reuses an earlier release's binaries, which report that earlier version), else the
+ * package's own version (a checkout, whose receiver build embeds it).
+ */
+export function expectedReceiverVersion(root = ROOT): string | undefined {
+  return readReceiverManifest(root)?.version ?? packageVersion(root);
+}
+
 /** Extract a version like `0.2.5` from `pi-speech-receiver --version` output; undefined when not present. */
 export function parseReceiverVersion(output: string): string | undefined {
   const m = /\b(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\b/.exec(output);
@@ -401,7 +410,7 @@ export async function inspectLocalBinary(
     ...(opts.gpuTarget ? { gpuTarget: opts.gpuTarget } : {}),
   });
   if (!choice.ok) return { edition: opts.device };
-  let version = choice.from === "cache" || choice.from === "package" ? packageVersion() : undefined;
+  let version = choice.from === "cache" || choice.from === "package" ? expectedReceiverVersion() : undefined;
   if (!version && opts.probeVersion) {
     version = await new Promise<string | undefined>((resolve) => {
       execFile(choice.path, ["--version"], { timeout: 2000 }, (err, stdout) => {
