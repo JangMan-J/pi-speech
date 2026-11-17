@@ -6,7 +6,7 @@ use pi_speech_receiver::models::catalog::{Entry, Kind};
 use pi_speech_receiver::models::download::{self, Failure};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
@@ -194,6 +194,10 @@ fn serve(
         }
         Mode::Whole | Mode::NoRanges => {
             let _ = conn.write_all(rest);
+            let _ = conn.flush();
+            let _ = conn.shutdown(std::net::Shutdown::Write);
+            let mut drain = [0u8; 64];
+            while reader.read(&mut drain).unwrap_or(0) > 0 {}
         }
     }
 }

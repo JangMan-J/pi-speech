@@ -149,10 +149,13 @@ describe("the bundled binaries", () => {
       mkdirSync(join(p, ".."), { recursive: true });
       writeFileSync(p, `#!/bin/sh\necho ${target}\n`);
     }
-    // Optional GPU archive with shared libraries beside the binary.
+    // Optional GPU archives with shared libraries beside the binary.
     mkdirSync(join(binaries, "linux-x64-cuda13"), { recursive: true });
     writeFileSync(join(binaries, "linux-x64-cuda13", "pi-speech-receiver"), "#!/bin/sh\necho gpu\n");
     writeFileSync(join(binaries, "linux-x64-cuda13", "libonnxruntime.so"), "libonnxruntime.so");
+    mkdirSync(join(binaries, "win32-x64-cuda13"), { recursive: true });
+    writeFileSync(join(binaries, "win32-x64-cuda13", "pi-speech-receiver.exe"), "MZ");
+    writeFileSync(join(binaries, "win32-x64-cuda13", "onnxruntime.dll"), "onnxruntime.dll");
 
     const root = join(dir, "pkg");
     const assetsDir = join(dir, "assets");
@@ -166,6 +169,7 @@ describe("the bundled binaries", () => {
     });
     expect(manifest.assets["linux-x64"].file).toBe(archiveFile("linux-x64"));
     expect(manifest.assets["linux-x64-cuda13"].file).toBe(archiveFile("linux-x64-cuda13"));
+    expect(manifest.assets["win32-x64-cuda13"].file).toBe(archiveFile("win32-x64-cuda13"));
     expect(releaseAssetSize("linux-x64", root)).toBe(manifest.assets["linux-x64"].size);
 
     const server = createServer((req, res) => {
@@ -212,6 +216,24 @@ describe("the bundled binaries", () => {
         expect(readFileSync(join(gpuFetched.path, "..", "libonnxruntime.so"), "utf8")).toBe("libonnxruntime.so");
       }
 
+      const winGpuFetched = await ensureBinary(env, {
+        root,
+        cacheDir,
+        platform: "win32",
+        arch: "x64",
+        device: "gpu",
+        gpuTarget: "win32-x64-cuda13",
+      });
+      expect(winGpuFetched).toMatchObject({
+        ok: true,
+        from: "cache",
+        edition: "gpu",
+        path: join(cacheDir, "0.2.6", "win32-x64-cuda13", "pi-speech-receiver.exe"),
+      });
+      if (winGpuFetched.ok) {
+        expect(readFileSync(join(winGpuFetched.path, "..", "onnxruntime.dll"), "utf8")).toBe("onnxruntime.dll");
+      }
+
       const remotePath = await ensureBinaryFor("darwin-arm64", env, { root, cacheDir });
       expect(remotePath).toBe(join(cacheDir, "0.2.6", "darwin-arm64", "pi-speech-receiver"));
       expect(binaryFor("darwin-arm64", env, root, cacheDir)).toBe(remotePath);
@@ -236,7 +258,7 @@ describe("the bundled binaries", () => {
 
 describe("in this checkout", () => {
   it("finds the binary built in receiver/target when there is one", () => {
-    const r = findBinary({});
+    const r = findBinary({}, { cacheDir: join(tmpdir(), "nonexistent-pi-speech-cache") });
     if (r.ok) expect(r.path).toMatch(/receiver[\\/]target[\\/](release|debug)[\\/]pi-speech-receiver/);
     else expect(r.reason).toMatch(/not installed/);
   });

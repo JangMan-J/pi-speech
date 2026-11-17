@@ -26,9 +26,9 @@ symphonia = { version = "0.6.1", default-features = false, features = ["pcm", "w
 # Local speech models run in-process: sherpa-onnx with ONNX Runtime, linked statically from the
 # project's prebuilt archives by default (fetched by sherpa-onnx-sys's build script; on Windows the
 # static-MT archive, which matches this crate's +crt-static build). The `shared` feature links the
-# shared libraries in SHERPA_ONNX_LIB_DIR instead (the release does, on Linux x64, from sherpa-onnx's
-# CUDA bundle): they go beside the binary, and a GPU run puts the bundle's directory, with ONNX
-# Runtime's CUDA provider, first on the library path.
+# shared libraries in SHERPA_ONNX_LIB_DIR instead (the release does, on Linux x64 and Windows x64,
+# from sherpa-onnx's CUDA bundle): they go beside the binary, and a GPU run finds ONNX Runtime's
+# CUDA provider beside it (or via the bundle's directory first on the library path).
 sherpa-onnx = { version = "2.0.1", default-features = false }
 # Gradium Phonon on-device TTS (pure Rust via `xn`, CPU streaming).
 ptts = { version = "0.7.1", default-features = false, features = ["hf"] }
@@ -49,13 +49,14 @@ serde_json = "1"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-# Console control handlers, process control (job objects), and WSAPoll.
+# Console control handlers, process control (job objects), dynamic library probing (gpu), and WSAPoll.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_System_Console",
     "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
     "Win32_System_Threading",
 ] }
 

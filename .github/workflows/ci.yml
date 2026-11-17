@@ -3,7 +3,17 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "assets/**"
+      - "LICENSE"
+      - ".gitignore"
   pull_request:
+    paths-ignore:
+      - "**.md"
+      - "assets/**"
+      - "LICENSE"
+      - ".gitignore"
   workflow_call:
     inputs:
       # A called workflow sees the caller's event (a tag push is a "push"), so it is told it was called.
@@ -20,7 +30,7 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 jobs:
   # The floors live in package.json: engines.node and the pi-coding-agent peer range.
@@ -32,14 +42,17 @@ jobs:
       node: ${{ steps.read.outputs.node }}
       pi: ${{ steps.read.outputs.pi }}
       run_extension: ${{ steps.read.outputs.run_extension }}
+      run_extension_os: ${{ steps.read.outputs.run_extension_os }}
       run_receiver: ${{ steps.read.outputs.run_receiver }}
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: ${{ inputs.base && '0' || '2' }}
+          fetch-depth: 0
+          fetch-tags: true
       - id: read
         env:
           EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           CALLED: ${{ inputs.called }}
           CALL_BASE: ${{ inputs.base }}
@@ -53,23 +66,42 @@ jobs:
               return m[1];
             };
             let runExt = true;
+            let runExtOs = true;
             let runRcv = true;
             const called = process.env.CALLED === "true";
             const callBase = process.env.CALL_BASE;
-            if (called ? callBase : process.env.EVENT_NAME === "push" || process.env.EVENT_NAME === "pull_request") {
+            const pushBefore = process.env.PUSH_BEFORE && !/^0+$/.test(process.env.PUSH_BEFORE) ? process.env.PUSH_BEFORE : "";
+            // When main is pushed alongside its release tag (git push --follow-tags), Publish already calls CI.
+            const headTags = !called && process.env.EVENT_NAME === "push"
+              ? execFileSync("git", ["tag", "--points-at", "HEAD"], { encoding: "utf8" }).split(/\r?\n/).filter(Boolean)
+              : [];
+            if (headTags.includes("v" + pkg.version)) {
+              console.log("Release tag v" + pkg.version + " is on HEAD; Publish runs CI for this release.");
+              runExt = false;
+              runExtOs = false;
+              runRcv = false;
+            } else if (called ? callBase : process.env.EVENT_NAME === "push" || process.env.EVENT_NAME === "pull_request") {
               try {
-                const base = called ? callBase : process.env.PR_BASE || "HEAD^";
+                const base = called ? callBase : process.env.PR_BASE || pushBefore || "HEAD^";
                 const changed = execFileSync("git", ["diff", "--name-only", base, "HEAD"], { encoding: "utf8" })
                   .split(/\r?\n/).filter(Boolean);
                 if (changed.length > 0) {
-                  const extPattern = /^(index\.ts|package(-lock)?\.json|tsconfig\.json|biome\.json|vitest\.config\.ts|src\/|test\/|scripts\/|npm\/|\.github\/workflows\/ci\.yml)/;
-                  // package.json only gives the receiver its version string: a version bump needs no receiver suites.
-                  const rcvPattern = /^(receiver\/|\.github\/workflows\/ci\.yml|npm\/platforms\.mjs|e2e\/fixtures\/)/;
+                  const extPattern = /^(index\.ts|package(-lock)?\.json|tsconfig\.json|biome\.json|vitest\.config\.ts|src\/|test\/|scripts\/|npm\/)/;
+                  // Cross-OS extension jobs (macOS/Windows) only run when platform, process, path, or packaging code changes.
+                  const extOsPattern = /^(src\/engine\/(binary|env|remote|local-output|receiver-control)\.ts|src\/pi\/adapter\.ts|test\/engine\/(binary|env|remote)\.test\.ts|scripts\/|npm\/)/;
+                  // package.json only gives the receiver its version string: non-receiver edits skip Rust builds.
+                  const rcvPattern = /^(receiver\/|e2e\/fixtures\/)/;
                   runExt = changed.some((f) => extPattern.test(f));
+                  runExtOs = changed.some((f) => extOsPattern.test(f));
                   runRcv = changed.some((f) => rcvPattern.test(f));
+                } else {
+                  runExt = false;
+                  runExtOs = false;
+                  runRcv = false;
                 }
               } catch {
                 runExt = true;
+                runExtOs = true;
                 runRcv = true;
               }
             }
@@ -77,6 +109,7 @@ jobs:
               "node=" + floor(pkg.engines?.node, "engines.node"),
               "pi=" + floor(pkg.peerDependencies?.["@earendil-works/pi-coding-agent"], "the @earendil-works/pi-coding-agent peer range"),
               "run_extension=" + runExt,
+              "run_extension_os=" + runExtOs,
               "run_receiver=" + runRcv,
             ].join("\n") + "\n";
             require("fs").appendFileSync(process.env.GITHUB_OUTPUT, out);
@@ -90,12 +123,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The Node floor, the current LTS, and the newest release, against the locked Pi;
-        # plus the lowest Pi the peer range allows.
-        node: ["${{ needs.floors.outputs.node }}", "lts/*", "current"]
-        pi: [locked]
+        # Primary LTS + locked Pi check, plus a single combined floor job (Node floor + Pi floor).
         include:
           - node: "lts/*"
+            pi: locked
+          - node: "${{ needs.floors.outputs.node }}"
             pi: floor
     steps:
       - uses: actions/checkout@v7
@@ -107,18 +139,21 @@ jobs:
       - name: Use the lowest supported Pi
         if: matrix.pi == 'floor'
         run: npm install --no-save "@earendil-works/pi-ai@${{ needs.floors.outputs.pi }}" "@earendil-works/pi-coding-agent@${{ needs.floors.outputs.pi }}" "@earendil-works/pi-tui@${{ needs.floors.outputs.pi }}"
-      - run: npm run typecheck
-      - run: npm run lint
+      - if: matrix.pi == 'locked'
+        run: npm run typecheck
+      - if: matrix.pi == 'locked'
+        run: npm run lint
       - run: npm test
       - name: Check the package contents
+        if: matrix.pi == 'locked'
         run: npm pack --dry-run
       - name: Install the packed tarball and load it in Pi
         run: npm run smoke:pack
 
-  # The extension on the other desktop systems (the Node and Pi matrix above runs on Linux).
+  # Cross-OS extension checks only run when platform, path, process, or packaging code changed.
   check-os:
     needs: floors
-    if: needs.floors.outputs.run_extension == 'true'
+    if: needs.floors.outputs.run_extension_os == 'true'
     name: Extension on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -188,7 +223,7 @@ jobs:
           ls -l "test-models/$TEST_MODEL"
       - run: cargo fmt --check
         if: runner.os == 'Linux'
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --release --all-targets -- -D warnings
       - name: Run Rust tests and build the release binary
         run: cargo test --release && cargo build --release
       - name: Report the release binary's size

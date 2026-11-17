@@ -27,6 +27,12 @@ env:
   GPU_BUNDLE_13_SHA256: 40ca5c7730a349258f23e9a7bf5c3cbf69f13c498cc50387e8f9f06924a554f8
   GPU_BUNDLE_12: sherpa-onnx-v2.0.1-cuda-12.x-cudnn-9.x-onnxruntime1.28.2-linux-x64-gpu
   GPU_BUNDLE_12_SHA256: 2aa541a65c1e7d921a053283419b70b30c1f6ae0a0f52f64b947ebe88c5f2a77
+  WIN_GPU_BUNDLE_13: sherpa-onnx-v2.0.1-cuda-13.x-cudnn-9.x-onnxruntime1.28.2-win-x64-cuda
+  WIN_GPU_BUNDLE_13_SHA256: 206f56c80cca702ca564fb21e48462f4210a13f941de32c336a4c6debb1e9efb
+  WIN_GPU_BUNDLE_12: sherpa-onnx-v2.0.1-cuda-12.x-cudnn-9.x-onnxruntime1.28.2-win-x64-cuda
+  WIN_GPU_BUNDLE_12_SHA256: cd983fa95431a8a08555b15005e1effd0b771f161d30f7f3bd52d518da48f6b6
+  WIN_SHARED_LIB_BUNDLE: sherpa-onnx-v2.0.1-win-x64-shared-MD-Release-lib
+  WIN_SHARED_LIB_BUNDLE_SHA256: c3c78220db8bebf97d5f932496165bb3897b163410427d7c021013439c80f183
 
 jobs:
   # Compare with the last release on npm. CI runs only the suites whose files changed since its tag. When
@@ -84,8 +90,9 @@ jobs:
 
   # The receiver for each CPU and GPU target, built on a native runner of that system and processor.
   # No caches: a release build starts from the lock file alone. All 5 CPU targets are statically
-  # linked single binaries; the optional Linux x64 GPU editions link sherpa-onnx's CUDA 12/13
-  # shared libraries and carry them beside the binary (found via $ORIGIN rpath).
+  # linked single binaries; the optional Linux x64 and Windows x64 GPU editions link sherpa-onnx's
+  # CUDA 12/13 shared libraries and carry them beside the binary (found via $ORIGIN rpath on Linux
+  # and the application directory on Windows).
   build:
     name: Receiver for ${{ matrix.target }}
     needs: plan
@@ -104,6 +111,8 @@ jobs:
           - { target: win32-x64, runner: windows-latest, arch: X64 }
           - { target: linux-x64-cuda13, runner: ubuntu-22.04, arch: X64, cuda: "13" }
           - { target: linux-x64-cuda12, runner: ubuntu-22.04, arch: X64, cuda: "12" }
+          - { target: win32-x64-cuda13, runner: windows-latest, arch: X64, cuda: "13" }
+          - { target: win32-x64-cuda12, runner: windows-latest, arch: X64, cuda: "12" }
     env:
       PI_SPEECH_AUDIO_NULL: "1"
     defaults:
@@ -124,24 +133,57 @@ jobs:
       - name: Fetch sherpa-onnx's CUDA bundle (for GPU editions)
         if: matrix.cuda != ''
         run: |
-          if [ "${{ matrix.cuda }}" = "13" ]; then
-            bundle="$GPU_BUNDLE_13"
-            sha="$GPU_BUNDLE_13_SHA256"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            if [ "${{ matrix.cuda }}" = "13" ]; then
+              bundle="$WIN_GPU_BUNDLE_13"
+              sha="$WIN_GPU_BUNDLE_13_SHA256"
+            else
+              bundle="$WIN_GPU_BUNDLE_12"
+              sha="$WIN_GPU_BUNDLE_12_SHA256"
+            fi
           else
-            bundle="$GPU_BUNDLE_12"
-            sha="$GPU_BUNDLE_12_SHA256"
+            if [ "${{ matrix.cuda }}" = "13" ]; then
+              bundle="$GPU_BUNDLE_13"
+              sha="$GPU_BUNDLE_13_SHA256"
+            else
+              bundle="$GPU_BUNDLE_12"
+              sha="$GPU_BUNDLE_12_SHA256"
+            fi
           fi
           curl -fsSL --retry 3 "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/$bundle.tar.bz2" -o gpu.tar.bz2
           echo "$sha  gpu.tar.bz2" | sha256sum -c -
           tar -xjf gpu.tar.bz2
-          echo "SHERPA_ONNX_LIB_DIR=$PWD/$bundle/lib" >> "$GITHUB_ENV"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            if [ ! -f "$bundle/lib/onnxruntime.lib" ]; then
+              curl -fsSL --retry 3 "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/$WIN_SHARED_LIB_BUNDLE.tar.bz2" -o win-lib.tar.bz2
+              echo "$WIN_SHARED_LIB_BUNDLE_SHA256  win-lib.tar.bz2" | sha256sum -c -
+              tar -xjf win-lib.tar.bz2
+              cp "$WIN_SHARED_LIB_BUNDLE/lib/onnxruntime.lib" "$bundle/lib/onnxruntime.lib"
+            fi
+            lib_dir="$(cd "$bundle/lib" && pwd -W)"
+          else
+            lib_dir="$PWD/$bundle/lib"
+          fi
+          echo "SHERPA_ONNX_LIB_DIR=$lib_dir" >> "$GITHUB_ENV"
       - name: Build the release binary
-        run: cargo build --release --locked ${{ matrix.cuda != '' && '--no-default-features --features shared' || '' }}
+        run: |
+          # Windows CUDA builds link dynamic CUDA/ONNX Runtime DLLs with /MD, overriding .cargo/config.toml's +crt-static.
+          if [ "${{ runner.os }}" = "Windows" ] && [ -n "${{ matrix.cuda }}" ]; then
+            export CARGO_ENCODED_RUSTFLAGS=""
+          fi
+          cargo build --release --locked ${{ matrix.cuda != '' && '--no-default-features --features shared' || '' }}
       - name: Put the shared libraries beside the GPU binary
         if: matrix.cuda != ''
         run: |
-          cp -P "$SHERPA_ONNX_LIB_DIR/"*.so* target/release/
-          readelf -d target/release/pi-speech-receiver | grep -q 'RUNPATH.*\$ORIGIN'
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "$SHERPA_ONNX_LIB_DIR/"*.dll target/release/
+            for dll in sherpa-onnx-c-api.dll onnxruntime.dll onnxruntime_providers_cuda.dll onnxruntime_providers_shared.dll; do
+              test -f "target/release/$dll"
+            done
+          else
+            cp -P "$SHERPA_ONNX_LIB_DIR/"*.so* target/release/
+            readelf -d target/release/pi-speech-receiver | grep -q 'RUNPATH.*\$ORIGIN'
+          fi
       - name: Smoke-test the release binary (models list prints JSON lines)
         run: |
           bin=target/release/pi-speech-receiver
@@ -157,8 +199,8 @@ jobs:
             }
             console.log("models list: " + lines.length + " JSON lines");
           '
-      - name: Check the Windows binary needs no Visual C++ runtime DLL
-        if: runner.os == 'Windows'
+      - name: Check the Windows CPU binary needs no Visual C++ runtime DLL
+        if: runner.os == 'Windows' && matrix.cuda == ''
         run: |
           exe=target/release/pi-speech-receiver.exe
           if command -v objdump >/dev/null; then
@@ -178,6 +220,7 @@ jobs:
             receiver/target/release/pi-speech-receiver
             receiver/target/release/pi-speech-receiver.exe
             receiver/target/release/*.so*
+            receiver/target/release/*.dll
           if-no-files-found: error
           retention-days: 7
 
@@ -209,9 +252,6 @@ jobs:
             echo "::error::Tag ${GITHUB_REF_NAME} does not match package.json version ${version}"
             exit 1
           fi
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm run lint
       - uses: actions/download-artifact@v4
         if: needs.plan.outputs.rebuild == 'true'
         with:

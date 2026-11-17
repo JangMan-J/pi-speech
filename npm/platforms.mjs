@@ -44,6 +44,8 @@ export const TARGETS = [
 export const GPU_TARGETS = [
   { os: "linux", cpu: "x64", target: "linux-x64-cuda13" },
   { os: "linux", cpu: "x64", target: "linux-x64-cuda12" },
+  { os: "win32", cpu: "x64", target: "win32-x64-cuda13" },
+  { os: "win32", cpu: "x64", target: "win32-x64-cuda12" },
 ];
 
 /** The shared libraries a target's binary links, which go beside it (none: all CPU targets are static). */
