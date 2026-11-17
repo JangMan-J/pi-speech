@@ -21,8 +21,8 @@ length you choose (about 15, 30 or 60 seconds), and are written by a Pi model of
 
 Tap Alt+Z to start and stop, or turn on **push-to-talk**: hold a key while you speak and let go when
 you're done. Push-to-talk needs a terminal that reports key releases: kitty, Ghostty, foot, Alacritty,
-iTerm2, Rio, Windows Terminal 1.25 or later, or WezTerm with `enable_kitty_keyboard = true`. It does not
-work inside tmux. Then choose how your words arrive:
+iTerm2, Rio, Windows Terminal 1.25 or later, or WezTerm with `enable_kitty_keyboard = true`. It works inside
+Zellij, but not inside tmux. Then choose how your words arrive:
 
 - **Typed**: words appear in the editor as you speak (with local transcription).
 - **Filled**: the whole transcript goes in when you stop.
