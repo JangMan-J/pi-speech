@@ -130,6 +130,8 @@ export interface Settings {
   dictationLanguage?: string;
   /** Whether dictation types live into Pi's editor while recording (for live-capable local STT models). */
   dictationLive?: boolean;
+  /** Send dictation to the focused Zellij pane when possible. */
+  dictationRedirect?: boolean;
   /** Trailing word or phrase that, when spoken at the end of dictation, submits the message in Pi. */
   dictationSubmitWord?: string;
   /** Domain vocabulary lines (terms or `wrong -> right`) for biasing STT and fixing spelling. */
@@ -328,6 +330,7 @@ export class SettingsFile {
       const spoken = str(raw.dictationLanguage);
       if (spoken) s.dictationLanguage = spoken;
       if (raw.dictationLive === true) s.dictationLive = true;
+      if (raw.dictationRedirect === true) s.dictationRedirect = true;
       const submitWord = str(raw.dictationSubmitWord);
       if (submitWord) s.dictationSubmitWord = submitWord;
       const vocab = strings(raw.dictationVocabulary);
@@ -403,6 +406,7 @@ export class SettingsFile {
       languages: s.languages,
       ...(s.dictationLanguage ? { dictationLanguage: s.dictationLanguage } : {}),
       ...(s.dictationLive ? { dictationLive: true } : {}),
+      ...(s.dictationRedirect ? { dictationRedirect: true } : {}),
       ...(s.dictationSubmitWord ? { dictationSubmitWord: s.dictationSubmitWord } : {}),
       ...(s.dictationVocabulary?.length ? { dictationVocabulary: s.dictationVocabulary } : {}),
       ...(s.dictationCommands?.length ? { dictationCommands: s.dictationCommands } : {}),

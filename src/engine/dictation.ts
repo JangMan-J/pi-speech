@@ -6,6 +6,7 @@
 
 import type { AudioInput, Recording } from "./audio";
 import { errorMessage } from "./env";
+import type { RedirectResult } from "./redirect";
 import { quietSplitByte, sliceWav, wavPcmInfo } from "./wav";
 
 /** A recording stops by itself, and is transcribed, after this long. */
@@ -41,6 +42,11 @@ export interface DictationDeps {
   prepare?(language?: string): void;
   /** Whether live typing while speaking is enabled by the user. */
   liveEnabled?(): boolean;
+  redirectEnabled?(): boolean;
+  redirect?: {
+    available(): Promise<RedirectResult>;
+    deliver(text: string, opts?: { submit?: boolean }): Promise<RedirectResult>;
+  };
   /** Whether the active STT model/route supports fast live chunking. */
   liveCapable?(): boolean;
   /** Poll interval (ms) for live typing snapshots. */
@@ -103,6 +109,10 @@ export class Dictation {
   private lastSnapBytes = 0;
   private liveAbort?: AbortController;
   private liveInFlight?: Promise<void>;
+  private redirectActive = false;
+  private redirectNotice = false;
+  /** Raw committed prefix already delivered elsewhere, never insert it again in Pi. */
+  private redirectedText = "";
 
   constructor(private readonly deps: DictationDeps) {}
 
@@ -117,13 +127,14 @@ export class Dictation {
 
   /** The status indicator text, or undefined when idle. */
   indicator(): string | undefined {
+    const suffix = this.redirectActive ? " → pane" : "";
     switch (this.current) {
       case "starting":
-        return "● REC 0:00";
+        return `● REC 0:00${suffix}`;
       case "recording":
-        return `● REC ${clock(Date.now() - this.startedAt)}`;
+        return `● REC ${clock(Date.now() - this.startedAt)}${suffix}`;
       case "transcribing":
-        return "… transcribing";
+        return `… transcribing${suffix}`;
       default:
         return undefined;
     }
@@ -182,8 +193,19 @@ export class Dictation {
     this.stopRequested = false;
     this.ui = ui;
     this.startedAt = Date.now();
+    this.redirectActive = false;
+    this.redirectedText = "";
     this.set("starting");
     try {
+      if (this.deps.redirectEnabled?.() && this.deps.redirect) {
+        const result = await this.deps.redirect.available();
+        this.redirectActive = result.ok;
+        if (!result.ok && (result.reason !== "Redirect needs Zellij; typing into Pi" || !this.redirectNotice)) {
+          this.notify(ui, result.reason, "warning");
+          if (result.reason === "Redirect needs Zellij; typing into Pi") this.redirectNotice = true;
+        }
+        this.changed();
+      }
       const recording = await this.deps.input().start();
       if (this.abandoned) {
         this.set("idle");
@@ -271,14 +293,25 @@ export class Dictation {
             if (ac.signal.aborted || !this.liveActive) return;
             this.committedText = joinTranscript(this.committedText, headText);
             this.committedByte = splitAt;
+            if (headText && this.redirectActive && this.deps.redirect) {
+              const transformed = this.deps.previewTransform ? this.deps.previewTransform(headText) : headText;
+              const result = await this.deps.redirect.deliver(`${this.redirectedText ? " " : ""}${transformed}`);
+              if (result.ok) this.redirectedText = joinTranscript(this.redirectedText, headText);
+              else {
+                this.redirectActive = false;
+                this.notify(ui, result.reason, "warning");
+                this.changed();
+              }
+            }
           }
         }
         const tailWav = this.committedByte > dataOffset ? sliceWav(wav, this.committedByte) : wav;
         const partial = (await this.deps.transcribe(tailWav, snap.format, ac.signal, this.language)).trim();
         if (ac.signal.aborted || !this.liveActive || this.current !== "recording") return;
         const combined = joinTranscript(this.committedText, partial);
-        const preview = this.deps.previewTransform ? this.deps.previewTransform(combined) : combined;
-        ui.setEditor?.(joinEditorText(this.baseEditor, preview));
+        const remaining = this.withoutRedirected(combined);
+        const preview = this.deps.previewTransform ? this.deps.previewTransform(remaining) : remaining;
+        if (!this.redirectActive) ui.setEditor?.(joinEditorText(this.baseEditor, preview));
       } catch {
         /* transient partial errors are ignored; final pass resolves cleanly */
       } finally {
@@ -311,11 +344,11 @@ export class Dictation {
     this.recording = undefined;
     const wasLive = this.liveActive;
     const base = this.baseEditor;
-    const committedByte = this.committedByte;
-    const committedText = this.committedText;
     this.endTimers();
     this.liveAbort?.abort();
     if (this.liveInFlight) await this.liveInFlight.catch(() => {});
+    const committedByte = this.committedByte;
+    const committedText = this.committedText;
     this.resetLive();
     this.set("transcribing");
     const abort = new AbortController();
@@ -325,9 +358,11 @@ export class Dictation {
       if (abort.signal.aborted) return;
       let rawText: string;
       const dataOffset = format === "wav" ? wavPcmInfo(audio).dataOffset : 0;
-      if (wasLive && committedByte > dataOffset && format === "wav" && audio.length > committedByte) {
-        const tailWav = sliceWav(audio, committedByte);
-        const tailText = (await this.deps.transcribe(tailWav, format, abort.signal, this.language)).trim();
+      if (wasLive && committedByte > dataOffset && format === "wav") {
+        const tailText =
+          audio.length > committedByte
+            ? (await this.deps.transcribe(sliceWav(audio, committedByte), format, abort.signal, this.language)).trim()
+            : "";
         rawText = joinTranscript(committedText, tailText);
       } else {
         rawText = (await this.deps.transcribe(audio, format, abort.signal, this.language)).trim();
@@ -345,15 +380,37 @@ export class Dictation {
     }
   }
 
+  private withoutRedirected(text: string): string {
+    return this.redirectedText && text.startsWith(this.redirectedText)
+      ? text.slice(this.redirectedText.length).trimStart()
+      : text;
+  }
+
   /** Apply vocabulary, voice command, or submit-word handling and deliver cleanly into Pi. */
   private async deliver(ui: DictationUi, rawText: string, wasLive: boolean, base: string): Promise<void> {
-    const outcome = this.deps.finalize ? this.deps.finalize(rawText) : { text: rawText };
+    const finalized = this.deps.finalize ? this.deps.finalize(rawText) : { text: rawText };
+    const sent = this.deps.previewTransform ? this.deps.previewTransform(this.redirectedText) : this.redirectedText;
+    const outcome =
+      sent && finalized.text.startsWith(sent)
+        ? { ...finalized, text: finalized.text.slice(sent.length).trimStart() }
+        : this.redirectedText
+          ? { ...finalized, text: this.withoutRedirected(rawText) }
+          : finalized;
     if (outcome.command) {
       if (wasLive) ui.setEditor?.(base);
       if (ui.runCommand) ui.runCommand(outcome.command);
       else if (ui.submit) ui.submit(outcome.command);
       else ui.paste(outcome.command);
       return;
+    }
+    if (this.redirectActive && this.deps.redirect) {
+      if (wasLive) ui.setEditor?.(base);
+      const prefix = this.redirectedText && outcome.text ? " " : "";
+      const result = await this.deps.redirect.deliver(prefix + outcome.text, { submit: outcome.submit });
+      if (result.ok) return;
+      this.notify(ui, result.reason, "warning");
+      if (result.reason.startsWith("Redirect text delivered")) return;
+      this.redirectActive = false;
     }
     if (outcome.submit) {
       if (wasLive) ui.setEditor?.(base);

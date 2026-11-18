@@ -21,6 +21,7 @@ Talk to Pi hands-free with push-to-talk and local models, even over SSH, and hea
 - **Push-to-talk or toggle**: Hold your PTT key like a walkie-talkie and release when you finish, or tap **Alt+Z** to start and stop.
 - **Live typing or fill-on-stop**: Stream words straight into the editor as you speak with local models, or insert the full transcript when you stop.
 - **Hands-free submit and commands**: End a prompt with `"send it"` or `"submit"` (or your own trigger phrase) to send immediately. Say `"compact"` on its own to run `/compact`, or map phrases to any slash command.
+- **Redirect**: In Dictation options, select Focused pane to send dictation to the focused Zellij pane. Outside Zellij or on errors it falls back to Pi. Zellij versions that do not report the focused pane cannot reliably detect Pi's own pane; focus another pane before dictating.
 - **Custom vocabulary**: Fix recurring mishearings (`pie` → `Pi`) and keep exact casing for project terms and tools.
 - **Live spectrum visualizer**: An optional theme-matched audio visualizer sits above the editor while recording or speaking.
 

@@ -37,6 +37,7 @@ import { Player } from "./player";
 import type { SpeechCatalog } from "./provider";
 import { type Notify, ReadAloud, type ReadAloudHost, type ReadAloudOptions, type ReadMode } from "./read-aloud";
 import { ReceiverControl } from "./receiver-control";
+import { createRedirect } from "./redirect";
 import { connectRemote, libraries, type RemoteLink, type RemotePrompts } from "./remote";
 import { DIRECTION_LABELS, type Notice, Routes } from "./routes";
 import { type BridgeMode, type DirectionSetting, type Machine, SettingsFile } from "./settings";
@@ -133,6 +134,8 @@ export class Engine {
       defaultLanguage: () => this.speech.settings.dictationLanguage,
       prepare: (language) => this.speech.prepareTranscription(language),
       liveEnabled: () => Boolean(this.speech.settings.dictationLive),
+      redirectEnabled: () => Boolean(this.speech.settings.dictationRedirect),
+      redirect: createRedirect({ env: opts.env }),
       liveCapable: () => canLiveDictate(this.speech.settings),
       previewTransform: (text) => rules.preview(text, this.speech.settings.dictationVocabulary),
       finalize: (rawText) => {

@@ -105,6 +105,7 @@ export type RowId =
   | "dictationSubmitWord"
   | "dictationVocabulary"
   | "dictationCommands"
+  | "dictationRedirect"
   // Hotkeys: the actions
   | "speak"
   | "dictate"
@@ -383,6 +384,7 @@ const DICTATION_IDS: RowId[] = [
   "dictationSubmitWord",
   "dictationVocabulary",
   "dictationCommands",
+  "dictationRedirect",
 ];
 
 const MENUS: Record<MenuMode["menu"], { title: string; ids: RowId[] }> = {
@@ -972,6 +974,17 @@ export class Panel {
         hints: () => [{ key: "Enter", action: "edit list in Pi" }],
         info: () => "Terms or spoken,replacement pairs (pie,Pi · clawed,Claude).",
         activate: () => this.openDictationEditor("vocabulary"),
+      },
+      dictationRedirect: {
+        label: "Redirect",
+        cycles: true,
+        render: () => ({ value: s().dictationRedirect ? "Focused pane" : "Off" }),
+        hints: () => [{ key: "Enter", action: "toggle" }],
+        info: () => "Send dictated text to the focused Zellij pane; otherwise type into Pi.",
+        step: () => {
+          s().dictationRedirect = !s().dictationRedirect;
+          this.speech.save();
+        },
       },
       dictationCommands: {
         label: "Commands",

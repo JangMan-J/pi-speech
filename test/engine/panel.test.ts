@@ -1982,6 +1982,7 @@ describe("the panel view model: history, files, and the dictation language", () 
       ["Submit word", "Off"],
       ["Vocabulary", "Off"],
       ["Commands", "Off"],
+      ["Redirect", "Off"],
     ]);
     await press2({ key: "right" });
     expect(panel2.view().rows[0]).toMatchObject({ label: "Output", value: "Typed" });
@@ -2022,6 +2023,12 @@ describe("the panel view model: history, files, and the dictation language", () 
     expect(lastEditor?.title).toBe("Voice slash commands");
     expect(panel2.view().rows[4]).toMatchObject({ label: "Commands", value: "1 command" });
     expect(settingsOf(p.work).dictationCommands).toEqual(["/compact"]);
+    await press2({ key: "down" });
+    await press2({ key: "right" });
+    expect(panel2.view().rows[5]).toMatchObject({ label: "Redirect", value: "Focused pane" });
+    expect(settingsOf(p.work).dictationRedirect).toBe(true);
+    await press2({ key: "enter" });
+    expect(panel2.view().rows[5].value).toBe("Off");
     await press2({ key: "escape" });
     expect(panel2.view().rows.find((r) => r.label === "Dictation options")).toMatchObject({
       value: "Typed",

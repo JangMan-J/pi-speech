@@ -72,6 +72,64 @@ function harness(opts: { start?: () => Promise<Recording>; transcript?: string |
 afterEach(() => vi.useRealTimers());
 
 describe("Dictation toggle", () => {
+  it("redirects committed live segments but not interim previews, then sends only the tail", async () => {
+    vi.useFakeTimers();
+    const h = harness();
+    const wav = Buffer.alloc(44 + 16 * 48000);
+    wav.write("RIFF", 0);
+    wav.write("WAVE", 8);
+    const rec: Recording = {
+      snapshot: async () => ({ audio: wav, format: "wav" }),
+      stop: async () => ({ audio: wav, format: "wav" }),
+      cancel: async () => {},
+    };
+    const redirect = {
+      available: vi.fn().mockResolvedValue({ ok: true, via: "zellij" }),
+      deliver: vi.fn().mockResolvedValue({ ok: true, via: "zellij" }),
+    };
+    h.service.transcribeAudio = vi.fn().mockResolvedValueOnce("first").mockResolvedValue("tail");
+    const d = h.make({
+      input: () => ({ name: "local", start: async () => rec }),
+      liveEnabled: () => true,
+      liveCapable: () => true,
+      liveMs: 10,
+      redirectEnabled: () => true,
+      redirect,
+    });
+    const setEditor = vi.fn();
+    const ui = { ...h.ctx, setEditor, getEditor: () => "" };
+    await d.toggle(ui);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(redirect.deliver).toHaveBeenCalledTimes(1);
+    expect(redirect.deliver).toHaveBeenCalledWith("first");
+    expect(setEditor).not.toHaveBeenCalled();
+    await d.toggle(ui);
+    expect(redirect.deliver).toHaveBeenLastCalledWith(" tail", { submit: undefined });
+    expect(h.pasted).toEqual([]);
+  });
+
+  it("routes a finalized submit to the pane and falls back without losing text on failure", async () => {
+    const h = harness();
+    const redirect = {
+      available: vi.fn().mockResolvedValue({ ok: true, via: "zellij" }),
+      deliver: vi
+        .fn()
+        .mockResolvedValueOnce({ ok: true, via: "zellij" })
+        .mockResolvedValueOnce({ ok: false, reason: "failed" }),
+    };
+    const d = h.make({ redirectEnabled: () => true, redirect, finalize: () => ({ text: "hello", submit: true }) });
+    const submit = vi.fn();
+    const ui = { ...h.ctx, submit };
+    await d.toggle(ui);
+    expect(d.indicator()).toContain("→ pane");
+    await d.toggle(ui);
+    expect(redirect.deliver).toHaveBeenCalledWith("hello", { submit: true });
+    expect(submit).not.toHaveBeenCalled();
+    await d.toggle(ui);
+    await d.toggle(ui);
+    expect(submit).toHaveBeenCalledWith("hello");
+    expect(h.notes.at(-1)?.message).toBe("failed");
+  });
   it("gets the transcription ready as soon as recording starts, in the dictation language", async () => {
     const h = harness();
     const prepared: Array<string | undefined> = [];

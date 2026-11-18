@@ -35,6 +35,17 @@ describe("the settings file", () => {
     });
   });
 
+  it("defaults redirect off and persists only a boolean enabled value", () => {
+    const file = new SettingsFile(dir);
+    const settings = file.load();
+    expect(Boolean(settings.dictationRedirect)).toBe(false);
+    settings.dictationRedirect = true;
+    file.save(settings);
+    expect(file.load().dictationRedirect).toBe(true);
+    writeFileSync(file.file, JSON.stringify({ dictationRedirect: "true" }));
+    expect(Boolean(file.load().dictationRedirect)).toBe(false);
+  });
+
   it("validates pttHotkeyId and persists hotkeys.ptt and osdStyle", () => {
     expect(pttHotkeyId("F8")).toBe("f8");
     expect(pttHotkeyId("alt+space")).toBe("alt+space");
