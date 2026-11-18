@@ -32,7 +32,16 @@ const ACTIONS = ["Speak…", "Dictate", "Push-to-talk"];
 const LETTER_HINTS = "Ctrl+O replay · Ctrl+L history · Ctrl+N stop · Ctrl+T transcribe";
 
 /** The rows of Receivers over SSH. */
-const BRIDGE_ROWS = ["Bridge", "Device", "Pairing", "Receiver", "Play audio on", "Record audio on", "Run models on"];
+const BRIDGE_ROWS = [
+  "Bridge",
+  "Device",
+  "Pairing",
+  "Local receiver",
+  "Remote receiver",
+  "Play audio on",
+  "Record audio on",
+  "Run models on",
+];
 
 const XAI_TOKEN = "xai-login-token-abcdef";
 
@@ -599,14 +608,14 @@ describe("the panel view model: keys in the main view", () => {
 });
 
 describe("the panel view model: Receivers", () => {
-  it("on this machine with Device Local it shows only Device and Receiver (hiding Bridge, Pairing, and DIRECTION)", async () => {
+  it("on this machine with Device Local it shows only Device and Local receiver", async () => {
     const p = open();
     await p.panel.idle();
     await p.goTo("Receivers");
     await p.press("enter");
     const v = p.panel.view();
     expect(v).toMatchObject({ menu: "bridge", crumb: "Receivers", selected: 0 });
-    expect(v.rows.map((r) => r.label)).toEqual(["Device", "Receiver"]);
+    expect(v.rows.map((r) => r.label)).toEqual(["Device", "Local receiver"]);
     expect(p.row("Device")).toMatchObject({ value: "Local", note: "Enter connects to Remote", opens: true });
     expect(p.hint()).toBe("← → Selects · Enter connect · Esc Main");
     await p.press("escape");
@@ -783,25 +792,25 @@ describe("the panel view model: Device and Receiver, on this machine", () => {
     await p.press("enter");
     expect(p.panel.view().status?.text).toMatch(/receiver 0\.3\.0.*expected 0\.2\.5/);
     expect(p.row("Device")).toMatchObject({ value: "Remote · spider", note: expect.stringMatching(/^✓ over SSH/) });
-    expect(p.row("Receiver")).toMatchObject({
+    expect(p.row("Remote receiver")).toMatchObject({
       value: "CPU v0.3.0",
-      note: "! u updates to v0.2.5",
+      note: "! Enter or u updates to v0.2.5",
       alert: true,
     });
     expect(p.hint()).toContain("u update to v0.2.5");
-    await p.press("down"); // Receiver
-    expect(p.hint()).toContain("u update to v0.2.5");
-    await p.type("u");
+    await p.goTo("Remote receiver");
+    expect(p.hint()).toContain("Enter / u update");
+    await p.press("enter");
     expect(updatedCalls).toBe(1);
     expect(p.panel.view().status?.text).toBe("✓ Updated pi-speech-receiver on spider to 0.2.5");
-    expect(p.row("Receiver")).toMatchObject({ value: "CPU v0.2.5" });
-    expect(p.row("Receiver")?.alert).toBeFalsy();
-    expect(p.hint()).not.toContain("update to");
+    expect(p.row("Remote receiver")).toMatchObject({ value: "CPU v0.2.5" });
+    expect(p.row("Remote receiver")?.alert).toBeFalsy();
+    expect(p.hint()).not.toContain("update");
     await p.type("u");
     expect(updatedCalls).toBe(1);
     expect(p.panel.view().status?.text).toBe("pi-speech-receiver on spider is already current (0.2.5)");
     // Device ←→ toggles back to Local (turning off the bridge while remembering spider) and back to Remote
-    await p.press("up"); // Device
+    await p.goTo("Device");
     expect(p.engine.routes.route).toBe("bridge");
     await p.press("left");
     expect(p.engine.routes.route).toBe("local");
@@ -928,7 +937,7 @@ if (cmd === "gpu") { console.log(JSON.stringify({ driver: false, cuda: null, cud
       await p.goTo("Receivers");
       await p.press("enter");
       await p.press("down"); // Receiver
-      expect(p.row("Receiver")).toMatchObject({ value: `CPU v${packageVersion()}`, note: "env" });
+      expect(p.row("Local receiver")).toMatchObject({ value: `CPU v${packageVersion()}`, note: "env" });
       await p.press("right");
       expect(p.panel.view().status?.text).toMatch(/GPU unavailable: no NVIDIA driver/);
       expect(p.engine.speech.settings.localDevice).toBe("cpu");
@@ -1005,8 +1014,8 @@ describe("the panel view model: Receivers' DIRECTION", () => {
     expect(p.selectedLabel()).toBe("Run models on");
     // Turn Bridge off: the three routing rows disappear and selection clamps when Bridge is turned off from row 0 or via engine.
     await p.engine.setBridge("off");
-    expect(p.panel.view().rows.map((r) => r.label)).toEqual(["Bridge", "Device", "Pairing", "Receiver"]);
-    expect(p.selectedLabel()).toBe("Receiver");
+    expect(p.panel.view().rows.map((r) => r.label)).toEqual(["Bridge", "Device", "Pairing", "Local receiver"]);
+    expect(p.selectedLabel()).toBe("Local receiver");
     expect(p.hint()).toMatch(/Esc Main$/);
     await p.engine.setBridge("auto");
     expect(p.panel.view().rows.map((r) => r.label)).toEqual(BRIDGE_ROWS);
@@ -1015,7 +1024,7 @@ describe("the panel view model: Receivers' DIRECTION", () => {
   it("over SSH each row cycles This machine | Remote machine and is saved; a choice that needs this host's microphone warns", async () => {
     const p = open({ SSH_CONNECTION: "1 2 3 4" });
     await p.goTo("Record audio on");
-    expect(BRIDGE_ROWS.slice(4).map((l) => p.row(l)?.value)).toEqual([
+    expect(BRIDGE_ROWS.slice(5).map((l) => p.row(l)?.value)).toEqual([
       "Remote machine",
       "Remote machine",
       "Remote machine",
@@ -1038,7 +1047,7 @@ describe("the panel view model: Receivers' DIRECTION", () => {
 describe("the panel view model: Receivers' Device and Pairing (Pi over SSH)", () => {
   // Over SSH the receiver is the user's own machine: the bridge mode and Pairing rows are there.
   const SSH = { SSH_CONNECTION: "1 2 3 4" };
-  const connected = async () => ({ ok: true, address: "127.0.0.1", port: 47613, ms: 52, version: "0.3.0" }) as const;
+  const connected = async () => ({ ok: true, address: "127.0.0.1", port: 47613, ms: 52, version: "0.2.5" }) as const;
   const refused = async () =>
     ({
       ok: false,
@@ -1062,6 +1071,62 @@ describe("the panel view model: Receivers' Device and Pairing (Pi over SSH)", ()
     expect(p.hint()).toBe("Enter address, pair · Esc Main");
   });
 
+  it.skipIf(!STAND_IN_BINARY)(
+    "keeps the receiver on This machine accessible without switching editions or turning off an SSH forward",
+    async () => {
+      const dir = trackTemp(mkdtempSync(join(tmpdir(), "pi-speech-split-receivers-")));
+      const bin = join(dir, "pi-speech-receiver");
+      writeFileSync(bin, "#!/bin/sh\necho pi-speech-receiver 0.2.6\n", { mode: 0o755 });
+      const p = open({ ...SSH, PI_SPEECH_BINARY: bin }, { before: (e) => (e.probeBridge = connected) });
+      await p.goTo("Receivers");
+      await p.press("enter");
+      expect(p.row("Local receiver")).toMatchObject({ value: "CPU v0.2.6" });
+      expect(p.row("Remote receiver")).toMatchObject({
+        value: "CPU v0.2.5",
+        note: `! update to v${packageVersion()} · Manage over SSH…`,
+        alert: true,
+      });
+      await p.press("down", "down", "down", "down"); // Remote receiver
+      expect(p.selectedLabel()).toBe("Remote receiver");
+      expect(p.hint()).not.toContain("CPU / GPU");
+      await p.press("right");
+      expect(p.panel.view().status?.text ?? "").not.toMatch(/Switching remote receiver edition/);
+      await p.press("enter");
+      expect(p.panel.view().crumb).toBe("Manage over SSH");
+      await p.press("escape", "up"); // Local receiver
+      await p.type("u");
+      expect(p.panel.view().status?.text).toMatch(/update the receiver set by PI_SPEECH_BINARY on This machine/i);
+      expect(p.engine.routes.route).toBe("bridge");
+      expect(p.engine.speech.settings.localDevice).toBe("cpu");
+    },
+  );
+
+  it("offers forwarded receivers explicit SSH maintenance without using the forward as an SSH host", async () => {
+    const p = open(SSH, { before: (e) => (e.probeBridge = connected) });
+    await p.goTo("Remote receiver");
+    await p.press("enter");
+    expect(p.panel.view().crumb).toBe("Manage over SSH");
+    expect(p.panel.view().rows.map((r) => r.label)).toEqual(["SSH host", "Install / update", "Start / restart"]);
+    expect(p.row("SSH host")?.value).toBe("not set");
+    await p.press("down", "enter"); // Install/update offers the host field first, not a guessed host.
+    expect(p.panel.view().input).toMatchObject({ label: "SSH host", value: "" });
+    await p.type("192.0.2.4:2222");
+    await p.press("enter");
+    expect(p.panel.view().status?.text).toContain("Use an SSH host");
+    expect(p.engine.speech.settings.receiverSshHost).toBeUndefined();
+    await p.press("escape", "enter");
+    await p.type("ssh://jang@playback:2222");
+    await p.press("enter");
+    expect(p.row("SSH host")?.value).toBe("ssh://jang@playback:2222");
+    expect(settingsOf(p.work)).toMatchObject({ receiverSshHost: "ssh://jang@playback:2222" });
+    expect(settingsOf(p.work).remoteHost).toBeUndefined();
+    expect(p.engine.routes.route).toBe("bridge");
+    expect(p.engine.routes.url).toBe("http://127.0.0.1:47613");
+    await p.press("escape");
+    expect(p.panel.view().crumb).toBe("Receivers");
+    expect(p.selectedLabel()).toBe("Remote receiver");
+  });
+
   it("names the address PI_SPEECH_BRIDGE_URL gives", async () => {
     const p = open(
       { ...SSH, PI_SPEECH_BRIDGE_URL: "http://localhost:5000" },
@@ -1071,10 +1136,15 @@ describe("the panel view model: Receivers' Device and Pairing (Pi over SSH)", ()
     expect(p.row("Device")).toMatchObject({ value: "Remote · localhost:5000", note: "from PI_SPEECH_BRIDGE_URL" });
   });
 
-  it("an unreachable receiver is ✗ Re-pair, whose Enter opens the address field", async () => {
+  it("an unreachable receiver advises checking the SSH forward instead of re-pairing", async () => {
     const p = open(SSH, { before: (e) => (e.probeBridge = refused) });
     await p.goTo("Pairing");
-    expect(p.row("Pairing")).toMatchObject({ value: "✗ Re-pair", note: "receiver unreachable", opens: true });
+    expect(p.row("Pairing")).toMatchObject({
+      value: "✗ Receiver unreachable",
+      note: "check the receiver and SSH forward",
+      alert: true,
+      opens: true,
+    });
     await p.press("enter");
     expect(p.panel.view().input).toMatchObject({ label: "Address", value: "", under: "pairing" });
     expect(p.panel.view().status?.text).toMatch(/--network/);
@@ -1173,7 +1243,7 @@ describe("the panel view model: Receivers' Device and Pairing (Pi over SSH)", ()
     await p.goTo("Receivers");
     await p.press("enter");
     expect(n).toBe(1);
-    expect(p.row("Pairing")?.value).toBe("✗ Re-pair");
+    expect(p.row("Pairing")?.value).toBe("✗ Receiver unreachable");
     ok = true;
     await vi.waitFor(() => expect(p.row("Pairing")?.value).toMatch(/^✓ Connected/));
     expect(n).toBeGreaterThan(1);

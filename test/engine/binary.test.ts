@@ -189,6 +189,21 @@ describe("the bundled binaries", () => {
       expect(hasBinaryFor("darwin-arm64", env, root)).toBe(true);
       expect(binaryFor("darwin-arm64", env, root, cacheDir)).toBeUndefined();
 
+      // Updating should fetch the release even when normal binary discovery finds a checkout build.
+      const hostTarget = `${process.platform}-${process.arch}`;
+      if (manifest.assets[hostTarget]) {
+        const checkout = join(root, "receiver", "target", "release", binaryFile(hostTarget));
+        mkdirSync(join(checkout, ".."), { recursive: true });
+        writeFileSync(checkout, "old build", { mode: 0o755 });
+        const updateCache = join(dir, "update-cache");
+        expect(await ensureBinaryFor(hostTarget, env, { root, cacheDir: updateCache })).toBe(checkout);
+        const updated = await ensureBinaryFor(hostTarget, env, { root, cacheDir: updateCache, releaseOnly: true });
+        expect(updated).toBe(join(updateCache, "0.2.6", hostTarget, binaryFile(hostTarget)));
+        expect(findBinary(env, { root, cacheDir: updateCache })).toMatchObject({ path: updated, from: "cache" });
+        expect(readFileSync(checkout, "utf8")).toBe("old build");
+        rmSync(join(root, "receiver"), { recursive: true });
+      }
+
       const fetched = await ensureBinary(env, { root, cacheDir, platform: "linux", arch: "x64" });
       expect(fetched).toMatchObject({
         ok: true,

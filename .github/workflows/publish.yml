@@ -1,7 +1,7 @@
 name: Publish
 
 # Push a tag that matches package.json, e.g. `npm version patch && git push --follow-tags`.
-# A release whose receiver/ did not change since the last one reuses that release's receivers (see plan).
+# Build receivers for each release so their reported version matches package.json.
 # npm authenticates this workflow by OIDC (trusted publishing): no npm token is stored,
 # and every published version carries a provenance attestation automatically.
 #
@@ -35,14 +35,11 @@ env:
   WIN_SHARED_LIB_BUNDLE_SHA256: c3c78220db8bebf97d5f932496165bb3897b163410427d7c021013439c80f183
 
 jobs:
-  # Compare with the last release on npm. CI runs only the suites whose files changed since its tag. When
-  # receiver/ (and the archive packer) is the same as at the tag the last release's receivers were built
-  # from, this release reuses those receivers and their receivers.json instead of building them again.
+  # Compare with the last release on npm so CI can select tests by changed files.
   plan:
     runs-on: ubuntu-latest
     outputs:
       base: ${{ steps.plan.outputs.base }}
-      rebuild: ${{ steps.plan.outputs.rebuild }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -57,30 +54,11 @@ jobs:
           version="$(node -p 'require("./package.json").version')"
           last="$(npm view "$name" version 2>/dev/null || true)"
           base=""
-          rebuild=true
           if [ -n "$last" ] && [ "$last" != "$version" ] && git rev-parse -q --verify "refs/tags/v$last^{commit}" >/dev/null; then
             base="v$last"
-            # Anything missing (no tarball, no receivers.json, no tag) means: build the receivers.
-            tarball="$(npm view "$name@$last" dist.tarball 2>/dev/null || true)"
-            if [ -n "$tarball" ] && curl -fsSL "$tarball" | tar -xzO package/receivers.json > last-receivers.json; then
-              built="$(node -p 'require("./last-receivers.json").tag')"
-              if git rev-parse -q --verify "refs/tags/$built^{commit}" >/dev/null \
-                && git diff --quiet "$built" HEAD -- receiver/ npm/platforms.mjs; then
-                rebuild=false
-                echo "::notice::receiver/ is unchanged since $built: this release reuses its receivers"
-              fi
-            fi
           fi
-          echo "Last release: ${last:-none}; CI base: ${base:-everything}; build receivers: $rebuild"
+          echo "Last release: ${last:-none}; CI base: ${base:-everything}"
           echo "base=$base" >> "$GITHUB_OUTPUT"
-          echo "rebuild=$rebuild" >> "$GITHUB_OUTPUT"
-      - if: steps.plan.outputs.rebuild == 'false'
-        uses: actions/upload-artifact@v4
-        with:
-          name: last-receivers
-          path: last-receivers.json
-          if-no-files-found: error
-          retention-days: 7
 
   check:
     needs: plan
@@ -95,8 +73,6 @@ jobs:
   # and the application directory on Windows).
   build:
     name: Receiver for ${{ matrix.target }}
-    needs: plan
-    if: needs.plan.outputs.rebuild == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: true
@@ -184,10 +160,16 @@ jobs:
             cp -P "$SHERPA_ONNX_LIB_DIR/"*.so* target/release/
             readelf -d target/release/pi-speech-receiver | grep -q 'RUNPATH.*\$ORIGIN'
           fi
-      - name: Smoke-test the release binary (models list prints JSON lines)
+      - name: Smoke-test the release binary and verify its version
         run: |
           bin=target/release/pi-speech-receiver
           [ -f "$bin.exe" ] && bin="$bin.exe"
+          version="$(node -p 'require("../package.json").version')"
+          actual="$("$bin" --version | tr -d '\r')"
+          if [ "$actual" != "pi-speech-receiver $version" ]; then
+            echo "::error::Expected receiver v$version, got $actual"
+            exit 1
+          fi
           "$bin" models list > models.jsonl
           cat models.jsonl
           node -e '
@@ -225,9 +207,7 @@ jobs:
           retention-days: 7
 
   publish:
-    needs: [plan, check, build]
-    # build is skipped when the receivers are reused; any failure or cancellation still stops the release.
-    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.check.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    needs: [check, build]
     runs-on: ubuntu-latest
     environment: npm
     permissions:
@@ -253,12 +233,10 @@ jobs:
             exit 1
           fi
       - uses: actions/download-artifact@v4
-        if: needs.plan.outputs.rebuild == 'true'
         with:
           pattern: receiver-*
           path: artifacts
       - name: Collect the built binaries
-        if: needs.plan.outputs.rebuild == 'true'
         run: |
           mkdir -p bundle
           for d in artifacts/receiver-*; do
@@ -267,7 +245,6 @@ jobs:
             cp -P "$d/"* "bundle/$target/"
           done
       - name: Pack release archives and write receivers.json
-        if: needs.plan.outputs.rebuild == 'true'
         run: |
           version="$(node -p 'require("./package.json").version')"
           node npm/platforms.mjs release \
@@ -279,30 +256,14 @@ jobs:
             --tag "${GITHUB_REF_NAME}"
           cat receivers.json
           npm pack --dry-run
-      - uses: actions/download-artifact@v4
-        if: needs.plan.outputs.rebuild == 'false'
-        with:
-          name: last-receivers
-      - name: Reuse the last release's receivers.json
-        if: needs.plan.outputs.rebuild == 'false'
-        run: |
-          mv last-receivers.json receivers.json
-          cat receivers.json
-          npm pack --dry-run
       - name: Create the GitHub release and upload receiver archives (before npm publish)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [ "${{ needs.plan.outputs.rebuild }}" = "true" ]; then
-            if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-              gh release upload "${GITHUB_REF_NAME}" release-assets/*.tar.gz --clobber
-            else
-              gh release create "${GITHUB_REF_NAME}" release-assets/*.tar.gz --verify-tag --generate-notes --title "${GITHUB_REF_NAME}"
-            fi
-          elif ! gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            built="$(node -p 'require("./receivers.json").tag')"
-            gh release create "${GITHUB_REF_NAME}" --verify-tag --generate-notes --title "${GITHUB_REF_NAME}" \
-              --notes "The receiver is unchanged: this release uses the receiver downloads of [$built](https://github.com/${GITHUB_REPOSITORY}/releases/tag/$built)."
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" release-assets/*.tar.gz --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" release-assets/*.tar.gz --verify-tag --generate-notes --title "${GITHUB_REF_NAME}"
           fi
       - name: Is this version already on npm?
         id: registry

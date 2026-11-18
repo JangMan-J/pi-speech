@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { planRemoteReceiver, platformOf, shQuote, sshConfigHosts } from "../../src/engine/remote";
+import { planRemoteReceiver, platformOf, readReceiverService, shQuote, sshConfigHosts } from "../../src/engine/remote";
 
 describe("the Remote machine over SSH: helpers", () => {
   it("lists the Hosts of ~/.ssh/config that name one machine, once each, in order", () => {
@@ -32,6 +32,34 @@ describe("the Remote machine over SSH: helpers", () => {
   it("quotes a word so that sh reads it as one, whatever is in it", () => {
     expect(shQuote("plain")).toBe("'plain'");
     expect(shQuote("it's $HOME; `x`")).toBe(`'it'\\''s $HOME; \`x\`'`);
+  });
+
+  it("recognizes the effective user receiver service, including a custom listen address", () => {
+    const path = "/home/listener/.local/bin/pi-speech-receiver";
+    const service = [
+      "Id=pi-speech-receiver.service",
+      "LoadState=loaded",
+      "Type=simple",
+      "User=",
+      "ActiveState=active",
+      "MainPID=42",
+      `ExecStart={ path=${path} ; argv[]=${path} serve --listen 127.0.0.1:47300 --token-file /home/listener/token ; ignore_errors=no ; pid=42 ; status=0/0 }`,
+    ].join("\n");
+    expect(readReceiverService(service, path)).toMatchObject({ exists: true, active: true, pid: 42 });
+    expect(readReceiverService("Id=pi-speech-receiver.service\nLoadState=not-found", path)).toMatchObject({
+      exists: false,
+    });
+    expect(() => readReceiverService(service.replace(" serve --listen", " ssh --listen"), path)).toThrow(/refusing/);
+    expect(() => readReceiverService(service.replaceAll(path, "/usr/bin/pi-speech-receiver"), path)).toThrow(
+      /refusing/,
+    );
+    expect(() => readReceiverService(`${service}\nExecStop=/usr/bin/sleep`, path)).toThrow(/refusing/);
+    expect(() => readReceiverService(service.replace("LoadState=loaded", "LoadState=masked"), path)).toThrow(
+      /refusing/,
+    );
+    expect(() =>
+      readReceiverService(service.replace("Id=pi-speech-receiver.service", "Id=other.service"), path),
+    ).toThrow(/cannot identify/);
   });
 
   it("decides when a remote receiver must be installed or updated", () => {

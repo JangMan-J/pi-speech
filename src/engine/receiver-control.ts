@@ -18,7 +18,7 @@ import type { Env } from "./env";
 import { errorMessage } from "./env";
 import { formatSize, type GpuInfo } from "./local-models";
 import type { RemoteLink, RemotePrompts } from "./remote";
-import { sshConfigHosts } from "./remote";
+import { manageRemoteReceiver, sshConfigHosts } from "./remote";
 import type { Routes } from "./routes";
 import type { BridgeMode } from "./settings";
 import type { Speech } from "./speech";
@@ -54,6 +54,7 @@ export interface ReceiverHost {
 }
 
 export type ReceiverNotice = { tone: "success" | "warning" | "info" | "error"; text: string };
+export type ReceiverSshAction = "update" | "restart";
 
 export type PairCodeOutcome =
   | { ok: true; tone: "success" | "warning"; text: string }
@@ -106,6 +107,61 @@ export class ReceiverControl {
     );
   }
 
+  canManageRemote(): boolean {
+    return !this.host.routes.ssh && this.host.remoteState === "connected" && Boolean(this.host.remoteHost);
+  }
+
+  canMaintainRemote(): boolean {
+    return this.host.routes.route === "bridge" && !this.canManageRemote();
+  }
+
+  get maintenanceHost(): string | undefined {
+    return this.host.speech.settings.receiverSshHost;
+  }
+
+  setMaintenanceHost(dest: string): void {
+    const host = "(?:[a-z0-9_][a-z0-9_.-]*|\\[[a-f0-9:.]+\\])";
+    const authority = `(?:[a-z0-9_][a-z0-9_.-]*@)?${host}`;
+    if (dest && !new RegExp(`^(?:${authority}|ssh://${authority}(?::[0-9]{1,5})?)$`, "i").test(dest)) {
+      throw new Error("Use an SSH host, user@host, or ssh://user@host:port (no password in the address)");
+    }
+    if (dest) this.host.speech.settings.receiverSshHost = dest;
+    else delete this.host.speech.settings.receiverSshHost;
+    this.host.speech.save();
+  }
+
+  async maintainRemote(action: ReceiverSshAction, prompts: RemotePrompts): Promise<ReceiverNotice> {
+    const dest = this.maintenanceHost;
+    if (!dest || !this.canMaintainRemote()) {
+      return { tone: "info", text: "Choose an SSH host for the receiver reached through this bridge" };
+    }
+    const r = await manageRemoteReceiver(dest, action, prompts, {
+      env: this.host.env as NodeJS.ProcessEnv,
+      binaryFor: (target) => ensureBinaryFor(target, this.host.env, { releaseOnly: true }),
+      hasBinaryFor: (target) => releaseAssetSize(target) !== undefined,
+      binarySizeFor: (target) => releaseAssetSize(target),
+      version: this.host.receiverVersion,
+    });
+    if (r.action === "cancelled") return { tone: "info", text: `No changes on ${dest}` };
+
+    const version = r.version ? ` v${r.version}` : "";
+    const text =
+      r.action === "current"
+        ? `Receiver${version} is current on ${dest}`
+        : `${r.action[0].toUpperCase()}${r.action.slice(1)} receiver${version} on ${dest}`;
+    await this.probeHealth();
+    await this.probePairing();
+    const p = this.pairing;
+    if (!p || p === "checking" || !p.ok) {
+      const fault = p && p !== "checking" && !p.ok ? ` (${pairingFault(p.reason)})` : "";
+      return { tone: "warning", text: `${text} · existing bridge not connected${fault}` };
+    }
+    if (r.version && p.version !== r.version) {
+      return { tone: "warning", text: `${text} · existing bridge still reports v${p.version}` };
+    }
+    return { tone: "success", text: `✓ ${text} · bridge connected` };
+  }
+
   connectedVersion(): string | undefined {
     const p = this.pairing;
     if (p && p !== "checking" && p.ok) return p.version;
@@ -130,19 +186,26 @@ export class ReceiverControl {
   }
 
   isRemoteOutdated(): boolean {
-    const ver = this.connectedVersion();
-    return (
-      this.host.remoteState === "connected" &&
-      (this.host.remoteOutdated || isReceiverOutdated(ver, this.host.receiverVersion))
-    );
+    return this.host.remoteOutdated || this.isVersionOutdated(this.connectedVersion());
   }
 
   isLocalOutdated(): boolean {
-    return (
-      !!this.localStatus?.version &&
-      isReceiverOutdated(this.localStatus.version, this.host.receiverVersion) &&
-      hasBinaryFor(`${process.platform}-${process.arch}`, this.host.env)
-    );
+    return this.isVersionOutdated(this.localStatus?.version);
+  }
+
+  private localReleaseTarget(): string | undefined {
+    return this.localStatus?.edition === "gpu"
+      ? (this.localGpu?.target ?? undefined)
+      : `${process.platform}-${process.arch}`;
+  }
+
+  /** If the current local binary can't be updated in place, tell the user what to update instead. */
+  localUpdateHint(): string | undefined {
+    if (this.localStatus?.from === "env") return "Update the receiver set by PI_SPEECH_BINARY on This machine";
+    const target = this.localReleaseTarget();
+    if (!target || releaseAssetSize(target) === undefined)
+      return "No release archive; rebuild receiver on This machine";
+    return undefined;
   }
 
   canSwitchLocalGpu(): boolean {
@@ -155,8 +218,7 @@ export class ReceiverControl {
 
   canSwitchRemoteEdition(): boolean {
     return (
-      !this.host.routes.ssh &&
-      this.host.remoteState === "connected" &&
+      this.canManageRemote() &&
       (this.connectedEdition() === "gpu" ||
         Boolean(
           this.remoteGpu?.hardware && this.remoteGpu.target && hasBinaryFor(this.remoteGpu.target, this.host.env),
@@ -244,15 +306,12 @@ export class ReceiverControl {
     if (!isReceiverOutdated(ver, expected)) {
       return { tone: "info", text: `Local receiver is already current (${ver ?? expected ?? "unknown"})` };
     }
-    const target =
-      this.host.speech.settings.localDevice === "gpu" && this.localGpu?.target
-        ? this.localGpu.target
-        : `${process.platform}-${process.arch}`;
-    if (!hasBinaryFor(target, this.host.env)) {
-      return { tone: "info", text: `No release archive for ${target} in receivers.json` };
+    const manual = this.localUpdateHint();
+    if (manual) return { tone: "info", text: manual };
+    const target = this.localReleaseTarget();
+    if (!target || !(await ensureBinaryFor(target, this.host.env, { releaseOnly: true }))) {
+      throw new Error(`no release archive for ${target ?? "the selected receiver"}`);
     }
-    const p = await ensureBinaryFor(target, this.host.env);
-    if (!p) throw new Error(`no release archive for ${target}`);
     this.host.speech.local.close();
     await this.refreshLocal(true);
     return { tone: "success", text: `✓ Updated local receiver to v${expected}` };
@@ -328,12 +387,13 @@ export class ReceiverControl {
 
   async updateRemote(prompts: RemotePrompts): Promise<ReceiverNotice> {
     const host = this.host.remoteHost;
-    if (!host) {
+    if (!host || !this.canManageRemote()) {
       return {
         tone: "info",
-        text: this.host.speech.settings.bridgeAddress
-          ? "Paired by address without SSH: update pi-speech-receiver on that machine"
-          : "Not connected to a Remote machine",
+        text:
+          this.host.routes.route === "bridge"
+            ? "Update pi-speech-receiver on the Remote machine; this bridge can't install updates"
+            : "Not connected to a Remote machine",
       };
     }
     const ver = this.connectedVersion();

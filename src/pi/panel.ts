@@ -276,7 +276,7 @@ export function openPanel(
             return {
               focused: true,
               render(width: number): string[] {
-                const login = activePanel.view().login;
+                const { login, menu } = activePanel.view();
                 if (!login) return [];
                 const inner = Math.max(6, width - 4);
                 const promptLines = wrapText(login.prompt, inner).map((l) => ({ styled: l, w: visibleWidth(l) }));
@@ -291,7 +291,7 @@ export function openPanel(
                 body.push({ styled: "", w: 0 });
                 const cutHints = cutText(hints, inner);
                 body.push({ styled: paneStyle.dim(cutHints), w: visibleWidth(cutHints) });
-                return renderBox(width, "Connect", body, "", paneStyle);
+                return renderBox(width, menu === "receiverSsh" ? "Manage over SSH" : "Connect", body, "", paneStyle);
               },
               invalidate() {},
               handleInput(data: string) {

@@ -281,6 +281,8 @@ const inflightDownloads = new Map<string, Promise<string>>();
 export interface EnsureBinaryOptions extends BinaryOptions {
   manifest?: ReceiverManifest;
   fetchFn?: typeof fetch;
+  /** For an explicit update, require the versioned release rather than reusing a checkout build. */
+  releaseOnly?: boolean;
 }
 
 /** Ensure the receiver binary for `target` is present on disk, downloading from GitHub Releases if needed. */
@@ -290,8 +292,10 @@ export async function ensureBinaryFor(
   opts: EnsureBinaryOptions = {},
 ): Promise<string | undefined> {
   const root = opts.root ?? ROOT;
-  const existing = binaryFor(target, env, root, opts.cacheDir);
-  if (existing) return existing;
+  if (!opts.releaseOnly) {
+    const existing = binaryFor(target, env, root, opts.cacheDir);
+    if (existing) return existing;
+  }
   if (target === `${process.platform}-${process.arch}` && env[BINARY_ENV]) return undefined;
 
   const manifest = opts.manifest ?? readReceiverManifest(root);

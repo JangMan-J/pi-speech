@@ -386,10 +386,10 @@ describe("receiver version verification in Engine.announce", () => {
   it("warns once over SSH when the running receiver is older than the extension", async () => {
     fakeOpenRouter();
     const made = makeEngine({ SSH_CONNECTION: "1 2 3 4" });
-    made.engine.routes.bridge.health = async () => ({ ok: true, version: "0.3.0" });
+    made.engine.routes.bridge.health = async () => ({ ok: true, version: "0.2.7" });
     const notice = await made.engine.announce();
     expect(notice?.level).toBe("warning");
-    expect(notice?.message).toMatch(/Receiver is 0\.3\.0.*expects/);
+    expect(notice?.message).toMatch(/Receiver is 0\.2\.7.*expects/);
     expect(await made.engine.announce()).toBeUndefined();
   });
 });

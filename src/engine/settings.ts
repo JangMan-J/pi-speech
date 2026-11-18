@@ -166,6 +166,8 @@ export interface Settings {
   bridgeAddress?: string;
   /** The Remote machine connected to over SSH (Connect), reconnected to at the start of a session. */
   remoteHost?: string;
+  /** Explicit SSH destination for maintaining a forwarded receiver; does not change the bridge route. */
+  receiverSshHost?: string;
   /** macOS: the notice that Option+letter reached Pi as a character has been shown (once per install). */
   optionKeyHintShown?: boolean;
   /** Whether provider models with no known price are shown in model pickers (toggled with Ctrl+U). */
@@ -356,6 +358,8 @@ export class SettingsFile {
       if (address) s.bridgeAddress = address;
       const remoteHost = str(raw.remoteHost);
       if (remoteHost) s.remoteHost = remoteHost;
+      const receiverSshHost = str(raw.receiverSshHost);
+      if (receiverSshHost) s.receiverSshHost = receiverSshHost;
       for (const d of DIRECTIONS) if (isMachine(raw[d])) s[d] = raw[d];
     } else if (raw) {
       // settings.json without a version
@@ -426,6 +430,7 @@ export class SettingsFile {
       ...(s.showUnpricedModels ? { showUnpricedModels: true } : {}),
       ...(s.bridgeAddress ? { bridgeAddress: s.bridgeAddress } : {}),
       ...(s.remoteHost ? { remoteHost: s.remoteHost } : {}),
+      ...(s.receiverSshHost ? { receiverSshHost: s.receiverSshHost } : {}),
       ...Object.fromEntries(DIRECTIONS.filter((d) => s[d] !== DEFAULT_SETTINGS[d]).map((d) => [d, s[d]])),
     };
     const tmp = `${this.file}.${process.pid}.tmp`;

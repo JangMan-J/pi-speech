@@ -63,7 +63,7 @@ import {
   TRUNCATE_SECONDS,
 } from "./read-aloud";
 import { ReadingFailed, readingFailedMessage } from "./reading";
-import { hostPort, pairingFault, type ReceiverNotice } from "./receiver-control";
+import { hostPort, pairingFault, type ReceiverNotice, type ReceiverSshAction } from "./receiver-control";
 import type { RemotePrompts } from "./remote";
 import {
   type BridgeMode,
@@ -114,6 +114,11 @@ export type RowId =
   | "device"
   | "pairing"
   | "receiver"
+  | "remoteReceiver"
+  // Manage over SSH
+  | "receiverSshHost"
+  | "receiverSshUpdate"
+  | "receiverSshRestart"
   // Receivers, DIRECTION
   | "playOn"
   | "recordOn"
@@ -125,7 +130,7 @@ export type RowId =
   | "truncate";
 
 /** What the panel shows: the main view, or one of its submenus. */
-export type MenuId = "main" | "hotkeys" | "bridge" | "readAloud" | "dictation";
+export type MenuId = "main" | MenuMode["menu"];
 
 /** The panel's tabs, in order; Tab and Shift+Tab step through them. */
 export type TabId = "main" | "readAloud" | "speechModel" | "voice" | "transcription" | "hotkeys" | "bridge";
@@ -310,11 +315,20 @@ interface PickerState {
 
 type MenuMode = {
   kind: "menu";
-  menu: "hotkeys" | "bridge" | "readAloud" | "dictation";
+  menu: "hotkeys" | "bridge" | "receiverSsh" | "readAloud" | "dictation";
   selected: number;
   capture?: HotkeyName;
+  back?: MenuMode;
 };
 type HotkeyName = keyof Hotkeys;
+type HostInput<P extends "connect" | "receiverSshHost"> = {
+  kind: "input";
+  purpose: P;
+  edit: LineEdit;
+  back: Mode;
+  hosts: string[];
+  next: number;
+};
 
 type Mode =
   | { kind: "list" }
@@ -325,7 +339,8 @@ type Mode =
   | { kind: "input"; purpose: "transcribe" | "dictation" | "submitWord"; edit: LineEdit; back: Mode }
   | { kind: "input"; purpose: "pairAddress"; edit: LineEdit; back: Mode }
   | { kind: "input"; purpose: "pairCode"; address: string; edit: LineEdit; back: Mode }
-  | { kind: "input"; purpose: "connect"; edit: LineEdit; back: Mode; hosts: string[]; next: number }
+  | HostInput<"connect">
+  | HostInput<"receiverSshHost">
   | {
       kind: "input";
       purpose: "secret";
@@ -351,7 +366,16 @@ const MAIN_IDS: RowId[] = [
   "osdStyle",
 ];
 const HOTKEY_IDS: RowId[] = ["speak", "dictate", "ptt"];
-const BRIDGE_IDS: RowId[] = ["bridgeMode", "device", "pairing", "receiver", "playOn", "recordOn", "modelsOn"];
+const BRIDGE_IDS: RowId[] = [
+  "bridgeMode",
+  "device",
+  "pairing",
+  "receiver",
+  "remoteReceiver",
+  "playOn",
+  "recordOn",
+  "modelsOn",
+];
 const READ_ALOUD_IDS: RowId[] = ["readMode", "summarizer", "summaryLength", "truncate"];
 const DICTATION_IDS: RowId[] = [
   "dictationLive",
@@ -364,6 +388,7 @@ const DICTATION_IDS: RowId[] = [
 const MENUS: Record<MenuMode["menu"], { title: string; ids: RowId[] }> = {
   hotkeys: { title: "Hotkeys", ids: HOTKEY_IDS },
   bridge: { title: "Receivers", ids: BRIDGE_IDS },
+  receiverSsh: { title: "Manage over SSH", ids: ["receiverSshHost", "receiverSshUpdate", "receiverSshRestart"] },
   readAloud: { title: "Read aloud options", ids: READ_ALOUD_IDS },
   dictation: { title: "Dictation options", ids: DICTATION_IDS },
 };
@@ -372,6 +397,7 @@ const MACHINE_WORDS: Record<Machine, string> = { this: "This machine", remote: "
 const isDirectionRow = (id: RowId): id is DirectionSetting => (DIRECTIONS as readonly RowId[]).includes(id);
 const CONNECT_HINT = "ssh Host, user@host, or host:port";
 const CONNECT_HOW = "Connect: ssh Host, user@host, or host:port";
+const RECEIVER_SSH_HINT = "SSH Host, user@host, or ssh://user@host:port";
 const PAIR_FIRST = "Pair first: enter host:port and press Enter; read the 6-digit code on the receiver.";
 const PAIR_HOW = "host:port (empty: ssh forward) or Tailscale/LAN address of --network receiver";
 const URL_FROM = "Address: Pairing setting, else PI_SPEECH_BRIDGE_URL, else ssh forward 127.0.0.1:47613";
@@ -498,6 +524,7 @@ export class Panel {
   private unlistenDownloads?: () => void;
   private readonly speakEdit = new LineEdit();
   private pendingPrompt?: () => void;
+  private receiverMaintenancePending = false;
   private piperSpeakers?: { model: string; ids: string[] };
   /** True while the user picked `piper-en` with no downloaded Piper voice yet (never persisted to settings). */
   private piperFamilyPending = false;
@@ -815,7 +842,7 @@ export class Panel {
           this.mode = { kind: "menu", menu: "bridge", selected: 0 };
           this.probe();
           this.startPairing();
-          if (!this.receivers.isRemoteDevice()) this.track(this.receivers.refreshLocal(true));
+          this.track(this.receivers.refreshLocal(true));
         },
       },
       osdStyle: {
@@ -1005,9 +1032,10 @@ export class Panel {
             ];
           if (this.receivers.isRemoteDevice()) {
             const expected = this.engine.receiverVersion;
-            const u: Hint[] = this.receivers.isRemoteOutdated()
-              ? [{ key: "u", action: `update to v${expected ?? "latest"}` }]
-              : [];
+            const u: Hint[] =
+              this.receivers.canManageRemote() && this.receivers.isRemoteOutdated()
+                ? [{ key: "u", action: `update to v${expected ?? "latest"}` }]
+                : [];
             return [
               { key: "← →", action: "Selects" },
               { key: "Enter", action: "reconnect" },
@@ -1059,31 +1087,58 @@ export class Panel {
         },
       },
       receiver: {
-        label: "Receiver",
+        label: "Local receiver",
         cycles: true,
-        render: () => this.receiverValue(),
+        render: () => this.localReceiverValue(),
         hints: () => {
-          const expected = this.engine.receiverVersion;
-          if (this.receivers.isRemoteDevice()) {
-            const u: Hint[] =
-              !this.engine.routes.ssh && this.receivers.isRemoteOutdated()
-                ? [{ key: "u", action: `update to v${expected ?? "latest"}` }]
-                : [];
-            const sw: Hint[] = this.receivers.canSwitchRemoteEdition() ? [{ key: "← →", action: "Selects" }] : [];
-            return [...sw, ...u];
-          }
           if (!this.receivers.localStatus?.from) return [{ key: "Enter", action: "fetch" }];
-          const u: Hint[] = this.receivers.isLocalOutdated() ? [{ key: "u", action: `update to v${expected}` }] : [];
-          return [{ key: "← →", action: "Selects" }, ...u];
+          const u: Hint[] = this.receivers.isLocalOutdated()
+            ? [{ key: "Enter / u", action: this.receivers.localUpdateHint() ? "update help" : "update" }]
+            : [];
+          return [...u, { key: "← →", action: "CPU / GPU" }];
         },
         activate: () => {
-          if (!this.receivers.isRemoteDevice() && !this.receivers.localStatus?.from) this.fetchLocalReceiver();
-          else this.step("receiver", 1);
+          if (!this.receivers.localStatus?.from) this.fetchLocalReceiver();
+          else if (this.receivers.isLocalOutdated()) this.updateLocalReceiver();
+        },
+        step: () => this.toggleLocalEdition(),
+      },
+      remoteReceiver: {
+        label: "Remote receiver",
+        cycles: true,
+        render: () => this.remoteReceiverValue(),
+        hints: () => {
+          if (this.receivers.canMaintainRemote()) return [{ key: "Enter", action: "manage over SSH" }];
+          const u: Hint[] = this.receivers.isRemoteOutdated() ? [{ key: "Enter / u", action: "update" }] : [];
+          const sw: Hint[] = this.receivers.canSwitchRemoteEdition() ? [{ key: "← →", action: "CPU / GPU" }] : [];
+          return [...u, ...sw];
+        },
+        activate: () => {
+          if (this.receivers.canMaintainRemote()) this.openReceiverSsh();
+          else if (this.receivers.isRemoteOutdated()) this.updateRemoteReceiver();
         },
         step: () => {
-          if (this.receivers.isRemoteDevice()) this.toggleRemoteEdition();
-          else this.toggleLocalEdition();
+          if (this.receivers.canSwitchRemoteEdition()) this.toggleRemoteEdition();
         },
+      },
+      receiverSshHost: {
+        label: "SSH host",
+        opens: true,
+        render: () => ({ value: this.receivers.maintenanceHost ?? "not set" }),
+        hints: () => [{ key: "Enter", action: "choose host" }],
+        activate: () => this.editReceiverSshHost(),
+      },
+      receiverSshUpdate: {
+        label: "Install / update",
+        render: () => ({ value: "Receiver binary", note: "restarts the service if updated" }),
+        hints: () => [{ key: "Enter", action: "install or update" }],
+        activate: () => this.maintainReceiver("update"),
+      },
+      receiverSshRestart: {
+        label: "Start / restart",
+        render: () => ({ value: "Receiver service", note: "keeps the installed version" }),
+        hints: () => [{ key: "Enter", action: "start or restart" }],
+        activate: () => this.maintainReceiver("restart"),
       },
       playOn: directionSpec("playOn", "Play audio on"),
       recordOn: directionSpec("recordOn", "Record audio on"),
@@ -1167,6 +1222,7 @@ export class Panel {
         : menu === "bridge"
           ? BRIDGE_IDS.filter((id) => {
               if ((id === "bridgeMode" || id === "pairing") && !this.engine.routes.ssh) return false;
+              if (id === "remoteReceiver" && !this.receivers.isRemoteDevice()) return false;
               if (isDirectionRow(id) && this.engine.routes.route !== "bridge") return false;
               return true;
             })
@@ -1258,6 +1314,9 @@ export class Panel {
         case "connect":
           view.input = input("Connect to", CONNECT_HINT, "device");
           break;
+        case "receiverSshHost":
+          view.input = input("SSH host", RECEIVER_SSH_HINT, "receiverSshHost");
+          break;
         case "secret":
           view.login = { prompt: m.label, secret: true, confirm: false, value: m.edit.value, cursor: m.edit.cursor };
           break;
@@ -1281,7 +1340,9 @@ export class Panel {
   }
 
   private tab(mode: Mode = this.mode): TabId {
-    if (mode.kind === "menu") return mode.menu === "dictation" ? "main" : mode.menu;
+    if (mode.kind === "menu") {
+      return mode.menu === "dictation" ? "main" : mode.menu === "receiverSsh" ? "bridge" : mode.menu;
+    }
     if (mode.kind === "picker") {
       return mode.picker.row === "history"
         ? "main"
@@ -1291,7 +1352,16 @@ export class Panel {
     }
     if (mode.kind === "input") {
       if (
-        ["connect", "pairAddress", "pairCode", "secret", "confirm", "dictation", "submitWord"].includes(mode.purpose)
+        [
+          "connect",
+          "receiverSshHost",
+          "pairAddress",
+          "pairCode",
+          "secret",
+          "confirm",
+          "dictation",
+          "submitWord",
+        ].includes(mode.purpose)
       ) {
         return this.tab(mode.back);
       }
@@ -1392,7 +1462,17 @@ export class Panel {
         opens: true,
       };
     }
-    return { value: "✗ Re-pair", note: pairingFault(p.reason), opens: true };
+    const fault = pairingFault(p.reason);
+    if (fault === "receiver unreachable") {
+      const forwarded = this.engine.routes.ssh && this.receivers.addressFrom() === "default";
+      return {
+        value: "✗ Receiver unreachable",
+        note: forwarded ? "check the receiver and SSH forward" : "check the receiver and address",
+        alert: true,
+        opens: true,
+      };
+    }
+    return { value: "✗ Re-pair", note: fault, opens: true };
   }
 
   private deviceValue(): Pick<PanelRow, "value" | "note" | "short" | "alert" | "opens"> {
@@ -1439,26 +1519,37 @@ export class Panel {
     return { value: "Local", note: host ? `←→ ${host} · Enter connects` : "Enter connects to Remote", opens: true };
   }
 
-  private receiverValue(): Pick<PanelRow, "value" | "note" | "short" | "alert"> {
+  private remoteReceiverValue(): Pick<PanelRow, "value" | "note" | "short" | "alert" | "opens"> {
     const e = this.engine;
-    const expected = e.receiverVersion;
-    if (this.receivers.isRemoteDevice()) {
-      if (e.remoteState === "connecting") return { value: "… checking" };
-      const ver = this.receivers.connectedVersion();
-      const ed = (this.receivers.connectedEdition() ?? "cpu").toUpperCase();
-      if (!ver) return { value: `${ed} · … checking` };
-      const label = `${ed} v${ver}`;
-      if (this.receivers.isVersionOutdated(ver) || e.remoteOutdated) {
-        return e.routes.ssh || e.remoteState !== "connected"
-          ? { value: label, note: `! update to v${expected}`, short: `! → v${expected}`, alert: true }
-          : { value: label, note: `! u updates to v${expected}`, short: `! u → v${expected}`, alert: true };
-      }
-      const rg = this.receivers.remoteGpu;
-      if (ed === "CPU" && rg?.hardware && rg.target && this.receivers.hasBinaryForTarget(rg.target)) {
-        return { value: label, note: `CUDA ${rg.cuda} ready · ←→ GPU` };
-      }
-      return { value: label };
+    if (e.remoteState === "connecting") return { value: "… checking" };
+    const ver = this.receivers.connectedVersion();
+    const ed = (this.receivers.connectedEdition() ?? "cpu").toUpperCase();
+    if (this.receivers.canMaintainRemote()) {
+      const outdated = this.receivers.isRemoteOutdated();
+      const p = this.receivers.pairing;
+      const unreachable = p && p !== "checking" && !p.ok && pairingFault(p.reason) === "receiver unreachable";
+      return {
+        value: unreachable ? "✗ unreachable" : ver ? `${ed} v${ver}` : "… checking",
+        note: outdated && !unreachable ? `! update to v${e.receiverVersion} · Manage over SSH…` : "Manage over SSH…",
+        alert: !!(outdated || unreachable),
+        opens: true,
+      };
     }
+    if (!ver) return { value: `${ed} · … checking` };
+    const label = `${ed} v${ver}`;
+    if (this.receivers.isRemoteOutdated()) {
+      return this.receivers.canManageRemote()
+        ? { value: label, note: `! Enter or u updates to v${e.receiverVersion}`, alert: true }
+        : { value: label, note: "! update on Remote machine", alert: true };
+    }
+    const rg = this.receivers.remoteGpu;
+    if (ed === "CPU" && rg && this.receivers.canSwitchRemoteEdition()) {
+      return { value: label, note: `CUDA ${rg.cuda} ready · ←→ GPU` };
+    }
+    return { value: label };
+  }
+
+  private localReceiverValue(): Pick<PanelRow, "value" | "note" | "short" | "alert"> {
     const st = this.receivers.localStatus;
     if (!st?.from) {
       const sz = this.receivers.localAssetSize();
@@ -1467,7 +1558,12 @@ export class Panel {
     const ed = (st.edition ?? this.speech.settings.localDevice).toUpperCase();
     const label = st.version ? `${ed} v${st.version}` : ed;
     if (this.receivers.isLocalOutdated()) {
-      return { value: label, note: `! u updates to v${expected}`, short: `! u → v${expected}`, alert: true };
+      const manual = this.receivers.localUpdateHint();
+      return {
+        value: label,
+        note: manual ? `! ${manual}` : `! Enter or u updates to v${this.engine.receiverVersion}`,
+        alert: true,
+      };
     }
     const lg = this.receivers.localGpu;
     if (ed === "CPU" && lg?.hardware && lg.target && this.receivers.hasBinaryForTarget(lg.target)) {
@@ -1712,7 +1808,7 @@ export class Panel {
       if (m.purpose === "speak") {
         return [{ key: "Enter", action }, ...MAIN_CHORD_HINTS.map((h) => ({ ...h, optional: true })), esc("close")];
       }
-      if (m.purpose === "connect" && m.hosts.length) {
+      if ((m.purpose === "connect" || m.purpose === "receiverSshHost") && m.hosts.length) {
         return [{ key: "Enter", action }, { key: "↑↓", action: "your ssh Hosts" }, esc("back")];
       }
       return [{ key: "Enter", action }, esc("back")];
@@ -1784,7 +1880,7 @@ export class Panel {
   }
 
   private menuHints(m: MenuMode): Hint[] {
-    const back: Hint = { key: "Esc", action: "Main" };
+    const back: Hint = { key: "Esc", action: m.menu === "receiverSsh" ? "Receivers" : "Main" };
     if (m.capture) {
       if (m.capture === "ptt") {
         return [
@@ -1932,7 +2028,11 @@ export class Panel {
         this.mode = m.back;
         if (m.purpose === "secret") m.resolve(undefined);
         if (m.purpose === "confirm") m.resolve(false);
-      } else if ((key === "up" || key === "down") && m.purpose === "connect" && m.hosts.length) {
+      } else if (
+        (key === "up" || key === "down") &&
+        (m.purpose === "connect" || m.purpose === "receiverSshHost") &&
+        m.hosts.length
+      ) {
         if (key === "up") m.next = (m.next - 1 + m.hosts.length) % m.hosts.length;
         m.edit = new LineEdit(m.hosts[m.next % m.hosts.length]);
         if (key === "down") m.next++;
@@ -1975,6 +2075,9 @@ export class Panel {
         if (m.menu === "hotkeys" && this.hotkeysChanged()) {
           this.rebind = true;
           this.close();
+        } else if (m.back) {
+          this.mode = m.back;
+          this.clearStatus();
         } else this.mode = { kind: "list" };
       }
       return;
@@ -2055,13 +2158,13 @@ export class Panel {
       this.disconnect();
       return;
     }
-    if (
-      m.kind === "menu" &&
-      m.menu === "bridge" &&
-      ch === "u" &&
-      (this.menuRows("bridge")[m.selected]?.id === "receiver" || this.menuRows("bridge")[m.selected]?.id === "device")
-    ) {
-      this.updateActiveReceiver();
+    if (m.kind === "menu" && m.menu === "bridge" && ch === "u") {
+      const id = this.menuRows("bridge")[m.selected]?.id;
+      if (id === "receiver") this.updateLocalReceiver();
+      else if (id === "remoteReceiver" && this.receivers.canMaintainRemote()) this.openReceiverSsh();
+      else if (id === "remoteReceiver" || (id === "device" && this.receivers.canManageRemote())) {
+        this.updateRemoteReceiver();
+      }
     }
   }
 
@@ -2513,6 +2616,16 @@ export class Panel {
       this.connect(m);
       return;
     }
+    if (m.purpose === "receiverSshHost") {
+      const dest = m.edit.value.trim();
+      this.receivers.setMaintenanceHost(dest);
+      this.mode = m.back;
+      this.setStatus(
+        "info",
+        dest ? `SSH maintenance host: ${dest} · bridge unchanged` : "SSH maintenance host cleared",
+      );
+      return;
+    }
     if (m.purpose === "submitWord") {
       const val = m.edit.value.trim();
       this.submitCustomActive = false;
@@ -2624,11 +2737,6 @@ export class Panel {
     this.connectHost(dest);
   }
 
-  private updateActiveReceiver(): void {
-    if (this.receivers.isRemoteDevice()) this.updateRemoteReceiver();
-    else this.updateLocalReceiver();
-  }
-
   private fetchLocalReceiver(): void {
     const target = `${process.platform}-${process.arch}`;
     this.setStatus("busy", `… fetching pi-speech-receiver (${target})`);
@@ -2641,12 +2749,7 @@ export class Panel {
   }
 
   private updateLocalReceiver(): void {
-    const expected = this.engine.receiverVersion;
-    const target =
-      this.speech.settings.localDevice === "gpu" && this.receivers.localGpu?.target
-        ? this.receivers.localGpu.target
-        : `${process.platform}-${process.arch}`;
-    this.setStatus("busy", `… updating local receiver (${target}) to v${expected}`);
+    this.setStatus("busy", `… updating local receiver to v${this.engine.receiverVersion}`);
     this.track(
       this.receivers.updateLocal().then(
         (n) => this.applyNotice(n),
@@ -2697,10 +2800,54 @@ export class Panel {
     );
   }
 
-  private remotePrompts(): RemotePrompts {
+  private openReceiverSsh(): void {
+    const back = this.home();
+    if (back.kind !== "menu" || back.menu !== "bridge") return;
+    this.mode = { kind: "menu", menu: "receiverSsh", selected: 0, back };
+    this.setStatus("info", "Manage the receiver on the Remote machine without changing the bridge");
+  }
+
+  private editReceiverSshHost(): void {
+    this.mode = {
+      kind: "input",
+      purpose: "receiverSshHost",
+      edit: new LineEdit(this.receivers.maintenanceHost ?? ""),
+      back: this.home(),
+      hosts: this.receivers.sshHosts(),
+      next: 0,
+    };
+    this.setStatus("info", "Enter the machine running the receiver, not the address of the forward");
+  }
+
+  private maintainReceiver(action: ReceiverSshAction): void {
+    if (this.receiverMaintenancePending) return;
+    const dest = this.receivers.maintenanceHost;
+    if (!dest) {
+      this.editReceiverSshHost();
+      return;
+    }
+    const home = this.home();
+    const active = () => !this.disposed && this.home() === home;
+    const report = (notice: ReceiverNotice) => {
+      if (active()) this.applyNotice(notice);
+      else this.engine.notify(notice.text, notice.tone === "success" ? "info" : notice.tone);
+    };
+    this.receiverMaintenancePending = true;
+    this.setStatus("busy", `… connecting to ${dest}`);
+    this.track(
+      this.receivers
+        .maintainRemote(action, this.remotePrompts(active))
+        .then(report, (err) => report({ tone: "error", text: `✗ ${errorMessage(err)}` }))
+        .finally(() => {
+          this.receiverMaintenancePending = false;
+        }),
+    );
+  }
+
+  private remotePrompts(active = () => !this.disposed): RemotePrompts {
     const ask = <T>(make: (resolve: (v: T) => void, back: Mode) => Mode, none: T) =>
       new Promise<T>((resolve) => {
-        if (this.disposed) return resolve(none);
+        if (!active()) return resolve(none);
         this.pendingPrompt = () => resolve(none);
         this.mode = make((v) => {
           this.pendingPrompt = undefined;
@@ -2709,7 +2856,9 @@ export class Panel {
         this.changed();
       });
     return {
-      progress: (text) => this.setStatus("busy", text),
+      progress: (text) => {
+        if (active()) this.setStatus("busy", text);
+      },
       password: (who) =>
         ask<string | undefined>(
           (resolve, back) => ({
@@ -3068,7 +3217,8 @@ export class Panel {
     this.track(this.receivers.probePairing());
     this.pairTimer = setInterval(() => {
       const home = this.home();
-      if (this.disposed || home.kind !== "menu" || home.menu !== "bridge") this.stopPairing();
+      if (this.disposed || home.kind !== "menu" || (home.menu !== "bridge" && home.menu !== "receiverSsh"))
+        this.stopPairing();
       else this.track(this.receivers.probePairing());
     }, this.deps.pairingMs ?? 2000);
     this.pairTimer.unref?.();

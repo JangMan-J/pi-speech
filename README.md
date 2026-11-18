@@ -28,6 +28,7 @@ Talk to Pi hands-free with push-to-talk and local models, even over SSH, and hea
 
 - **Pi on a server, audio on your laptop**: Connect with `pi-speech-receiver ssh <server>` (binaries are on the [releases page](https://github.com/JangMan-J/pi-speech/releases)). Pi stays on the remote host while your laptop handles the microphone and speakers, so dictation, push-to-talk, and read-aloud work over SSH without forwarding audio daemons.
 - **Offload heavy models**: Pair a desktop or GPU host from `/speech` to run local models on another machine while keeping audio on your laptop.
+- **Manage a forwarded receiver**: Open `/speech` → **Receivers** → **Remote receiver** → **Manage over SSH**. Enter the SSH host of the machine running the receiver, not the address of the forward. Then choose **Install / update** or **Start / restart**. Pi asks for SSH authentication and confirmation in the panel. This manages the Linux `pi-speech-receiver` systemd user service without changing the bridge address, pairing, or audio routes.
 
 ## Live mid-turn narration and spoken summaries
 

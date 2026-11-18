@@ -195,14 +195,11 @@ function privateDir(env: NodeJS.ProcessEnv): string {
   throw new RemoteError("cannot make a private directory for the SSH connection");
 }
 
-/**
- * Connect to `dest` and lease its receiver; see the module comment. Throws a RemoteError that says what failed
- * (in ssh's words where it gave any).
- */
-export async function connectRemote(dest: string, prompts: RemotePrompts, opts: ConnectOptions): Promise<RemoteLink> {
+/** Authenticate a private connection shared by the receiver connection and maintenance flows. */
+async function openSsh(dest: string, prompts: RemotePrompts, opts: ConnectOptions, maintenance = false) {
   if (process.platform === "win32") {
     throw new RemoteError(
-      "Connect over SSH needs OpenSSH with ControlMaster, which Windows lacks: pair by address instead",
+      "Receiver SSH needs OpenSSH with ControlMaster, which Windows lacks: pair by address instead",
     );
   }
   if (!dest.trim() || /^-/.test(dest.trim())) throw new RemoteError("name the machine: a Host or user@host");
@@ -215,15 +212,22 @@ export async function connectRemote(dest: string, prompts: RemotePrompts, opts: 
   const host = field("hostname") ?? dest;
   const port = field("port") ?? "22";
   const user = field("user");
-  const who = user ? `${user}@${host}` : host;
+  const effectiveHost = port === "22" ? host : `${host.includes(":") ? `[${host}]` : host}:${port}`;
+  const who = user ? `${user}@${effectiveHost}` : effectiveHost;
 
   const dir = privateDir(env);
   const sock = join(dir, "cm");
-  const via = ["-S", sock, "-o", "ControlMaster=no"];
-  let lease: ChildProcess | undefined;
-  const cleanup = async () => {
-    lease?.stdin?.end();
-    lease?.kill();
+  const transport = maintenance ? ["-T", "-o", "ClearAllForwardings=yes"] : [];
+  // With no control socket, maintenance commands must fail, not open a new SSH session.
+  const via = [
+    "-S",
+    sock,
+    "-o",
+    "ControlMaster=no",
+    ...transport,
+    ...(maintenance ? ["-o", "ProxyCommand=false"] : []),
+  ];
+  const close = async () => {
     await run(["-S", sock, "-O", "exit", "--", dest], env).catch(() => {});
     rmSync(dir, { recursive: true, force: true });
   };
@@ -240,6 +244,7 @@ export async function connectRemote(dest: string, prompts: RemotePrompts, opts: 
           "-o",
           `ConnectTimeout=${CONNECT_TIMEOUT_S}`,
           "-N",
+          ...transport,
           ...extra,
           "--",
           dest,
@@ -292,9 +297,27 @@ export async function connectRemote(dest: string, prompts: RemotePrompts, opts: 
     if (m.code !== 0) throw new RemoteError(`not connected to ${dest}: ${sshWhy(m.stderr)}`);
     opts.signal?.throwIfAborted();
 
-    // ── The receiver there ───────────────────────────────────────────────
     const sh = (script: string, input?: string | NodeJS.ReadableStream) =>
       run([...via, "--", dest, `sh -c ${shQuote(script)}`], env, input);
+    return { dest, who, env, sock, via, sh, close };
+  } catch (err) {
+    await close();
+    throw err;
+  }
+}
+
+/** Connect to `dest`, lease its receiver, and open the audio bridge. */
+export async function connectRemote(dest: string, prompts: RemotePrompts, opts: ConnectOptions): Promise<RemoteLink> {
+  const ssh = await openSsh(dest, prompts, opts);
+  dest = ssh.dest;
+  const { sh, env, sock, via } = ssh;
+  let lease: ChildProcess | undefined;
+  const cleanup = async () => {
+    lease?.stdin?.end();
+    lease?.kill();
+    await ssh.close();
+  };
+  try {
     const find = await sh(
       `command -v ${RECEIVER} 2>/dev/null || { p="$HOME/.local/bin/${RECEIVER}"; [ -x "$p" ] && echo "$p"; }; echo "uname: $(uname -sm)"`,
     );
@@ -370,16 +393,7 @@ export async function connectRemote(dest: string, prompts: RemotePrompts, opts: 
             `… ${plan.action === "update" ? "updating" : "installing"} pi-speech-receiver on ${dest} (${mb} MB)`,
           );
           const home = `$HOME/.local/lib/${RECEIVER}`;
-          for (const file of files) {
-            const name = basename(file);
-            const mode = file === binary ? 755 : 644;
-            const put = await sh(
-              `mkdir -p "${home}" && cat > "${home}/${name}.new" && chmod ${mode} "${home}/${name}.new" && mv -f "${home}/${name}.new" "${home}/${name}"`,
-              createReadStream(file),
-            );
-            if (put.code !== 0)
-              throw new RemoteError(`cannot install pi-speech-receiver on ${dest}: ${sshWhy(put.stderr)}`);
-          }
+          await transferReceiver(sh, binary, `"${home}"`);
           const target = `$HOME/.local/bin/${RECEIVER}`;
           const link = await sh(
             `mkdir -p "$HOME/.local/bin" && ln -sf "${home}/${basename(binary)}" "${target}" && echo "${target}"`,
@@ -483,6 +497,306 @@ export async function connectRemote(dest: string, prompts: RemotePrompts, opts: 
   } catch (err) {
     await cleanup();
     throw err;
+  }
+}
+
+type Ssh = Awaited<ReturnType<typeof openSsh>>;
+
+/** `dir` is a shell-quoted path or a trusted shell expansion. Transfer libraries before the executable. */
+async function transferReceiver(sh: Ssh["sh"], binary: string, dir: string): Promise<void> {
+  for (const file of [...libraries(binary), binary]) {
+    const path = `${dir}/${shQuote(basename(file))}`;
+    const temp = `${path}.new`;
+    const mode = file === binary ? 755 : 644;
+    const r = await sh(
+      `mkdir -p ${dir} && cat > ${temp} && chmod ${mode} ${temp} && mv -f ${temp} ${path}`,
+      createReadStream(file),
+    );
+    if (r.code !== 0) throw new RemoteError(`cannot transfer ${basename(file)}: ${sshWhy(r.stderr)}`);
+  }
+}
+
+const RECEIVER_UNIT = `${RECEIVER}.service`;
+const unitProperty = [
+  "Id",
+  "LoadState",
+  "ActiveState",
+  "Type",
+  "User",
+  "MainPID",
+  "ExecStart",
+  "ExecStartPre",
+  "ExecStartPost",
+  "ExecStop",
+  "ExecStopPost",
+];
+const userSystemctl = `systemctl --user`;
+
+function serverCommand(command: string | undefined, expectedPath: string): boolean {
+  const match = /^\{ path=(.+?) ; argv\[\]=(.*?) ; [^{}]*\}$/.exec(command ?? "");
+  if (match?.[1] !== expectedPath || !match[2].startsWith(expectedPath)) return false;
+  const args = match[2].slice(expectedPath.length);
+  if (args && !args.startsWith(" ")) return false;
+  return /^(?:serve(?: |$))?(?:(?:--network|--(?:listen|token-file)(?:=| )[\w./:[\]%-]+)(?: |$))*$/.test(args.trim());
+}
+
+/** Interpret systemctl's effective unit, never shell-evaluating its reported command. */
+export function readReceiverService(output: string, path: string) {
+  const fields = Object.fromEntries(
+    output
+      .trim()
+      .split(/\r?\n/)
+      .map((line) => line.split(/=(.*)/s).slice(0, 2)),
+  );
+  if (fields.Id !== RECEIVER_UNIT || !fields.LoadState) {
+    throw new RemoteError("cannot identify the systemd user receiver service");
+  }
+  if (fields.LoadState === "not-found") return { exists: false, active: false, pid: 0 };
+  if (
+    fields.LoadState !== "loaded" ||
+    !["simple", "exec"].includes(fields.Type ?? "") ||
+    fields.User ||
+    fields.ExecStartPre ||
+    fields.ExecStartPost ||
+    fields.ExecStop ||
+    fields.ExecStopPost ||
+    !serverCommand(fields.ExecStart, path)
+  ) {
+    throw new RemoteError(`refusing to change ${RECEIVER_UNIT}: expected a user service that runs ${path} directly`);
+  }
+  if (!["active", "inactive", "failed"].includes(fields.ActiveState ?? "")) {
+    throw new RemoteError(`${RECEIVER_UNIT} is ${fields.ActiveState ?? "changing state"}; try again when it settles`);
+  }
+  const active = fields.ActiveState === "active";
+  const pid = Number(fields.MainPID);
+  if (active && (!Number.isSafeInteger(pid) || pid < 1)) throw new RemoteError("cannot identify the running receiver");
+  return { exists: true, active, pid, command: fields.ExecStart };
+}
+
+async function receiverService(sh: Ssh["sh"], path: string) {
+  const report = await sh(`${userSystemctl} show ${RECEIVER_UNIT} ${unitProperty.map((p) => `-p ${p}`).join(" ")}`);
+  if (report.code !== 0)
+    throw new RemoteError(`cannot inspect the systemd user receiver service: ${sshWhy(report.stderr)}`);
+  return readReceiverService(report.stdout, path);
+}
+
+async function receiverVersion(sh: Ssh["sh"], path: string): Promise<string | undefined> {
+  const r = await sh(`${shQuote(path)} --version`);
+  return r.code === 0 ? parseReceiverVersion(r.stdout) : undefined;
+}
+
+async function runningReceiverVersion(sh: Ssh["sh"], pid: number, home: string, path: string) {
+  const proc = `/proc/${pid}/exe`;
+  const r = await sh(`readlink ${proc} && readlink -f ${shQuote(path)}`);
+  const [live, disk] = r.stdout.trim().split(/\r?\n/);
+  const exe = live?.replace(/ \(deleted\)$/, "");
+  const lib = `${home}/.local/lib/${RECEIVER}`;
+  const suffix = exe?.startsWith(`${lib}.`) ? exe.slice(lib.length + 1) : "";
+  if (
+    !exe ||
+    (exe !== disk && exe !== path && exe !== `${lib}/${RECEIVER}` && !/^[a-z0-9]{6}\/pi-speech-receiver$/i.test(suffix))
+  ) {
+    throw new RemoteError("the running service does not point to the expected receiver executable");
+  }
+  return receiverVersion(sh, proc);
+}
+
+/** A host CUDA probe is not the installed edition: inspect the installed provider for its CUDA major. */
+async function receiverTarget(sh: Ssh["sh"], path: string, platform: string): Promise<string> {
+  const gpu = await sh(`${shQuote(path)} gpu`);
+  let info: { edition?: string; why?: string } | undefined;
+  try {
+    if (gpu.code === 0) info = JSON.parse(gpu.stdout);
+  } catch {
+    /* diagnosed below */
+  }
+  if (info?.edition === "cpu" || info?.why === "this build of pi-speech-receiver runs models on the CPU only")
+    return platform;
+  if (info?.edition === "gpu") {
+    const deps = await sh(
+      `dir=$(dirname "$(readlink -f ${shQuote(path)})") && readelf -d "$dir/libonnxruntime_providers_cuda.so"`,
+    );
+    const majors = new Set(Array.from(deps.stdout.matchAll(/\[libcudart\.so\.(12|13)(?:\.\d+)*\]/g), (m) => m[1]));
+    if (deps.code === 0 && majors.size === 1) return `${platform}-cuda${[...majors][0]}`;
+  }
+  throw new RemoteError("cannot verify the installed receiver edition; refusing to switch it during an update");
+}
+
+const STARTUP_UNIT = `[Unit]
+Description=Pi Speech receiver
+After=pipewire.service pipewire-pulse.service
+
+[Service]
+ExecStart="%h/.local/bin/${RECEIVER}" serve --listen 127.0.0.1:47613
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+`;
+
+/** Maintain the user service over SSH without taking a lease or changing the existing bridge. */
+export async function manageRemoteReceiver(
+  dest: string,
+  action: "update" | "restart",
+  prompts: RemotePrompts,
+  opts: ConnectOptions,
+): Promise<{ action: "installed" | "updated" | "restarted" | "current" | "cancelled"; version?: string }> {
+  const { sh, who, close } = await openSsh(dest, prompts, opts, true);
+  const checked = async (script: string, why: string, input?: string) => {
+    const r = await sh(script, input);
+    if (r.code !== 0) throw new RemoteError(`${why} on ${who}: ${sshWhy(r.stderr)}`);
+    return r.stdout.trim();
+  };
+  try {
+    const [system, home] = (await checked(`uname -sm && printf '%s\\n' "$HOME"`, "cannot identify the SSH host")).split(
+      /\r?\n/,
+    );
+    const platform = platformOf(system ?? "");
+    if (!platform?.startsWith("linux-") || !home?.startsWith("/")) {
+      throw new RemoteError("Manage over SSH supports Linux receiver hosts with a systemd user service");
+    }
+    const path = `${home}/.local/bin/${RECEIVER}`;
+    const qPath = shQuote(path);
+    const unit = await receiverService(sh, path);
+    const onDisk = (await sh(`test -x ${qPath}`)).code === 0;
+    if (unit.active && !onDisk)
+      throw new RemoteError(`the running service on ${who} has no installed executable to verify`);
+    const diskVersion = onDisk ? await receiverVersion(sh, path) : undefined;
+    const runningVersion = unit.active ? await runningReceiverVersion(sh, unit.pid, home, path) : undefined;
+    const verifyUnchanged = async () => {
+      const now = await receiverService(sh, path);
+      if (
+        now.exists !== unit.exists ||
+        now.command !== unit.command ||
+        now.active !== unit.active ||
+        now.pid !== unit.pid
+      ) {
+        throw new RemoteError("the receiver service changed while waiting; reopen Manage over SSH and try again");
+      }
+    };
+    const restart = async (expected?: string) => {
+      prompts.progress(`… ${unit.active ? "restarting" : "starting"} the receiver on ${who}`);
+      await checked(`${userSystemctl} restart ${RECEIVER_UNIT}`, "cannot start the receiver service");
+      const state = await receiverService(sh, path);
+      const version = state.active ? await runningReceiverVersion(sh, state.pid, home, path) : undefined;
+      if (!version || (expected && version !== expected))
+        throw new RemoteError(`the receiver service on ${who} did not start${expected ? ` at v${expected}` : ""}`);
+      return version;
+    };
+
+    if (
+      action === "restart" ||
+      (unit.exists && diskVersion && opts.version && !isReceiverOutdated(diskVersion, opts.version))
+    ) {
+      if (!unit.exists) throw new RemoteError(`no receiver service on ${who}; use Install / update first`);
+      if (!onDisk) throw new RemoteError(`the service on ${who} has no executable; use Install / update first`);
+      if (action === "update" && runningVersion && runningVersion === diskVersion)
+        return { action: "current", version: diskVersion };
+      if (
+        !(await prompts.confirm(
+          `${unit.active ? "Restart" : "Start"} ${RECEIVER_UNIT} on ${who}${diskVersion ? ` (v${diskVersion})` : ""}?`,
+        ))
+      )
+        return { action: "cancelled" };
+      await verifyUnchanged();
+      return { action: "restarted", version: await restart(diskVersion) };
+    }
+    if (!opts.version) throw new RemoteError("this extension does not know its receiver release version");
+    const target = onDisk ? await receiverTarget(sh, path, platform) : platform;
+    if (opts.hasBinaryFor && !opts.hasBinaryFor(target))
+      throw new RemoteError(`no v${opts.version} release archive for ${target}`);
+    if (
+      !(await prompts.confirm(
+        `${unit.exists ? "Update and restart" : "Install and start"} ${RECEIVER_UNIT} on ${who} (v${opts.version}, ${target})?`,
+      ))
+    )
+      return { action: "cancelled" };
+    opts.signal?.throwIfAborted();
+    prompts.progress(`… fetching the ${target} receiver`);
+    const binary = await opts.binaryFor(target);
+    if (!binary) throw new RemoteError(`no v${opts.version} release archive for ${target}`);
+    if (basename(binary) !== RECEIVER) throw new RemoteError("the release archive does not contain pi-speech-receiver");
+    const stage = await checked(
+      `mkdir -p "$HOME/.local/lib" && mktemp -d "$HOME/.local/lib/${RECEIVER}.XXXXXX"`,
+      "cannot stage the receiver",
+    );
+    const stagePrefix = `${home}/.local/lib/${RECEIVER}.`;
+    if (!stage.startsWith(stagePrefix) || !/^[a-z0-9]{6}$/i.test(stage.slice(stagePrefix.length))) {
+      throw new RemoteError("SSH did not return a valid receiver staging directory");
+    }
+    const qStage = shQuote(stage);
+    const before = `${qStage}/previous`;
+    const next = `${qStage}/${RECEIVER}`;
+    const unitFile = `"\${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/${RECEIVER_UNIT}"`;
+    let changed = false;
+    let createdUnit = false;
+    let keep = false;
+    try {
+      prompts.progress(`… transferring the receiver to ${who}`);
+      await transferReceiver(sh, binary, qStage);
+      if (
+        (await receiverVersion(sh, `${stage}/${RECEIVER}`)) !== opts.version ||
+        (await receiverTarget(sh, `${stage}/${RECEIVER}`, platform)) !== target
+      ) {
+        throw new RemoteError(`the downloaded receiver on ${who} is not v${opts.version} (${target})`);
+      }
+      await verifyUnchanged();
+      opts.signal?.throwIfAborted();
+      // Save the old link or regular file and atomically switch the launch path after verifying the full bundle.
+      await checked(
+        `set -e; mkdir -p "$HOME/.local/bin"; if [ -e ${qPath} ] || [ -L ${qPath} ]; then cp -a ${qPath} ${before}; fi; ln -s ${next} ${qStage}/next; mv -Tf ${qStage}/next ${qPath}`,
+        "cannot install the receiver",
+      );
+      changed = true;
+      if (!unit.exists) {
+        await checked(
+          `set -e; mkdir -p "\${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"; cat > ${qStage}/unit; (set -C; cat ${qStage}/unit > ${unitFile})`,
+          "cannot create the receiver service",
+          STARTUP_UNIT,
+        );
+        createdUnit = true;
+        await checked(`${userSystemctl} daemon-reload`, "cannot load the receiver service");
+      }
+      const version = await restart(opts.version);
+      if (createdUnit) await checked(`${userSystemctl} enable ${RECEIVER_UNIT}`, "cannot enable the receiver service");
+      keep = true;
+      await sh(`rm -f ${before} ${qStage}/unit`).catch(() => {});
+      return { action: unit.exists ? "updated" : "installed", version };
+    } catch (err) {
+      if (changed) {
+        // If SSH is lost during rollback, keep the staged files rather than deleting a possibly live binary.
+        keep = true;
+        const rollback = await sh(
+          [
+            "set -e",
+            ...(createdUnit
+              ? [
+                  `${userSystemctl} disable --now ${RECEIVER_UNIT}`,
+                  `rm -f ${unitFile}`,
+                  `${userSystemctl} daemon-reload`,
+                ]
+              : unit.exists && !unit.active
+                ? [`${userSystemctl} stop ${RECEIVER_UNIT}`]
+                : []),
+            `if [ -e ${before} ] || [ -L ${before} ]; then mv -Tf ${before} ${qPath}; else rm -f ${qPath}; fi`,
+            ...(unit.active ? [`${userSystemctl} restart ${RECEIVER_UNIT}`] : []),
+          ].join("; "),
+        ).catch(() => undefined);
+        if (rollback?.code === 0) keep = false;
+        else
+          throw new RemoteError(
+            `${err instanceof Error ? err.message : err}; rollback could not be verified on ${who}`,
+          );
+      }
+      throw err;
+    } finally {
+      if (!keep) {
+        // If the install's response was lost, don't remove a bundle that became the launch target.
+        await sh(`if [ "$(readlink ${qPath})" != ${next} ]; then rm -rf ${qStage}; fi`).catch(() => {});
+      }
+    }
+  } finally {
+    await close();
   }
 }
 
