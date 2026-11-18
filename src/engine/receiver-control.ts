@@ -5,6 +5,7 @@
 
 import { type BridgeHealth, type BridgeProbe, bridgeTarget, displayUrl, PairingError } from "../bridge/client";
 import {
+  BINARY_ENV,
   ensureBinary,
   ensureBinaryFor,
   findBinary,
@@ -312,9 +313,18 @@ export class ReceiverControl {
     if (!target || !(await ensureBinaryFor(target, this.host.env, { releaseOnly: true }))) {
       throw new Error(`no release archive for ${target ?? "the selected receiver"}`);
     }
-    this.host.speech.local.close();
+    this.host.speech.closeWorkers();
     await this.refreshLocal(true);
-    return { tone: "success", text: `✓ Updated local receiver to v${expected}` };
+    if (!isReceiverOutdated(this.localStatus?.version, expected)) {
+      return { tone: "success", text: `✓ Updated local receiver to v${expected}` };
+    }
+    const path = this.localStatus?.path;
+    const from = this.localStatus?.from;
+    const where = path ? `${path}${from ? ` (${from})` : ""}` : (from ?? "an unknown binary");
+    return {
+      tone: "warning",
+      text: `! Receiver ${this.localStatus?.version ?? "old"} is still in use at ${where} (expected ${expected})`,
+    };
   }
 
   async switchLocalEdition(prompts: RemotePrompts): Promise<ReceiverNotice> {

@@ -4,8 +4,9 @@
  * Every system's binary is packed in this package under `bin/<platform>-<arch>/`; the one for this machine is
  * picked at runtime. Found, in order:
  *   1. `PI_SPEECH_BINARY`: an explicit path (or a name looked up on PATH); when set it must be an executable.
- *   2. The packaged location: `bin/<platform>-<arch>/`, then `bin/` in this package.
- *   3. In a checkout: `receiver/target/release`, then `receiver/target/debug`.
+ *   2. The cached release for the expected version: `<cache>/<version>/<platform>-<arch>/`.
+ *   3. The packaged location: `bin/<platform>-<arch>/`, then `bin/` in this package.
+ *   4. In a checkout: `receiver/target/release`, then `receiver/target/debug`.
  */
 
 import { execFile } from "node:child_process";
@@ -155,26 +156,26 @@ export function findBinary(env: Env, opts: BinaryOptions = {}): BinaryChoice {
   const version = readReceiverManifest(root)?.version ?? packageVersion(root);
   const cacheBase = opts.cacheDir ?? receiverCacheDir(env, platform);
   if (opts.device === "gpu") {
-    if (opts.gpuTarget) {
-      const pkgGpu = at(join(root, "bin", opts.gpuTarget, file));
-      if (pkgGpu) return { ok: true, path: pkgGpu, from: "package", edition: "gpu" };
-    }
     if (version) {
       const cachedGpu = findCachedGpu(cacheBase, version, target, file, opts.gpuTarget, at);
       if (cachedGpu) return { ok: true, path: cachedGpu, from: "cache", edition: "gpu" };
+    }
+    if (opts.gpuTarget) {
+      const pkgGpu = at(join(root, "bin", opts.gpuTarget, file));
+      if (pkgGpu) return { ok: true, path: pkgGpu, from: "package", edition: "gpu" };
     }
     if (platform === process.platform && arch === process.arch) {
       const checkoutGpu = findCheckoutGpu(root, file, at);
       if (checkoutGpu) return { ok: true, path: checkoutGpu, from: "checkout", edition: "gpu" };
     }
   }
-  for (const p of [join(root, "bin", target, file), join(root, "bin", file)]) {
-    const path = at(p);
-    if (path) return { ok: true, path, from: "package", edition: "cpu" };
-  }
   if (version) {
     const cached = at(join(cacheBase, version, target, file));
     if (cached) return { ok: true, path: cached, from: "cache", edition: "cpu" };
+  }
+  for (const p of [join(root, "bin", target, file), join(root, "bin", file)]) {
+    const path = at(p);
+    if (path) return { ok: true, path, from: "package", edition: "cpu" };
   }
   for (const profile of ["release", "debug"]) {
     const path = at(join(root, "receiver", "target", profile, file));
@@ -283,6 +284,11 @@ export interface EnsureBinaryOptions extends BinaryOptions {
   fetchFn?: typeof fetch;
   /** For an explicit update, require the versioned release rather than reusing a checkout build. */
   releaseOnly?: boolean;
+  /**
+   * Install `<cache>/<manifest.version>/<target>/` even when another binary (package, checkout, or an
+   * older cache entry) is already on disk. A cache file for that version is reused; it is not downloaded again.
+   */
+  force?: boolean;
 }
 
 /** Ensure the receiver binary for `target` is present on disk, downloading from GitHub Releases if needed. */
@@ -292,11 +298,11 @@ export async function ensureBinaryFor(
   opts: EnsureBinaryOptions = {},
 ): Promise<string | undefined> {
   const root = opts.root ?? ROOT;
-  if (!opts.releaseOnly) {
+  if (!opts.releaseOnly && !opts.force) {
     const existing = binaryFor(target, env, root, opts.cacheDir);
     if (existing) return existing;
   }
-  if (target === `${process.platform}-${process.arch}` && env[BINARY_ENV]) return undefined;
+  if (!opts.force && target === `${process.platform}-${process.arch}` && env[BINARY_ENV]) return undefined;
 
   const manifest = opts.manifest ?? readReceiverManifest(root);
   const asset = manifest?.assets[target];
@@ -402,30 +408,57 @@ export interface LocalBinaryStatus {
   version?: string;
   edition: "cpu" | "gpu";
   from?: Extract<BinaryChoice, { ok: true }>["from"];
+  /** Absolute path of the binary `findBinary` chose. */
+  path?: string;
 }
 
-/** Inspect the local receiver binary on disk, optionally running `--version` when not from cache/package. */
-export async function inspectLocalBinary(
-  env: Env,
-  opts: { device: "cpu" | "gpu"; gpuTarget?: string; probeVersion?: boolean },
-): Promise<LocalBinaryStatus> {
+export interface InspectLocalBinaryOptions {
+  device: "cpu" | "gpu";
+  gpuTarget?: string;
+  /** Run `--version`. Package and cache fall back to the expected version when this is off or the probe fails. */
+  probeVersion?: boolean;
+  root?: string;
+  cacheDir?: string;
+  platform?: NodeJS.Platform;
+  arch?: string;
+  /** Run the binary (tests inject this). Resolves to stdout, or undefined when the probe fails. */
+  exec?: (file: string, args: readonly string[]) => Promise<string | undefined>;
+}
+
+function execVersion(file: string): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    execFile(file, ["--version"], { timeout: 2000 }, (err, stdout) => {
+      resolve(err ? undefined : String(stdout));
+    });
+  });
+}
+
+/** Inspect the local receiver binary on disk, probing `--version` for every source when asked. */
+export async function inspectLocalBinary(env: Env, opts: InspectLocalBinaryOptions): Promise<LocalBinaryStatus> {
   const choice = findBinary(env, {
     device: opts.device,
     ...(opts.gpuTarget ? { gpuTarget: opts.gpuTarget } : {}),
+    ...(opts.root ? { root: opts.root } : {}),
+    ...(opts.cacheDir ? { cacheDir: opts.cacheDir } : {}),
+    ...(opts.platform ? { platform: opts.platform } : {}),
+    ...(opts.arch ? { arch: opts.arch } : {}),
   });
   if (!choice.ok) return { edition: opts.device };
-  let version = choice.from === "cache" || choice.from === "package" ? expectedReceiverVersion() : undefined;
-  if (!version && opts.probeVersion) {
-    version = await new Promise<string | undefined>((resolve) => {
-      execFile(choice.path, ["--version"], { timeout: 2000 }, (err, stdout) => {
-        resolve(err ? undefined : parseReceiverVersion(String(stdout)));
-      });
-    });
+  const assumed = choice.from === "cache" || choice.from === "package" ? expectedReceiverVersion(opts.root) : undefined;
+  let version = assumed;
+  if (opts.probeVersion) {
+    try {
+      const output = await (opts.exec ?? execVersion)(choice.path, ["--version"]);
+      version = (output === undefined ? undefined : parseReceiverVersion(output)) ?? assumed;
+    } catch {
+      version = assumed;
+    }
   }
   return {
     ...(version ? { version } : {}),
     edition: choice.edition ?? opts.device,
     from: choice.from,
+    path: choice.path,
   };
 }
 

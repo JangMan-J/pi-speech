@@ -2,7 +2,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { archiveFile, binaryFile, bundleBinaries, createReleaseAssets, TARGETS } from "../../npm/platforms.mjs";
 import {
   binaryFor,
@@ -12,6 +12,7 @@ import {
   extractTarGz,
   findBinary,
   hasBinaryFor,
+  inspectLocalBinary,
   isReceiverOutdated,
   packageVersion,
   parseReceiverVersion,
@@ -88,6 +89,104 @@ describe.skipIf(onWindows)("finding the bundled binary", () => {
       reason: `PI_SPEECH_BINARY (${join(dir, "missing")}) is not an executable`,
       chosen: true,
     });
+  });
+
+  it("prefers a cached binary of the expected version over the package and checkout builds", () => {
+    const root = join(dir, "root");
+    mkdirSync(root, { recursive: true });
+    writeFileSync(
+      join(root, "receivers.json"),
+      JSON.stringify({ version: "0.2.7", repo: "JangMan-J/pi-speech", tag: "v0.2.7", assets: {} }),
+    );
+    exe("root", "receiver", "target", "release", "pi-speech-receiver");
+    exe("root", "bin", "linux-x64", "pi-speech-receiver");
+    const cached = exe("cache", "0.2.7", "linux-x64", "pi-speech-receiver");
+    expect(findBinary({}, opts({ cacheDir: join(dir, "cache") }))).toEqual({
+      ok: true,
+      path: cached,
+      from: "cache",
+      edition: "cpu",
+    });
+  });
+
+  it("probes --version for a packaged or cached binary when asked, else assumes the expected version", async () => {
+    const root = join(dir, "root");
+    mkdirSync(root, { recursive: true });
+    writeFileSync(
+      join(root, "receivers.json"),
+      JSON.stringify({ version: "0.2.7", repo: "JangMan-J/pi-speech", tag: "v0.2.7", assets: {} }),
+    );
+    const packaged = exe("root", "bin", "linux-x64", "pi-speech-receiver");
+    const look = {
+      device: "cpu" as const,
+      root,
+      cacheDir: join(dir, "cache"),
+      platform: "linux" as const,
+      arch: "x64",
+    };
+    const exec = vi.fn(async (): Promise<string | undefined> => "pi-speech-receiver 0.2.5\n");
+    await expect(inspectLocalBinary({}, { ...look, probeVersion: true, exec })).resolves.toMatchObject({
+      version: "0.2.5",
+      from: "package",
+      path: packaged,
+      edition: "cpu",
+    });
+    expect(exec).toHaveBeenCalledWith(packaged, ["--version"]);
+
+    exec.mockClear();
+    await expect(inspectLocalBinary({}, { ...look, exec })).resolves.toMatchObject({
+      version: "0.2.7",
+      from: "package",
+      path: packaged,
+    });
+    expect(exec).not.toHaveBeenCalled();
+
+    exec.mockResolvedValue(undefined);
+    await expect(inspectLocalBinary({}, { ...look, probeVersion: true, exec })).resolves.toMatchObject({
+      version: "0.2.7",
+      from: "package",
+    });
+
+    const cached = exe("cache", "0.2.7", "linux-x64", "pi-speech-receiver");
+    exec.mockResolvedValue("pi-speech-receiver 0.2.4\n");
+    await expect(inspectLocalBinary({}, { ...look, probeVersion: true, exec })).resolves.toMatchObject({
+      version: "0.2.4",
+      from: "cache",
+      path: cached,
+    });
+
+    exec.mockRejectedValue(new Error("probe failed"));
+    await expect(inspectLocalBinary({}, { ...look, probeVersion: true, exec })).resolves.toMatchObject({
+      version: "0.2.7",
+      from: "cache",
+    });
+  });
+
+  it("does not invent a version for an env or checkout binary whose probe fails", async () => {
+    const root = join(dir, "root");
+    mkdirSync(root, { recursive: true });
+    writeFileSync(
+      join(root, "receivers.json"),
+      JSON.stringify({ version: "0.2.7", repo: "JangMan-J/pi-speech", tag: "v0.2.7", assets: {} }),
+    );
+    const checkout = exe("root", "receiver", "target", "release", "pi-speech-receiver");
+    const look = {
+      device: "cpu" as const,
+      root,
+      cacheDir: join(dir, "empty-cache"),
+      platform: "linux" as const,
+      arch: "x64",
+      probeVersion: true,
+    };
+    await expect(inspectLocalBinary({}, { ...look, exec: async () => undefined })).resolves.toEqual({
+      edition: "cpu",
+      from: "checkout",
+      path: checkout,
+    });
+    const custom = exe("elsewhere", "my-receiver");
+    await expect(
+      inspectLocalBinary({ PI_SPEECH_BINARY: custom }, { ...look, exec: async () => "pi-speech-receiver 0.2.5\n" }),
+    ).resolves.toMatchObject({ version: "0.2.5", from: "env", path: custom });
   });
 
   it("says how to get one when there is none", () => {
@@ -304,5 +403,67 @@ describe("in this checkout", () => {
     expect(isReceiverOutdated("0.3.0", "0.2.5")).toBe(true);
     expect(isReceiverOutdated(undefined, "0.2.5")).toBe(false);
     expect(isReceiverOutdated("0.2.4", undefined)).toBe(false);
+  });
+});
+
+describe.skipIf(onWindows)("forcing a receiver install", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "pi-speech-force-"));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("downloads the expected version instead of reusing a stale package or checkout binary", async () => {
+    const target = `${process.platform}-${process.arch}`;
+    const binaries = join(dir, "binaries");
+    for (const { target: name } of TARGETS) {
+      const file = binaryFile(name);
+      const p = join(binaries, name, file);
+      mkdirSync(join(p, ".."), { recursive: true });
+      writeFileSync(p, `#!/bin/sh\necho ${name}\n`);
+      chmodSync(p, 0o755);
+    }
+    const root = join(dir, "pkg");
+    const assetsDir = join(dir, "assets");
+    mkdirSync(root, { recursive: true });
+    createReleaseAssets({
+      binariesDir: binaries,
+      assetsDir,
+      manifestPath: join(root, "receivers.json"),
+      version: "0.2.7",
+    });
+    const file = binaryFile(target);
+    const stalePkg = join(root, "bin", target, file);
+    mkdirSync(join(stalePkg, ".."), { recursive: true });
+    writeFileSync(stalePkg, "#!/bin/sh\necho old\n");
+    chmodSync(stalePkg, 0o755);
+    const staleCheckout = join(root, "receiver", "target", "release", file);
+    mkdirSync(join(staleCheckout, ".."), { recursive: true });
+    writeFileSync(staleCheckout, "#!/bin/sh\necho checkout\n");
+    chmodSync(staleCheckout, 0o755);
+
+    const cacheDir = join(dir, "cache");
+    const calls: string[] = [];
+    const fetchFn: typeof fetch = async (input) => {
+      const url = String(input);
+      calls.push(url);
+      const name = decodeURIComponent(url.slice(url.lastIndexOf("/") + 1));
+      const filePath = join(assetsDir, name);
+      if (!existsSync(filePath)) return new Response("missing", { status: 404 });
+      return new Response(readFileSync(filePath));
+    };
+
+    await expect(ensureBinaryFor(target, {}, { root, cacheDir, fetchFn })).resolves.toBe(stalePkg);
+    expect(calls).toEqual([]);
+
+    const cached = join(cacheDir, "0.2.7", target, file);
+    await expect(ensureBinaryFor(target, {}, { root, cacheDir, fetchFn, force: true })).resolves.toBe(cached);
+    expect(calls).toHaveLength(1);
+    expect(findBinary({}, { root, cacheDir })).toEqual({ ok: true, path: cached, from: "cache", edition: "cpu" });
+    expect(readFileSync(cached, "utf8")).toContain(target);
+
+    calls.length = 0;
+    await expect(ensureBinaryFor(target, {}, { root, cacheDir, fetchFn, force: true })).resolves.toBe(cached);
+    expect(calls).toEqual([]);
   });
 });
