@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolveXaiToken } from "../../src/engine/credentials";
 import {
   listXaiVoices,
+  XAI_FALLBACK_VOICES,
   XAI_MODEL,
   XAI_PRICE,
   XaiProvider,
@@ -240,5 +241,16 @@ describe("XaiProvider", () => {
     expect(p.cachedVoices()?.map((v) => v.id)).toEqual(["eve"]);
     p.forget();
     expect(p.cachedVoices()).toBeUndefined();
+  });
+
+  it("voicesFor falls back to the fixed xAI voices when the fetch fails, but not without a login", async () => {
+    stubFetch(() => Response.json({ error: "down" }, { status: 503 }));
+    const p = new XaiProvider(() => registry(TOKEN));
+    expect(await p.voicesFor()).toEqual(["eve", "ara", "leo", "rex", "sal"]);
+    expect(await p.voicesFor()).toEqual([...XAI_FALLBACK_VOICES]);
+    await expect(p.voices()).rejects.toThrow(/503/);
+    expect(p.cachedVoices()).toBeUndefined();
+    const none = new XaiProvider(() => registry(undefined));
+    await expect(none.voicesFor()).rejects.toThrow(/log in to xAI in Pi/);
   });
 });

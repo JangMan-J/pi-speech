@@ -151,6 +151,9 @@ export async function xaiTranscribe(
   return typeof data.text === "string" ? data.text : "";
 }
 
+/** The voices offered when the xAI voice list cannot be fetched, as Jing's Zellij plugin does. */
+export const XAI_FALLBACK_VOICES: readonly string[] = ["eve", "ara", "leo", "rex", "sal"];
+
 /** xAI as a speech provider: offered only while Pi holds an xAI credential. */
 export class XaiProvider implements SpeechProvider {
   readonly name = "xAI";
@@ -207,8 +210,14 @@ export class XaiProvider implements SpeechProvider {
     return this.cache;
   }
 
+  /** The voice ids; without a login this throws, but a failed fetch falls back to XAI_FALLBACK_VOICES. */
   async voicesFor(): Promise<string[]> {
-    return (await this.voices()).map((v) => v.id);
+    await this.requireToken();
+    try {
+      return (await this.voices()).map((v) => v.id);
+    } catch {
+      return [...XAI_FALLBACK_VOICES];
+    }
   }
 
   /** The voice list from the last successful fetch, if any. */
