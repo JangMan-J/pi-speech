@@ -8,6 +8,7 @@
  * read-only rows naming why; topology-bound routing rows appear in Receivers only while a bridge is active.
  */
 
+import { hostname } from "node:os";
 import {
   COMMANDS_EDITOR_HEADER,
   formatEditorPrefill,
@@ -251,6 +252,7 @@ export interface PanelDeps {
   successMs?: number;
   hotkeys?: Hotkeys;
   pairingMs?: number;
+  hostName?: string;
 }
 
 /** A one-line text field: the value and the cursor, in code points. */
@@ -395,7 +397,7 @@ const MENUS: Record<MenuMode["menu"], { title: string; ids: RowId[] }> = {
   dictation: { title: "Dictation options", ids: DICTATION_IDS },
 };
 
-const MACHINE_WORDS: Record<Machine, string> = { this: "This machine", remote: "Remote machine" };
+
 const isDirectionRow = (id: RowId): id is DirectionSetting => (DIRECTIONS as readonly RowId[]).includes(id);
 const CONNECT_HINT = "ssh Host, user@host, or host:port";
 const CONNECT_HOW = "Connect: ssh Host, user@host, or host:port";
@@ -684,8 +686,9 @@ export class Panel {
       cycles: true,
       render: () =>
         this.engine.routes.route !== "bridge"
-          ? { value: MACHINE_WORDS.this, note: "no bridge in use" }
-          : { value: val(id, MACHINE_WORDS[s()[id]]) },
+          ? { value: this.machineName("this"), note: "no receiver connected" }
+          : { value: this.machineName((this.pending.get(id) as Machine | undefined) ?? s()[id]) },
+      info: () => `${label}: ←→ chooses between ${this.machineName("this")} and ${this.machineName("remote")}.`,
       hints: () => [{ key: "← →", action: "Selects" }],
       step: (dir) => {
         try {
@@ -874,7 +877,7 @@ export class Panel {
           if (!s().dictationLive) return { value: "Filled" };
           if (!canLiveDictate(s())) return { value: "Typed", note: "choose a local transcription model" };
           const entry = this.localModels?.find((m) => m.id === s().localTranscriptionModel);
-          return isLiveCapableLocalStt(entry ?? s().localTranscriptionModel, s().localDevice)
+          return isLiveCapableLocalStt(entry ?? s().localTranscriptionModel, this.activeReceiverEdition())
             ? { value: "Typed" }
             : { value: "Typed", note: "chunked; may lag on CPU" };
         },
@@ -1005,7 +1008,8 @@ export class Panel {
       }),
       // Receivers
       bridgeMode: {
-        label: "Bridge",
+        label: "SSH receiver",
+        info: () => `Pi runs on ${this.machineName("this")}; choose whether to use the desk receiver over SSH.`,
         cycles: true,
         render: () => {
           const v = val("bridgeMode", this.engine.routes.mode);
@@ -1033,7 +1037,10 @@ export class Panel {
         },
       },
       device: {
-        label: "Device",
+        label: "Connection",
+        info: () => this.engine.routes.ssh
+          ? `Pi runs on ${this.machineName("this")}; the desk receiver connects over SSH. ←→ switches; Enter explains the address.`
+          : `Pi runs on ${this.machineName("this")}; Enter connects an SSH receiver, ←→ switches, x disconnects.`,
         opens: true,
         cycles: true,
         render: () => this.deviceValue(),
@@ -1092,6 +1099,7 @@ export class Panel {
       },
       pairing: {
         label: "Pairing",
+        info: () => "Enter manages the receiver address and pairing code.",
         render: () => this.pairingValue(),
         hints: () => [{ key: "Enter", action: "address, pair" }],
         activate: () => {
@@ -1101,6 +1109,7 @@ export class Panel {
       },
       receiver: {
         label: "Local receiver",
+        info: () => `Receiver edition on ${this.machineName("this")}: ←→ switches CPU/GPU when available; u updates.`,
         cycles: true,
         render: () => this.localReceiverValue(),
         hints: () => {
@@ -1291,7 +1300,7 @@ export class Panel {
             ? "Summarization only: same model, same reply (no additional request)."
             : `Summarization only: ${callNote} (your speech model speaks it).`,
       };
-    } else if (home.kind === "menu" && (home.menu === "readAloud" || home.menu === "dictation") && this.mode === home) {
+    } else if (home.kind === "menu" && (home.menu === "readAloud" || home.menu === "dictation" || home.menu === "bridge") && this.mode === home) {
       const id = baseRows[home.selected]?.id;
       const info = id ? this.rowSpecs[id].info?.() : undefined;
       if (info) view.status = { tone: "info", text: info };
@@ -1443,15 +1452,22 @@ export class Panel {
     return {};
   }
 
+  private machineName(machine: Machine): string {
+    const host = this.deps.hostName ?? (hostname().split(".")[0] || "this-host");
+    if (machine === "this") return `${this.engine.routes.ssh ? "Pi host" : "This host"} (${host})`;
+    if (this.engine.routes.ssh) return "Desk (over SSH)";
+    return this.engine.remoteHost ? `SSH (${this.engine.remoteHost})` : `Remote (${this.speech.settings.bridgeAddress ?? hostPort(this.engine.routes.url) ?? "not connected"})`;
+  }
+
   private bridgeNote(mode: BridgeMode): Pick<PanelRow, "note" | "short" | "alert"> {
     const routes = this.engine.routes;
     const when = mode === "auto" ? "on over SSH · " : "";
-    if (routes.routeFor(mode) === "local") return { note: `${when}plays on This machine`, short: "This machine" };
+    if (routes.routeFor(mode) === "local") return { note: `${when}plays on ${this.machineName("this")}`, short: "Pi host" };
     const r = this.receivers.health;
     const host = routes.url.replace(/^[a-z]+:\/\//, "");
     const state = !r || r === "checking" ? "… checking" : r.ok ? `✓ ${host}` : "✗ receiver unreachable";
     const alert = typeof r === "object" && !r.ok;
-    const where = this.speech.settings.playOn === "remote" ? "plays on the Remote machine" : "bridge in use";
+    const where = this.speech.settings.playOn === "remote" ? `plays on ${this.machineName("remote")}` : "bridge in use";
     return { note: `${when}${where} · ${state}`, short: state, ...(alert ? { alert } : {}) };
   }
 
@@ -1492,29 +1508,29 @@ export class Panel {
     const e = this.engine;
     const host = e.remoteHost;
     if (e.routes.ssh) {
-      if (e.routes.route !== "bridge") return { value: "Local (this host)", note: "←→ switches to Remote" };
+      if (e.routes.route !== "bridge") return { value: this.machineName("this"), note: "←→ switches to Desk (over SSH)" };
       const at = hostPort(e.routes.url);
       const from = this.receivers.addressFrom();
       if (!at) {
         return from === "pairing"
-          ? { value: "Remote · not set", note: "✗ the address set in Pairing is not usable", alert: true }
-          : { value: "Remote · not set", note: "✗ PI_SPEECH_BRIDGE_URL is not a URL", alert: true };
+          ? { value: "Desk · not set", note: "✗ the address set in Pairing is not usable", alert: true }
+          : { value: "Desk · not set", note: "✗ PI_SPEECH_BRIDGE_URL is not a URL", alert: true };
       }
       const note = { pairing: "set in Pairing", env: "from PI_SPEECH_BRIDGE_URL", default: "ssh forward" }[from];
-      return { value: `Remote · ${at}`, note };
+      return { value: `Desk · ${at}`, note };
     }
     switch (e.remoteState) {
       case "connecting":
-        return { value: `Remote · ${host ?? "…"}`, note: "… connecting", opens: true };
+        return { value: `SSH (${host ?? "…"})`, note: "… connecting", opens: true };
       case "connected": {
         const p = this.receivers.pairing;
         const ms = p && p !== "checking" && p.ok ? ` · ${p.ms} ms` : "";
-        return { value: `Remote · ${host ?? "connected"}`, note: `✓ over SSH${ms}`, opens: true };
+        return { value: `SSH (${host ?? "connected"})`, note: `✓ over SSH${ms}`, opens: true };
       }
       case "lost":
       case "failed":
         return {
-          value: `Remote · ${host ?? "not connected"}`,
+          value: `SSH (${host ?? "not connected"})`,
           note: `✗ ${e.remoteError ?? "not connected"}`,
           alert: true,
           opens: true,
@@ -1523,13 +1539,13 @@ export class Panel {
     if (this.speech.settings.bridgeAddress && e.routes.route === "bridge") {
       const p = this.pairingValue();
       return {
-        value: `Remote · ${this.speech.settings.bridgeAddress}`,
+        value: `Remote (${this.speech.settings.bridgeAddress})`,
         note: p.note ?? p.value,
         ...(p.alert ? { alert: true } : {}),
         opens: true,
       };
     }
-    return { value: "Local", note: host ? `←→ ${host} · Enter connects` : "Enter connects to Remote", opens: true };
+    return { value: this.machineName("this"), note: host ? `←→ SSH (${host}) · Enter connects` : "Enter connects an SSH receiver", opens: true };
   }
 
   private remoteReceiverValue(): Pick<PanelRow, "value" | "note" | "short" | "alert" | "opens"> {
@@ -1559,6 +1575,7 @@ export class Panel {
     if (ed === "CPU" && rg && this.receivers.canSwitchRemoteEdition()) {
       return { value: label, note: `CUDA ${rg.cuda} ready · ←→ GPU` };
     }
+    if (ed === "GPU" && rg?.cuda) return { value: label, note: `CUDA ${rg.cuda}` };
     return { value: label };
   }
 
@@ -1604,16 +1621,16 @@ export class Panel {
     };
     if (!routes.ssh) {
       if (this.engine.remoteState === "connecting")
-        return { value: this.engine.remoteHost ?? "…", note: "… connecting" };
+        return { value: this.machineName("remote"), note: "… connecting" };
       if (this.engine.remoteState === "lost" || this.engine.remoteState === "failed") {
         return {
-          value: this.engine.remoteHost ?? "not connected",
+          value: this.machineName("remote"),
           note: `✗ ${this.engine.remoteError ?? "not connected"}`,
           alert: true,
         };
       }
       if (this.engine.remoteState === "connected") {
-        const host = this.engine.remoteHost ?? "connected";
+        const host = this.machineName("remote");
         const p = this.receivers.pairing;
         const ver = this.receivers.connectedVersion();
         const ed = (this.receivers.connectedEdition() ?? "cpu").toUpperCase();
@@ -1629,21 +1646,21 @@ export class Panel {
         return { value: host, note: `✓ ${ed}${ver ? ` v${ver}` : ""}${ms}` };
       }
       if (routes.route === "bridge") {
-        return { value: this.speech.settings.bridgeAddress ?? hostPort(routes.url) ?? "bridge", ...answers() };
+        return { value: this.machineName("remote"), ...answers() };
       }
       const st = this.receivers.localStatus;
       if (st?.from) {
         const ed = (st.edition ?? this.speech.settings.localDevice).toUpperCase();
         const ver = st.version ? ` v${st.version}` : "";
         if (st.version && this.receivers.isVersionOutdated(st.version)) {
-          return { value: `Local · ${ed}${ver}`, note: `! update to v${expected}`, alert: true };
+          return { value: `${this.machineName("this")} · ${ed}${ver}`, note: `! update to v${expected}`, alert: true };
         }
-        return { value: `Local · ${ed}${ver}` };
+        return { value: `${this.machineName("this")} · ${ed}${ver}` };
       }
-      return { value: "Local" };
+      return { value: this.machineName("this") };
     }
-    if (routes.route !== "bridge") return { value: "Local (this host)", note: "audio and models on this host" };
-    return { value: "ssh forward", ...answers() };
+    if (routes.route !== "bridge") return { value: this.machineName("this"), note: "audio and models on Pi host" };
+    return { value: "Desk (over SSH)", ...answers() };
   }
 
   private voiceLock(): { value: string; note: string; info: string; canSample: boolean } | undefined {
@@ -1734,7 +1751,7 @@ export class Panel {
   }
 
   private activeReceiverEdition(): "cpu" | "gpu" {
-    if (this.receivers.isRemoteDevice()) {
+    if (this.engine.routes.modelsRoute === "bridge") {
       return this.receivers.connectedEdition() ?? (this.receivers.remoteGpu?.hardware ? "gpu" : "cpu");
     }
     return this.speech.settings.localDevice;
@@ -1747,6 +1764,7 @@ export class Panel {
       localModels: this.localModels,
       edition: this.activeReceiverEdition(),
       modelsRoute: this.engine.routes.modelsRoute,
+      modelHost: this.machineName(this.engine.routes.modelsRoute === "bridge" ? "remote" : "this"),
       piperFamilyPending: this.piperFamilyPending,
       downloadOf: (id) => this.downloadOf(id),
       providerName: (id) => this.speech.providerName(id),
@@ -1842,7 +1860,9 @@ export class Panel {
       }
       if (p.local) {
         const toggle: Hint = { key: "Ctrl+T", action: "provider" };
-        const gpuHint: Hint[] = this.receivers.canSwitchLocalGpu()
+        const gpuHint: Hint[] = (this.receivers.isRemoteDevice()
+          ? this.receivers.connectedEdition() !== "gpu" && this.receivers.canSwitchRemoteEdition()
+          : this.receivers.canSwitchLocalGpu())
           ? [{ key: "Ctrl+G", action: "GPU", optional: true }]
           : [];
         if (this.pickerItems(p).length === 0) return [...gpuHint, toggle, esc("back")];
@@ -1977,10 +1997,11 @@ export class Panel {
       } else if (
         matches("gpu") &&
         p.local &&
-        !this.receivers.isRemoteDevice() &&
-        this.speech.settings.localDevice === "cpu"
+        ((this.receivers.isRemoteDevice() && this.receivers.connectedEdition() !== "gpu" && this.receivers.canSwitchRemoteEdition()) ||
+          (!this.receivers.isRemoteDevice() && this.speech.settings.localDevice === "cpu"))
       ) {
-        this.toggleLocalEdition();
+        if (this.receivers.isRemoteDevice()) this.toggleRemoteEdition();
+        else this.toggleLocalEdition();
       }
       return true;
     }

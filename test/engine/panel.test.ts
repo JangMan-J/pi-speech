@@ -33,8 +33,8 @@ const LETTER_HINTS = "Ctrl+O replay · Ctrl+L history · Ctrl+N stop · Ctrl+T t
 
 /** The rows of Receivers over SSH. */
 const BRIDGE_ROWS = [
-  "Bridge",
-  "Device",
+  "SSH receiver",
+  "Connection",
   "Pairing",
   "Local receiver",
   "Remote receiver",
@@ -80,6 +80,7 @@ function open(
     ui,
     close,
     changed,
+    hostName: "test-host",
     ...(opts.hotkeys ? { hotkeys: opts.hotkeys } : {}),
     ...(opts.pairingMs ? { pairingMs: opts.pairingMs } : {}),
   });
@@ -158,7 +159,7 @@ describe("the panel view model: the main view", () => {
       "Transcription model": "openai/whisper-large-v3-turbo",
       "Dictation options": "Filled",
       Hotkeys: "Alt+S · Alt+Z",
-      Receivers: expect.stringMatching(/^Local/),
+      Receivers: expect.stringMatching(/^This host/),
       "Spectrum OSD": "Lines",
     });
     expect(p.row("Dictation options")).toMatchObject({ value: "Filled", note: "auto", opens: true });
@@ -608,15 +609,45 @@ describe("the panel view model: keys in the main view", () => {
 });
 
 describe("the panel view model: Receivers", () => {
-  it("on this machine with Device Local it shows only Device and Local receiver", async () => {
+  it("uses the model host edition for live dictation over SSH", async () => {
+    const p = open({ SSH_CONNECTION: "1 2 3 4" });
+    await p.panel.idle();
+    p.engine.speech.settings.localDevice = "cpu";
+    p.engine.speech.settings.transcriptionSource = "local";
+    p.engine.speech.settings.localTranscriptionModel = "whisper-turbo";
+    p.engine.speech.settings.dictationLive = true;
+    const edition = vi.spyOn(p.engine.receivers, "connectedEdition").mockReturnValue("gpu");
+    await p.goTo("Dictation options");
+    await p.press("enter");
+    expect(p.row("Output")).toMatchObject({ value: "Typed" });
+    expect(p.row("Output")?.note).toBeUndefined();
+    edition.mockReturnValue("cpu");
+    expect(p.row("Output")?.note).toBe("chunked; may lag on CPU");
+  });
+
+  it("reports the desk GPU and CUDA even when the SSH host has no GPU binary", async () => {
+    const p = open({ SSH_CONNECTION: "1 2 3 4" });
+    await p.panel.idle();
+    const receiver = p.engine.receivers;
+    receiver.remoteGpu = { driver: true, cuda: 13, cudnn: true, hardware: true, target: "unavailable-target", usable: true, why: null };
+    vi.spyOn(receiver, "connectedVersion").mockReturnValue(p.engine.receiverVersion);
+    const edition = vi.spyOn(receiver, "connectedEdition").mockReturnValue("gpu");
+    await p.goTo("Remote receiver");
+    expect(p.row("Remote receiver")).toMatchObject({ value: expect.stringMatching(/^GPU/), note: "CUDA 13" });
+    edition.mockReturnValue("cpu");
+    expect(p.row("Remote receiver")).toMatchObject({ value: expect.stringMatching(/^CPU/), note: "CUDA 13 ready · ←→ GPU" });
+  });
+
+  it("on this machine with Device Local it shows only Connection and Local receiver", async () => {
     const p = open();
     await p.panel.idle();
     await p.goTo("Receivers");
     await p.press("enter");
     const v = p.panel.view();
     expect(v).toMatchObject({ menu: "bridge", crumb: "Receivers", selected: 0 });
-    expect(v.rows.map((r) => r.label)).toEqual(["Device", "Local receiver"]);
-    expect(p.row("Device")).toMatchObject({ value: "Local", note: "Enter connects to Remote", opens: true });
+    expect(v.rows.map((r) => r.label)).toEqual(["Connection", "Local receiver"]);
+    expect(p.row("Connection")).toMatchObject({ value: "This host (test-host)", note: "Enter connects an SSH receiver", opens: true });
+    expect(p.panel.view().status?.text).toContain("Pi runs on This host (test-host)");
     expect(p.hint()).toBe("← → Selects · Enter connect · Esc Main");
     await p.press("escape");
     expect(p.panel.view().menu).toBe("main");
@@ -629,12 +660,13 @@ describe("the panel view model: Receivers", () => {
     await p.goTo("Receivers");
     await p.press("enter");
     expect(p.panel.view().rows.map((r) => r.label)).toEqual(BRIDGE_ROWS);
-    expect(p.row("Bridge")?.value).toBe("auto");
+    expect(p.row("SSH receiver")?.value).toBe("auto");
+    expect(p.panel.view().status?.text).toContain("Pi runs on Pi host (test-host)");
     expect(p.hint()).toBe("← → Selects · Esc Main");
     await p.press("right");
-    expect(p.row("Bridge")?.value).toBe("on");
+    expect(p.row("SSH receiver")?.value).toBe("on");
     await p.press("enter");
-    expect(p.row("Bridge")?.value).toBe("off");
+    expect(p.row("SSH receiver")?.value).toBe("off");
     expect(settingsOf(p.work).bridge).toBe("off");
     await p.press("escape");
     expect(p.panel.view().menu).toBe("main");
@@ -651,10 +683,10 @@ describe("the panel view model: Receivers", () => {
       },
     );
     await p.panel.idle();
-    await p.goTo("Bridge");
-    expect(p.row("Bridge")).toMatchObject({
+    await p.goTo("SSH receiver");
+    expect(p.row("SSH receiver")).toMatchObject({
       value: "auto",
-      note: "on over SSH · plays on the Remote machine · ✗ receiver unreachable",
+      note: "on over SSH · plays on Desk (over SSH) · ✗ receiver unreachable",
       alert: true,
     });
   });
@@ -664,22 +696,22 @@ describe("the panel view model: Device and Receiver, on this machine", () => {
   it("the main view's Receivers row summarizes Local or Remote connection state", async () => {
     const p = open();
     await p.panel.idle();
-    expect(p.row("Receivers")).toMatchObject({ value: expect.stringMatching(/^Local/), opens: true });
+    expect(p.row("Receivers")).toMatchObject({ value: expect.stringMatching(/^This host/), opens: true });
     p.engine.speech.settings.remoteHost = "spider";
     p.engine.remoteState = "connecting";
-    expect(p.row("Receivers")).toMatchObject({ value: "spider", note: "… connecting" });
+    expect(p.row("Receivers")).toMatchObject({ value: "SSH (spider)", note: "… connecting" });
     p.engine.remoteState = "connected";
-    expect(p.row("Receivers")).toMatchObject({ value: "spider", note: expect.stringMatching(/^✓ CPU/) });
+    expect(p.row("Receivers")).toMatchObject({ value: "SSH (spider)", note: expect.stringMatching(/^✓ CPU/) });
     p.engine.remoteState = "lost";
     p.engine.remoteError = "the connection to spider ended";
     expect(p.row("Receivers")).toMatchObject({
-      value: "spider",
+      value: "SSH (spider)",
       note: "✗ the connection to spider ended",
       alert: true,
     });
     const ssh = open({ SSH_CONNECTION: "1 2 3 4" });
     await ssh.panel.idle();
-    expect(ssh.row("Receivers")).toMatchObject({ value: "ssh forward", note: "✓" });
+    expect(ssh.row("Receivers")).toMatchObject({ value: "Desk (over SSH)", note: "✓" });
   });
 
   it("Enter on Device opens Connect; arrows step through the Hosts of ~/.ssh/config", async () => {
@@ -689,7 +721,7 @@ describe("the panel view model: Device and Receiver, on this machine", () => {
     const p = open({ HOME: home });
     await p.goTo("Receivers");
     await p.press("enter");
-    await p.goTo("Device");
+    await p.goTo("Connection");
     await p.press("enter");
     expect(p.panel.view().input).toMatchObject({ label: "Connect to", value: "", under: "device" });
     expect(p.panel.view().status?.text).toBe("Your ssh Hosts: spider, build, lab");
@@ -743,7 +775,7 @@ describe("the panel view model: Device and Receiver, on this machine", () => {
     expect(p.panel.view().login?.value).toBe("hunter2"); // the renderer draws it as dots
     await p.press("enter");
     expect(p.panel.view().status?.text).toMatch(/^✓ Connected to spider over SSH, receiver 0.3.0/);
-    expect(p.row("Device")).toMatchObject({ value: "Remote · spider", note: expect.stringMatching(/^✓ over SSH/) });
+    expect(p.row("Connection")).toMatchObject({ value: "SSH (spider)", note: expect.stringMatching(/^✓ over SSH/) });
   });
 
   it("Receiver shows edition/version on connection, offers u only when outdated, and Device ←→ toggles Local ↔ Remote", async () => {
@@ -791,7 +823,7 @@ describe("the panel view model: Device and Receiver, on this machine", () => {
     await p.type("spider");
     await p.press("enter");
     expect(p.panel.view().status?.text).toMatch(/receiver 0\.3\.0.*expected 0\.2\.5/);
-    expect(p.row("Device")).toMatchObject({ value: "Remote · spider", note: expect.stringMatching(/^✓ over SSH/) });
+    expect(p.row("Connection")).toMatchObject({ value: "SSH (spider)", note: expect.stringMatching(/^✓ over SSH/) });
     expect(p.row("Remote receiver")).toMatchObject({
       value: "CPU v0.3.0",
       note: "! Enter or u updates to v0.2.5",
@@ -816,14 +848,14 @@ describe("the panel view model: Device and Receiver, on this machine", () => {
     expect(p.engine.routes.route).toBe("local");
     expect(settingsOf(p.work).bridge).toBe("auto");
     expect(settingsOf(p.work).remoteHost).toBe("spider");
-    expect(p.row("Device")).toMatchObject({ value: "Local", note: expect.stringContaining("spider") });
+    expect(p.row("Connection")).toMatchObject({ value: "This host (test-host)", note: expect.stringContaining("spider") });
     await p.press("escape");
-    expect(p.row("Receivers")).toMatchObject({ value: expect.stringMatching(/^Local/) });
+    expect(p.row("Receivers")).toMatchObject({ value: expect.stringMatching(/^This host/) });
     expect(p.row("Receivers")?.alert).toBeFalsy();
     await p.goTo("Receivers");
     await p.press("enter", "right");
     expect(p.engine.routes.route).toBe("bridge");
-    expect(p.row("Device")).toMatchObject({ value: "Remote · spider" });
+    expect(p.row("Connection")).toMatchObject({ value: "SSH (spider)" });
   });
 
   it.skipIf(!STAND_IN_BINARY)(
@@ -1014,7 +1046,7 @@ describe("the panel view model: Receivers' DIRECTION", () => {
     expect(p.selectedLabel()).toBe("Run models on");
     // Turn Bridge off: the three routing rows disappear and selection clamps when Bridge is turned off from row 0 or via engine.
     await p.engine.setBridge("off");
-    expect(p.panel.view().rows.map((r) => r.label)).toEqual(["Bridge", "Device", "Pairing", "Local receiver"]);
+    expect(p.panel.view().rows.map((r) => r.label)).toEqual(["SSH receiver", "Connection", "Pairing", "Local receiver"]);
     expect(p.selectedLabel()).toBe("Local receiver");
     expect(p.hint()).toMatch(/Esc Main$/);
     await p.engine.setBridge("auto");
@@ -1025,13 +1057,13 @@ describe("the panel view model: Receivers' DIRECTION", () => {
     const p = open({ SSH_CONNECTION: "1 2 3 4" });
     await p.goTo("Record audio on");
     expect(BRIDGE_ROWS.slice(5).map((l) => p.row(l)?.value)).toEqual([
-      "Remote machine",
-      "Remote machine",
-      "Remote machine",
+      "Desk (over SSH)",
+      "Desk (over SSH)",
+      "Desk (over SSH)",
     ]);
     expect(p.hint()).toBe("← → Selects · Esc Main");
     await p.press("right");
-    expect(p.row("Record audio on")?.value).toBe("This machine");
+    expect(p.row("Record audio on")?.value).toBe("Pi host (test-host)");
     expect(p.panel.view().status).toMatchObject({ tone: "warning", text: expect.stringMatching(/needs a microphone/) });
     expect(settingsOf(p.work).recordOn).toBe("this");
     expect(p.engine.routes.inputRoute).toBe("local");
@@ -1061,9 +1093,9 @@ describe("the panel view model: Receivers' Device and Pairing (Pi over SSH)", ()
     await p.goTo("Receivers");
     await p.press("enter");
     expect(p.panel.view().rows.map((r) => r.label)).toEqual(BRIDGE_ROWS);
-    expect(p.row("Device")).toMatchObject({ value: "Remote · 127.0.0.1:47613", note: "ssh forward" });
+    expect(p.row("Connection")).toMatchObject({ value: "Desk · 127.0.0.1:47613", note: "ssh forward" });
     expect(p.row("Pairing")).toMatchObject({ value: "✓ Connected to 127.0.0.1:47613 · 52 ms", opens: true });
-    await p.goTo("Device");
+    await p.goTo("Connection");
     expect(p.hint()).toBe("← → Selects · Enter where it comes from · Esc Main");
     await p.press("enter");
     expect(p.panel.view().status).toMatchObject({ tone: "info", text: expect.stringMatching(/PI_SPEECH_BRIDGE_URL/) });
@@ -1132,8 +1164,8 @@ describe("the panel view model: Receivers' Device and Pairing (Pi over SSH)", ()
       { ...SSH, PI_SPEECH_BRIDGE_URL: "http://localhost:5000" },
       { before: (e) => (e.probeBridge = connected) },
     );
-    await p.goTo("Device");
-    expect(p.row("Device")).toMatchObject({ value: "Remote · localhost:5000", note: "from PI_SPEECH_BRIDGE_URL" });
+    await p.goTo("Connection");
+    expect(p.row("Connection")).toMatchObject({ value: "Desk · localhost:5000", note: "from PI_SPEECH_BRIDGE_URL" });
   });
 
   it("an unreachable receiver advises checking the SSH forward instead of re-pairing", async () => {
@@ -1203,7 +1235,7 @@ describe("the panel view model: Receivers' Device and Pairing (Pi over SSH)", ()
     expect(p.panel.view().status).toMatchObject({ tone: "success", text: expect.stringContaining(tokenFile) });
     expect(readFileSync(tokenFile, "utf8").trim()).toBe(token);
     expect(settingsOf(p.work).bridgeAddress).toBe("100.64.0.2:47613");
-    expect(p.row("Device")).toMatchObject({ value: "Remote · 100.64.0.2:47613", note: "set in Pairing" });
+    expect(p.row("Connection")).toMatchObject({ value: "Desk · 100.64.0.2:47613", note: "set in Pairing" });
     // Over SSH pairing leaves the bridge mode and the directions as they are.
     expect(settingsOf(p.work).bridge ?? "auto").toBe("auto");
   });
@@ -1220,11 +1252,11 @@ describe("the panel view model: Receivers' Device and Pairing (Pi over SSH)", ()
         };
       },
     });
-    await p.goTo("Bridge");
+    await p.goTo("SSH receiver");
     await p.press("right");
     await vi.waitFor(() => expect(p.panel.view().input).toMatchObject({ label: "Address", under: "pairing" }));
     expect(p.panel.view().status).toMatchObject({ tone: "info", text: expect.stringMatching(/^Pair first/) });
-    expect(p.row("Bridge")?.value).toBe("auto");
+    expect(p.row("SSH receiver")?.value).toBe("auto");
     await p.press("escape");
     expect(p.panel.view().menu).toBe("bridge");
   });
@@ -2179,6 +2211,26 @@ describe.skipIf(!STAND_IN_BINARY)("the panel view model: Local sources", () => {
     const p = open({ PI_SPEECH_BINARY: bin.path });
     return { ...p, bin, calls: () => readFileSync(bin.log, "utf8").trim().split("\n") };
   };
+
+  it("offers remote GPU switching from the model picker and Receiver row", async () => {
+    const p = local();
+    await p.panel.idle();
+    const receiver = p.engine.receivers;
+    vi.spyOn(receiver, "isRemoteDevice").mockReturnValue(true);
+    vi.spyOn(receiver, "canSwitchRemoteEdition").mockReturnValue(true);
+    vi.spyOn(receiver, "connectedEdition").mockReturnValue("cpu");
+    const toggle = vi.spyOn(receiver, "switchRemoteEdition").mockResolvedValue({ tone: "info", text: "Switch on desk" });
+    p.engine.speech.setSource("transcription", "local");
+    await p.goTo("Transcription model");
+    await p.press("enter");
+    expect(p.hint()).toContain("Ctrl+G GPU");
+    await p.press({ combo: "ctrl+g" });
+    expect(toggle).toHaveBeenCalledTimes(1);
+    await p.press("escape");
+    await p.goTo("Receiver");
+    await p.press("right");
+    expect(toggle).toHaveBeenCalledTimes(2);
+  });
 
   it("lists the on-device transcription models with size and state; a downloaded one is chosen at once", async () => {
     const p = local();

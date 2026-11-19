@@ -258,6 +258,7 @@ export interface PickerContext {
   localModels?: LocalModel[];
   edition: "cpu" | "gpu";
   modelsRoute: "local" | "bridge";
+  modelHost?: string;
   piperFamilyPending: boolean;
   downloadOf(id: string): ActiveDownload | undefined;
   providerName(id: string): string;
@@ -499,7 +500,7 @@ export function buildPickerView(p: PickerInput, ctx: PickerContext): PickerView 
       ...(p.row === "speechModel" ? [{ header: "Tags" }] : []),
     ];
     view.sort = ctx.settings.localModelSort;
-    view.detail = ctx.modelsRoute === "bridge" ? "Remote machine" : "On this machine";
+    view.detail = `Models on ${ctx.modelHost ?? (ctx.modelsRoute === "bridge" ? "receiver" : "Pi host")}`;
     if (p.ids?.length === 0) view.empty = "No local models of this kind";
   } else if (isModelRow(p.row)) {
     view.providerHeader = "Provider";
