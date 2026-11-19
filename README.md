@@ -61,17 +61,17 @@ Speech and transcription each switch independently between **Local** and cloud p
 
 Jing's speech-settings pane saves TTS/STT source, model, and voice to `$XDG_CONFIG_HOME/zellij/pi-speech.json` (default `~/.config/zellij/pi-speech.json`). It reads Pi Speech's `<agent dir>/pi-speech/settings.json` as a fallback. If the Zellij file exists, Pi Speech imports it at load when it is newer than its own settings file, and mirrors saved choices back on save. Pi Speech never creates the Zellij file.
 
-| Jing key | Pi Speech setting |
-| --- | --- |
-| `ttsSource` | `speechSource` |
-| `sttSource` | `transcriptionSource` |
-| `model` | `localSpeechModel` |
-| `voice` | `localSpeechVoice` |
-| `sttModel` | `localTranscriptionModel` |
-| `providerTtsModel` | `speechModel` |
-| `providerVoice` | `voice` |
-| `providerSttModel` | `transcriptionModel` |
-| `url` | Not imported; use Pairing or `PI_SPEECH_BRIDGE_URL` |
+| Jing key           | Pi Speech setting                                   |
+| ------------------ | --------------------------------------------------- |
+| `ttsSource`        | `speechSource`                                      |
+| `sttSource`        | `transcriptionSource`                               |
+| `model`            | `localSpeechModel`                                  |
+| `voice`            | `localSpeechVoice`                                  |
+| `sttModel`         | `localTranscriptionModel`                           |
+| `providerTtsModel` | `speechModel`                                       |
+| `providerVoice`    | `voice`                                             |
+| `providerSttModel` | `transcriptionModel`                                |
+| `url`              | Not imported; use Pairing or `PI_SPEECH_BRIDGE_URL` |
 
 Jing plugin overrides `speech_url` and `speech_token_file` correspond to `PI_SPEECH_BRIDGE_URL` and `PI_SPEECH_BRIDGE_TOKEN_FILE`. If xAI cannot fetch its voice list, it falls back to `eve`, `ara`, `leo`, `rex`, and `sal`.
 
