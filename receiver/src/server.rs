@@ -1426,13 +1426,14 @@ impl Shared {
         }
     }
 
-    /// Stop the recorder of recording `id`, wait for it to end, and take the entry out.
+    /// Stop the recorder of recording `id` (or the active recording when `id == "active"`),
+    /// wait for it to end, and take the entry out.
     fn finish_recording(&self, id: &str) -> Option<Result<Rec, Response>> {
-        let ctl = lock(&self.inner)
+        let (target_id, ctl) = lock(&self.inner)
             .recs
             .iter()
-            .find(|r| r.id == id)
-            .map(|r| Arc::clone(&r.ctl))?;
+            .find(|r| r.id == id || (id == "active" && r.phase == RecPhase::Recording))
+            .map(|r| (r.id.clone(), Arc::clone(&r.ctl)))?;
         ctl.stop();
         let g = lock(&self.inner);
         let (mut g, _) = self
@@ -1440,10 +1441,10 @@ impl Shared {
             .wait_timeout_while(g, SETTLE, |g| {
                 g.recs
                     .iter()
-                    .any(|r| r.id == id && r.phase == RecPhase::Recording)
+                    .any(|r| r.id == target_id && r.phase == RecPhase::Recording)
             })
             .unwrap_or_else(|e| e.into_inner());
-        let i = g.recs.iter().position(|r| r.id == id)?;
+        let i = g.recs.iter().position(|r| r.id == target_id)?;
         if g.recs[i].phase == RecPhase::Recording {
             return Some(Err(Response::error(503, "the recorder did not stop")));
         }
