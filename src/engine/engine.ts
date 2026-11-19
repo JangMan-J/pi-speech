@@ -32,6 +32,7 @@ import { DictationRuleCache } from "./dictation-rules";
 import { Downloads } from "./downloads";
 import { type Env, errorMessage } from "./env";
 import { Indicator } from "./indicator";
+import { jingConfigPath } from "./jing-config";
 import { canLiveDictate, type LocalModels } from "./local-models";
 import { Player } from "./player";
 import type { SpeechCatalog } from "./provider";
@@ -90,7 +91,7 @@ export class Engine {
     this.env = opts.env;
     this.receiverVersion = opts.receiverVersion ?? expectedReceiverVersion();
     this.probeBridge = () => probeBridge(() => bridgeConfig(opts.env, this.bridgeAddress(), this.linkToken()));
-    const settingsFile = new SettingsFile(join(opts.agentDir, "pi-speech"));
+    const settingsFile = new SettingsFile(join(opts.agentDir, "pi-speech"), jingConfigPath(opts.env));
     const mode = settingsFile.load().bridge;
     this.routes = new Routes({
       env: opts.env,

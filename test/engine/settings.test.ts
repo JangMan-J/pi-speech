@@ -1,4 +1,13 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -313,5 +322,83 @@ describe("the hotkeys", () => {
     }
     expect(keyLabel("ctrl+alt+d")).toBe("Ctrl+Alt+D");
     expect(keyLabel("alt+s")).toBe("Alt+S");
+  });
+});
+
+describe("Jing's pi-speech.json", () => {
+  const jingPath = () => join(dirname(dir), "zellij", "pi-speech.json");
+  const writeJing = (d: unknown) => {
+    mkdirSync(dirname(jingPath()), { recursive: true });
+    writeFileSync(jingPath(), JSON.stringify(d));
+  };
+  const saved = (f: SettingsFile) => JSON.parse(readFileSync(f.file, "utf8"));
+
+  it("imports a Jing file newer than settings.json and persists it", () => {
+    const f = new SettingsFile(dir, jingPath());
+    f.save(f.load());
+    writeJing({ ttsSource: "local", model: "kokoro", voice: "af_sol", providerVoice: "Puck" });
+    utimesSync(f.file, 1000, 1000);
+    utimesSync(jingPath(), 2000, 2000);
+    const s = f.load();
+    expect(s.speechSource).toBe("local");
+    expect(s.localSpeechModel).toBe("kokoro");
+    expect(s.localSpeechVoice).toBe("af_sol");
+    expect(s.voice).toBe("Puck");
+    const d = saved(f);
+    expect(d.speechSource).toBe("local");
+    expect(d.localSpeechModel).toBe("kokoro");
+    expect(d.localSpeechVoice).toBe("af_sol");
+    expect(d.voice).toBe("Puck");
+  });
+
+  it("ignores a Jing file older than settings.json", () => {
+    const f = new SettingsFile(dir, jingPath());
+    f.save(f.load());
+    writeJing({ ttsSource: "local", model: "kokoro", providerVoice: "Puck" });
+    utimesSync(f.file, 2000, 2000);
+    utimesSync(jingPath(), 1000, 1000);
+    const s = f.load();
+    expect(s.speechSource).toBe("provider");
+    expect(s.localSpeechModel).toBeUndefined();
+    expect(s.voice).toBe(DEFAULT_SETTINGS.voice);
+  });
+
+  it("mirrors save() into an existing Jing file, keeping unknown keys", () => {
+    writeJing({ url: "ws://example:1234", extra: 1 });
+    const f = new SettingsFile(dir, jingPath());
+    utimesSync(jingPath(), 1000, 1000);
+    const s = f.load();
+    s.voice = "Puck";
+    s.speechSource = "local";
+    s.localSpeechModel = "kokoro";
+    f.save(s);
+    const d = JSON.parse(readFileSync(jingPath(), "utf8"));
+    expect(d.url).toBe("ws://example:1234");
+    expect(d.extra).toBe(1);
+    expect(d.providerVoice).toBe("Puck");
+    expect(d.ttsSource).toBe("local");
+    expect(d.model).toBe("kokoro");
+    // Our own mirror is newer but matches, so loading changes nothing.
+    expect(f.load()).toEqual(s);
+  });
+
+  it("does not create a missing Jing file", () => {
+    const f = new SettingsFile(dir, jingPath());
+    const s = f.load();
+    s.voice = "Puck";
+    f.save(s);
+    expect(existsSync(jingPath())).toBe(false);
+    expect(f.load().voice).toBe("Puck");
+  });
+
+  it("without a jingFile leaves behavior unchanged", () => {
+    writeJing({ ttsSource: "local", providerVoice: "Puck" });
+    const f = new SettingsFile(dir);
+    const s = f.load();
+    expect(s.speechSource).toBe("provider");
+    expect(s.voice).toBe(DEFAULT_SETTINGS.voice);
+    s.voice = "Charon";
+    f.save(s);
+    expect(JSON.parse(readFileSync(jingPath(), "utf8")).providerVoice).toBe("Puck");
   });
 });

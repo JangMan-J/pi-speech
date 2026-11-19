@@ -7,9 +7,10 @@
  * versioned file remains. What read-aloud reads is not a setting (it starts Off in every session); its options are.
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { EndpointConfig } from "./endpoints";
+import { applyJingConfig, readJingConfig, writeJingConfig } from "./jing-config";
 import {
   DEFAULT_READ_ALOUD,
   type ReadAloudOptions,
@@ -311,7 +312,11 @@ function copyDefaults(): Settings {
 export class SettingsFile {
   readonly file: string;
 
-  constructor(readonly dir: string) {
+  /** `jingFile`: Jing's `pi-speech.json`; imported when newer than settings.json, mirrored on save when present. */
+  constructor(
+    readonly dir: string,
+    readonly jingFile?: string,
+  ) {
     this.file = join(dir, "settings.json");
   }
 
@@ -383,6 +388,20 @@ export class SettingsFile {
     for (const [model, voices] of Object.entries(overrides)) {
       s.languages[model] = { ...s.languages[model], ...voices };
     }
+    try {
+      // applyJingConfig returns false when the values already match, so a mirror written by our own save()
+      // (newer than settings.json) changes nothing and cannot loop.
+      if (
+        this.jingFile &&
+        existsSync(this.jingFile) &&
+        (!existsSync(this.file) || statSync(this.jingFile).mtimeMs > statSync(this.file).mtimeMs)
+      ) {
+        const c = readJingConfig(this.jingFile);
+        if (c && applyJingConfig(s, c)) legacy = true;
+      }
+    } catch {
+      // An unreadable Jing file is ignored.
+    }
     if (legacy) {
       try {
         this.save(s);
@@ -441,5 +460,12 @@ export class SettingsFile {
     writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`);
     renameSync(tmp, this.file);
     for (const f of LEGACY_FILES) rmSync(join(this.dir, f), { force: true });
+    if (this.jingFile && existsSync(this.jingFile)) {
+      try {
+        writeJingConfig(this.jingFile, s);
+      } catch {
+        // Jing's file is a courtesy mirror; failing to write it never fails the save.
+      }
+    }
   }
 }
