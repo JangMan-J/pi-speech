@@ -218,12 +218,18 @@ export class ReceiverControl {
   }
 
   canSwitchRemoteEdition(): boolean {
-    return (
-      this.canManageRemote() &&
-      (this.connectedEdition() === "gpu" ||
+    if (!this.isRemoteDevice()) return false;
+    if (this.canManageRemote()) {
+      return (
+        this.connectedEdition() === "gpu" ||
         Boolean(
           this.remoteGpu?.hardware && this.remoteGpu.target && hasBinaryFor(this.remoteGpu.target, this.host.env),
-        ))
+        )
+      );
+    }
+    return (
+      this.host.routes.route === "bridge" &&
+      (this.connectedEdition() === "gpu" || Boolean(this.remoteGpu?.hardware))
     );
   }
 
@@ -259,7 +265,8 @@ export class ReceiverControl {
       const h = await this.host.routes.bridge.health();
       if (seq !== this.probeSeq) return;
       this.health = h;
-      if (h.ok && this.host.routes.bridge.gpu && !this.remoteGpu) {
+      if (!h.ok) this.remoteGpu = undefined;
+      if (h.ok && this.host.routes.bridge.gpu) {
         void this.host.routes.bridge
           .gpu()
           .then((g) => {
@@ -271,7 +278,10 @@ export class ReceiverControl {
           .catch(() => {});
       }
     } catch (err) {
-      if (seq === this.probeSeq) this.health = { ok: false, reason: errorMessage(err) };
+      if (seq === this.probeSeq) {
+        this.health = { ok: false, reason: errorMessage(err) };
+        this.remoteGpu = undefined;
+      }
     }
   }
 
@@ -365,10 +375,23 @@ export class ReceiverControl {
   }
 
   async switchRemoteEdition(prompts: RemotePrompts): Promise<ReceiverNotice> {
+    const ed = this.connectedEdition() ?? "cpu";
+    if ((this.host.routes.ssh || this.host.remoteState !== "connected") && this.host.routes.route === "bridge") {
+      if (!this.remoteGpu && this.host.routes.bridge.gpu) {
+        this.remoteGpu = await this.host.routes.bridge.gpu().catch(() => undefined) as GpuInfo | undefined;
+      }
+      if (ed === "gpu") {
+        return { tone: "info", text: "Desk receiver is running the GPU edition; restart it with the CPU edition to switch" };
+      }
+      const info = this.remoteGpu;
+      if (!info?.hardware) {
+        return { tone: "warning", text: `! Desk GPU unavailable: ${info?.why ?? "no compatible GPU detected"}` };
+      }
+      return { tone: "info", text: `Desk has CUDA ${info.cuda ?? "unknown"} (${info.target ?? "unknown target"}): start the GPU edition of pi-speech-receiver on your desk machine` };
+    }
     if (this.host.routes.ssh || this.host.remoteState !== "connected" || !this.host.remoteHost) {
       return { tone: "info", text: "Switching remote receiver edition requires an SSH connection" };
     }
-    const ed = this.connectedEdition() ?? "cpu";
     if (ed === "gpu") {
       const target = this.host.remotePlatform;
       if (!target || !hasBinaryFor(target, this.host.env)) {

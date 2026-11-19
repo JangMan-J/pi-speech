@@ -26,6 +26,95 @@ function control(env: Record<string, string> = {}) {
   return { ctl: new ReceiverControl(host as unknown as ReceiverHost), closeWorkers, host };
 }
 
+const gpu = { driver: true, cuda: 13, cudnn: true, hardware: true, usable: true, why: null, target: "linux-x64-cuda13" };
+const noGpu = { driver: false, cuda: null, cudnn: false, hardware: false, why: "no NVIDIA driver" };
+
+function remoteControl(ssh: boolean) {
+  const bridge = {
+    health: vi.fn(async (): Promise<any> => ({ ok: true, edition: "cpu" })),
+    gpu: vi.fn(async (): Promise<any> => gpu),
+  };
+  const host = {
+    env: {}, routes: { ssh, route: "bridge", bridge },
+    remoteState: ssh ? "off" : "connected", remoteHost: ssh ? undefined : "server",
+    remotePlatform: "linux-x64", remoteEdition: "cpu",
+    updateRemoteReceiver: vi.fn(async () => ({ dest: "server", version: "1.0" })),
+    probeBridge: vi.fn(async () => ({ ok: false, reason: "offline" })),
+  };
+  const prompts = { progress: vi.fn(), confirm: vi.fn(async () => true), password: vi.fn(async () => "") };
+  return { ctl: new ReceiverControl(host as unknown as ReceiverHost), host, bridge, prompts };
+}
+
+describe("remote GPU", () => {
+  beforeEach(() => vi.mocked(hasBinaryFor).mockReset());
+
+  it("refreshes GPU information on every healthy probe and clears it on failure or leaving bridge", async () => {
+    const { ctl, bridge, host } = remoteControl(true);
+    const onGpu = vi.fn();
+    await ctl.probeHealth(onGpu);
+    await vi.waitFor(() => expect(ctl.remoteGpu).toEqual(gpu));
+    bridge.gpu.mockResolvedValueOnce({ ...gpu, edition: "gpu" });
+    bridge.health.mockResolvedValueOnce({ ok: true, edition: "gpu" });
+    await ctl.probeHealth(onGpu);
+    await vi.waitFor(() => expect(ctl.remoteGpu?.edition).toBe("gpu"));
+    expect(onGpu).toHaveBeenCalledTimes(2);
+    bridge.health.mockResolvedValueOnce({ ok: false, reason: "offline" });
+    await ctl.probeHealth();
+    expect(ctl.remoteGpu).toBeUndefined();
+    ctl.remoteGpu = gpu;
+    bridge.health.mockRejectedValueOnce(new Error("offline"));
+    await ctl.probeHealth();
+    expect(ctl.remoteGpu).toBeUndefined();
+    ctl.remoteGpu = gpu;
+    host.routes.route = "local";
+    await ctl.probeHealth();
+    expect(ctl.remoteGpu).toBeUndefined();
+  });
+
+  it("offers manual switching on an SSH tunnel with GPU hardware, probing if needed", async () => {
+    const { ctl, bridge, prompts, host } = remoteControl(true);
+    expect(ctl.canSwitchRemoteEdition()).toBe(false);
+    expect(await ctl.switchRemoteEdition(prompts)).toEqual({ tone: "info", text: "Desk has CUDA 13 (linux-x64-cuda13): start the GPU edition of pi-speech-receiver on your desk machine" });
+    expect(bridge.gpu).toHaveBeenCalledOnce();
+    expect(ctl.canSwitchRemoteEdition()).toBe(true);
+    expect(host.updateRemoteReceiver).not.toHaveBeenCalled();
+  });
+
+  it("explains how to switch an SSH-tunnel GPU receiver back to CPU", async () => {
+    const { ctl, prompts } = remoteControl(true);
+    ctl.health = { ok: true, edition: "gpu" } as any;
+    expect(ctl.canSwitchRemoteEdition()).toBe(true);
+    expect(await ctl.switchRemoteEdition(prompts)).toEqual({ tone: "info", text: expect.stringMatching(/GPU edition.*restart.*CPU edition/) });
+  });
+
+  it("reports missing GPU hardware on an SSH tunnel", async () => {
+    const { ctl, bridge, prompts } = remoteControl(true);
+    bridge.gpu.mockResolvedValueOnce(noGpu);
+    expect(await ctl.switchRemoteEdition(prompts)).toEqual({ tone: "warning", text: expect.stringContaining("no NVIDIA driver") });
+    expect(ctl.canSwitchRemoteEdition()).toBe(false);
+  });
+
+  it("installs GPU and CPU editions over outbound SSH", async () => {
+    const { ctl, host, prompts } = remoteControl(false);
+    ctl.remoteGpu = gpu;
+    vi.mocked(hasBinaryFor).mockReturnValue(true);
+    expect(ctl.canSwitchRemoteEdition()).toBe(true);
+    expect(await ctl.switchRemoteEdition(prompts)).toEqual({ tone: "success", text: "✓ server: GPU receiver v1.0" });
+    expect(host.updateRemoteReceiver).toHaveBeenCalledWith(prompts, { targetOverride: gpu.target });
+    ctl.health = { ok: true, edition: "gpu" } as any;
+    expect(await ctl.switchRemoteEdition(prompts)).toEqual({ tone: "success", text: "✓ server: CPU receiver v1.0" });
+    expect(host.updateRemoteReceiver).toHaveBeenLastCalledWith(prompts, { targetOverride: "linux-x64" });
+  });
+
+  it("requires an available archive for outbound CPU to GPU, but not for a paired receiver", () => {
+    const outbound = remoteControl(false);
+    outbound.ctl.remoteGpu = gpu;
+    expect(outbound.ctl.canSwitchRemoteEdition()).toBe(false);
+    outbound.host.remoteState = "off";
+    expect(outbound.ctl.canSwitchRemoteEdition()).toBe(true);
+  });
+});
+
 describe("updateLocal", () => {
   beforeEach(() => {
     vi.mocked(ensureBinaryFor).mockReset();
