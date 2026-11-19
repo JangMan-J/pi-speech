@@ -21,6 +21,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { isReceiverOutdated, parseReceiverVersion } from "./binary";
+import { formatSize } from "./local-models";
 
 export interface RemotePrompts {
   /** The password for `who`; undefined when the user does not give one. */
@@ -684,9 +685,13 @@ export async function manageRemoteReceiver(
       return version;
     };
 
+    const installedTarget = onDisk ? await receiverTarget(sh, path, platform) : undefined;
+    const target = opts.targetOverride === "cpu" ? platform : (opts.targetOverride ?? installedTarget ?? platform);
+    const editionMatches = !opts.targetOverride || installedTarget === target;
+
     if (
       action === "restart" ||
-      (unit.exists && diskVersion && opts.version && !isReceiverOutdated(diskVersion, opts.version))
+      (editionMatches && unit.exists && diskVersion && opts.version && !isReceiverOutdated(diskVersion, opts.version))
     ) {
       if (!unit.exists) throw new RemoteError(`no receiver service on ${who}; use Install / update first`);
       if (!onDisk) throw new RemoteError(`the service on ${who} has no executable; use Install / update first`);
@@ -702,12 +707,13 @@ export async function manageRemoteReceiver(
       return { action: "restarted", version: await restart(diskVersion) };
     }
     if (!opts.version) throw new RemoteError("this extension does not know its receiver release version");
-    const target = onDisk ? await receiverTarget(sh, path, platform) : platform;
     if (opts.hasBinaryFor && !opts.hasBinaryFor(target))
       throw new RemoteError(`no v${opts.version} release archive for ${target}`);
+    const sz = opts.binarySizeFor?.(target);
+    const sizeNote = sz ? `, ${formatSize(sz)}` : "";
     if (
       !(await prompts.confirm(
-        `${unit.exists ? "Update and restart" : "Install and start"} ${RECEIVER_UNIT} on ${who} (v${opts.version}, ${target})?`,
+        `${unit.exists ? "Update and restart" : "Install and start"} ${RECEIVER_UNIT} on ${who} (v${opts.version}, ${target}${sizeNote})?`,
       ))
     )
       return { action: "cancelled" };

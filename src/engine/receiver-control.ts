@@ -116,7 +116,7 @@ export class ReceiverControl {
   }
 
   get maintenanceHost(): string | undefined {
-    return this.host.speech.settings.receiverSshHost;
+    return this.host.speech?.settings?.receiverSshHost;
   }
 
   setMaintenanceHost(dest: string): void {
@@ -130,7 +130,11 @@ export class ReceiverControl {
     this.host.speech.save();
   }
 
-  async maintainRemote(action: ReceiverSshAction, prompts: RemotePrompts): Promise<ReceiverNotice> {
+  async maintainRemote(
+    action: ReceiverSshAction,
+    prompts: RemotePrompts,
+    targetOverride?: string,
+  ): Promise<ReceiverNotice> {
     const dest = this.maintenanceHost;
     if (!dest || !this.canMaintainRemote()) {
       return { tone: "info", text: "Choose an SSH host for the receiver reached through this bridge" };
@@ -141,6 +145,7 @@ export class ReceiverControl {
       hasBinaryFor: (target) => releaseAssetSize(target) !== undefined,
       binarySizeFor: (target) => releaseAssetSize(target),
       version: this.host.receiverVersion,
+      ...(targetOverride ? { targetOverride } : {}),
     });
     if (r.action === "cancelled") return { tone: "info", text: `No changes on ${dest}` };
 
@@ -377,6 +382,9 @@ export class ReceiverControl {
         this.remoteGpu = (await this.host.routes.bridge.gpu().catch(() => undefined)) as GpuInfo | undefined;
       }
       if (ed === "gpu") {
+        if (this.canMaintainRemote() && this.maintenanceHost) {
+          return this.maintainRemote("update", prompts, "cpu");
+        }
         return {
           tone: "info",
           text: "Desk receiver is running the GPU edition; restart it with the CPU edition to switch",
@@ -385,6 +393,15 @@ export class ReceiverControl {
       const info = this.remoteGpu;
       if (!info?.hardware) {
         return { tone: "warning", text: `! Desk GPU unavailable: ${info?.why ?? "no compatible GPU detected"}` };
+      }
+      if (this.canMaintainRemote() && this.maintenanceHost) {
+        if (!info.target || !hasBinaryFor(info.target, this.host.env)) {
+          return {
+            tone: "warning",
+            text: `! No GPU receiver archive for ${info.target ?? "unknown target"} in receivers.json`,
+          };
+        }
+        return this.maintainRemote("update", prompts, info.target);
       }
       return {
         tone: "info",

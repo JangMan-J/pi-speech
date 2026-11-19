@@ -11,6 +11,7 @@ pub const EDITION: &str = if cfg!(feature = "shared") {
 };
 
 pub mod audio;
+pub mod ctl;
 pub mod engines;
 pub mod front;
 pub mod gpu;

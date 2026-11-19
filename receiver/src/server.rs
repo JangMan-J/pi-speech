@@ -313,6 +313,26 @@ impl Inner {
         (rec, play)
     }
 
+    fn active_status(
+        &self,
+        client: Option<&str>,
+    ) -> (usize, Option<String>, Option<PathBuf>, Option<PathBuf>) {
+        let playing_count = self
+            .plays
+            .iter()
+            .filter(|p| {
+                p.state == PlayState::Playing && (client.is_none() || p.client.as_deref() == client)
+            })
+            .count();
+        let recording_id = self
+            .recs
+            .iter()
+            .find(|r| r.phase == RecPhase::Recording)
+            .map(|r| r.id.clone());
+        let (rec, play) = self.active_level_paths(client);
+        (playing_count, recording_id, rec, play)
+    }
+
     fn all_settled(&self) -> bool {
         self.plays.iter().all(|p| p.state != PlayState::Playing)
             && self.recs.iter().all(|r| r.phase != RecPhase::Recording)
@@ -834,6 +854,7 @@ impl Shared {
                 Response::json(200, format!("{{\"stopped\": {n}}}"))
             }
             ("POST", ["v1", "pair"]) => self.pair(conn, req),
+            ("GET", ["v1", "status"]) => self.get_status(req),
             ("GET", ["v1", "levels"]) => self.get_levels(req),
             ("POST", ["v1", "record", "start"]) => self.start_recording(),
             ("POST", ["v1", "record", id, "stop"]) => self.stop_recording(id),
@@ -868,6 +889,42 @@ impl Shared {
         if let Some(path) = removed_levels {
             let _ = fs::remove_file(path);
         }
+    }
+
+    fn get_status(&self, req: &Request) -> Response {
+        let client = match client_of(req) {
+            Ok(c) => c,
+            Err(resp) => return resp,
+        };
+        let (playing_count, recording_id, rec_levels, play_levels) =
+            lock(&self.inner).active_status(client.as_deref());
+        let rec = rec_levels.as_deref().and_then(spectrum::read_levels);
+        let play = play_levels.as_deref().and_then(spectrum::read_levels);
+        let fmt_bands = |b: &[u8; spectrum::BANDS]| {
+            let parts: Vec<String> = b.iter().map(|v| v.to_string()).collect();
+            format!("[{}]", parts.join(","))
+        };
+        let mut level_fields = Vec::new();
+        if let Some(b) = rec.as_ref() {
+            level_fields.push(format!("\"recording\":{}", fmt_bands(b)));
+        }
+        if let Some(b) = play.as_ref() {
+            level_fields.push(format!("\"playing\":{}", fmt_bands(b)));
+        }
+        let rec_json = match recording_id {
+            Some(id) => format!("{{\"id\":{}}}", json_str(&id)),
+            None => "null".to_string(),
+        };
+        Response::json(
+            200,
+            format!(
+                "{{\"protocol\":1,\"name\":\"pi-speech-receiver\",\"version\":{},\"edition\":{},\"playing\":{},\"playingCount\":{playing_count},\"recording\":{rec_json},\"levels\":{{{}}}}}",
+                json_str(crate::VERSION),
+                json_str(crate::EDITION),
+                playing_count > 0,
+                level_fields.join(","),
+            ),
+        )
     }
 
     fn get_levels(&self, req: &Request) -> Response {

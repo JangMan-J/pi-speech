@@ -1,6 +1,6 @@
 use pi_speech_receiver::audio::{play, record};
 use pi_speech_receiver::server::{self, Config, Server, DEFAULT_PORT};
-use pi_speech_receiver::{gpu, lease, models, shared, signals, speak, ssh, token, transcribe};
+use pi_speech_receiver::{ctl, gpu, lease, models, shared, signals, speak, ssh, token, transcribe};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -12,7 +12,8 @@ const NETWORK_NOTE: &str = "--network allows a --listen address that is not loop
 
 fn usage() -> String {
     format!(
-        "usage: {SERVE_USAGE}\n       {}\n       {}\n       {}\n       {}\n       {}\n       {}\n       {}\n       {}\n\n{NETWORK_NOTE}\n\n{}\n\n{}",
+        "usage: {SERVE_USAGE}\n       {}\n       {}\n       {}\n       {}\n       {}\n       {}\n       {}\n       {}\n       {}\n\n{NETWORK_NOTE}\n\n{}\n\n{}",
+        ctl::USAGE,
         ssh::USAGE,
         ssh::PAIR_USAGE,
         lease::USAGE,
@@ -95,6 +96,10 @@ fn serve(args: &[String]) -> Result<(), String> {
         }
     };
     println!("listening {}", srv.local_addr());
+    let _state_guard = ctl::StateGuard::register(
+        &format!("http://{}", srv.local_addr()),
+        args.token_file.as_deref(),
+    );
     if server::check_loopback(&srv.local_addr()).is_err() {
         eprintln!("pi-speech-receiver: listening beyond this machine; the bridge is plain HTTP: on a LAN anyone on it can read the audio and the token, Tailscale encrypts");
     }
@@ -120,6 +125,7 @@ fn main() -> ExitCode {
         Some("pair") => return ssh::pair_main(&args[1..]),
         Some("shared") => return shared::shared_main(&args[1..]),
         Some("lease") => return lease::lease_main(&args[1..]),
+        Some("ctl") => return ctl::main(&args[1..]),
         Some("serve") => &args[1..],
         _ => &args[..],
     };

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ensureBinaryFor, hasBinaryFor, inspectLocalBinary, releaseAssetSize } from "../../src/engine/binary";
 import { ReceiverControl, type ReceiverHost } from "../../src/engine/receiver-control";
+import { manageRemoteReceiver } from "../../src/engine/remote";
 
 vi.mock("../../src/engine/binary", async () => {
   const actual = await vi.importActual<typeof import("../../src/engine/binary")>("../../src/engine/binary");
@@ -10,6 +11,14 @@ vi.mock("../../src/engine/binary", async () => {
     hasBinaryFor: vi.fn(),
     inspectLocalBinary: vi.fn(),
     releaseAssetSize: vi.fn(),
+  };
+});
+
+vi.mock("../../src/engine/remote", async () => {
+  const actual = await vi.importActual<typeof import("../../src/engine/remote")>("../../src/engine/remote");
+  return {
+    ...actual,
+    manageRemoteReceiver: vi.fn(),
   };
 });
 
@@ -195,5 +204,78 @@ describe("updateLocal", () => {
       text: `! Receiver 0.2.5 is still in use at ${stale} (checkout) (expected 0.2.7)`,
     });
     expect(closeWorkers).toHaveBeenCalledOnce();
+  });
+
+  it("switches a forwarded SSH bridge receiver between CPU and GPU via Manage over SSH when receiverSshHost is set", async () => {
+    vi.mocked(manageRemoteReceiver).mockReset();
+    vi.mocked(hasBinaryFor).mockReturnValue(true);
+    let edition: "cpu" | "gpu" = "cpu";
+    const host = {
+      env: {},
+      speech: {
+        settings: { localDevice: "cpu" as const, receiverSshHost: "desk" },
+        local: { gpu: vi.fn(async () => undefined) },
+        closeWorkers: vi.fn(),
+        save: vi.fn(),
+      },
+      routes: {
+        ssh: true,
+        route: "bridge" as const,
+        bridge: {
+          health: vi.fn(async () => ({ ok: true as const, version: "0.3.1", edition })),
+          gpu: vi.fn(async () => ({
+            driver: true,
+            cuda: 13,
+            cudnn: true,
+            hardware: true,
+            target: "linux-x64-cuda",
+            usable: true,
+            why: null,
+          })),
+        },
+      },
+      remoteState: "disconnected" as const,
+      receiverVersion: "0.3.1",
+      probeBridge: vi.fn(async () => ({
+        ok: true as const,
+        address: "127.0.0.1",
+        port: 47613,
+        ms: 4,
+        version: "0.3.1",
+      })),
+    };
+    const ctl = new ReceiverControl(host as unknown as ReceiverHost);
+    ctl.pairing = { ok: true, address: "127.0.0.1", port: 47613, ms: 4, version: "0.3.1" };
+    const prompts = { confirm: vi.fn(async () => true), progress: vi.fn(), password: vi.fn(async () => undefined) };
+
+    vi.mocked(manageRemoteReceiver).mockImplementation(async () => {
+      edition = "gpu";
+      return { action: "updated", version: "0.3.1" };
+    });
+    await expect(ctl.switchRemoteEdition(prompts)).resolves.toEqual({
+      tone: "success",
+      text: "✓ Updated receiver v0.3.1 on desk · bridge connected",
+    });
+    expect(manageRemoteReceiver).toHaveBeenCalledWith(
+      "desk",
+      "update",
+      prompts,
+      expect.objectContaining({ targetOverride: "linux-x64-cuda" }),
+    );
+
+    vi.mocked(manageRemoteReceiver).mockImplementation(async () => {
+      edition = "cpu";
+      return { action: "updated", version: "0.3.1" };
+    });
+    await expect(ctl.switchRemoteEdition(prompts)).resolves.toEqual({
+      tone: "success",
+      text: "✓ Updated receiver v0.3.1 on desk · bridge connected",
+    });
+    expect(manageRemoteReceiver).toHaveBeenLastCalledWith(
+      "desk",
+      "update",
+      prompts,
+      expect.objectContaining({ targetOverride: "cpu" }),
+    );
   });
 });
