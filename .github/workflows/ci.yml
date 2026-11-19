@@ -296,7 +296,7 @@ jobs:
           echo "$text"
           echo "$text" | grep -qi "fox"
       - name: Keep the release binary for testing on real machines
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pi-speech-receiver-${{ runner.os }}-${{ runner.arch }}
           path: |
