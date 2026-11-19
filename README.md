@@ -57,6 +57,24 @@ Speech and transcription each switch independently between **Local** and cloud p
   - **Supertonic 3** (31 languages), **Pocket TTS**, **ZipVoice distill**, **Matcha-TTS**, **Kitten v0.8**, and **Piper** (including 904-speaker LibriTTS and 109-speaker VCTK packs).
 - **NVIDIA GPU acceleration (Linux & Windows)**: Switch to the CUDA 12 or CUDA 13 GPU receiver right from `/speech` for full-precision transcription (`fp32`/`fp16`) and heavyweight expressive TTS models.
 
+## Sharing settings with Jing's Zellij sidebar
+
+Jing's speech-settings pane saves TTS/STT source, model, and voice to `$XDG_CONFIG_HOME/zellij/pi-speech.json` (default `~/.config/zellij/pi-speech.json`). It reads Pi Speech's `<agent dir>/pi-speech/settings.json` as a fallback. If the Zellij file exists, Pi Speech imports it at load when it is newer than its own settings file, and mirrors saved choices back on save. Pi Speech never creates the Zellij file.
+
+| Jing key | Pi Speech setting |
+| --- | --- |
+| `ttsSource` | `speechSource` |
+| `sttSource` | `transcriptionSource` |
+| `model` | `localSpeechModel` |
+| `voice` | `localSpeechVoice` |
+| `sttModel` | `localTranscriptionModel` |
+| `providerTtsModel` | `speechModel` |
+| `providerVoice` | `voice` |
+| `providerSttModel` | `transcriptionModel` |
+| `url` | Not imported; use Pairing or `PI_SPEECH_BRIDGE_URL` |
+
+Jing plugin overrides `speech_url` and `speech_token_file` correspond to `PI_SPEECH_BRIDGE_URL` and `PI_SPEECH_BRIDGE_TOKEN_FILE`. If xAI cannot fetch its voice list, it falls back to `eve`, `ara`, `leo`, `rex`, and `sal`.
+
 ## Cloud providers and agent tools
 
 Local models need no keys. When you want cloud voices or models, use OpenRouter, xAI, OpenAI, Groq, Together, Mistral, DeepInfra, or any OpenAI-compatible server.
