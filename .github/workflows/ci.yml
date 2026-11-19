@@ -199,7 +199,7 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - name: Cache sherpa-onnx's prebuilt archive
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: receiver/target/sherpa-onnx-prebuilt/*.tar.bz2
           key: prebuilt-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('receiver/Cargo.lock') }}
@@ -210,7 +210,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'pull_request' }}
       - name: Cache the test model
         id: model-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: test-models
           key: test-model-${{ env.TEST_MODEL }}
@@ -270,7 +270,7 @@ jobs:
       - name: Cache sherpa-onnx's Linux x64 shared-library bundle
         if: runner.os == 'Linux' && runner.arch == 'X64'
         id: gpu-bundle-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: receiver/gpu.tar.bz2
           key: gpu-bundle-${{ env.GPU_BUNDLE_SHA256 }}
