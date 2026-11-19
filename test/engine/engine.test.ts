@@ -7,7 +7,16 @@ import type { AudioInput } from "../../src/engine/audio";
 import type { Machine } from "../../src/engine/settings";
 import { LOCAL_SPEECH_UNAVAILABLE } from "../../src/engine/speech";
 import { Surface } from "../../src/engine/surface";
-import { CATALOG, fakeOpenRouter, fakeReceiver, makeEngine, STAND_IN_BINARY, scriptedUi, trackTemp, wavFixture } from "./fixtures";
+import {
+  CATALOG,
+  fakeOpenRouter,
+  fakeReceiver,
+  makeEngine,
+  STAND_IN_BINARY,
+  scriptedUi,
+  trackTemp,
+  wavFixture,
+} from "./fixtures";
 
 afterEach(() => vi.unstubAllGlobals());
 const tick = () => new Promise((r) => setTimeout(r, 0));
@@ -208,14 +217,34 @@ describe("GPU receiver over SSH without a server binary", () => {
     engine.routes.bridge.health = async () => ({ ok: true, version: "1.0.0", edition: "gpu" });
     engine.routes.bridge.gpu = async () => ({ hardware: true, name: "Laptop GPU" });
     const list = vi.fn(async () => [
-      { id: "kokoro", kind: "speech", name: "Kokoro", languages: ["en"], size: 100, downloaded: true, partial: 0, path: "/gpu/kokoro" },
-      { id: "parakeet-v3", kind: "transcription", name: "Parakeet", languages: ["en"], size: 200, downloaded: true, partial: 0, path: "/gpu/parakeet" },
+      {
+        id: "kokoro",
+        kind: "speech",
+        name: "Kokoro",
+        languages: ["en"],
+        size: 100,
+        downloaded: true,
+        partial: 0,
+        path: "/gpu/kokoro",
+      },
+      {
+        id: "parakeet-v3",
+        kind: "transcription",
+        name: "Parakeet",
+        languages: ["en"],
+        size: 200,
+        downloaded: true,
+        partial: 0,
+        path: "/gpu/parakeet",
+      },
     ]);
     const voices = vi.fn(async () => [{ name: "gpu-voice", number: 0 }]);
     const transcribe = vi.fn(async () => "words from laptop");
     const speak = vi.fn(async () => ({
       format: { codec: "pcm" as const, rate: 24000, channels: 1 },
-      chunks: (async function* () { yield new Uint8Array(4800); })(),
+      chunks: (async function* () {
+        yield new Uint8Array(4800);
+      })(),
     }));
     engine.routes.bridge.models = { list, voices, transcribe, speak };
     expect(await engine.routes.bridge.health()).toMatchObject({ ok: true, edition: "gpu" });
@@ -239,13 +268,23 @@ describe("GPU receiver over SSH without a server binary", () => {
     expect(ensureBinary).not.toHaveBeenCalled();
 
     engine.setDirection("modelsOn", "this");
-    const calls = [list.mock.calls.length, voices.mock.calls.length, transcribe.mock.calls.length, speak.mock.calls.length];
+    const calls = [
+      list.mock.calls.length,
+      voices.mock.calls.length,
+      transcribe.mock.calls.length,
+      speak.mock.calls.length,
+    ];
     await expect(speech.local.list()).rejects.toThrow();
     await expect(speech.localVoices("kokoro")).rejects.toThrow();
     await expect(speech.transcribeAudio(audio, "wav")).rejects.toThrow();
     await expect(speech.speak("Hello server", { play: false })).rejects.toThrow();
     expect(ensureBinary).toHaveBeenCalled();
-    expect([list.mock.calls.length, voices.mock.calls.length, transcribe.mock.calls.length, speak.mock.calls.length]).toEqual(calls);
+    expect([
+      list.mock.calls.length,
+      voices.mock.calls.length,
+      transcribe.mock.calls.length,
+      speak.mock.calls.length,
+    ]).toEqual(calls);
 
     engine.setDirection("modelsOn", "remote");
     expect(await speech.localVoices("kokoro")).toEqual(["gpu-voice"]);

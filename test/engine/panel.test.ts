@@ -629,13 +629,27 @@ describe("the panel view model: Receivers", () => {
     const p = open({ SSH_CONNECTION: "1 2 3 4" });
     await p.panel.idle();
     const receiver = p.engine.receivers;
-    receiver.remoteGpu = { driver: true, cuda: 13, cudnn: true, hardware: true, target: "unavailable-target", usable: true, why: null };
+    receiver.remoteGpu = {
+      driver: true,
+      cuda: 13,
+      cudnn: true,
+      hardware: true,
+      target: "unavailable-target",
+      usable: true,
+      why: null,
+    };
     vi.spyOn(receiver, "connectedVersion").mockReturnValue(p.engine.receiverVersion);
     const edition = vi.spyOn(receiver, "connectedEdition").mockReturnValue("gpu");
     await p.goTo("Remote receiver");
-    expect(p.row("Remote receiver")).toMatchObject({ value: expect.stringMatching(/^GPU/), note: "CUDA 13" });
+    expect(p.row("Remote receiver")).toMatchObject({
+      value: expect.stringMatching(/^GPU/),
+      note: "CUDA 13 · Manage over SSH…",
+    });
     edition.mockReturnValue("cpu");
-    expect(p.row("Remote receiver")).toMatchObject({ value: expect.stringMatching(/^CPU/), note: "CUDA 13 ready · ←→ GPU" });
+    expect(p.row("Remote receiver")).toMatchObject({
+      value: expect.stringMatching(/^CPU/),
+      note: "CUDA 13 ready · ←→ GPU · Manage over SSH…",
+    });
   });
 
   it("on this machine with Device Local it shows only Connection and Local receiver", async () => {
@@ -646,7 +660,11 @@ describe("the panel view model: Receivers", () => {
     const v = p.panel.view();
     expect(v).toMatchObject({ menu: "bridge", crumb: "Receivers", selected: 0 });
     expect(v.rows.map((r) => r.label)).toEqual(["Connection", "Local receiver"]);
-    expect(p.row("Connection")).toMatchObject({ value: "This host (test-host)", note: "Enter connects an SSH receiver", opens: true });
+    expect(p.row("Connection")).toMatchObject({
+      value: "This host (test-host)",
+      note: "Enter connects an SSH receiver",
+      opens: true,
+    });
     expect(p.panel.view().status?.text).toContain("Pi runs on This host (test-host)");
     expect(p.hint()).toBe("← → Selects · Enter connect · Esc Main");
     await p.press("escape");
@@ -786,6 +804,7 @@ describe("the panel view model: Device and Receiver, on this machine", () => {
       {},
       {
         before: (e) => {
+          vi.spyOn(e.receivers, "refreshLocal").mockResolvedValue();
           (e as unknown as { receiverVersion: string }).receiverVersion = expected;
           e.probeBridge = async () => ({
             ok: true,
@@ -842,13 +861,16 @@ describe("the panel view model: Device and Receiver, on this machine", () => {
     expect(updatedCalls).toBe(1);
     expect(p.panel.view().status?.text).toBe("pi-speech-receiver on spider is already current (0.2.5)");
     // Device ←→ toggles back to Local (turning off the bridge while remembering spider) and back to Remote
-    await p.goTo("Device");
+    await p.goTo("Connection");
     expect(p.engine.routes.route).toBe("bridge");
     await p.press("left");
     expect(p.engine.routes.route).toBe("local");
     expect(settingsOf(p.work).bridge).toBe("auto");
     expect(settingsOf(p.work).remoteHost).toBe("spider");
-    expect(p.row("Connection")).toMatchObject({ value: "This host (test-host)", note: expect.stringContaining("spider") });
+    expect(p.row("Connection")).toMatchObject({
+      value: "This host (test-host)",
+      note: expect.stringContaining("spider"),
+    });
     await p.press("escape");
     expect(p.row("Receivers")).toMatchObject({ value: expect.stringMatching(/^This host/) });
     expect(p.row("Receivers")?.alert).toBeFalsy();
@@ -1046,7 +1068,12 @@ describe("the panel view model: Receivers' DIRECTION", () => {
     expect(p.selectedLabel()).toBe("Run models on");
     // Turn Bridge off: the three routing rows disappear and selection clamps when Bridge is turned off from row 0 or via engine.
     await p.engine.setBridge("off");
-    expect(p.panel.view().rows.map((r) => r.label)).toEqual(["SSH receiver", "Connection", "Pairing", "Local receiver"]);
+    expect(p.panel.view().rows.map((r) => r.label)).toEqual([
+      "SSH receiver",
+      "Connection",
+      "Pairing",
+      "Local receiver",
+    ]);
     expect(p.selectedLabel()).toBe("Local receiver");
     expect(p.hint()).toMatch(/Esc Main$/);
     await p.engine.setBridge("auto");
@@ -2219,7 +2246,9 @@ describe.skipIf(!STAND_IN_BINARY)("the panel view model: Local sources", () => {
     vi.spyOn(receiver, "isRemoteDevice").mockReturnValue(true);
     vi.spyOn(receiver, "canSwitchRemoteEdition").mockReturnValue(true);
     vi.spyOn(receiver, "connectedEdition").mockReturnValue("cpu");
-    const toggle = vi.spyOn(receiver, "switchRemoteEdition").mockResolvedValue({ tone: "info", text: "Switch on desk" });
+    const toggle = vi
+      .spyOn(receiver, "switchRemoteEdition")
+      .mockResolvedValue({ tone: "info", text: "Switch on desk" });
     p.engine.speech.setSource("transcription", "local");
     await p.goTo("Transcription model");
     await p.press("enter");
@@ -2227,7 +2256,7 @@ describe.skipIf(!STAND_IN_BINARY)("the panel view model: Local sources", () => {
     await p.press({ combo: "ctrl+g" });
     expect(toggle).toHaveBeenCalledTimes(1);
     await p.press("escape");
-    await p.goTo("Receiver");
+    await p.goTo("Remote receiver");
     await p.press("right");
     expect(toggle).toHaveBeenCalledTimes(2);
   });

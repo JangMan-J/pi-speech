@@ -397,7 +397,6 @@ const MENUS: Record<MenuMode["menu"], { title: string; ids: RowId[] }> = {
   dictation: { title: "Dictation options", ids: DICTATION_IDS },
 };
 
-
 const isDirectionRow = (id: RowId): id is DirectionSetting => (DIRECTIONS as readonly RowId[]).includes(id);
 const CONNECT_HINT = "ssh Host, user@host, or host:port";
 const CONNECT_HOW = "Connect: ssh Host, user@host, or host:port";
@@ -1038,9 +1037,10 @@ export class Panel {
       },
       device: {
         label: "Connection",
-        info: () => this.engine.routes.ssh
-          ? `Pi runs on ${this.machineName("this")}; the desk receiver connects over SSH. ←→ switches; Enter explains the address.`
-          : `Pi runs on ${this.machineName("this")}; Enter connects an SSH receiver, ←→ switches, x disconnects.`,
+        info: () =>
+          this.engine.routes.ssh
+            ? `Pi runs on ${this.machineName("this")}; the desk receiver connects over SSH. ←→ switches; Enter explains the address.`
+            : `Pi runs on ${this.machineName("this")}; Enter connects an SSH receiver, ←→ switches, x disconnects.`,
         opens: true,
         cycles: true,
         render: () => this.deviceValue(),
@@ -1300,7 +1300,11 @@ export class Panel {
             ? "Summarization only: same model, same reply (no additional request)."
             : `Summarization only: ${callNote} (your speech model speaks it).`,
       };
-    } else if (home.kind === "menu" && (home.menu === "readAloud" || home.menu === "dictation" || home.menu === "bridge") && this.mode === home) {
+    } else if (
+      home.kind === "menu" &&
+      (home.menu === "readAloud" || home.menu === "dictation" || home.menu === "bridge") &&
+      this.mode === home
+    ) {
       const id = baseRows[home.selected]?.id;
       const info = id ? this.rowSpecs[id].info?.() : undefined;
       if (info) view.status = { tone: "info", text: info };
@@ -1456,13 +1460,16 @@ export class Panel {
     const host = this.deps.hostName ?? (hostname().split(".")[0] || "this-host");
     if (machine === "this") return `${this.engine.routes.ssh ? "Pi host" : "This host"} (${host})`;
     if (this.engine.routes.ssh) return "Desk (over SSH)";
-    return this.engine.remoteHost ? `SSH (${this.engine.remoteHost})` : `Remote (${this.speech.settings.bridgeAddress ?? hostPort(this.engine.routes.url) ?? "not connected"})`;
+    return this.engine.remoteHost
+      ? `SSH (${this.engine.remoteHost})`
+      : `Remote (${this.speech.settings.bridgeAddress ?? hostPort(this.engine.routes.url) ?? "not connected"})`;
   }
 
   private bridgeNote(mode: BridgeMode): Pick<PanelRow, "note" | "short" | "alert"> {
     const routes = this.engine.routes;
     const when = mode === "auto" ? "on over SSH · " : "";
-    if (routes.routeFor(mode) === "local") return { note: `${when}plays on ${this.machineName("this")}`, short: "Pi host" };
+    if (routes.routeFor(mode) === "local")
+      return { note: `${when}plays on ${this.machineName("this")}`, short: "Pi host" };
     const r = this.receivers.health;
     const host = routes.url.replace(/^[a-z]+:\/\//, "");
     const state = !r || r === "checking" ? "… checking" : r.ok ? `✓ ${host}` : "✗ receiver unreachable";
@@ -1508,7 +1515,8 @@ export class Panel {
     const e = this.engine;
     const host = e.remoteHost;
     if (e.routes.ssh) {
-      if (e.routes.route !== "bridge") return { value: this.machineName("this"), note: "←→ switches to Desk (over SSH)" };
+      if (e.routes.route !== "bridge")
+        return { value: this.machineName("this"), note: "←→ switches to Desk (over SSH)" };
       const at = hostPort(e.routes.url);
       const from = this.receivers.addressFrom();
       if (!at) {
@@ -1545,7 +1553,11 @@ export class Panel {
         opens: true,
       };
     }
-    return { value: this.machineName("this"), note: host ? `←→ SSH (${host}) · Enter connects` : "Enter connects an SSH receiver", opens: true };
+    return {
+      value: this.machineName("this"),
+      note: host ? `←→ SSH (${host}) · Enter connects` : "Enter connects an SSH receiver",
+      opens: true,
+    };
   }
 
   private remoteReceiverValue(): Pick<PanelRow, "value" | "note" | "short" | "alert" | "opens"> {
@@ -1557,9 +1569,14 @@ export class Panel {
       const outdated = this.receivers.isRemoteOutdated();
       const p = this.receivers.pairing;
       const unreachable = p && p !== "checking" && !p.ok && pairingFault(p.reason) === "receiver unreachable";
+      const rg = this.receivers.remoteGpu;
+      let note = "Manage over SSH…";
+      if (outdated && !unreachable) note = `! update to v${e.receiverVersion} · Manage over SSH…`;
+      else if (ed === "CPU" && rg?.hardware) note = `CUDA ${rg.cuda} ready · ←→ GPU · Manage over SSH…`;
+      else if (ed === "GPU" && rg?.cuda) note = `CUDA ${rg.cuda} · Manage over SSH…`;
       return {
         value: unreachable ? "✗ unreachable" : ver ? `${ed} v${ver}` : "… checking",
-        note: outdated && !unreachable ? `! update to v${e.receiverVersion} · Manage over SSH…` : "Manage over SSH…",
+        note,
         alert: !!(outdated || unreachable),
         opens: true,
       };
@@ -1620,8 +1637,7 @@ export class Panel {
       return { note: "✓" };
     };
     if (!routes.ssh) {
-      if (this.engine.remoteState === "connecting")
-        return { value: this.machineName("remote"), note: "… connecting" };
+      if (this.engine.remoteState === "connecting") return { value: this.machineName("remote"), note: "… connecting" };
       if (this.engine.remoteState === "lost" || this.engine.remoteState === "failed") {
         return {
           value: this.machineName("remote"),
@@ -1860,9 +1876,11 @@ export class Panel {
       }
       if (p.local) {
         const toggle: Hint = { key: "Ctrl+T", action: "provider" };
-        const gpuHint: Hint[] = (this.receivers.isRemoteDevice()
-          ? this.receivers.connectedEdition() !== "gpu" && this.receivers.canSwitchRemoteEdition()
-          : this.receivers.canSwitchLocalGpu())
+        const gpuHint: Hint[] = (
+          this.receivers.isRemoteDevice()
+            ? this.receivers.connectedEdition() !== "gpu" && this.receivers.canSwitchRemoteEdition()
+            : this.receivers.canSwitchLocalGpu()
+        )
           ? [{ key: "Ctrl+G", action: "GPU", optional: true }]
           : [];
         if (this.pickerItems(p).length === 0) return [...gpuHint, toggle, esc("back")];
@@ -1997,7 +2015,9 @@ export class Panel {
       } else if (
         matches("gpu") &&
         p.local &&
-        ((this.receivers.isRemoteDevice() && this.receivers.connectedEdition() !== "gpu" && this.receivers.canSwitchRemoteEdition()) ||
+        ((this.receivers.isRemoteDevice() &&
+          this.receivers.connectedEdition() !== "gpu" &&
+          this.receivers.canSwitchRemoteEdition()) ||
           (!this.receivers.isRemoteDevice() && this.speech.settings.localDevice === "cpu"))
       ) {
         if (this.receivers.isRemoteDevice()) this.toggleRemoteEdition();

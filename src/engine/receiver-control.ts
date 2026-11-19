@@ -5,7 +5,6 @@
 
 import { type BridgeHealth, type BridgeProbe, bridgeTarget, displayUrl, PairingError } from "../bridge/client";
 import {
-  BINARY_ENV,
   ensureBinary,
   ensureBinaryFor,
   findBinary,
@@ -222,14 +221,11 @@ export class ReceiverControl {
     if (this.canManageRemote()) {
       return (
         this.connectedEdition() === "gpu" ||
-        Boolean(
-          this.remoteGpu?.hardware && this.remoteGpu.target && hasBinaryFor(this.remoteGpu.target, this.host.env),
-        )
+        Boolean(this.remoteGpu?.hardware && this.remoteGpu.target && hasBinaryFor(this.remoteGpu.target, this.host.env))
       );
     }
     return (
-      this.host.routes.route === "bridge" &&
-      (this.connectedEdition() === "gpu" || Boolean(this.remoteGpu?.hardware))
+      this.host.routes.route === "bridge" && (this.connectedEdition() === "gpu" || Boolean(this.remoteGpu?.hardware))
     );
   }
 
@@ -378,16 +374,22 @@ export class ReceiverControl {
     const ed = this.connectedEdition() ?? "cpu";
     if ((this.host.routes.ssh || this.host.remoteState !== "connected") && this.host.routes.route === "bridge") {
       if (!this.remoteGpu && this.host.routes.bridge.gpu) {
-        this.remoteGpu = await this.host.routes.bridge.gpu().catch(() => undefined) as GpuInfo | undefined;
+        this.remoteGpu = (await this.host.routes.bridge.gpu().catch(() => undefined)) as GpuInfo | undefined;
       }
       if (ed === "gpu") {
-        return { tone: "info", text: "Desk receiver is running the GPU edition; restart it with the CPU edition to switch" };
+        return {
+          tone: "info",
+          text: "Desk receiver is running the GPU edition; restart it with the CPU edition to switch",
+        };
       }
       const info = this.remoteGpu;
       if (!info?.hardware) {
         return { tone: "warning", text: `! Desk GPU unavailable: ${info?.why ?? "no compatible GPU detected"}` };
       }
-      return { tone: "info", text: `Desk has CUDA ${info.cuda ?? "unknown"} (${info.target ?? "unknown target"}): start the GPU edition of pi-speech-receiver on your desk machine` };
+      return {
+        tone: "info",
+        text: `Desk has CUDA ${info.cuda ?? "unknown"} (${info.target ?? "unknown target"}): start the GPU edition of pi-speech-receiver on your desk machine`,
+      };
     }
     if (this.host.routes.ssh || this.host.remoteState !== "connected" || !this.host.remoteHost) {
       return { tone: "info", text: "Switching remote receiver edition requires an SSH connection" };

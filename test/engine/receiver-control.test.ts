@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { ensureBinaryFor, hasBinaryFor, inspectLocalBinary } from "../../src/engine/binary";
+import { ensureBinaryFor, hasBinaryFor, inspectLocalBinary, releaseAssetSize } from "../../src/engine/binary";
 import { ReceiverControl, type ReceiverHost } from "../../src/engine/receiver-control";
 
 vi.mock("../../src/engine/binary", async () => {
@@ -9,6 +9,7 @@ vi.mock("../../src/engine/binary", async () => {
     ensureBinaryFor: vi.fn(),
     hasBinaryFor: vi.fn(),
     inspectLocalBinary: vi.fn(),
+    releaseAssetSize: vi.fn(),
   };
 });
 
@@ -26,7 +27,15 @@ function control(env: Record<string, string> = {}) {
   return { ctl: new ReceiverControl(host as unknown as ReceiverHost), closeWorkers, host };
 }
 
-const gpu = { driver: true, cuda: 13, cudnn: true, hardware: true, usable: true, why: null, target: "linux-x64-cuda13" };
+const gpu = {
+  driver: true,
+  cuda: 13,
+  cudnn: true,
+  hardware: true,
+  usable: true,
+  why: null,
+  target: "linux-x64-cuda13",
+};
 const noGpu = { driver: false, cuda: null, cudnn: false, hardware: false, why: "no NVIDIA driver" };
 
 function remoteControl(ssh: boolean) {
@@ -35,9 +44,12 @@ function remoteControl(ssh: boolean) {
     gpu: vi.fn(async (): Promise<any> => gpu),
   };
   const host = {
-    env: {}, routes: { ssh, route: "bridge", bridge },
-    remoteState: ssh ? "off" : "connected", remoteHost: ssh ? undefined : "server",
-    remotePlatform: "linux-x64", remoteEdition: "cpu",
+    env: {},
+    routes: { ssh, route: "bridge", bridge },
+    remoteState: ssh ? "off" : "connected",
+    remoteHost: ssh ? undefined : "server",
+    remotePlatform: "linux-x64",
+    remoteEdition: "cpu",
     updateRemoteReceiver: vi.fn(async () => ({ dest: "server", version: "1.0" })),
     probeBridge: vi.fn(async () => ({ ok: false, reason: "offline" })),
   };
@@ -74,7 +86,10 @@ describe("remote GPU", () => {
   it("offers manual switching on an SSH tunnel with GPU hardware, probing if needed", async () => {
     const { ctl, bridge, prompts, host } = remoteControl(true);
     expect(ctl.canSwitchRemoteEdition()).toBe(false);
-    expect(await ctl.switchRemoteEdition(prompts)).toEqual({ tone: "info", text: "Desk has CUDA 13 (linux-x64-cuda13): start the GPU edition of pi-speech-receiver on your desk machine" });
+    expect(await ctl.switchRemoteEdition(prompts)).toEqual({
+      tone: "info",
+      text: "Desk has CUDA 13 (linux-x64-cuda13): start the GPU edition of pi-speech-receiver on your desk machine",
+    });
     expect(bridge.gpu).toHaveBeenCalledOnce();
     expect(ctl.canSwitchRemoteEdition()).toBe(true);
     expect(host.updateRemoteReceiver).not.toHaveBeenCalled();
@@ -84,13 +99,19 @@ describe("remote GPU", () => {
     const { ctl, prompts } = remoteControl(true);
     ctl.health = { ok: true, edition: "gpu" } as any;
     expect(ctl.canSwitchRemoteEdition()).toBe(true);
-    expect(await ctl.switchRemoteEdition(prompts)).toEqual({ tone: "info", text: expect.stringMatching(/GPU edition.*restart.*CPU edition/) });
+    expect(await ctl.switchRemoteEdition(prompts)).toEqual({
+      tone: "info",
+      text: expect.stringMatching(/GPU edition.*restart.*CPU edition/),
+    });
   });
 
   it("reports missing GPU hardware on an SSH tunnel", async () => {
     const { ctl, bridge, prompts } = remoteControl(true);
     bridge.gpu.mockResolvedValueOnce(noGpu);
-    expect(await ctl.switchRemoteEdition(prompts)).toEqual({ tone: "warning", text: expect.stringContaining("no NVIDIA driver") });
+    expect(await ctl.switchRemoteEdition(prompts)).toEqual({
+      tone: "warning",
+      text: expect.stringContaining("no NVIDIA driver"),
+    });
     expect(ctl.canSwitchRemoteEdition()).toBe(false);
   });
 
@@ -120,6 +141,7 @@ describe("updateLocal", () => {
     vi.mocked(ensureBinaryFor).mockReset();
     vi.mocked(hasBinaryFor).mockReset();
     vi.mocked(inspectLocalBinary).mockReset();
+    vi.mocked(releaseAssetSize).mockReset().mockReturnValue(1234);
   });
 
   it("warns when PI_SPEECH_BINARY pins an old receiver instead of pretending to update", async () => {
